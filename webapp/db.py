@@ -1,4 +1,4 @@
-"""SQLite 数据访问（通用部署平台版）：9 表 + 泛型 CRUD + JSON 序列化 + 删除保护 + 审计"""
+"""SQLite 数据访问（通用部署平台版）：泛型 CRUD + JSON 序列化 + 删除保护 + 审计 + 告警系统"""
 import json
 import sqlite3
 import time

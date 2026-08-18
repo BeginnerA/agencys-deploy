@@ -1,5 +1,6 @@
 """DB 扩展测试：告警 5 张新表 + services 加列 + JSON 字段往返"""
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -11,6 +12,9 @@ class TestDbExtensions(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.db = os.path.join(self.tmp, "test.db")
         dbm.init_db(self.db)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_new_tables_exist(self):
         conn = dbm.get_conn(self.db)
