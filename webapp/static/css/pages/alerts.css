@@ -1,4 +1,10 @@
-/* alerts.css — 告警中心（告警列表 Tab） */
+/* alerts.css — 告警中心（告警列表 Tab + 规则管理 Tab） */
+
+/* ---- Tab 切换栏 ---- */
+.alert-tabs-bar{display:flex;gap:0;margin-bottom:var(--sp-4);border-bottom:1px solid var(--border)}
+.alert-tabs-bar .tab-btn{border-bottom:none;margin-bottom:-1px}
+
+/* ---- 告警列表 Tab ---- */
 .alert-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--sp-3);margin-bottom:var(--sp-4)}
 .alert-stat{background:linear-gradient(180deg,rgba(17,34,65,.6),rgba(13,27,51,.9));
   border:1px solid var(--border);border-radius:var(--r-card);padding:14px 18px}
@@ -39,3 +45,29 @@
 /* 分页 */
 .alert-pagination{display:flex;align-items:center;justify-content:center;gap:var(--sp-3);margin-top:var(--sp-4);padding:var(--sp-3) 0}
 .alert-pagination .pg-info{font-size:var(--fs-12);color:var(--text-2);font-family:var(--font-num)}
+
+/* ==================== 规则管理 Tab ==================== */
+/* 规则表格 */
+.rules-tbl td{font-size:var(--fs-13)}
+.rules-tbl .num{text-align:right;font-family:var(--font-num)}
+.rules-tbl .rule-remark{font-size:var(--fs-11);color:var(--text-3);margin-top:2px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rules-tbl .rule-actions{white-space:nowrap;display:flex;gap:4px}
+
+/* 规则类型徽标 */
+.rule-mt-badge{display:inline-block;padding:2px 8px;border-radius:var(--r-full);font-size:var(--fs-11);font-weight:500}
+.rule-mt-badge.mt-metric{background:rgba(0,212,255,.12);color:var(--primary);border:1px solid rgba(0,212,255,.35)}
+.rule-mt-badge.mt-status{background:rgba(255,122,69,.12);color:var(--accent);border:1px solid rgba(255,122,69,.35)}
+.rule-mt-badge.mt-log_keyword{background:rgba(254,176,25,.12);color:var(--warning);border:1px solid rgba(254,176,25,.35)}
+
+/* 规则条件次级文本 */
+.rule-sub{font-size:var(--fs-11);color:var(--text-3);margin-top:2px}
+
+/* 渠道标签列表 */
+.rule-ch-list{display:flex;flex-wrap:wrap;gap:4px}
+.rule-ch-tag{display:inline-block;padding:1px 6px;border-radius:var(--r-full);font-size:var(--fs-11);
+  background:rgba(0,212,255,.06);color:var(--text-2);border:1px solid var(--border)}
+
+/* 渠道 checkbox 组（抽屉表单内） */
+.rule-ch-box{display:flex;flex-wrap:wrap;gap:8px 16px}
+.rule-ch-cb{display:inline-flex;align-items:center;gap:5px;font-size:var(--fs-13);color:var(--text-1);cursor:pointer}
+.rule-ch-cb input{width:auto;margin:0}
