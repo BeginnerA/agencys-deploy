@@ -94,6 +94,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     env TEXT DEFAULT '',
     version TEXT DEFAULT '',
     previous_version TEXT DEFAULT '',
+    extra TEXT DEFAULT '',
+    action TEXT DEFAULT 'deploy',
     status TEXT DEFAULT 'pending',
     log_file TEXT DEFAULT '',
     created_by INTEGER DEFAULT 0,
@@ -177,6 +179,32 @@ CREATE TABLE IF NOT EXISTS platform_settings (
     value TEXT DEFAULT '',
     updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS log_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    env TEXT NOT NULL DEFAULT '',
+    service TEXT NOT NULL DEFAULT '',
+    container TEXT NOT NULL DEFAULT '',
+    file_path TEXT NOT NULL DEFAULT '',
+    line_offset INTEGER NOT NULL DEFAULT 0,
+    line_count INTEGER NOT NULL DEFAULT 0,
+    keywords TEXT DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS log_scan_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    env TEXT NOT NULL DEFAULT '',
+    server TEXT NOT NULL DEFAULT '',
+    container TEXT NOT NULL DEFAULT '',
+    service TEXT NOT NULL DEFAULT '',
+    last_ts TEXT DEFAULT '',
+    last_line INTEGER DEFAULT 0,
+    updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_log_scan_state_key
+    ON log_scan_state(env, server, container);
+CREATE VIRTUAL TABLE IF NOT EXISTS log_fts USING fts5(
+    ts, env, service, content, content='log_entries', content_rowid='id'
+);
 """
 
 # JSON 字段（读写时自动序列化/反序列化）
@@ -187,13 +215,16 @@ JSON_FIELDS = {
     "alert_rules": {"scope", "channels"},
     "alerts": {"target_info"},
     "silence_windows": {"weekdays", "scope"},
+    "tasks": {"extra"},
+    "log_entries": {"keywords"},
 }
 
 # 表名白名单（泛型 CRUD 的标识符护栏，防 SQL 注入）
 TABLES = frozenset(("projects", "services", "environments", "servers",
                     "env_servers", "pipelines", "users", "tasks", "audit_logs",
                     "alert_rules", "alerts", "alert_events",
-                    "silence_windows", "platform_settings"))
+                    "silence_windows", "platform_settings",
+                    "log_entries", "log_scan_state"))
 
 
 def _check_table(table: str):
@@ -228,6 +259,21 @@ def _migrate(conn):
         conn.execute("ALTER TABLE services ADD COLUMN log_retention_days INTEGER")
     if "log_collect_interval" not in srv_cols:
         conn.execute("ALTER TABLE services ADD COLUMN log_collect_interval INTEGER")
+    task_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    # tasks 补列顺序：先加被引用列（extra/action 的 UPDATE 依赖 extra），再加其余列
+    if "project_id" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN project_id INTEGER DEFAULT 0")
+    if "ref_id" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN ref_id INTEGER DEFAULT 0")
+    if "created_by" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN created_by INTEGER DEFAULT 0")
+    if "extra" not in task_cols:
+        # 任务运行参数（--skip-build/--rollback/--auto-version）持久化，供重新运行恢复
+        conn.execute("ALTER TABLE tasks ADD COLUMN extra TEXT DEFAULT ''")
+    if "action" not in task_cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN action TEXT DEFAULT 'deploy'")
+        # 存量数据：extra 含 --rollback 的记录回填为 rollback（extra 列必须先加好）
+        conn.execute("UPDATE tasks SET action='rollback' WHERE extra LIKE '%--rollback%'")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(servers)")}
     if "role" in cols:
         return
@@ -478,17 +524,18 @@ def reorder_env_servers(db_path: str, env_id: int, server_ids: list) -> None:
 # ---------- 任务 ----------
 
 def create_task(db_path: str, project_id: int, type_: str, ref_id: int, name: str,
-                env: str, version: str, previous_version: str, created_by: int) -> int:
+                env: str, version: str, previous_version: str, created_by: int,
+                extra: list = None, action: str = 'deploy') -> int:
     fields = dict(project_id=project_id, type=type_, ref_id=ref_id, name=name,
                   env=env, version=version, previous_version=previous_version,
-                  status="pending", created_by=created_by,
-                  started_at=int(time.time()))
+                  extra=extra or [], action=action, status="pending",
+                  created_by=created_by, started_at=int(time.time()))
     return create_record(db_path, "tasks", fields)
 
 
 def update_task(db_path: str, task_id: int, **fields) -> bool:
     """白名单字段更新；返回是否更新成功"""
-    allowed = {"status", "log_file", "started_at", "finished_at"}
+    allowed = {"status", "log_file", "started_at", "finished_at", "version", "previous_version"}
     return update_record(db_path, "tasks", task_id, {k: v for k, v in fields.items()
                                                       if k in allowed})
 
@@ -503,7 +550,7 @@ def list_tasks(db_path: str, project_id: int = None, limit: int = 100) -> list:
         else:
             rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT ?",
                                 (limit,)).fetchall()
-        return [dict(r) for r in rows]
+        return [_deserialize("tasks", dict(r)) for r in rows]
     finally:
         conn.close()
 

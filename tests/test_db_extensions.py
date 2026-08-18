@@ -48,6 +48,17 @@ class TestDbExtensions(unittest.TestCase):
         self.assertIn("log_retention_days", cols)
         self.assertIn("log_collect_interval", cols)
 
+    def test_task_extra_persist_roundtrip(self):
+        """任务运行参数（--skip-build/--rollback）必须持久化，供"重新运行"恢复"""
+        pid = dbm.create_record(self.db, "projects", dict(
+            name="p1", code="p1", created_at=1))
+        tid = dbm.create_task(self.db, pid, "project", 1, "svc", "test",
+                              "", "", 1, extra=["--skip-build", "--rollback"])
+        t = dbm.get_task(self.db, tid)
+        self.assertEqual(t["extra"], ["--skip-build", "--rollback"])
+        listed = dbm.list_tasks(self.db, project_id=pid, limit=10)
+        self.assertEqual(listed[0]["extra"], ["--skip-build", "--rollback"])
+
     def test_alert_rules_json_roundtrip(self):
         rid = dbm.create_record(self.db, "alert_rules", dict(
             name="cpu", metric_type="metric", metric="cpu", compare=">",
@@ -58,6 +69,52 @@ class TestDbExtensions(unittest.TestCase):
         r = dbm.get_record(self.db, "alert_rules", rid)
         self.assertEqual(r["scope"]["type"], "all")
         self.assertEqual(r["channels"], ["email"])
+
+
+class TestLogTables(unittest.TestCase):
+    """日志中心表结构验证"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "test.db")
+        dbm.init_db(self.db)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_log_entries_table_exists(self):
+        conn = dbm.get_conn(self.db)
+        try:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='log_entries'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+        finally:
+            conn.close()
+
+    def test_log_scan_state_table_exists(self):
+        conn = dbm.get_conn(self.db)
+        try:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='log_scan_state'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+        finally:
+            conn.close()
+
+    def test_log_fts_table_exists(self):
+        conn = dbm.get_conn(self.db)
+        try:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='log_fts'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+        finally:
+            conn.close()
+
+    def test_log_entries_in_tables_whitelist(self):
+        self.assertIn("log_entries", dbm.TABLES)
+        self.assertIn("log_scan_state", dbm.TABLES)
 
 
 if __name__ == "__main__":
