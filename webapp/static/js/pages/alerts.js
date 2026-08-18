@@ -211,9 +211,11 @@
       const stCls = a.status === 'firing' ? 'running'
                   : a.status === 'acked' ? 'warning'
                   : 'success';
+      const notifyCount = a.notify_count || 0;
       return `
         <div class="alert-row ${esc(a.status)}" data-id="${a.id}">
           <span class="badge ${sevCls}">${esc(a.severity || 'P2')}</span>
+          ${notifyCount > 0 ? `<span class="notify-count" title="通知次数">×${notifyCount}</span>` : ''}
           <div class="ar-main">
             <div class="ar-title">${esc(a.subject)}</div>
             <div class="ar-detail">${esc(a.description || '')}${target ? ' · ' + esc(target) : ''}</div>
@@ -227,6 +229,9 @@
           ${a.status !== 'resolved'
             ? '<button class="btn sm danger" data-act="resolve" style="margin-left:4px">解决</button>'
             : ''}
+          ${a.status === 'firing'
+            ? '<button class="btn sm ghost" data-act="silence" style="margin-left:4px">静默 24h</button>'
+            : ''}
         </div>`;
     }).join('');
     // 绑定操作按钮（事件委托）
@@ -238,6 +243,7 @@
       const id = Number(row.dataset.id);
       if (btn.dataset.act === 'ack') ackAlert(id);
       else if (btn.dataset.act === 'resolve') resolveAlert(id);
+      else if (btn.dataset.act === 'silence') silenceAlert(id);
     };
     renderPagination();
   }
@@ -280,6 +286,32 @@
       toastSuccess('已解决');
       loadAlerts();
       loadAlertCounts();
+    } catch(e) {
+      toastError(e.message || '操作失败');
+    }
+  }
+
+  async function silenceAlert(id){
+    if (!await confirmDialog('确认将此告警静默 24 小时？')) return;
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const endAt = now + 24 * 60 * 60;  // 24 小时后
+      const alert = alerts.find(a => a.id === id);
+      const scope = alert ? {rules: [alert.rule_id], envs: [], servers: []} : {rules: [], envs: [], servers: []};
+      await api('/api/alerts/silences', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: `告警 #${id} 静默 24h`,
+          type: 'one_time',
+          start_at: now,
+          end_at: endAt,
+          scope: scope,
+          enabled: true,
+          remark: '快捷静默操作'
+        })
+      });
+      toastSuccess('已静默 24 小时');
+      loadAlerts();
     } catch(e) {
       toastError(e.message || '操作失败');
     }

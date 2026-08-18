@@ -32,6 +32,15 @@
 .badge.p2{background:rgba(254,176,25,.14);color:var(--warning);border:1px solid rgba(254,176,25,.4)}
 .badge.p3{background:rgba(0,212,255,.12);color:var(--primary);border:1px solid rgba(0,212,255,.35)}
 
+/* 通知次数标签 */
+.notify-count{
+  display:inline-flex;align-items:center;justify-content:center;
+  min-width:24px;height:20px;padding:0 6px;
+  background:rgba(255,122,69,.15);color:var(--accent);
+  border-radius:var(--r-full);font-size:var(--fs-11);font-weight:600;
+  margin-right:var(--sp-2);
+}
+
 /* 工具栏搜索框 */
 .alert-toolbar{display:flex;align-items:center;gap:var(--sp-3);margin-bottom:var(--sp-4);flex-wrap:wrap}
 .alert-search{
