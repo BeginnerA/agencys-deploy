@@ -1,9 +1,9 @@
-// pages/alerts.js — 告警中心（告警列表 Tab + 规则管理 Tab + 静默窗口 Tab，消费后端 /api/alerts API）
+// pages/alerts.js — 告警中心（告警列表 Tab + 规则管理 Tab + 静默窗口 Tab + 历史统计 Tab，消费后端 /api/alerts API）
 (function(){
   let timer = null;
   let destroyed = false;
   let searchTimer = null;
-  let currentTab = 'silences';  // 预留 Tab 切换（Task 5 完善），当前 silences 便于测试
+  let currentTab = 'stats';  // 预留 Tab 切换（Task 5 完善），当前 stats 便于测试
 
   // 告警列表状态
   let alerts = [];
@@ -28,6 +28,11 @@
   let silences = [];
   let editingSilenceId = null;
   let silenceSaving = false;
+
+  // ---- 历史统计 Tab 状态 ----
+  let statsChart = null;
+  let statsDays = 7;
+  let statsResizeHandler = null;
 
   // 常量定义
   const SEVERITIES = [['P0','P0'],['P1','P1'],['P2','P2'],['P3','P3']];
@@ -69,7 +74,7 @@
     }
   }
 
-  async function loadStats(){
+  async function loadAlertCounts(){
     try {
       const [f, a, r] = await Promise.all([
         api('/api/alerts?status=firing&page_size=1').catch(() => ({total:0})),
@@ -83,7 +88,7 @@
       updateStats();
       updateAlertBadge(firingCount);
     } catch(e) {
-      console.warn('loadStats failed', e);
+      console.warn('loadAlertCounts failed', e);
     }
   }
 
@@ -105,6 +110,7 @@
         <button class="tab-btn ${currentTab==='alerts'?'active':''}" data-tab="alerts">🔔 告警列表</button>
         <button class="tab-btn ${currentTab==='rules'?'active':''}" data-tab="rules">📏 规则管理</button>
         <button class="tab-btn ${currentTab==='silences'?'active':''}" data-tab="silences">🔕 静默窗口</button>
+        <button class="tab-btn ${currentTab==='stats'?'active':''}" data-tab="stats">📊 历史统计</button>
       </div>
       <div id="tabContent"></div>`;
     root.querySelectorAll('.tab-btn[data-tab]').forEach(btn => {
@@ -113,15 +119,17 @@
     if (currentTab === 'alerts') renderAlertsTab();
     else if (currentTab === 'rules') renderRulesTab();
     else if (currentTab === 'silences') renderSilencesTab();
+    else if (currentTab === 'stats') renderStatsTab();
   }
 
   function switchTab(tab){
     if (currentTab === tab) return;
     currentTab = tab;
     renderPage();
-    if (tab === 'alerts') { loadStats(); loadAlerts(); }
+    if (tab === 'alerts') { loadAlertCounts(); loadAlerts(); }
     else if (tab === 'rules') { loadRules(); }
     else if (tab === 'silences') { loadSilences(); }
+    else if (tab === 'stats') { loadStats(); }
   }
 
   // ==================== 告警列表 Tab ====================
@@ -258,7 +266,7 @@
       await api(`/api/alerts/${id}/ack`, {method:'POST'});
       toastSuccess('已确认');
       loadAlerts();
-      loadStats();
+      loadAlertCounts();
     } catch(e) {
       toastError(e.message || '操作失败');
     }
@@ -270,10 +278,115 @@
       await api(`/api/alerts/${id}/resolve`, {method:'POST'});
       toastSuccess('已解决');
       loadAlerts();
-      loadStats();
+      loadAlertCounts();
     } catch(e) {
       toastError(e.message || '操作失败');
     }
+  }
+
+  // ==================== 历史统计 Tab ====================
+
+  async function loadStats(){
+    const container = document.getElementById('statsChartWrap');
+    try {
+      const data = await api('/api/alerts/stats?days=' + statsDays);
+      if (destroyed) return;
+      renderStatsChart(data);
+    } catch(e) {
+      console.warn('loadStats failed', e);
+      if (container) {
+        container.innerHTML = `<div class="panel"><div class="error-state"><div class="e-ico">⚠️</div>
+          <div class="muted">统计数据加载失败</div>
+          <button class="btn sm e-btn">重试</button></div></div>`;
+        const btn = container.querySelector('.e-btn');
+        if (btn) btn.addEventListener('click', loadStats);
+      }
+    }
+  }
+
+  function renderStatsTab(){
+    const tc = document.getElementById('tabContent');
+    if (!tc) return;
+    tc.innerHTML = `
+      <div class="alert-toolbar">
+        <span class="weak" style="font-size:12px">时间范围</span>
+        <select class="filter-sel" id="statsDaysSel">
+          <option value="7" ${statsDays===7?'selected':''}>近 7 天</option>
+          <option value="14" ${statsDays===14?'selected':''}>近 14 天</option>
+          <option value="30" ${statsDays===30?'selected':''}>近 30 天</option>
+        </select>
+      </div>
+      <div id="statsChartWrap">${skeletonHTML(3)}</div>`;
+    const sel = document.getElementById('statsDaysSel');
+    if (sel) {
+      sel.onchange = () => {
+        statsDays = Number(sel.value);
+        loadStats();
+      };
+    }
+    loadStats();
+  }
+
+  function renderStatsChart(data){
+    const wrap = document.getElementById('statsChartWrap');
+    if (!wrap) return;
+    // 释放旧实例
+    if (statsChart) { try{ statsChart.dispose(); }catch(e){} statsChart = null; }
+    // 创建图表容器
+    wrap.innerHTML = '<div id="statsChart" style="width:100%;height:400px"></div>';
+    const dom = document.getElementById('statsChart');
+    if (!dom || !window.echarts) {
+      if (dom) dom.innerHTML = '<div class="panel"><div class="muted" style="text-align:center;padding:40px">图表库未加载</div></div>';
+      return;
+    }
+    statsChart = echarts.init(dom);
+    const dates = data.map(d => d.date);
+    const sevColors = {P0:'#FF4560', P1:'#FF7A45', P2:'#FEB019', P3:'#00D4FF'};
+    const series = ['P0','P1','P2','P3'].map(sev => ({
+      name: sev,
+      type: 'bar',
+      stack: 'total',
+      barMaxWidth: 32,
+      itemStyle: {color: sevColors[sev], borderRadius: sev === 'P0' ? [3,3,0,0] : 0},
+      emphasis: {focus: 'series'},
+      data: data.map(d => d[sev] || 0)
+    }));
+    statsChart.setOption({
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: {type: 'shadow'},
+        backgroundColor: 'rgba(13,27,51,.92)',
+        borderColor: 'rgba(0,212,255,.25)',
+        textStyle: {color: '#C8D6E5', fontSize: 12}
+      },
+      legend: {
+        data: ['P0','P1','P2','P3'],
+        textStyle: {color: '#8FA8C8'},
+        top: 0,
+        itemGap: 20
+      },
+      grid: {left: '3%', right: '4%', bottom: '3%', top: 40, containLabel: true},
+      xAxis: {
+        type: 'category',
+        data: dates,
+        axisLine: {lineStyle: {color: 'rgba(0,212,255,.2)'}},
+        axisLabel: {color: '#8FA8C8', fontSize: 11},
+        axisTick: {show: false}
+      },
+      yAxis: {
+        type: 'value',
+        minInterval: 1,
+        axisLine: {show: false},
+        axisLabel: {color: '#8FA8C8', fontSize: 11},
+        splitLine: {lineStyle: {color: 'rgba(0,212,255,.08)'}
+        }
+      },
+      series: series
+    });
+    // resize 监听
+    if (statsResizeHandler) window.removeEventListener('resize', statsResizeHandler);
+    statsResizeHandler = () => { if (statsChart) statsChart.resize(); };
+    window.addEventListener('resize', statsResizeHandler);
   }
 
   // ==================== 规则管理 Tab ====================
@@ -803,13 +916,15 @@
       destroyed = false;
       renderPage();
       if (currentTab === 'alerts') {
-        await Promise.all([loadStats(), loadAlerts()]);
+        await Promise.all([loadAlertCounts(), loadAlerts()]);
         if (destroyed) return [];
-        timer = setInterval(() => { loadAlerts(); loadStats(); }, 15000);
+        timer = setInterval(() => { loadAlerts(); loadAlertCounts(); }, 15000);
       } else if (currentTab === 'rules') {
         loadRules();
       } else if (currentTab === 'silences') {
         loadSilences();
+      } else if (currentTab === 'stats') {
+        loadStats();
       }
       return [timer];
     },
@@ -819,6 +934,9 @@
       if (searchTimer) clearTimeout(searchTimer);
       timer = null;
       searchTimer = null;
+      // 清理历史统计图表
+      if (statsResizeHandler) { window.removeEventListener('resize', statsResizeHandler); statsResizeHandler = null; }
+      if (statsChart) { try{ statsChart.dispose(); }catch(e){} statsChart = null; }
     },
   };
 })();
