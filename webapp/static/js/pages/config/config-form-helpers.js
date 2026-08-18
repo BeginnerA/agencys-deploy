@@ -233,10 +233,14 @@
 
   // ---- 校验工具 ----
   const IP_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+  const HOST_RE = /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
   function ipValid(host){
-    const m = IP_RE.exec(String(host || '').trim());
-    if (!m) return false;
-    return m.slice(1).every(seg => Number(seg) >= 0 && Number(seg) <= 255);
+    const h = String(host || '').trim();
+    // 允许 IPv4 地址
+    const m = IP_RE.exec(h);
+    if (m) return m.slice(1).every(seg => Number(seg) >= 0 && Number(seg) <= 255);
+    // 允许域名/主机名（如 host.docker.internal、localhost）
+    return HOST_RE.test(h);
   }
   const SAFE_NAME_RE = /^[A-Za-z0-9_-]+$/;
   function safeName(name){ return SAFE_NAME_RE.test(String(name || '')); }

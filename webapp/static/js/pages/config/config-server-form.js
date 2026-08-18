@@ -93,8 +93,8 @@
     function validate(){
       let ok = true;
       const host = val('sHost').trim();
-      if (!host){ H.fieldErr('sHost', '服务器 IP 必填'); ok = false; }
-      else if (!H.ipValid(host)){ H.fieldErr('sHost', 'IP 格式错误（IPv4 各段 0~255）'); ok = false; }
+      if (!host){ H.fieldErr('sHost', '服务器 IP 或域名必填'); ok = false; }
+      else if (!H.ipValid(host)){ H.fieldErr('sHost', 'IP 格式错误（IPv4 各段 0~255）或域名无效'); ok = false; }
       else if (st.others.some(x => x.host === host)){ H.fieldErr('sHost', '该 IP 已存在（全平台唯一）'); ok = false; }
       else H.fieldErr('sHost', '');
       const port = val('sPort').trim();
