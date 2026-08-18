@@ -91,6 +91,6 @@
 
 /* ==================== 历史统计 Tab ==================== */
 #statsChartWrap .panel{padding:0}
-#statsChartWrap .error-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px}
-#statsChartWrap .error-state .e-ico{font-size:36px;margin-bottom:12px}
-#statsChartWrap .error-state .muted{color:var(--text-2);font-size:13px;margin-bottom:16px}
+#statsChartWrap .error-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:var(--sp-7) var(--sp-5)}
+#statsChartWrap .error-state .e-ico{font-size:var(--fs-32);margin-bottom:var(--sp-3)}
+#statsChartWrap .error-state .muted{color:var(--text-2);font-size:var(--fs-13);margin-bottom:var(--sp-4)}

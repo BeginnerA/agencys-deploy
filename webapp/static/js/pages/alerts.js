@@ -324,12 +324,17 @@
         loadStats();
       };
     }
-    loadStats();
   }
 
   function renderStatsChart(data){
     const wrap = document.getElementById('statsChartWrap');
     if (!wrap) return;
+    // 检查是否有数据
+    const hasData = data.some(d => (d.P0||0)+(d.P1||0)+(d.P2||0)+(d.P3||0) > 0);
+    if (!hasData) {
+      wrap.innerHTML = `<div class="panel">${emptyState('📊', '所选时间范围内暂无告警数据')}</div>`;
+      return;
+    }
     // 释放旧实例
     if (statsChart) { try{ statsChart.dispose(); }catch(e){} statsChart = null; }
     // 创建图表容器
@@ -347,7 +352,7 @@
       type: 'bar',
       stack: 'total',
       barMaxWidth: 32,
-      itemStyle: {color: sevColors[sev], borderRadius: sev === 'P0' ? [3,3,0,0] : 0},
+      itemStyle: {color: sevColors[sev], borderRadius: sev === 'P3' ? [3,3,0,0] : 0},
       emphasis: {focus: 'series'},
       data: data.map(d => d[sev] || 0)
     }));
@@ -664,7 +669,6 @@
       </div>
       <div id="silenceListContainer">${skeletonHTML(3)}</div>`;
     document.getElementById('btnNewSilence').onclick = () => openSilenceDrawer(null);
-    loadSilences();
   }
 
   function renderSilenceList(){
