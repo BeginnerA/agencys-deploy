@@ -23,6 +23,7 @@
   let rules = [];
   let editingRuleId = null;
   let ruleTypeFilter = 'all';
+  let ruleSaving = false;
 
   // ---- 静默窗口 Tab 状态 ----
   let silences = [];
@@ -568,6 +569,8 @@
   }
 
   async function saveRule(){
+    if (ruleSaving) return;
+    ruleSaving = true;
     const saveBtn = document.getElementById('rfSave');
     if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = '保存中…'; }
     try {
@@ -607,6 +610,7 @@
     } catch(e) {
       toastError(e.message || '保存失败');
     } finally {
+      ruleSaving = false;
       if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '保存'; }
     }
   }
