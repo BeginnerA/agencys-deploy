@@ -3,7 +3,7 @@
   let timer = null;
   let destroyed = false;
   let searchTimer = null;
-  let currentTab = 'stats';  // 预留 Tab 切换（Task 5 完善），当前 stats 便于测试
+  let currentTab = 'alerts';  // Tab 切换：alerts | rules | silences | stats
 
   // 告警列表状态
   let alerts = [];
