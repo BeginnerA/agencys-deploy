@@ -1,5 +1,6 @@
 """告警 API：列表/ack/resolve/统计 + 规则 CRUD + 静默窗口 CRUD + 渠道配置"""
 import json
+import re
 import time
 from datetime import datetime, timedelta
 
@@ -13,6 +14,15 @@ alert_bp = Blueprint("alert", __name__)
 SEVERITIES = ("P0", "P1", "P2", "P3")
 STATUSES = ("firing", "acked", "resolved")
 CHANNELS = ("email", "wecom", "webhook", "sms_aliyun", "feishu", "dingtalk")
+
+_HHMM = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+
+
+def _valid_scope(scope) -> bool:
+    """静默窗口/规则 scope 结构校验：{rules,envs,servers} 均为列表"""
+    return (isinstance(scope, dict)
+            and all(isinstance(scope.get(k), list)
+                    for k in ("rules", "envs", "servers")))
 
 
 def _paged():
@@ -201,6 +211,13 @@ def update_rule(rule_id):
     err = _validate_rule(body, partial=True)
     if err:
         return jsonify({"error": err}), 400
+    # 合并 old + 已提供的字段后整体复校验：防止 metric_type/metric 等
+    # 跨字段组合失配（如 status 规则配 cpu）导致规则被引擎静默忽略
+    merged = dict(old)
+    merged.update({k: v for k, v in body.items() if v is not None})
+    err = _validate_rule(merged)
+    if err:
+        return jsonify({"error": err}), 400
     # 局部更新：未提供的字段保持原值，避免 PUT 部分提交静默重置配置
     dbm.update_record(db, "alert_rules", rule_id, dict(
         name=(body.get("name") or old["name"]).strip(),
@@ -276,11 +293,17 @@ def create_silence():
             float(start_at); float(end_at)
         except (TypeError, ValueError):
             return jsonify({"error": "一次性窗口需 epoch 秒 start_at/end_at"}), 400
+    elif wtype == "recurring":
+        if not (_HHMM.match(str(start_at)) and _HHMM.match(str(end_at))):
+            return jsonify({"error": "周期窗口需 HH:MM 格式 start_at/end_at"}), 400
+    scope = body.get("scope") or {"rules": [], "envs": [], "servers": []}
+    if not _valid_scope(scope):
+        return jsonify({"error": "scope 需为 {rules,envs,servers} 列表结构"}), 400
     now = int(time.time())
     wid = dbm.create_record(current_app.config["DB_PATH"], "silence_windows", dict(
         name=name, type=wtype, start_at=str(start_at), end_at=str(end_at),
         weekdays=body.get("weekdays") or [],
-        scope=body.get("scope") or {"rules": [], "envs": [], "servers": []},
+        scope=scope,
         enabled=1 if body.get("enabled", True) else 0,
         remark=body.get("remark", ""), created_at=now))
     audit("create_silence", "silence", wid, {"name": name})
@@ -306,6 +329,11 @@ def update_silence(silence_id):
             float(start_at); float(end_at)
         except (TypeError, ValueError):
             return jsonify({"error": "一次性窗口需 epoch 秒 start_at/end_at"}), 400
+    elif wtype == "recurring":
+        if not (_HHMM.match(str(start_at)) and _HHMM.match(str(end_at))):
+            return jsonify({"error": "周期窗口需 HH:MM 格式 start_at/end_at"}), 400
+    if "scope" in body and not _valid_scope(body["scope"]):
+        return jsonify({"error": "scope 需为 {rules,envs,servers} 列表结构"}), 400
     # 局部更新：未提供的字段保持原值，避免 PUT 部分提交静默重置配置
     dbm.update_record(db, "silence_windows", silence_id, dict(
         name=(body.get("name") or old["name"]).strip(),

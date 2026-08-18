@@ -241,7 +241,9 @@ class AlertEngine:
         if rows:
             a = rows[0]
             # 静默期首次触发的告警：窗口已过期、仍在 firing 且从未通知 → 补发一次
-            if a["notify_count"] == 0 and not self._silenced(rule, target_info):
+            # （acked/resolved 不再补发：ack 后停止重复通知）
+            if (a["status"] == "firing" and a["notify_count"] == 0
+                    and not self._silenced(rule, target_info)):
                 alert = dbm.get_record(self._db_path, "alerts", a["id"])
                 send_alert(self._db_path, alert, rule.get("channels") or [])
                 dbm.update_record(self._db_path, "alerts", a["id"],
@@ -277,6 +279,8 @@ class AlertEngine:
             if not w.get("enabled") or not self._window_active(w, now):
                 continue
             scope = w.get("scope") or {}
+            if not isinstance(scope, dict):
+                continue  # 脏数据：非法 scope 视为窗口不生效
             rules = scope.get("rules") or []
             envs = scope.get("envs") or []
             servers = scope.get("servers") or []
@@ -303,12 +307,17 @@ class AlertEngine:
             return False
 
         def to_min(s):
-            h, _, m = str(s).partition(":")
-            return int(h) * 60 + int(m)
+            try:
+                h, _, m = str(s).partition(":")
+                return int(h) * 60 + int(m)
+            except ValueError:
+                return None  # 非法时间格式
 
-        cur = lt.tm_hour * 60 + lt.tm_min
         s_min = to_min(w.get("start_at", "00:00"))
         e_min = to_min(w.get("end_at", "23:59"))
+        if s_min is None or e_min is None:
+            return False  # 脏数据：非法时间视为窗口不生效
+        cur = lt.tm_hour * 60 + lt.tm_min
         if s_min <= e_min:
             return s_min <= cur <= e_min
         return cur >= s_min or cur <= e_min  # 跨午夜
@@ -319,6 +328,8 @@ class AlertEngine:
                   service: str = None) -> bool:
         """规则作用域：all/project/env/server/service；ids 为对应 id/名称列表"""
         scope = rule.get("scope") or {"type": "all", "ids": []}
+        if not isinstance(scope, dict):
+            return True  # 脏数据：非法 scope 按全局放行，宁可多告警不漏告警
         t, ids = scope.get("type", "all"), scope.get("ids") or []
         if t == "all":
             return True

@@ -230,6 +230,47 @@ class TestAlertEngine(unittest.TestCase):
         channels = [x["channel"] for x in dbm.list_records(self.db, "alert_events")]
         self.assertIn("wecom", channels)
 
+    def test_silence_catchup_skipped_after_ack(self):
+        """窗口内触发 → ack → 窗口过期：不再补发（ack 后停止重复通知）"""
+        self._metric_rule(metric="cpu", threshold=80, duration=0)
+        self._silence()
+        e = self._engine(interval=30)
+        e._push_history((self.env_id, "h1", "cpu"), 95.0)
+        e._evaluate_metric_rules()
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["notify_count"], 0)
+        # 窗口内 ack
+        dbm.update_record(self.db, "alerts", alerts[0]["id"], {"status": "acked"})
+        # 窗口过期后再评估 → 不补发
+        w = dbm.list_records(self.db, "silence_windows")[0]
+        dbm.update_record(self.db, "silence_windows", w["id"],
+                          {"end_at": str(int(time.time()) - 1)})
+        e._push_history((self.env_id, "h1", "cpu"), 95.0)
+        e._evaluate_metric_rules()
+        a = dbm.get_record(self.db, "alerts", alerts[0]["id"])
+        self.assertEqual(a["notify_count"], 0)
+        channels = [x["channel"] for x in dbm.list_records(self.db, "alert_events")]
+        self.assertNotIn("wecom", channels)
+
+    def test_silence_invalid_window_data_no_crash(self):
+        """静默窗口脏数据（非法时间/非法 scope）不抛异常、窗口不生效；
+        规则 scope 非法按全局放行"""
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules",
+                              self._metric_rule(metric="cpu", duration=0))
+        # recurring 非法时间
+        self._silence(type="recurring", start_at="abc", end_at="25:99")
+        self.assertFalse(e._silenced(rule, {"env": "test", "host": "h1"}))
+        # one_time 激活但 scope 非法类型
+        self._silence(type="one_time", scope="oops")
+        self.assertFalse(e._silenced(rule, {"env": "test", "host": "h1"}))
+        # 规则 scope 非法 → 按全局放行（_in_scope 不抛异常）
+        rid = self._metric_rule(metric="cpu", duration=0, scope="oops")
+        r = dbm.get_record(self.db, "alert_rules", rid)
+        env = {"id": self.env_id, "project_id": self.proj_id, "name": "test"}
+        self.assertTrue(e._in_scope(r, env, host="h1"))
+
     # ---- 服务下线状态规则 ----
     def test_service_down_fires(self):
         dbm.create_record(self.db, "alert_rules", dict(
