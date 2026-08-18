@@ -286,7 +286,10 @@
     } catch(e) {
       console.warn('loadRules failed', e);
       const box = document.getElementById('ruleListContainer');
-      if (box) box.innerHTML = `<div class="panel">规则加载失败</div>`;
+      if (box) {
+        box.innerHTML = `<div class="panel">${errorState('规则加载失败')}</div>`;
+        box.querySelector('.e-btn')?.addEventListener('click', loadRules);
+      }
     }
   }
 
@@ -527,7 +530,10 @@
     } catch(e) {
       console.warn('loadSilences failed', e);
       const box = document.getElementById('silenceListContainer');
-      if (box) box.innerHTML = `<div class="panel">${errorState('静默窗口加载失败', 'loadSilences')}</div>`;
+      if (box) {
+        box.innerHTML = `<div class="panel">${errorState('静默窗口加载失败')}</div>`;
+        box.querySelector('.e-btn')?.addEventListener('click', loadSilences);
+      }
     }
   }
 
