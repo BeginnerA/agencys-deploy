@@ -110,6 +110,73 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     detail TEXT DEFAULT '{}',
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    metric_type TEXT NOT NULL DEFAULT 'metric',
+    metric TEXT DEFAULT '',
+    compare TEXT DEFAULT '>',
+    threshold REAL DEFAULT 0,
+    duration_seconds INTEGER DEFAULT 0,
+    scope TEXT DEFAULT '{"type":"all","ids":[]}',
+    severity TEXT DEFAULT 'P2',
+    channels TEXT DEFAULT '[]',
+    escalation_interval INTEGER DEFAULT 30,
+    enabled INTEGER DEFAULT 1,
+    remark TEXT DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER DEFAULT 0,
+    fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'firing',
+    severity TEXT NOT NULL DEFAULT 'P2',
+    subject TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    target_info TEXT DEFAULT '{}',
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    ack_by TEXT DEFAULT '',
+    ack_at INTEGER,
+    resolved_by TEXT DEFAULT '',
+    resolved_at INTEGER,
+    resolved_type TEXT DEFAULT '',
+    notify_count INTEGER DEFAULT 0,
+    escalation_level INTEGER DEFAULT 0,
+    escalation_at INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_active
+    ON alerts(fingerprint) WHERE status != 'resolved';
+CREATE TABLE IF NOT EXISTS alert_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    target TEXT DEFAULT '',
+    payload TEXT DEFAULT '',
+    ok INTEGER DEFAULT 0,
+    detail TEXT DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS silence_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'one_time',
+    start_at TEXT DEFAULT '0',
+    end_at TEXT DEFAULT '0',
+    weekdays TEXT DEFAULT '[]',
+    scope TEXT DEFAULT '{"rules":[],"envs":[],"servers":[]}',
+    enabled INTEGER DEFAULT 1,
+    remark TEXT DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS platform_settings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT UNIQUE NOT NULL,
+    value TEXT DEFAULT '',
+    updated_at INTEGER NOT NULL
+);
 """
 
 # JSON 字段（读写时自动序列化/反序列化）
@@ -117,11 +184,16 @@ JSON_FIELDS = {
     "services": {"build_order", "nacos_groups", "dubbo_services", "log_error_keywords"},
     "environments": {"registry", "nacos", "mysql_snailjob", "ssh", "build", "deploy"},
     "pipelines": {"stages"},
+    "alert_rules": {"scope", "channels"},
+    "alerts": {"target_info"},
+    "silence_windows": {"weekdays", "scope"},
 }
 
 # 表名白名单（泛型 CRUD 的标识符护栏，防 SQL 注入）
 TABLES = frozenset(("projects", "services", "environments", "servers",
-                    "env_servers", "pipelines", "users", "tasks", "audit_logs"))
+                    "env_servers", "pipelines", "users", "tasks", "audit_logs",
+                    "alert_rules", "alerts", "alert_events",
+                    "silence_windows", "platform_settings"))
 
 
 def _check_table(table: str):
@@ -147,9 +219,15 @@ def init_db(db_path: str):
 
 
 def _migrate(conn):
-    """存量库结构迁移（幂等）：servers 表补 role 列。
-    旧版 importer 将 YAML role 写入 remark，故迁移时把存量 remark 迁入 role 并清空
+    """存量库结构迁移（幂等）：services 补日志相关列，servers 补 role 列。
+    services 加列先于 role 迁移执行，避免提前 return 跳过加列。
+    role 迁移：旧版 importer 将 YAML role 写入 remark，故迁移时把存量 remark 迁入 role 并清空
     （备注留空给用户做说明，角色归角色）。"""
+    srv_cols = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
+    if "log_retention_days" not in srv_cols:
+        conn.execute("ALTER TABLE services ADD COLUMN log_retention_days INTEGER")
+    if "log_collect_interval" not in srv_cols:
+        conn.execute("ALTER TABLE services ADD COLUMN log_collect_interval INTEGER")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(servers)")}
     if "role" in cols:
         return
