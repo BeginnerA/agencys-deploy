@@ -58,6 +58,23 @@ class TestChannels(unittest.TestCase):
             self.assertIn("Signature", kwargs["data"])
             self.assertIn("TemplateParam", kwargs["data"])
 
+    def test_aliyun_sign_known_answer(self):
+        """签名算法与阿里云官方规范一致的已知答案校验（防生产签名盲区）"""
+        params = {
+            "AccessKeyId": "ak", "Action": "SendSms",
+            "Format": "JSON", "PhoneNumbers": "13800000000",
+            "RegionId": "cn-hangzhou", "SignName": "S",
+            "SignatureMethod": "HMAC-SHA1",
+            "SignatureNonce": "n1",
+            "SignatureVersion": "1.0",
+            "TemplateCode": "T1",
+            "TemplateParam": '{"content":"告警"}',
+            "Timestamp": "2026-01-01T00:00:00Z",
+            "Version": "2017-05-25",
+        }
+        self.assertEqual(ac._aliyun_sign(params, "sk"),
+                         "CY44ypIgMTzw0KowWte6FyxSvIQ=")
+
     def test_send_alert_retry_then_success(self):
         """第一次失败第二次成功：重试生效且结果记录 ok"""
         with mock.patch.object(ac, "_send_wecom") as sw:

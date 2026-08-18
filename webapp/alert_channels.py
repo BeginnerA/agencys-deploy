@@ -17,6 +17,7 @@ import hmac
 import json
 import os
 import smtplib
+import sys
 import time
 import urllib.parse
 import uuid
@@ -199,6 +200,12 @@ _CHANNEL_FUNCS = {"email": "_send_email", "wecom": "_send_wecom",
                   "webhook": "_send_webhook", "sms_aliyun": "_send_aliyun_sms",
                   "feishu": "_send_feishu", "dingtalk": "_send_dingtalk"}
 
+# 导入期校验：渠道函数名必须在模块中可解析，重命名时静默失败提前暴露
+_MISSING = [n for n in _CHANNEL_FUNCS.values()
+            if not callable(getattr(sys.modules[__name__], n, None))]
+if _MISSING:
+    raise ImportError(f"渠道发送函数未定义: {_MISSING}")
+
 
 def send_alert(db_path: str, alert: dict, channels: list) -> list:
     """按渠道发送告警通知（失败重试 2 次指数退避），结果写 alert_events。
@@ -209,21 +216,26 @@ def send_alert(db_path: str, alert: dict, channels: list) -> list:
     results = []
     now = int(time.time())
     for channel in channels:
-        if channel not in _CHANNEL_FUNCS:
+        func_name = _CHANNEL_FUNCS.get(channel)
+        if not func_name:
             continue
-        cfg = get_channel_config(db_path, channel)
         ok, detail = False, ""
-        for attempt in range(RETRIES + 1):
-            try:
-                globals()[_CHANNEL_FUNCS[channel]](cfg, text, alert)
-                ok, detail = True, "ok"
-                break
-            except Exception as e:
-                detail = str(e)[:200]
-                if attempt < RETRIES:
-                    time.sleep(2 ** attempt)
+        try:
+            cfg = get_channel_config(db_path, channel)
+            for attempt in range(RETRIES + 1):
+                try:
+                    getattr(sys.modules[__name__], func_name)(cfg, text, alert)
+                    ok, detail = True, "ok"
+                    break
+                except Exception as e:
+                    detail = str(e)[:200]
+                    if attempt < RETRIES:
+                        time.sleep(2 ** attempt)
+            dbm.create_record(db_path, "alert_events", dict(
+                alert_id=alert["id"], channel=channel, target="", payload="",
+                ok=1 if ok else 0, detail=detail, created_at=now))
+        except Exception as e:
+            # 配置解析/事件落库失败同样不外抛（告警引擎不被通知阻塞）
+            detail = str(e)[:200]
         results.append((channel, ok, detail))
-        dbm.create_record(db_path, "alert_events", dict(
-            alert_id=alert["id"], channel=channel, target="", payload="",
-            ok=1 if ok else 0, detail=detail, created_at=now))
     return results
