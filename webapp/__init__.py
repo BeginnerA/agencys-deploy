@@ -88,10 +88,12 @@ def create_app():
     from .routes.config_routes import config_bp
     from .routes.deploy_routes import deploy_bp
     from .routes.dash_routes import dash_bp
+    from .routes.alert_routes import alert_bp
     app.register_blueprint(auth_bp, url_prefix="/api")
     app.register_blueprint(config_bp, url_prefix="/api")
     app.register_blueprint(deploy_bp, url_prefix="/api")
     app.register_blueprint(dash_bp, url_prefix="/api")
+    app.register_blueprint(alert_bp, url_prefix="/api")
 
     from flask import render_template
 
