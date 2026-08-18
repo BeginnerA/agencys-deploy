@@ -43,9 +43,12 @@ def search_logs():
             params.append(to_ts)
 
         if keyword:
-            # FTS5 检索
-            fts_sql = "SELECT rowid FROM log_fts WHERE log_fts MATCH ?"
-            fts_rows = conn.execute(fts_sql, (keyword,)).fetchall()
+            # FTS5 检索（特殊字符可能导致 OperationalError，捕获后返回空结果）
+            try:
+                fts_sql = "SELECT rowid FROM log_fts WHERE log_fts MATCH ?"
+                fts_rows = conn.execute(fts_sql, (keyword,)).fetchall()
+            except Exception:
+                return jsonify({"rows": [], "total": 0, "error": "搜索关键词包含非法字符"})
             if not fts_rows:
                 return jsonify({"rows": [], "total": 0})
             rowids = [r["rowid"] for r in fts_rows]
@@ -69,7 +72,7 @@ def search_logs():
         ).fetchall()
 
         return jsonify({
-            "rows": [dict(r) for r in rows],
+            "rows": [dbm._deserialize("log_entries", dict(r)) for r in rows],
             "total": total,
             "page": page,
             "page_size": page_size,
@@ -98,10 +101,16 @@ def log_context():
             return jsonify({"error": "日志条目不存在"}), 404
 
         file_path = entry["file_path"]
-        if not os.path.isfile(file_path):
+        # 路径遍历防护：确保文件在预期的日志目录内
+        log_base = os.path.realpath(
+            os.path.join(current_app.root_path, "..", "data", "logs", "collect"))
+        real_path = os.path.realpath(file_path)
+        if not real_path.startswith(log_base + os.sep):
+            return jsonify({"error": "非法日志文件路径"}), 403
+        if not os.path.isfile(real_path):
             return jsonify({"error": "日志文件不存在", "file": file_path}), 404
 
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        with open(real_path, "r", encoding="utf-8", errors="ignore") as f:
             all_lines = f.readlines()
 
         offset = entry["line_offset"]
