@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  platform:
+    build: .
+    container_name: agencys-platform
+    ports:
+      - "8099:8099"
+    volumes:
+      # 持久化数据目录（SQLite 数据库、日志、密钥等）
+      - ./data:/app/data
+      # 配置文件（可选，如需自定义配置可取消注释）
+      # - ./config:/app/config
+    environment:
+      - DASHBOARD_MONITOR_INTERVAL=30
+      # 可选：设置管理员初始密码（默认 admin）
+      # - DASHBOARD_PASSWORD=your_password
+      # 可选：设置密钥（生产环境建议设置）
+      # - DASHBOARD_SECRET_KEY=your_secret_key
+    restart: unless-stopped

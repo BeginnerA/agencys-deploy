@@ -1,0 +1,73 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'DEPLOY_MODE', choices: ['service', 'pipeline'], description: '发布方式：单服务 / 流水线')
+        choice(name: 'PROJECT', choices: ['xxx', 'xxx', 'xxx'], description: '发布项目（单服务模式，示例占位；安装 Active Choices 插件可从 config/projects.yaml 动态加载）')
+        choice(name: 'PIPELINE', choices: ['xxx', 'xxx', 'xxx'], description: '流水线名（流水线模式，示例占位）')
+        string(name: 'VERSION', defaultValue: '', description: '新版本号，例如 1.0.29（留空且勾选自动版本时自动推导）')
+        string(name: 'PREVIOUS_VERSION', defaultValue: '', description: '回滚用旧版本号，例如 1.0.28（首次发版可留空）')
+        booleanParam(name: 'AUTO_VERSION', defaultValue: false, description: '自动查询服务器当前版本（--auto-version）')
+        choice(name: 'ENV', choices: ['prod', 'test'], description: '目标环境')
+        booleanParam(name: 'SKIP_BUILD', defaultValue: false, description: '跳过 Maven 构建（镜像已存在）')
+        booleanParam(name: 'CLEAR_SUMMARY', defaultValue: false, description: '发布后清零 sj_job_summary 计数器')
+    }
+
+    environment {
+        // Jenkins Credentials 中创建，参考 docs/jenkins-setup.md
+        SSH_PASSWORD        = credentials('xxx-ssh-password')
+        NOTIFY_FEISHU_WEBHOOK = credentials('xxx-feishu-webhook')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Install Python deps') {
+            steps {
+                sh 'pip install -r requirements.txt'
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+                    def cmd = ''
+                    if (params.DEPLOY_MODE == 'pipeline') {
+                        cmd = "python deploy_pipeline.py --pipeline ${params.PIPELINE} --env ${params.ENV}"
+                    } else {
+                        cmd = "python deploy.py --project ${params.PROJECT} --env ${params.ENV}"
+                    }
+                    if (params.AUTO_VERSION) {
+                        cmd += ' --auto-version'
+                    } else {
+                        if (params.VERSION) { cmd += " --version ${params.VERSION}" }
+                        if (params.PREVIOUS_VERSION) { cmd += " --previous-version ${params.PREVIOUS_VERSION}" }
+                    }
+                    if (params.SKIP_BUILD) { cmd += ' --skip-build' }
+                    if (params.CLEAR_SUMMARY) { cmd += ' --clear-summary' }
+                    sh cmd
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                def event = (currentBuild.currentResult == 'SUCCESS') ? 'success' : 'failed'
+                def projName = (params.DEPLOY_MODE == 'pipeline') ? params.PIPELINE : params.PROJECT
+                sh "python scripts/notify.py --event ${event} --project '${projName}' --version '${params.VERSION}' --env ${params.ENV} --detail 'Jenkins Build #${env.BUILD_NUMBER}'"
+            }
+        }
+        failure {
+            echo '发布失败，请查看控制台日志；必要时执行回滚（deploy.py --rollback 或 deploy_pipeline.py --rollback）。'
+        }
+        success {
+            echo '发布成功。'
+        }
+    }
+}

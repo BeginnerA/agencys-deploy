@@ -1,0 +1,33 @@
+/* base.css — reset + 基础元素 + 工具类 */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:var(--font-sans); font-size:var(--fs-14); color:var(--text-1);
+  background:var(--bg-base); line-height:1.6; overflow:hidden;
+}
+/* 背景氛围：顶部青蓝光晕 + 网格 */
+body::before{
+  content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:
+    radial-gradient(900px 420px at 75% -10%, rgba(0,212,255,.10), transparent 60%),
+    radial-gradient(700px 380px at -10% 110%, rgba(0,122,255,.10), transparent 60%),
+    linear-gradient(rgba(0,212,255,.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,212,255,.035) 1px, transparent 1px);
+  background-size:auto,auto,44px 44px,44px 44px;
+}
+a{color:var(--primary);text-decoration:none}
+a:hover{text-decoration:underline}
+ul,ol{list-style:none}
+input,select,textarea,button{font-family:inherit;font-size:inherit;color:inherit}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:rgba(0,212,255,.22);border-radius:var(--r-full)}
+::-webkit-scrollbar-thumb:hover{background:rgba(0,212,255,.4)}
+::-webkit-scrollbar-track{background:transparent}
+.hidden{display:none!important}
+.num{font-family:var(--font-num);letter-spacing:.5px}
+.muted{color:var(--text-2)} .weak{color:var(--text-3)}
+.err{color:var(--danger)} .ok{color:var(--success)} .warn{color:var(--warning)}
+.flex{display:flex;align-items:center} .flex-1{flex:1;min-width:0}
+.gap-2{gap:var(--sp-2)} .gap-3{gap:var(--sp-3)} .gap-4{gap:var(--sp-4)}
+/* 文本省略 */
+.ellipsis{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

@@ -1,0 +1,26 @@
+/* responsive.css — 1280 断点降级（规格 §10） */
+@media (max-width: 1600px){
+  .dash-grid{grid-template-columns:300px 1fr}
+  .dash-grid > div:last-child{grid-column:1/-1}
+}
+@media (max-width: 1280px){
+  /* 导航折叠为 64px 图标模式（等价 #sidebar.collapsed 视觉） */
+  #sidebar{width:var(--nav-w-collapsed)}
+  #sidebar .logo-name,#sidebar .logo-sub,
+  #sidebar .nav-txt,#sidebar .nav-group-title,#sidebar .nav-badge{display:none}
+  #sidebar .nav-item{justify-content:center;padding:9px 0}
+  #sidebar .nav-item.active::before{left:0}
+  /* KPI 条 6 列 → 3 列换行 */
+  .kpi-row{grid-template-columns:repeat(3,1fr)}
+  /* 大屏网格纵向堆叠 */
+  .dash-grid{grid-template-columns:1fr}
+  .env-grid{grid-template-columns:repeat(2,1fr)}
+  .hm-summary-row{grid-template-columns:repeat(2,1fr)}
+  /* 表单抽屉单列 */
+  .form-grid{grid-template-columns:1fr}
+  /* 配置页左右布局改上下 */
+  .cfg-layout{grid-template-columns:1fr}
+  /* 内容区横向滚动兑底 */
+  #content{overflow-x:auto}
+  .page-inner{min-width:960px}
+}

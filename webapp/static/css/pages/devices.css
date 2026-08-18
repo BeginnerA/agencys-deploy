@@ -1,0 +1,2 @@
+/* devices.css — 设备总览（服务卡片墙网格） */
+#svcWall{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:var(--sp-4);margin-bottom:var(--sp-4)}

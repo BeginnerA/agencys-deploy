@@ -1,0 +1,16 @@
+/* deploy.css — 发布中心 */
+.deploy-toolbar{display:flex;align-items:center;gap:var(--sp-3);margin-bottom:var(--sp-4);flex-wrap:wrap}
+.deploy-toolbar .chip{font-size:12px}
+.task-tbl .num{font-family:var(--font-num)}
+.task-name{cursor:pointer;color:var(--text-1);transition:var(--t-fast)}
+.task-name:hover{color:var(--primary)}
+/* 任务详情抽屉 */
+.log-console{
+  background:#050B18;border:1px solid var(--border);border-radius:var(--r-ctl);
+  padding:12px;height:calc(100vh - 370px);overflow-y:auto;
+  font-family:var(--font-num);font-size:12px;line-height:1.7;white-space:pre-wrap;word-break:break-all;
+}
+.log-console .tail{color:var(--primary);animation:blink 1.2s infinite}
+.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 20px;margin-bottom:16px;font-size:13px}
+.detail-grid .dg-label{color:var(--text-3);font-size:12px}
+.task-drawer-actions{display:flex;gap:10px;margin-top:12px}

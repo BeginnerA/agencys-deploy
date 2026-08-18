@@ -1,0 +1,509 @@
+"""SQLite 数据访问（通用部署平台版）：9 表 + 泛型 CRUD + JSON 序列化 + 删除保护 + 审计"""
+import json
+import sqlite3
+import time
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    code TEXT UNIQUE NOT NULL,
+    description TEXT DEFAULT '',
+    git_org TEXT DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS services (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    image_name TEXT NOT NULL,
+    service_name TEXT NOT NULL,
+    docker_context TEXT DEFAULT '',
+    dockerfile TEXT DEFAULT '',
+    build_order TEXT DEFAULT '[]',
+    nacos_groups TEXT DEFAULT '[]',
+    dubbo_services TEXT DEFAULT '[]',
+    snailjob_group TEXT DEFAULT '',
+    health_url TEXT DEFAULT '',
+    health_port INTEGER DEFAULT 0,
+    log_error_keywords TEXT DEFAULT '[]',
+    clear_log_dir TEXT DEFAULT '',
+    git_repo TEXT DEFAULT '',
+    enabled INTEGER DEFAULT 1,
+    UNIQUE(project_id, name)
+);
+CREATE TABLE IF NOT EXISTS environments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    is_default INTEGER DEFAULT 0,
+    registry TEXT DEFAULT '{}',
+    nacos TEXT DEFAULT '{}',
+    mysql_snailjob TEXT DEFAULT '{}',
+    ssh TEXT DEFAULT '{}',
+    build TEXT DEFAULT '{}',
+    deploy TEXT DEFAULT '{}',
+    docker_compose_path TEXT DEFAULT '',
+    maven_profile TEXT DEFAULT '',
+    monitor_enabled INTEGER DEFAULT 1,
+    UNIQUE(project_id, name)
+);
+CREATE TABLE IF NOT EXISTS servers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    host TEXT NOT NULL,
+    -- ssh 系列列 NULL = 未配置（导出时继承环境级 ssh），显式值（含空串）才是覆盖
+    ssh_port INTEGER,
+    ssh_user TEXT,
+    ssh_password TEXT,
+    ssh_key_file TEXT,
+    nacos_ip TEXT DEFAULT '',
+    role TEXT DEFAULT '',
+    remark TEXT DEFAULT '',
+    enabled INTEGER DEFAULT 1,
+    UNIQUE(host)
+);
+CREATE TABLE IF NOT EXISTS env_servers (
+    env_id INTEGER NOT NULL REFERENCES environments(id),
+    server_id INTEGER NOT NULL REFERENCES servers(id),
+    order_no INTEGER DEFAULT 0,
+    PRIMARY KEY (env_id, server_id)
+);
+CREATE TABLE IF NOT EXISTS pipelines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    build_first INTEGER DEFAULT 1,
+    stages TEXT DEFAULT '[]',
+    UNIQUE(project_id, name)
+);
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'viewer',
+    must_change_password INTEGER DEFAULT 0,
+    enabled INTEGER DEFAULT 1,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    type TEXT NOT NULL,
+    ref_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    env TEXT DEFAULT '',
+    version TEXT DEFAULT '',
+    previous_version TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',
+    log_file TEXT DEFAULT '',
+    created_by INTEGER DEFAULT 0,
+    started_at INTEGER,
+    finished_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER DEFAULT 0,
+    username TEXT DEFAULT '',
+    action TEXT NOT NULL,
+    target_type TEXT DEFAULT '',
+    target_id INTEGER DEFAULT 0,
+    detail TEXT DEFAULT '{}',
+    created_at INTEGER NOT NULL
+);
+"""
+
+# JSON 字段（读写时自动序列化/反序列化）
+JSON_FIELDS = {
+    "services": {"build_order", "nacos_groups", "dubbo_services", "log_error_keywords"},
+    "environments": {"registry", "nacos", "mysql_snailjob", "ssh", "build", "deploy"},
+    "pipelines": {"stages"},
+}
+
+# 表名白名单（泛型 CRUD 的标识符护栏，防 SQL 注入）
+TABLES = frozenset(("projects", "services", "environments", "servers",
+                    "env_servers", "pipelines", "users", "tasks", "audit_logs"))
+
+
+def _check_table(table: str):
+    if table not in TABLES:
+        raise ValueError(f"非法表名: {table}")
+
+
+def get_conn(db_path: str):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db(db_path: str):
+    conn = get_conn(db_path)
+    try:
+        conn.executescript(SCHEMA)
+        _migrate(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _migrate(conn):
+    """存量库结构迁移（幂等）：servers 表补 role 列。
+    旧版 importer 将 YAML role 写入 remark，故迁移时把存量 remark 迁入 role 并清空
+    （备注留空给用户做说明，角色归角色）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(servers)")}
+    if "role" in cols:
+        return
+    conn.execute("ALTER TABLE servers ADD COLUMN role TEXT DEFAULT ''")
+    conn.execute("UPDATE servers SET role = remark, remark = '' "
+                 "WHERE remark IS NOT NULL AND remark != ''")
+
+
+def _serialize(table: str, fields: dict) -> dict:
+    out = dict(fields)
+    for k in JSON_FIELDS.get(table, set()):
+        if k in out and not isinstance(out[k], str):
+            out[k] = json.dumps(out[k], ensure_ascii=False)
+    return out
+
+
+def _deserialize(table: str, row: dict) -> dict:
+    out = dict(row)
+    for k in JSON_FIELDS.get(table, set()):
+        if k in out and out[k]:
+            try:
+                out[k] = json.loads(out[k])
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+# ---------- 泛型 CRUD ----------
+
+def get_record(db_path: str, table: str, record_id: int):
+    _check_table(table)
+    conn = get_conn(db_path)
+    try:
+        row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (record_id,)).fetchone()
+        return _deserialize(table, dict(row)) if row else None
+    finally:
+        conn.close()
+
+
+def list_records(db_path: str, table: str, where: str = "", params: tuple = (),
+                 order: str = "id"):
+    _check_table(table)
+    conn = get_conn(db_path)
+    try:
+        sql = f"SELECT * FROM {table}"
+        if where:
+            sql += f" WHERE {where}"
+        sql += f" ORDER BY {order}"
+        rows = conn.execute(sql, params).fetchall()
+        return [_deserialize(table, dict(r)) for r in rows]
+    finally:
+        conn.close()
+
+
+def create_record(db_path: str, table: str, fields: dict) -> int:
+    _check_table(table)
+    fields = _serialize(table, fields)
+    cols = ", ".join(fields.keys())
+    marks = ", ".join("?" * len(fields))
+    conn = get_conn(db_path)
+    try:
+        cur = conn.execute(f"INSERT INTO {table} ({cols}) VALUES ({marks})",
+                           tuple(fields.values()))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def update_record(db_path: str, table: str, record_id: int, fields: dict) -> bool:
+    _check_table(table)
+    fields = _serialize(table, fields)
+    if not fields:
+        return False
+    sets = ", ".join(f"{k}=?" for k in fields)
+    conn = get_conn(db_path)
+    try:
+        cur = conn.execute(f"UPDATE {table} SET {sets} WHERE id=?",
+                           tuple(fields.values()) + (record_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ---------- 删除保护 ----------
+
+def delete_project(db_path: str, project_id: int) -> tuple:
+    """返回 (ok, message)；项目下有服务/流水线/环境时禁止删除"""
+    conn = get_conn(db_path)
+    try:
+        for table in ("services", "pipelines", "environments"):
+            n = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE project_id=?",
+                             (project_id,)).fetchone()[0]
+            if n:
+                return False, f"项目下仍有 {n} 个{table}，请先删除"
+        conn.execute("DELETE FROM tasks WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+        conn.commit()
+        return True, ""
+    finally:
+        conn.close()
+
+
+def delete_environment(db_path: str, env_id: int) -> tuple:
+    conn = get_conn(db_path)
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM env_servers WHERE env_id=?",
+                         (env_id,)).fetchone()[0]
+        if n:
+            return False, f"环境仍绑定 {n} 台服务器，请先解绑"
+        # 注：tasks.env 存环境名而非环境 id，历史任务不阻止环境删除
+        conn.execute("DELETE FROM environments WHERE id=?", (env_id,))
+        conn.commit()
+        return True, ""
+    finally:
+        conn.close()
+
+
+def delete_server(db_path: str, server_id: int) -> tuple:
+    conn = get_conn(db_path)
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM env_servers WHERE server_id=?",
+                         (server_id,)).fetchone()[0]
+        if n:
+            return False, f"服务器被 {n} 个环境引用，请先解绑"
+        conn.execute("DELETE FROM servers WHERE id=?", (server_id,))
+        conn.commit()
+        return True, ""
+    finally:
+        conn.close()
+
+
+def delete_record(db_path: str, table: str, record_id: int) -> bool:
+    """泛型删除（users/services/pipelines 等无删除保护的简单表）；返回是否删除了记录"""
+    _check_table(table)
+    conn = get_conn(db_path)
+    try:
+        cur = conn.execute(f"DELETE FROM {table} WHERE id=?", (record_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ---------- 域查询 ----------
+
+def list_services(db_path: str, project_id: int) -> list:
+    return list_records(db_path, "services", "project_id=?", (project_id,), "id")
+
+
+def list_environments(db_path: str, project_id: int) -> list:
+    return list_records(db_path, "environments", "project_id=?", (project_id,), "id")
+
+
+def list_pipelines(db_path: str, project_id: int) -> list:
+    return list_records(db_path, "pipelines", "project_id=?", (project_id,), "id")
+
+
+def get_service_by_name(db_path: str, project_id: int, name: str):
+    rows = list_records(db_path, "services", "project_id=? AND name=?",
+                        (project_id, name))
+    return rows[0] if rows else None
+
+
+def get_pipeline_by_name(db_path: str, project_id: int, name: str):
+    rows = list_records(db_path, "pipelines", "project_id=? AND name=?",
+                        (project_id, name))
+    return rows[0] if rows else None
+
+
+def get_env_by_name(db_path: str, project_id: int, name: str):
+    rows = list_records(db_path, "environments", "project_id=? AND name=?",
+                        (project_id, name))
+    return rows[0] if rows else None
+
+
+def get_default_env(db_path: str, project_id: int):
+    rows = list_records(db_path, "environments",
+                        "project_id=? AND is_default=1", (project_id,))
+    if rows:
+        return rows[0]
+    rows = list_records(db_path, "environments", "project_id=?", (project_id,))
+    return rows[0] if rows else None
+
+
+def list_env_servers(db_path: str, env_id: int) -> list:
+    """环境绑定的服务器（按 order_no 排序），每个元素含 server 字段 + order_no"""
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT s.*, es.order_no FROM servers s "
+            "JOIN env_servers es ON es.server_id=s.id "
+            "WHERE es.env_id=? AND s.enabled=1 ORDER BY es.order_no",
+            (env_id,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def list_server_envs(db_path: str, server_id: int) -> list:
+    """服务器绑定的环境（按 order_no 排序）；供连接测试回退环境级 ssh 配置"""
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT e.* FROM environments e "
+            "JOIN env_servers es ON es.env_id=e.id "
+            "WHERE es.server_id=? ORDER BY es.order_no",
+            (server_id,)).fetchall()
+        return [_deserialize("environments", dict(r)) for r in rows]
+    finally:
+        conn.close()
+
+
+def bind_server(db_path: str, env_id: int, server_id: int, order_no: int = 0):
+    conn = get_conn(db_path)
+    try:
+        conn.execute("INSERT OR REPLACE INTO env_servers (env_id,server_id,order_no) "
+                     "VALUES (?,?,?)", (env_id, server_id, order_no))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def unbind_server(db_path: str, env_id: int, server_id: int):
+    conn = get_conn(db_path)
+    try:
+        conn.execute("DELETE FROM env_servers WHERE env_id=? AND server_id=?",
+                     (env_id, server_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reorder_env_servers(db_path: str, env_id: int, server_ids: list) -> None:
+    """批量重排环境绑定顺序，单事务提交（避免逐条 commit 的部分重排）"""
+    conn = get_conn(db_path)
+    try:
+        conn.executemany(
+            "INSERT OR REPLACE INTO env_servers (env_id,server_id,order_no) "
+            "VALUES (?,?,?)",
+            [(env_id, sid, idx) for idx, sid in enumerate(server_ids)])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------- 任务 ----------
+
+def create_task(db_path: str, project_id: int, type_: str, ref_id: int, name: str,
+                env: str, version: str, previous_version: str, created_by: int) -> int:
+    fields = dict(project_id=project_id, type=type_, ref_id=ref_id, name=name,
+                  env=env, version=version, previous_version=previous_version,
+                  status="pending", created_by=created_by,
+                  started_at=int(time.time()))
+    return create_record(db_path, "tasks", fields)
+
+
+def update_task(db_path: str, task_id: int, **fields) -> bool:
+    """白名单字段更新；返回是否更新成功"""
+    allowed = {"status", "log_file", "started_at", "finished_at"}
+    return update_record(db_path, "tasks", task_id, {k: v for k, v in fields.items()
+                                                      if k in allowed})
+
+
+def list_tasks(db_path: str, project_id: int = None, limit: int = 100) -> list:
+    conn = get_conn(db_path)
+    try:
+        if project_id:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE project_id=? ORDER BY id DESC LIMIT ?",
+                (project_id, limit)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT ?",
+                                (limit,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_task(db_path: str, task_id: int):
+    return get_record(db_path, "tasks", task_id)
+
+
+def delete_task(db_path: str, task_id: int) -> tuple:
+    """删除已完成的任务及其日志文件；返回 (ok, message)"""
+    conn = get_conn(db_path)
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            return False, "任务不存在"
+        if dict(row)["status"] in ("running", "pending"):
+            return False, "运行中或等待中的任务不能删除"
+        log_file = dict(row).get("log_file", "")
+        conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    import os
+    if log_file:
+        try: os.remove(log_file)
+        except OSError: pass
+    return True, ""
+
+
+# ---------- 审计 ----------
+
+def create_audit(db_path: str, user_id: int, username: str, action: str,
+                 target_type: str = "", target_id: int = 0, detail: dict = None):
+    create_record(db_path, "audit_logs", dict(
+        user_id=user_id, username=username, action=action,
+        target_type=target_type, target_id=target_id,
+        detail=json.dumps(detail or {}, ensure_ascii=False),
+        created_at=int(time.time())))
+
+
+def list_audit_logs(db_path: str, limit: int = 100) -> list:
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?",
+                            (limit,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def list_audit_logs_paged(db_path: str, page: int = 1, page_size: int = 20) -> tuple:
+    """返回 (rows, total)；page 从 1 开始"""
+    conn = get_conn(db_path)
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM audit_logs").fetchone()[0]
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ? OFFSET ?",
+            (page_size, offset)).fetchall()
+        return [dict(r) for r in rows], total
+    finally:
+        conn.close()
+
+
+# ---------- 用户 ----------
+
+def get_user_by_name(db_path: str, username: str):
+    rows = list_records(db_path, "users", "username=?", (username,))
+    return rows[0] if rows else None
+
+
+def list_users(db_path: str) -> list:
+    return list_records(db_path, "users", "", (), "id")
+
+
+def project_count(db_path: str) -> int:
+    conn = get_conn(db_path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    finally:
+        conn.close()

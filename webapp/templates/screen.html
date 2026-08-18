@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>智能运维平台 · 运维中心</title>
+<meta name="description" content="智能运维平台运维控制台：监控大屏、发布中心、告警中心、日志中心、配置管理">
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/layout.css">
+<link rel="stylesheet" href="/static/css/components.css">
+<link rel="stylesheet" href="/static/css/pages/dashboard.css">
+<link rel="stylesheet" href="/static/css/pages/devices.css">
+<link rel="stylesheet" href="/static/css/pages/deploy.css">
+<link rel="stylesheet" href="/static/css/pages/alerts.css">
+<link rel="stylesheet" href="/static/css/pages/logs.css">
+<link rel="stylesheet" href="/static/css/pages/config.css">
+<link rel="stylesheet" href="/static/css/responsive.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar"></aside>
+  <div id="main">
+    <header id="topbar"></header>
+    <div id="breadcrumb"></div>
+    <main id="content"></main>
+    <footer id="marqueeBar" class="hidden"></footer>
+  </div>
+</div>
+
+<!-- 全局容器：抽屉 / 弹窗 / toast -->
+<div id="drawerRoot" class="hidden"></div>
+<div id="modalRoot" class="hidden"></div>
+<div id="toastRoot"></div>
+
+<script>window.PLATFORM_NAME = '智能运维平台';</script>
+<script src="/static/vendor/echarts.min.js"></script>
+<script src="/static/js/api.js"></script>
+<script src="/static/js/components.js"></script>
+<script src="/static/js/data.js"></script>
+<script src="/static/js/layout.js"></script>
+<script src="/static/js/router.js"></script>
+<script src="/static/js/pages/dashboard.js"></script>
+<script src="/static/js/pages/devices.js"></script>
+<script src="/static/js/pages/deploy.js"></script>
+<script src="/static/js/pages/alerts.js"></script>
+<script src="/static/js/pages/logs.js"></script>
+<script src="/static/js/pages/config/config-form-helpers.js"></script>
+<script src="/static/js/pages/config/config-home.js"></script>
+<script src="/static/js/pages/config/config-project.js"></script>
+<script src="/static/js/pages/config/config-env-form.js"></script>
+<script src="/static/js/pages/config/config-pipeline-editor.js"></script>
+<script src="/static/js/pages/config/config-service-form.js"></script>
+<script src="/static/js/pages/config/config-server-form.js"></script>
+<script src="/static/js/pages/config/config.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>

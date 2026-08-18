@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>智能运维平台 · 登录</title>
+<meta name="description" content="智能运维平台运维控制台登录">
+<link rel="stylesheet" href="/static/css/tokens.css">
+<link rel="stylesheet" href="/static/css/base.css">
+<style>
+  body.login-body{display:flex;align-items:center;justify-content:center;overflow:hidden}
+  .login-wrap{width:400px;max-width:92vw;position:relative;z-index:1}
+  .login-card{
+    background:linear-gradient(160deg,rgba(17,34,65,.72),rgba(13,27,51,.88));
+    border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-panel);
+    backdrop-filter:blur(14px);padding:44px 40px 38px;text-align:center;
+  }
+  .login-logo{
+    width:56px;height:56px;margin:0 auto 14px;border-radius:14px;
+    background:linear-gradient(135deg,var(--primary),#0066FF);display:flex;align-items:center;justify-content:center;
+    font-size:28px;box-shadow:var(--shadow-glow);
+  }
+  .login-title{font-size:24px;font-weight:700;letter-spacing:1px}
+  .login-sub{font-size:11px;color:var(--text-3);letter-spacing:3px;margin:6px 0 32px}
+  .login-card .field{margin-bottom:16px;text-align:left}
+  .login-card .field input{
+    width:100%;padding:11px 14px;border:1px solid var(--border);border-radius:8px;
+    background:rgba(0,212,255,.05);color:var(--text-1);outline:none;transition:var(--t-fast);
+  }
+  .login-card .field input:focus{border-color:var(--primary);box-shadow:var(--shadow-glow)}
+  .login-card .field input::placeholder{color:var(--text-3)}
+  .login-btn{
+    width:100%;padding:12px;border:none;border-radius:8px;cursor:pointer;font-size:15px;font-weight:600;
+    background:linear-gradient(135deg,var(--primary),#0090FF);color:#04121F;transition:var(--t-fast);
+  }
+  .login-btn:hover{box-shadow:var(--shadow-glow);filter:brightness(1.1)}
+  .login-btn:disabled{opacity:.6;cursor:wait}
+  .login-err{display:none;margin:0 0 12px;padding:8px 12px;border-radius:6px;
+    background:rgba(255,69,96,.12);border:1px solid rgba(255,69,96,.45);color:#FF8A99;font-size:13px;text-align:left}
+  .login-foot{font-size:11px;color:var(--text-3);margin-top:20px;letter-spacing:1px}
+</style>
+</head>
+<body class="login-body">
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="login-logo">⚡</div>
+    <div class="login-title">智能运维平台</div>
+    <div class="login-sub">DEPLOY &amp; OPERATIONS CONSOLE</div>
+    <div class="login-err" id="err"></div>
+    <div class="field"><input id="username" placeholder="用户名" autocomplete="username"></div>
+    <div class="field"><input id="password" type="password" placeholder="密码" autocomplete="current-password"></div>
+    <button class="login-btn" id="loginBtn">登 录</button>
+    <div class="login-foot">INTERNAL OPS TOOL · AUTHORIZED ACCESS ONLY</div>
+  </div>
+</div>
+<script>
+(function(){
+  const btn = document.getElementById('loginBtn');
+  function showErr(msg){ const e = document.getElementById('err'); e.textContent = msg; e.style.display = 'block'; }
+  async function login(){
+    const username = document.getElementById('username').value.trim();
+    const password = document.getElementById('password').value;
+    if(!username || !password){ showErr('请输入用户名和密码'); return; }
+    btn.disabled = true; btn.textContent = '登录中...';
+    try{
+      const resp = await fetch('/api/auth/login', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({username, password})});
+      const data = await resp.json().catch(() => ({}));
+      if(resp.ok && data.token && data.user){
+        localStorage.setItem('token', data.token);
+        localStorage.setItem('user', JSON.stringify(data.user));
+        location.href = '/screen#/dashboard';
+      }else{
+        showErr(data.error || '登录失败，请重试');
+      }
+    }catch(e){
+      showErr('网络异常，请检查服务是否可用');
+    }finally{
+      btn.disabled = false; btn.textContent = '登 录';
+    }
+  }
+  btn.onclick = login;
+  ['username','password'].forEach(id => document.getElementById(id).addEventListener('keydown',
+    e => { if(e.key === 'Enter' && !btn.disabled) login(); }));
+})();
+</script>
+</body>
+</html>

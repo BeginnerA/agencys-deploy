@@ -1,0 +1,40 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+*.egg-info
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 本地数据（不打包进镜像，通过 volume 挂载）
+data/*.db
+data/logs/*
+data/runtime/*
+data/export/*
+data/secret_key
+
+# 备份文件
+backups/*
+
+# 文档
+docs
+*.md
+
+# 其他
+.superpowers
+dist

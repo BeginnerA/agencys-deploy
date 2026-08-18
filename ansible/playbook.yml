@@ -1,0 +1,92 @@
+---
+# Ansible 滚动发布剧本（可选方案）
+# 使用示例：
+#   ansible-playbook -i inventory.ini playbook.yml \
+#     -e "project=xxx version=1.0.29 service_name=xxx image=harbor.example.com/xxx/xxx:1.0.29"
+#
+# 该剧本只负责单项目多服务器滚动更新，Nacos 下线上线通过调用本地 Python 脚本完成。
+
+- name: 智能运维平台滚动发布
+  hosts: xxx
+  serial: 1
+  gather_facts: no
+  vars:
+    project: "{{ project | mandatory }}"
+    version: "{{ version | mandatory }}"
+    service_name: "{{ service_name | mandatory }}"
+    image: "{{ image | mandatory }}"
+    docker_compose_path: "/data/docker/docker-compose.yml"
+    health_timeout: "120"
+
+  pre_tasks:
+    - name: Nacos 下线当前服务器实例
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: >
+          python ../scripts/nacos_manager.py offline
+          --service {{ service_name }}
+          --ip {{ inventory_hostname }}
+      changed_when: true
+
+    - name: 等待 Nacos 实例消失
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: >
+          python -c "
+          import sys; sys.path.insert(0, '../scripts');
+          from nacos_manager import NacosClient;
+          c = NacosClient();
+          c.wait_for_absence('{{ service_name }}', '{{ inventory_hostname }}', timeout=60)
+          "
+      changed_when: false
+
+  tasks:
+    - name: 拉取新镜像
+      ansible.builtin.command:
+        cmd: "docker pull {{ image }}"
+      register: pull_result
+      changed_when: "'Downloaded newer image' in pull_result.stdout or 'Pull complete' in pull_result.stdout"
+
+    - name: 停止旧容器
+      ansible.builtin.command:
+        cmd: "docker compose -f {{ docker_compose_path }} stop {{ service_name }}"
+      ignore_errors: yes
+
+    - name: 删除旧容器
+      ansible.builtin.command:
+        cmd: "docker compose -f {{ docker_compose_path }} rm -f {{ service_name }}"
+      ignore_errors: yes
+
+    - name: 修改 docker-compose.yml 镜像版本
+      ansible.builtin.lineinfile:
+        path: "{{ docker_compose_path }}"
+        regexp: "^\\s*image:\\s*{{ registry_namespace | default('xxx') }}/{{ service_name }}:.*$"
+        line: "    image: {{ image }}"
+        backrefs: no
+      vars:
+        registry_namespace: "xxx"
+
+    - name: 启动新容器
+      ansible.builtin.command:
+        cmd: "docker compose -f {{ docker_compose_path }} up -d {{ service_name }}"
+
+  post_tasks:
+    - name: 等待健康检查通过
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: >
+          python ../scripts/health_check.py
+          --host {{ inventory_hostname }}
+          --project {{ project }}
+          --version {{ version }}
+      changed_when: false
+
+    - name: Nacos 上线当前服务器实例
+      delegate_to: localhost
+      ansible.builtin.command:
+        cmd: >
+          python ../scripts/nacos_manager.py online
+          --service {{ service_name }}
+          --ip {{ inventory_hostname }}
+          --weight 1
+      changed_when: true

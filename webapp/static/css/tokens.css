@@ -1,0 +1,48 @@
+/* tokens.css — 深蓝科技风设计系统变量 */
+:root{
+  /* 原生控件（下拉面板/滚动条等）跟随深色主题渲染 */
+  color-scheme:dark;
+
+  /* 色板（规格 §3.1） */
+  --bg-base:#0A142F;            /* 页面主背景 */
+  --bg-panel:#0D1B33;           /* 卡片/面板背景 */
+  --bg-panel-2:#112241;         /* 悬浮/次级面板 */
+  --bg-hover:rgba(0,212,255,.06); /* 行/项悬浮底 */
+  --border:rgba(0,212,255,.15);   /* 边框/分隔线 */
+  --border-strong:rgba(0,212,255,.32);
+  --primary:#00D4FF;            /* 主色青 */
+  --primary-dim:rgba(0,212,255,.55);
+  --success:#00E396;            /* 正常/成功 */
+  --warning:#FEB019;            /* 警告 */
+  --danger:#FF4560;             /* 异常/失败 */
+  --accent:#FF7A45;             /* 强调橙（运行中） */
+  --text-1:#E6F1FF;             /* 主文字 */
+  --text-2:#8FA8C8;             /* 次级文字 */
+  --text-3:#5A7296;             /* 弱化/占位 */
+
+  /* 字体（规格 §3.2） */
+  --font-sans:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;
+  --font-num:"DIN Alternate","Roboto Mono",Consolas,monospace;
+  --fs-11:11px; --fs-12:12px; --fs-13:13px; --fs-14:14px;
+  --fs-16:16px; --fs-20:20px; --fs-24:24px; --fs-32:32px;
+
+  /* 间距（规格 §3.3） */
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px;
+  --sp-5:24px; --sp-6:32px; --sp-7:48px;
+
+  /* 圆角 */
+  --r-panel:10px; --r-card:8px; --r-ctl:6px; --r-full:999px;
+
+  /* 阴影（规格 §3.3） */
+  --shadow-panel:0 4px 16px rgba(0,0,0,.35);
+  --shadow-glow:0 0 12px rgba(0,212,255,.25);
+
+  /* 动效（规格 §3.4） */
+  --ease:cubic-bezier(.4,0,.2,1);
+  --t-fast:all .15s var(--ease);
+  --t-smooth:all .25s var(--ease);
+
+  /* 布局尺寸 */
+  --nav-w:220px; --nav-w-collapsed:64px;
+  --topbar-h:56px;
+}

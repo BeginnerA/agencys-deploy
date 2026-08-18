@@ -1,0 +1,33 @@
+# =============================================================================
+# 项目元数据配置（服务清单，新增项目时按相同结构添加即可）
+# 服务名（如 xxx）即该项目的键，被 --project 参数与 config/pipelines.yaml 引用
+# =============================================================================
+# 可配置参数说明：
+#
+# projects.<服务名>       - 服务键名，须与 docker-compose 服务名、镜像名对应
+# build_order            - Maven 构建顺序，按顺序对每个模块执行 mvn clean {goal} -P{profile}
+#   build_order[].name      - 模块名（仅用于日志展示）
+#   build_order[].path      - 模块相对路径（相对 deploy.project_root）
+#   build_order[].goal      - Maven goal：install / package 等
+#   build_order[].extra_profile - （可选）额外 Maven profile，与环境 profile 组合为 -P{env},{extra}；
+#                           用于同一仓库按 profile 产出不同 jar 的项目（如 basketball 的 web/job/cli）
+# docker_context         - Dockerfile 所在目录（docker build 上下文）
+# dockerfile             - Dockerfile 相对路径
+# image_name             - 镜像短名，完整镜像名为 {registry}/{namespace}/{image_name}:{version}
+# service_name           - docker-compose.yml 里的服务名
+# nacos_groups           - Nacos 分组列表，服务在多个分组下注册时须全部列出（上下线会遍历所有分组）
+# dubbo_services         - Dubbo 额外服务名列表（Nacos 里除应用服务名外还可能出现的服务名）
+# snailjob_group         - SnailJob group_name，非定时任务项目留空
+# health_url             - 健康检查 URL，{ip} 会被替换为当前服务器 IP；留空/省略则退化为容器状态 + 日志检查
+# health_port            - 健康检查端口，也用于判断服务是否已启动
+# log_error_keywords     - 日志中判定启动失败的错误关键字
+# clear_log_dir          - 宿主机应用日志目录（如 1Panel 挂载的 logs 目录）；配置了该路径则在启动新
+#                         容器前清空该目录下所有文件（保留目录结构）；省略/留空则不清空（默认）
+#
+# 镜像版本号（version / previous_version）不在本文件配置，由命令行参数传入：
+#   ./deploy.sh --project <服务名> --version <新版本> [--previous-version <旧版本>]
+#   --previous-version 可省略（首次发版）；省略时发布失败跳过容器回滚，仅恢复 Nacos 上线
+#
+# git_repo 字段说明：服务源码所在 Git 仓库路径（相对 deploy.project_root），发布成功后在
+# 该仓库打 v{version} tag 并推送远端；多服务共用仓库时填仓库目录名（如 xxx）
+# =============================================================================
