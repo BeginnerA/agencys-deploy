@@ -1,167 +1,260 @@
-// pages/alerts.js — 告警中心（聚合 + 项目/环境筛选 + 标记已处理 + 导航角标）
+// pages/alerts.js — 告警中心（告警列表 Tab，消费后端 /api/alerts API）
 (function(){
   let timer = null;
-  let alerts = [];
-  let levelFilter = 'all';
-  let showFilter = 'unacked';   // unacked / acked / all
-  let projFilter = 'all';       // all / 项目 id
-  let envFilter = 'all';        // all / 环境名（仅选中项目时生效）
-  let projects = [];
-  let envs = [];
-  let destroyed = false;        // 路由切换后丢弃 in-flight 轮询响应，防覆盖新页面
+  let destroyed = false;
+  let searchTimer = null;
+  let currentTab = 'alerts';  // 预留 Tab 切换（Task 5 实现规则/静默/渠道等 Tab）
 
-  async function ensureProjects(){
-    if (projects.length) return;
-    projects = await api('/api/projects').catch(() => []);
-  }
-  async function loadEnvs(){
-    envs = [];
-    if (projFilter !== 'all'){
-      const p = projects.find(x => x.id === Number(projFilter));
-      if (p) envs = await api(`/api/projects/${p.id}/environments`).catch(() => []);
-      else projFilter = 'all';
-    }
-    if (envFilter !== 'all' && !envs.some(e => e.name === envFilter)) envFilter = 'all';
-  }
+  // 告警列表状态
+  let alerts = [];
+  let total = 0;
+  let currentPage = 1;
+  const pageSize = 20;
+  let sevFilter = 'all';
+  let statusFilter = 'all';
+  let keyword = '';
+
+  // 统计计数
+  let firingCount = 0;
+  let ackedCount = 0;
+  let resolvedCount = 0;
+
+  // 常量定义
+  const SEVERITIES = [['P0','P0'],['P1','P1'],['P2','P2'],['P3','P3']];
+  const STATUSES = [['firing','活跃'],['acked','已确认'],['resolved','已解决']];
+  const SEV_LABEL = {P0:'P0 紧急',P1:'P1 重要',P2:'P2 一般',P3:'P3 提示'};
+  const ST_LABEL = {firing:'活跃',acked:'已确认',resolved:'已解决'};
+
+  // ---- 数据加载 ----
+
   async function loadAlerts(){
-    const q = new URLSearchParams({limit:'500'});
-    if (projFilter !== 'all') q.set('project_id', projFilter);
-    const [tasks, overview] = await Promise.all([
-      api('/api/tasks?' + q).catch(() => []),
-      api('/api/dashboard/overview').catch(() => null),
-    ]);
-    // 环境筛选：任务告警按 env 过滤
-    if (envFilter !== 'all') tasks = tasks.filter(t => t.env === envFilter);
-    // 监控数据：选中项目（全部时为所有项目默认环境）；环境筛选下仅取含该环境的项目
-    const projs = projFilter === 'all' ? projects : projects.filter(p => p.id === Number(projFilter));
-    const monByProject = {};
-    for (const p of projs){
-      try{
-        const pEnvs = await api(`/api/projects/${p.id}/environments`).catch(() => []);
-        let names;
-        if (envFilter !== 'all'){
-          if (!pEnvs.some(e => e.name === envFilter)) continue; // 无此环境 → 不产生服务告警
-          names = [envFilter];
-        } else if (projFilter !== 'all'){
-          names = pEnvs.map(e => e.name); // 选中项目：聚合全部环境
-        } else {
-          const env = pEnvs.find(e => e.is_default) || pEnvs[0];
-          if (!env) continue;
-          names = [env.name];
-        }
-        const merged = {services: {}};
-        for (const name of names){
-          const mon = await api(`/api/monitor/overview?project_id=${p.id}&env=${name}`);
-          if (mon && mon.services) Object.assign(merged.services, mon.services);
-        }
-        if (Object.keys(merged.services).length) monByProject[p.name] = merged;
-      }catch(e){ /* 单项目监控失败跳过 */ }
+    try {
+      const q = new URLSearchParams({page: String(currentPage), page_size: String(pageSize)});
+      if (sevFilter !== 'all') q.set('severity', sevFilter);
+      if (statusFilter !== 'all') q.set('status', statusFilter);
+      if (keyword) q.set('keyword', keyword);
+      const data = await api('/api/alerts?' + q);
+      if (destroyed) return;
+      alerts = data.rows || [];
+      total = data.total || 0;
+      renderList();
+    } catch(e) {
+      // 列表加载失败时保留上次数据，不阻塞轮询
+      console.warn('loadAlerts failed', e);
     }
-    alerts = computeAlerts(tasks, overview, monByProject);
-    if (destroyed) return; // 页面已销毁（路由切换），丢弃过期响应
-    render();
   }
-  function render(){
+
+  async function loadStats(){
+    try {
+      const [f, a, r] = await Promise.all([
+        api('/api/alerts?status=firing&page_size=1').catch(() => ({total:0})),
+        api('/api/alerts?status=acked&page_size=1').catch(() => ({total:0})),
+        api('/api/alerts?status=resolved&page_size=1').catch(() => ({total:0})),
+      ]);
+      if (destroyed) return;
+      firingCount = f.total || 0;
+      ackedCount = a.total || 0;
+      resolvedCount = r.total || 0;
+      updateStats();
+      updateAlertBadge(firingCount);
+    } catch(e) {
+      console.warn('loadStats failed', e);
+    }
+  }
+
+  function updateStats(){
+    const fn = document.getElementById('statFiring');
+    const an = document.getElementById('statAcked');
+    const rn = document.getElementById('statResolved');
+    if (fn) fn.textContent = firingCount;
+    if (an) an.textContent = ackedCount;
+    if (rn) rn.textContent = resolvedCount;
+  }
+
+  // ---- 渲染 ----
+
+  function renderPage(){
     const root = document.getElementById('pageRoot');
-    const unacked = alerts.filter(a => a.status === 'unacked').length;
-    const acked = alerts.filter(a => a.status === 'acked').length;
-    const filtered = alerts.filter(a =>
-      (levelFilter === 'all' || a.level === levelFilter) &&
-      (showFilter === 'all' || a.status === showFilter));
     root.innerHTML = `
       <div class="alert-stats">
-        <div class="alert-stat unacked"><div class="as-num">${unacked}</div><div class="as-label">未处理</div></div>
-        <div class="alert-stat"><div class="as-num">${acked}</div><div class="as-label">已处理</div></div>
-        <div class="alert-stat"><div class="as-num">${alerts.length}</div><div class="as-label">全部</div></div>
+        <div class="alert-stat firing"><div class="as-num" id="statFiring">0</div><div class="as-label">活跃</div></div>
+        <div class="alert-stat acked"><div class="as-num" id="statAcked">0</div><div class="as-label">已确认</div></div>
+        <div class="alert-stat resolved"><div class="as-num" id="statResolved">0</div><div class="as-label">已解决</div></div>
       </div>
-      <div class="deploy-toolbar">
-        <span class="weak" style="font-size:12px">项目</span>
-        <select class="filter-sel" id="alProjSel"></select>
-        <span class="weak" style="font-size:12px">环境</span>
-        <select class="filter-sel" id="alEnvSel"></select>
-        <span style="width:1px;height:20px;background:var(--border);margin:0 4px"></span>
+      <div class="alert-toolbar deploy-toolbar">
         <span class="weak" style="font-size:12px">级别</span>
-        ${[['all','全部'],['critical','严重'],['warning','警告']].map(([k, v]) =>
-          `<span class="chip ${k === levelFilter ? 'active' : ''}" data-lv="${k}">${v}</span>`).join('')}
+        ${SEVERITIES.map(([k, v]) =>
+          `<span class="chip ${k === sevFilter ? 'active' : ''}" data-sev="${k}">${v}</span>`).join('')}
         <span style="width:1px;height:20px;background:var(--border);margin:0 4px"></span>
         <span class="weak" style="font-size:12px">状态</span>
-        ${[['unacked','未处理'],['acked','已处理'],['all','全部']].map(([k, v]) =>
-          `<span class="chip ${k === showFilter ? 'active' : ''}" data-sh="${k}">${v}</span>`).join('')}
+        ${STATUSES.map(([k, v]) =>
+          `<span class="chip ${k === statusFilter ? 'active' : ''}" data-st="${k}">${v}</span>`).join('')}
         <span style="flex:1"></span>
+        <input class="alert-search" type="text" placeholder="搜索告警..." value="${esc(keyword)}" id="alertKeyword">
       </div>
-      <div id="alertList">
-        ${filtered.length ? filtered.map(a => `
-          <div class="alert-row ${a.status}" data-key="${esc(a.key)}">
-            <span class="badge ${a.level === 'critical' ? 'critical' : 'warning'}">${a.level === 'critical' ? '严重' : '警告'}</span>
-            <div class="ar-main">
-              <div class="ar-title">${esc(a.title)}</div>
-              <div class="ar-detail">${esc(a.detail)}</div>
-            </div>
-            <span class="ar-time">${fmtTime(a.ts)}</span>
-            ${a.status === 'unacked'
-              ? '<button class="btn sm primary" data-ack="1">标记已处理</button>'
-              : '<button class="btn sm ghost" data-ack="0">恢复未处理</button>'}
-          </div>`).join('')
-          : `<div class="panel">${emptyState('🎉', '暂无告警，一切正常')}</div>`}
-      </div>`;
-    const projSel = document.getElementById('alProjSel');
-    if (projSel){
-      projSel.innerHTML = '<option value="all">全部项目</option>' + projects.map(p =>
-        `<option value="${p.id}" ${p.id === Number(projFilter) ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
-      projSel.onchange = async () => {
-        projFilter = projSel.value; envFilter = 'all';
-        await loadEnvs();
+      <div id="alertList">${skeletonHTML(4)}</div>
+      <div id="alertPagination"></div>`;
+    bindToolbar();
+  }
+
+  function bindToolbar(){
+    const root = document.getElementById('pageRoot');
+    // 级别筛选
+    root.querySelectorAll('.chip[data-sev]').forEach(c => {
+      c.onclick = () => {
+        sevFilter = sevFilter === c.dataset.sev ? 'all' : c.dataset.sev;
+        currentPage = 1;
+        root.querySelectorAll('.chip[data-sev]').forEach(x =>
+          x.classList.toggle('active', x.dataset.sev === sevFilter));
         loadAlerts();
       };
-    }
-    const envSel = document.getElementById('alEnvSel');
-    if (envSel){
-      if (projFilter === 'all'){
-        envSel.disabled = true;
-        envSel.innerHTML = '<option value="all">全部环境</option>';
-      }else{
-        envSel.disabled = false;
-        envSel.innerHTML = '<option value="all">全部环境</option>' + envs.map(e =>
-          `<option value="${esc(e.name)}" ${e.name === envFilter ? 'selected' : ''}>${esc(e.name)}</option>`).join('');
-        envSel.onchange = () => { envFilter = envSel.value; loadAlerts(); };
-      }
-    }
-    root.querySelectorAll('.chip[data-lv]').forEach(c => c.onclick = () => {
-      levelFilter = c.dataset.lv;
-      document.querySelectorAll('.chip[data-lv]').forEach(x => x.classList.toggle('active', x === c));
-      render();
     });
-    root.querySelectorAll('.chip[data-sh]').forEach(c => c.onclick = () => {
-      showFilter = c.dataset.sh;
-      document.querySelectorAll('.chip[data-sh]').forEach(x => x.classList.toggle('active', x === c));
-      render();
+    // 状态筛选
+    root.querySelectorAll('.chip[data-st]').forEach(c => {
+      c.onclick = () => {
+        statusFilter = statusFilter === c.dataset.st ? 'all' : c.dataset.st;
+        currentPage = 1;
+        root.querySelectorAll('.chip[data-st]').forEach(x =>
+          x.classList.toggle('active', x.dataset.st === statusFilter));
+        loadAlerts();
+      };
     });
-    root.querySelectorAll('[data-ack]').forEach(btn => btn.onclick = () => {
-      const key = btn.closest('.alert-row').dataset.key;
-      if (btn.dataset.ack === '1') ackAlert(key); else unackAlert(key);
-      toastSuccess(btn.dataset.ack === '1' ? '已标记处理' : '已恢复未处理');
+    // 关键词搜索（300ms 防抖）
+    const inp = document.getElementById('alertKeyword');
+    if (inp) {
+      inp.oninput = () => {
+        if (searchTimer) clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => {
+          keyword = inp.value.trim();
+          currentPage = 1;
+          loadAlerts();
+        }, 300);
+      };
+    }
+  }
+
+  function renderList(){
+    const box = document.getElementById('alertList');
+    if (!box) return;
+    if (!alerts.length) {
+      box.innerHTML = `<div class="panel">${emptyState('🔕', '暂无告警')}</div>`;
+      renderPagination();
+      return;
+    }
+    box.innerHTML = alerts.map(a => {
+      const target = parseTarget(a.target_info);
+      const sevCls = (a.severity || 'P2').toLowerCase();
+      const stLabel = ST_LABEL[a.status] || esc(a.status);
+      const stCls = a.status === 'firing' ? 'running'
+                  : a.status === 'acked' ? 'warning'
+                  : 'success';
+      return `
+        <div class="alert-row ${esc(a.status)}" data-id="${a.id}">
+          <span class="badge ${sevCls}">${esc(a.severity || 'P2')}</span>
+          <div class="ar-main">
+            <div class="ar-title">${esc(a.subject)}</div>
+            <div class="ar-detail">${esc(a.description || '')}${target ? ' · ' + esc(target) : ''}</div>
+          </div>
+          <span class="badge ${stCls}" style="margin-right:8px">${stLabel}</span>
+          <span class="ar-time" title="首次出现">${fmtTime(a.first_seen_at)}</span>
+          <span class="ar-time" title="最近出现" style="margin-left:4px">${fmtTime(a.last_seen_at)}</span>
+          ${a.status === 'firing'
+            ? '<button class="btn sm primary" data-act="ack" style="margin-left:8px">确认</button>'
+            : ''}
+          ${a.status !== 'resolved'
+            ? '<button class="btn sm danger" data-act="resolve" style="margin-left:4px">解决</button>'
+            : ''}
+        </div>`;
+    }).join('');
+    // 绑定操作按钮（事件委托）
+    box.onclick = (e) => {
+      const btn = e.target.closest('[data-act]');
+      if (!btn) return;
+      const row = btn.closest('.alert-row');
+      if (!row) return;
+      const id = Number(row.dataset.id);
+      if (btn.dataset.act === 'ack') ackAlert(id);
+      else if (btn.dataset.act === 'resolve') resolveAlert(id);
+    };
+    renderPagination();
+  }
+
+  function renderPagination(){
+    const el = document.getElementById('alertPagination');
+    if (!el) return;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    if (total <= pageSize) { el.innerHTML = ''; return; }
+    el.innerHTML = `
+      <div class="alert-pagination">
+        <button class="btn sm" id="pgPrev" ${currentPage <= 1 ? 'disabled' : ''}>上一页</button>
+        <span class="pg-info">${currentPage} / ${totalPages}</span>
+        <button class="btn sm" id="pgNext" ${currentPage >= totalPages ? 'disabled' : ''}>下一页</button>
+      </div>`;
+    const prev = document.getElementById('pgPrev');
+    const next = document.getElementById('pgNext');
+    if (prev) prev.onclick = () => { if (currentPage > 1) { currentPage--; loadAlerts(); } };
+    if (next) next.onclick = () => { if (currentPage < totalPages) { currentPage++; loadAlerts(); } };
+  }
+
+  // ---- 操作 ----
+
+  async function ackAlert(id){
+    if (!await confirmDialog('确认将此告警标记为已确认？')) return;
+    try {
+      await api(`/api/alerts/${id}/ack`, {method:'POST'});
+      toastSuccess('已确认');
       loadAlerts();
-    });
-    updateAlertBadge(unacked);
+      loadStats();
+    } catch(e) {
+      toastError(e.message || '操作失败');
+    }
+  }
+
+  async function resolveAlert(id){
+    if (!await confirmDialog('确认将此告警标记为已解决？')) return;
+    try {
+      await api(`/api/alerts/${id}/resolve`, {method:'POST'});
+      toastSuccess('已解决');
+      loadAlerts();
+      loadStats();
+    } catch(e) {
+      toastError(e.message || '操作失败');
+    }
+  }
+
+  // ---- 工具函数 ----
+
+  function parseTarget(raw){
+    if (!raw) return '';
+    try {
+      const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const parts = [];
+      if (obj.project) parts.push(obj.project);
+      if (obj.env) parts.push(obj.env);
+      if (obj.service) parts.push(obj.service);
+      if (obj.server) parts.push(obj.server);
+      return parts.join(' / ');
+    } catch(e) {
+      return '';
+    }
   }
 
   // ---- 模块导出 ----
   window.alerts = {
     render: async function(root){
       destroyed = false;
-      root.innerHTML = skeletonHTML(3);
-      await ensureProjects();
-      await loadEnvs();
-      render();
-      await loadAlerts();
-      if (destroyed) return []; // destroy 后在途续体不再创建轮询
-      timer = setInterval(loadAlerts, 15000);
+      renderPage();
+      await Promise.all([loadStats(), loadAlerts()]);
+      if (destroyed) return [];
+      timer = setInterval(() => { loadAlerts(); loadStats(); }, 15000);
       return [timer];
     },
     destroy: function(){
       destroyed = true;
       if (timer) clearInterval(timer);
+      if (searchTimer) clearTimeout(searchTimer);
       timer = null;
+      searchTimer = null;
     },
   };
 })();
