@@ -1,7 +1,7 @@
-// pages/logs.js — 日志中心（任务日志/审计日志双 Tab + 项目/环境筛选 + 日志追尾）
+// pages/logs.js — 日志中心（任务日志/审计日志/服务日志三 Tab + 项目/环境筛选 + 日志追尾）
 (function(){
   let timer = null;       // 追尾定时器
-  let tab = 'task';       // task / audit（audit 仅 admin）
+  let tab = 'task';       // task / audit / service（audit 仅 admin）
   let projFilter = 'all'; // all / 项目 id
   let envFilter = 'all';  // all / 环境名（仅选中项目时生效）
   let projects = [];
@@ -52,7 +52,7 @@
     if (!sel) return;
     const visible = envFilter === 'all' ? tasks : tasks.filter(t => t.env === envFilter);
     sel.innerHTML = '<option value="">— 选择任务 —</option>' + visible.map(t =>
-      `<option value="${t.id}" ${t.id === currentId ? 'selected' : ''}>#${t.id} ${esc(t.name)} [${esc(t.env || '-')}] ${esc(t.status)}</option>`
+      `<option value="${t.id}" ${t.id === currentId ? 'selected' : ''}>#${t.id} ${esc(t.name)} [${esc(t.env || '-')}] ${t.action === 'rollback' ? '↩回滚' : '发布'} ${esc(t.status)}</option>`
     ).join('');
   }
   // 全量拉取：offset 循环直至任务终态/无新日志或 1000 轮（防死循环）
@@ -172,6 +172,46 @@
       await renderAudit();
       return;
     }
+    if (tab === 'service') {
+      stopTail();
+      body.innerHTML = `
+        <div class="panel">
+          <div class="panel-title">服务日志</div>
+          <div class="flex gap-3" style="margin-bottom:12px;flex-wrap:wrap;align-items:center">
+            <span class="weak" style="font-size:12px">环境</span>
+            <select class="filter-sel" id="svcLogEnvSel">
+              <option value="">全部环境</option>
+            </select>
+            <span class="weak" style="font-size:12px">服务</span>
+            <select class="filter-sel" id="svcLogSvcSel">
+              <option value="">全部服务</option>
+            </select>
+            <span class="weak" style="font-size:12px">关键词</span>
+            <input type="text" class="filter-input" id="svcLogKeyword" placeholder="ERROR / Exception / ..." style="width:200px">
+            <button class="btn sm" id="svcLogSearch">检索</button>
+          </div>
+          <div id="svcLogResults">
+            <div class="muted" style="text-align:center;padding:40px">请输入检索条件</div>
+          </div>
+        </div>
+        <div id="svcLogContextDrawer" class="drawer-overlay" style="display:none">
+          <div class="drawer right" style="width:600px">
+            <div class="drawer-header">
+              <span>日志上下文</span>
+              <button class="btn sm" id="svcLogCtxClose">关闭</button>
+            </div>
+            <div class="drawer-body">
+              <pre id="svcLogCtxContent" class="log-console" style="height:500px;overflow:auto"></pre>
+            </div>
+          </div>
+        </div>`;
+      loadServiceLogOptions();
+      document.getElementById('svcLogSearch').onclick = () => searchServiceLogs();
+      document.getElementById('svcLogCtxClose').onclick = () => {
+        document.getElementById('svcLogContextDrawer').style.display = 'none';
+      };
+      return;
+    }
     body.innerHTML = `
       <div class="panel">
         <div class="panel-title">任务日志</div>
@@ -236,6 +276,94 @@
     if (logBox()) logBox().textContent = '请选择任务';
   }
 
+  // ---- 服务日志 Tab ----
+  async function loadServiceLogOptions() {
+    const services = await api('/api/logs/services').catch(() => []);
+    const envSel = document.getElementById('svcLogEnvSel');
+    const svcSel = document.getElementById('svcLogSvcSel');
+    if (!envSel || !svcSel) return;
+    const envSet = new Set(services.map(s => s.env));
+    envSel.innerHTML = '<option value="">全部环境</option>' +
+      [...envSet].map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join('');
+    envSel.onchange = () => {
+      const env = envSel.value;
+      const filtered = env ? services.filter(s => s.env === env) : services;
+      svcSel.innerHTML = '<option value="">全部服务</option>' +
+        filtered.map(s => `<option value="${esc(s.service)}">${esc(s.service)}</option>`).join('');
+    };
+  }
+
+  async function searchServiceLogs() {
+    const env = document.getElementById('svcLogEnvSel')?.value || '';
+    const service = document.getElementById('svcLogSvcSel')?.value || '';
+    const keyword = document.getElementById('svcLogKeyword')?.value || '';
+    if (!keyword && !env && !service) {
+      toastError('请至少选择一个筛选条件');
+      return;
+    }
+    const results = document.getElementById('svcLogResults');
+    if (results) results.innerHTML = '<div class="muted" style="text-align:center;padding:20px">检索中...</div>';
+    try {
+      const params = new URLSearchParams();
+      if (env) params.set('env', env);
+      if (service) params.set('service', service);
+      if (keyword) params.set('keyword', keyword);
+      params.set('page_size', '100');
+      const data = await api('/api/logs?' + params);
+      renderServiceLogResults(data);
+    } catch (e) {
+      if (results) results.innerHTML = `<div class="panel">检索失败：${esc(e.message)}</div>`;
+    }
+  }
+
+  function renderServiceLogResults(data) {
+    const results = document.getElementById('svcLogResults');
+    if (!results) return;
+    if (!data.rows || data.rows.length === 0) {
+      results.innerHTML = '<div class="muted" style="text-align:center;padding:40px">无匹配结果</div>';
+      return;
+    }
+    results.innerHTML = `
+      <div class="muted" style="font-size:12px;margin-bottom:8px">共 ${data.total} 条，显示前 ${data.rows.length} 条</div>
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr><th style="width:140px">时间</th><th style="width:80px">环境</th><th style="width:120px">服务</th><th>内容</th><th style="width:60px">操作</th></tr></thead>
+          <tbody>
+            ${data.rows.map(r => `
+              <tr>
+                <td class="num muted">${fmtTime(r.ts)}</td>
+                <td>${esc(r.env)}</td>
+                <td>${esc(r.service)}</td>
+                <td class="svc-log-content" title="${esc(r.file_path)}">${esc((r.content || '').slice(0, 120))}</td>
+                <td><button class="btn sm" data-ctx="${r.id}">上下文</button></td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>`;
+    // 事件委托绑定上下文按钮
+    results.onclick = async (e) => {
+      const btn = e.target.closest('[data-ctx]');
+      if (!btn) return;
+      const entryId = btn.dataset.ctx;
+      const drawer = document.getElementById('svcLogContextDrawer');
+      const content = document.getElementById('svcLogCtxContent');
+      if (!drawer || !content) return;
+      drawer.style.display = 'flex';
+      content.textContent = '加载中...';
+      try {
+        const ctxData = await api(`/api/logs/context?id=${entryId}&lines=10`);
+        if (ctxData.error) {
+          content.textContent = ctxData.error;
+          return;
+        }
+        content.textContent = ctxData.lines.join('');
+      } catch (e) {
+        content.textContent = '加载失败：' + e.message;
+      }
+    };
+  }
+
   // ---- 模块导出 ----
   window.logs = {
     render: async function(root){
@@ -244,8 +372,8 @@
       await loadEnvs();
       root.innerHTML = `
         <div class="deploy-toolbar">
-          ${[['task','任务日志'],['audit','审计日志']]
-            .filter(([k]) => k === 'task' || isAdmin())
+          ${[['task','任务日志'],['audit','审计日志'],['service','服务日志']]
+            .filter(([k]) => k === 'task' || k === 'audit' && isAdmin() || k === 'service')
             .map(([k, v]) => `<span class="chip ${k === tab ? 'active' : ''}" data-tab="${k}">${v}</span>`).join('')}
         </div>
         <div id="logBody"></div>`;
