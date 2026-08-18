@@ -77,6 +77,9 @@ def create_app():
     app.config["DB_PATH"] = str(DATA_DIR / "platform.db")
     app.config["MONITOR_INTERVAL"] = int(os.environ.get("DASHBOARD_MONITOR_INTERVAL", "30"))
     init_db(app.config["DB_PATH"])
+    # 历史自动版本任务回填：从日志解析实际版本号写入 DB（幂等，仅处理 version 为空的记录）
+    from .task_manager import backfill_existing_auto_versions
+    backfill_existing_auto_versions(app.config["DB_PATH"])
     # 空库引导（导入 config/ 旧 YAML + 建 admin）；
     # 非空库但 admin 缺失时仅补建 admin，不重导入（避免 config/ 旧文件覆盖 DB 权威配置）
     if project_count(app.config["DB_PATH"]) == 0:
@@ -89,11 +92,13 @@ def create_app():
     from .routes.deploy_routes import deploy_bp
     from .routes.dash_routes import dash_bp
     from .routes.alert_routes import alert_bp
+    from .routes.log_routes import log_bp
     app.register_blueprint(auth_bp, url_prefix="/api")
     app.register_blueprint(config_bp, url_prefix="/api")
     app.register_blueprint(deploy_bp, url_prefix="/api")
     app.register_blueprint(dash_bp, url_prefix="/api")
     app.register_blueprint(alert_bp, url_prefix="/api")
+    app.register_blueprint(log_bp, url_prefix="/api")
 
     from flask import render_template
 
