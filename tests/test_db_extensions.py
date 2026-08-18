@@ -1,4 +1,4 @@
-"""DB 扩展测试：告警 5 张新表 + services 加列 + JSON 字段往返"""
+"""DB 扩展测试：告警表 + 日志中心表 + services 加列 + JSON 字段往返 + FTS5 检索"""
 import os
 import shutil
 import tempfile
@@ -115,6 +115,39 @@ class TestLogTables(unittest.TestCase):
     def test_log_entries_in_tables_whitelist(self):
         self.assertIn("log_entries", dbm.TABLES)
         self.assertIn("log_scan_state", dbm.TABLES)
+
+    def test_log_fts_insert_and_query(self):
+        """FTS5 外部内容模式：写入 log_entries 后同步 FTS，验证 MATCH 查询"""
+        conn = dbm.get_conn(self.db)
+        try:
+            cur = conn.execute(
+                "INSERT INTO log_entries(ts, env, service, content) VALUES (?,?,?,?)",
+                (1000, "prod", "my-svc", "Error: connection refused"))
+            rowid = cur.lastrowid
+            conn.execute(
+                "INSERT INTO log_fts(rowid, ts, env, service, content) VALUES (?,?,?,?,?)",
+                (rowid, "1000", "prod", "my-svc", "Error: connection refused"))
+            rows = conn.execute(
+                "SELECT * FROM log_fts WHERE log_fts MATCH ?", ("Error",)).fetchall()
+            self.assertEqual(len(rows), 1)
+        finally:
+            conn.close()
+
+    def test_log_scan_state_unique_index(self):
+        """log_scan_state 唯一索引：同 (env, server, container) 不能重复"""
+        conn = dbm.get_conn(self.db)
+        try:
+            conn.execute(
+                "INSERT INTO log_scan_state(env, server, container, service, last_ts, last_line, updated_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("prod", "10.0.0.1", "api", "api", "", 0, 1000))
+            with self.assertRaises(Exception):
+                conn.execute(
+                    "INSERT INTO log_scan_state(env, server, container, service, last_ts, last_line, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    ("prod", "10.0.0.1", "api", "api-v2", "", 0, 1000))
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

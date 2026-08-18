@@ -188,6 +188,7 @@ CREATE TABLE IF NOT EXISTS log_entries (
     file_path TEXT NOT NULL DEFAULT '',
     line_offset INTEGER NOT NULL DEFAULT 0,
     line_count INTEGER NOT NULL DEFAULT 0,
+    content TEXT NOT NULL DEFAULT '',
     keywords TEXT DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS log_scan_state (
@@ -274,6 +275,10 @@ def _migrate(conn):
         conn.execute("ALTER TABLE tasks ADD COLUMN action TEXT DEFAULT 'deploy'")
         # 存量数据：extra 含 --rollback 的记录回填为 rollback（extra 列必须先加好）
         conn.execute("UPDATE tasks SET action='rollback' WHERE extra LIKE '%--rollback%'")
+    # log_entries 补 content 列（FTS5 外部内容模式要求内容表有 content 列）
+    log_cols = {r["name"] for r in conn.execute("PRAGMA table_info(log_entries)")}
+    if "content" not in log_cols:
+        conn.execute("ALTER TABLE log_entries ADD COLUMN content TEXT NOT NULL DEFAULT ''")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(servers)")}
     if "role" in cols:
         return
