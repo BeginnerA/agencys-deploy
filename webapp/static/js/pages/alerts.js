@@ -1,9 +1,9 @@
-// pages/alerts.js — 告警中心（告警列表 Tab + 规则管理 Tab，消费后端 /api/alerts API）
+// pages/alerts.js — 告警中心（告警列表 Tab + 规则管理 Tab + 静默窗口 Tab，消费后端 /api/alerts API）
 (function(){
   let timer = null;
   let destroyed = false;
   let searchTimer = null;
-  let currentTab = 'rules';  // 预留 Tab 切换（Task 5 完善），当前默认 rules 便于测试
+  let currentTab = 'silences';  // 预留 Tab 切换（Task 5 完善），当前 silences 便于测试
 
   // 告警列表状态
   let alerts = [];
@@ -24,6 +24,11 @@
   let editingRuleId = null;
   let ruleTypeFilter = 'all';
 
+  // ---- 静默窗口 Tab 状态 ----
+  let silences = [];
+  let editingSilenceId = null;
+  let silenceSaving = false;
+
   // 常量定义
   const SEVERITIES = [['P0','P0'],['P1','P1'],['P2','P2'],['P3','P3']];
   const STATUSES = [['firing','活跃'],['acked','已确认'],['resolved','已解决']];
@@ -40,6 +45,8 @@
   const COMPARE_OPS = [['<','<'],['<=','<='],['>','>'],['>=','>=']];
   const CHANNELS = [['email','邮件'],['wecom','企微'],['webhook','Webhook'],['sms_aliyun','阿里云短信'],['feishu','飞书'],['dingtalk','钉钉']];
   const SCOPE_TYPES = [['all','全部'],['project','项目'],['env','环境'],['server','服务器'],['service','服务']];
+  const SILENCE_TYPES = [['one_time','一次性'],['recurring','周期']];
+  const WEEKDAY_LABELS = {1:'周一',2:'周二',3:'周三',4:'周四',5:'周五',6:'周六',7:'周日'};
   const MT_LABEL = {metric:'指标',status:'状态',log_keyword:'日志关键词'};
   const CMP_LABEL = {'<':'<','<=':'≤','>':'>','>=':'≥'};
 
@@ -97,13 +104,15 @@
       <div class="alert-tabs-bar">
         <button class="tab-btn ${currentTab==='alerts'?'active':''}" data-tab="alerts">🔔 告警列表</button>
         <button class="tab-btn ${currentTab==='rules'?'active':''}" data-tab="rules">📏 规则管理</button>
+        <button class="tab-btn ${currentTab==='silences'?'active':''}" data-tab="silences">🔕 静默窗口</button>
       </div>
       <div id="tabContent"></div>`;
     root.querySelectorAll('.tab-btn[data-tab]').forEach(btn => {
       btn.onclick = () => switchTab(btn.dataset.tab);
     });
     if (currentTab === 'alerts') renderAlertsTab();
-    else renderRulesTab();
+    else if (currentTab === 'rules') renderRulesTab();
+    else if (currentTab === 'silences') renderSilencesTab();
   }
 
   function switchTab(tab){
@@ -111,6 +120,8 @@
     currentTab = tab;
     renderPage();
     if (tab === 'alerts') { loadStats(); loadAlerts(); }
+    else if (tab === 'rules') { loadRules(); }
+    else if (tab === 'silences') { loadSilences(); }
   }
 
   // ==================== 告警列表 Tab ====================
@@ -506,6 +517,259 @@
     return {type: raw.type || 'all', ids: raw.ids || []};
   }
 
+  // ==================== 静默窗口 Tab ====================
+
+  async function loadSilences(){
+    try {
+      silences = await api('/api/alerts/silences');
+      if (destroyed) return;
+      renderSilenceList();
+    } catch(e) {
+      console.warn('loadSilences failed', e);
+      const box = document.getElementById('silenceListContainer');
+      if (box) box.innerHTML = `<div class="panel">${errorState('静默窗口加载失败', 'loadSilences')}</div>`;
+    }
+  }
+
+  function renderSilencesTab(){
+    const tc = document.getElementById('tabContent');
+    if (!tc) return;
+    tc.innerHTML = `
+      <div class="alert-toolbar">
+        <span style="flex:1"></span>
+        <button class="btn primary sm" id="btnNewSilence">＋ 新建窗口</button>
+      </div>
+      <div id="silenceListContainer">${skeletonHTML(3)}</div>`;
+    document.getElementById('btnNewSilence').onclick = () => openSilenceDrawer(null);
+    loadSilences();
+  }
+
+  function renderSilenceList(){
+    const box = document.getElementById('silenceListContainer');
+    if (!box) return;
+    if (!silences.length) {
+      box.innerHTML = `<div class="panel">${emptyState('🔕', '暂无静默窗口')}</div>`;
+      return;
+    }
+    box.innerHTML = `
+      <div class="panel" style="padding:0"><div class="tbl-wrap"><table class="tbl silence-tbl">
+        <thead><tr><th>名称</th><th>类型</th><th>时间</th><th>周期</th><th>作用域</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>${silences.map(s => {
+          const typeLabel = s.type === 'recurring' ? '周期' : '一次性';
+          const typeCls = s.type === 'recurring' ? 'recurring' : 'one-time';
+          let timeStr = '';
+          if (s.type === 'one_time') {
+            timeStr = `${fmtTime(Number(s.start_at))} ~ ${fmtTime(Number(s.end_at))}`;
+          } else {
+            timeStr = `${esc(s.start_at)} ~ ${esc(s.end_at)}`;
+          }
+          const wdStr = (s.weekdays && s.weekdays.length)
+            ? s.weekdays.map(d => WEEKDAY_LABELS[d] || d).join('、')
+            : '-';
+          const scope = parseSilenceScope(s.scope);
+          const scopeParts = [];
+          if (scope.rules && scope.rules.length) scopeParts.push(`规则: ${scope.rules.length}`);
+          if (scope.envs && scope.envs.length) scopeParts.push(`环境: ${scope.envs.length}`);
+          if (scope.servers && scope.servers.length) scopeParts.push(`服务器: ${scope.servers.length}`);
+          const scopeStr = scopeParts.length ? scopeParts.join(', ') : '全部';
+          return `<tr>
+            <td><b>${esc(s.name)}</b>${s.remark ? `<div class="silence-remark">${esc(s.remark)}</div>` : ''}</td>
+            <td><span class="silence-type-badge ${typeCls}">${typeLabel}</span></td>
+            <td class="silence-time">${timeStr}</td>
+            <td>${wdStr}</td>
+            <td>${esc(scopeStr)}</td>
+            <td><span class="badge ${s.enabled ? 'success' : 'pending'}">${s.enabled ? '启用' : '停用'}</span></td>
+            <td class="silence-actions">
+              <button class="btn sm" data-sa="edit" data-sid="${s.id}">编辑</button>
+              <button class="btn sm danger" data-sa="del" data-sid="${s.id}">删除</button>
+            </td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table></div></div>`;
+    // 事件委托
+    box.onclick = async (e) => {
+      const btn = e.target.closest('[data-sa]');
+      if (!btn) return;
+      const id = Number(btn.dataset.sid);
+      if (btn.dataset.sa === 'edit') {
+        const s = silences.find(x => x.id === id);
+        if (s) openSilenceDrawer(s);
+      } else if (btn.dataset.sa === 'del') {
+        await deleteSilence(id);
+      }
+    };
+  }
+
+  function parseSilenceScope(raw){
+    if (!raw) return {rules:[], envs:[], servers:[]};
+    if (typeof raw === 'string') {
+      try { raw = JSON.parse(raw); } catch(e) { return {rules:[], envs:[], servers:[]}; }
+    }
+    return {
+      rules: raw.rules || [],
+      envs: raw.envs || [],
+      servers: raw.servers || []
+    };
+  }
+
+  function openSilenceDrawer(silence){
+    editingSilenceId = silence ? silence.id : null;
+    const title = silence ? '编辑静默窗口' : '新建静默窗口';
+    const s = silence || {};
+    const scope = parseSilenceScope(s.scope);
+    const weekdays = s.weekdays || [];
+    const wtype = s.type || 'one_time';
+
+    const bodyHTML = `
+      <div class="form-grid" id="silenceForm">
+        <div class="field"><label>名称 *</label><input id="sfName" value="${esc(s.name||'')}" placeholder="窗口名称"></div>
+        <div class="field"><label>类型</label>
+          <select id="sfType">${SILENCE_TYPES.map(([k,v]) =>
+            `<option value="${k}" ${wtype===k?'selected':''}>${v}</option>`).join('')}</select></div>
+        <div class="field" id="sfStartWrap"><label id="sfStartLabel">开始时间</label>
+          <input id="sfStart" value="${esc(s.start_at||'')}" placeholder=""></div>
+        <div class="field" id="sfEndWrap"><label id="sfEndLabel">结束时间</label>
+          <input id="sfEnd" value="${esc(s.end_at||'')}" placeholder=""></div>
+        <div class="field full" id="sfWeekdaysWrap" style="display:none">
+          <label>周期（多选）</label>
+          <div class="silence-wd-box">${[1,2,3,4,5,6,7].map(d =>
+            `<label class="silence-wd-cb"><input type="checkbox" value="${d}" ${weekdays.includes(d)?'checked':''}> ${WEEKDAY_LABELS[d]}</label>`
+          ).join('')}</div></div>
+        <div class="field"><label>作用域 - 规则 IDs（逗号分隔）</label>
+          <input id="sfScopeRules" value="${esc((scope.rules||[]).join(','))}" placeholder="1,2,3"></div>
+        <div class="field"><label>作用域 - 环境 IDs（逗号分隔）</label>
+          <input id="sfScopeEnvs" value="${esc((scope.envs||[]).join(','))}" placeholder="1,2,3"></div>
+        <div class="field"><label>作用域 - 服务器 IDs（逗号分隔）</label>
+          <input id="sfScopeServers" value="${esc((scope.servers||[]).join(','))}" placeholder="1,2,3"></div>
+        <div class="field check"><input type="checkbox" id="sfEnabled" ${s.enabled !== 0 ? 'checked' : ''}>
+          <label for="sfEnabled" style="margin:0">启用</label></div>
+        <div class="field full"><label>备注</label>
+          <textarea id="sfRemark" rows="2">${esc(s.remark||'')}</textarea></div>
+        <div class="full" style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
+          <button class="btn" id="sfCancel">取消</button>
+          <button class="btn primary" id="sfSave">保存</button>
+        </div>
+      </div>`;
+    openDrawer({title, body: bodyHTML, wide: true});
+
+    // 类型联动
+    const selType = document.getElementById('sfType');
+    function updateFieldVis(){
+      const t = selType.value;
+      const isRecurring = t === 'recurring';
+      const startInput = document.getElementById('sfStart');
+      const endInput = document.getElementById('sfEnd');
+      const startLabel = document.getElementById('sfStartLabel');
+      const endLabel = document.getElementById('sfEndLabel');
+      const wdWrap = document.getElementById('sfWeekdaysWrap');
+      if (isRecurring) {
+        startInput.type = 'text';
+        endInput.type = 'text';
+        startInput.placeholder = 'HH:MM（如 08:00）';
+        endInput.placeholder = 'HH:MM（如 22:00）';
+        startLabel.textContent = '开始时间（HH:MM）';
+        endLabel.textContent = '结束时间（HH:MM）';
+        wdWrap.style.display = '';
+      } else {
+        startInput.type = 'number';
+        endInput.type = 'number';
+        startInput.placeholder = 'Epoch 秒（如 1700000000）';
+        endInput.placeholder = 'Epoch 秒（如 1700100000）';
+        startLabel.textContent = '开始时间（Epoch 秒）';
+        endLabel.textContent = '结束时间（Epoch 秒）';
+        wdWrap.style.display = 'none';
+      }
+    }
+    selType.onchange = updateFieldVis;
+    updateFieldVis();
+
+    // 按钮
+    document.getElementById('sfCancel').onclick = () => {
+      const c = document.getElementById('dwClose');
+      if (c) c.click();
+    };
+    document.getElementById('sfSave').onclick = () => saveSilence();
+  }
+
+  async function saveSilence(){
+    if (silenceSaving) return;
+    const saveBtn = document.getElementById('sfSave');
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = '保存中…'; }
+    silenceSaving = true;
+    try {
+      const name = document.getElementById('sfName').value.trim();
+      if (!name) { toastError('窗口名称必填'); return; }
+      const wtype = document.getElementById('sfType').value;
+      const startAt = document.getElementById('sfStart').value.trim();
+      const endAt = document.getElementById('sfEnd').value.trim();
+      if (!startAt || !endAt) { toastError('起止时间必填'); return; }
+
+      // 校验
+      if (wtype === 'one_time') {
+        if (isNaN(parseFloat(startAt)) || isNaN(parseFloat(endAt))) {
+          toastError('一次性窗口需输入 epoch 秒'); return;
+        }
+      } else {
+        const hhmm = /^([01]?\d|2[0-3]):[0-5]\d$/;
+        if (!hhmm.test(startAt) || !hhmm.test(endAt)) {
+          toastError('周期窗口需 HH:MM 格式'); return;
+        }
+      }
+
+      // weekdays
+      const weekdays = wtype === 'recurring'
+        ? [...document.querySelectorAll('#sfWeekdaysWrap input:checked')].map(c => Number(c.value))
+        : [];
+
+      // scope
+      const parseIds = (id) => {
+        const raw = document.getElementById(id).value.trim();
+        return raw ? raw.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n)) : [];
+      };
+      const scope = {
+        rules: parseIds('sfScopeRules'),
+        envs: parseIds('sfScopeEnvs'),
+        servers: parseIds('sfScopeServers')
+      };
+
+      const enabled = document.getElementById('sfEnabled').checked;
+      const remark = document.getElementById('sfRemark').value.trim();
+
+      const payload = {
+        name, type: wtype, start_at: startAt, end_at: endAt,
+        weekdays, scope, enabled, remark
+      };
+
+      if (editingSilenceId) {
+        await api(`/api/alerts/silences/${editingSilenceId}`, {method:'PUT', body: JSON.stringify(payload)});
+        toastSuccess('窗口已更新');
+      } else {
+        await api('/api/alerts/silences', {method:'POST', body: JSON.stringify(payload)});
+        toastSuccess('窗口已创建');
+      }
+      const c = document.getElementById('dwClose');
+      if (c) c.click();
+      loadSilences();
+    } catch(e) {
+      toastError(e.message || '保存失败');
+    } finally {
+      silenceSaving = false;
+      const saveBtn = document.getElementById('sfSave');
+      if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '保存'; }
+    }
+  }
+
+  async function deleteSilence(id){
+    if (!await confirmDialog('确认删除此静默窗口？删除后不可恢复。')) return;
+    try {
+      await api(`/api/alerts/silences/${id}`, {method:'DELETE'});
+      toastSuccess('窗口已删除');
+      loadSilences();
+    } catch(e) {
+      toastError(e.message || '删除失败');
+    }
+  }
+
   // ---- 工具函数（告警列表用） ----
 
   function parseTarget(raw){
@@ -532,6 +796,10 @@
         await Promise.all([loadStats(), loadAlerts()]);
         if (destroyed) return [];
         timer = setInterval(() => { loadAlerts(); loadStats(); }, 15000);
+      } else if (currentTab === 'rules') {
+        loadRules();
+      } else if (currentTab === 'silences') {
+        loadSilences();
       }
       return [timer];
     },

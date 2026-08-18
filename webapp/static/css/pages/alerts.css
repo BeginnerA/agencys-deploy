@@ -1,4 +1,4 @@
-/* alerts.css — 告警中心（告警列表 Tab + 规则管理 Tab） */
+/* alerts.css — 告警中心（告警列表 Tab + 规则管理 Tab + 静默窗口 Tab） */
 
 /* ---- Tab 切换栏 ---- */
 .alert-tabs-bar{display:flex;gap:0;margin-bottom:var(--sp-4);border-bottom:1px solid var(--border)}
@@ -71,3 +71,20 @@
 .rule-ch-box{display:flex;flex-wrap:wrap;gap:8px 16px}
 .rule-ch-cb{display:inline-flex;align-items:center;gap:5px;font-size:var(--fs-13);color:var(--text-1);cursor:pointer}
 .rule-ch-cb input{width:auto;margin:0}
+
+/* ==================== 静默窗口 Tab ==================== */
+/* 静默表格 */
+.silence-tbl td{font-size:var(--fs-13)}
+.silence-tbl .silence-time{font-family:var(--font-num);font-size:var(--fs-12);white-space:nowrap}
+.silence-tbl .silence-actions{white-space:nowrap;display:flex;gap:4px}
+.silence-tbl .silence-remark{font-size:var(--fs-11);color:var(--text-3);margin-top:2px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* 静默类型徽标 */
+.silence-type-badge{display:inline-block;padding:2px 8px;border-radius:var(--r-full);font-size:var(--fs-11);font-weight:500}
+.silence-type-badge.one-time{background:rgba(0,212,255,.12);color:var(--primary);border:1px solid rgba(0,212,255,.35)}
+.silence-type-badge.recurring{background:rgba(254,176,25,.12);color:var(--warning);border:1px solid rgba(254,176,25,.35)}
+
+/* weekdays checkbox 组 */
+.silence-wd-box{display:flex;flex-wrap:wrap;gap:8px 16px}
+.silence-wd-cb{display:inline-flex;align-items:center;gap:5px;font-size:var(--fs-13);color:var(--text-1);cursor:pointer}
+.silence-wd-cb input{width:auto;margin:0}
