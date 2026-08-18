@@ -274,6 +274,8 @@
       renderRuleList();
     } catch(e) {
       console.warn('loadRules failed', e);
+      const box = document.getElementById('ruleListContainer');
+      if (box) box.innerHTML = `<div class="panel">规则加载失败</div>`;
     }
   }
 
@@ -424,35 +426,40 @@
       document.getElementById('rfScopeIdsWrap').style.display = selScope.value === 'all' ? 'none' : '';
     };
     // 按钮
-    document.getElementById('rfCancel').onclick = () => { const r = document.getElementById('drawerRoot'); r.classList.add('hidden'); r.innerHTML = ''; };
+    document.getElementById('rfCancel').onclick = () => {
+      const c = document.getElementById('dwClose');
+      if (c) c.click();
+    };
     document.getElementById('rfSave').onclick = () => saveRule();
   }
 
   async function saveRule(){
-    const name = document.getElementById('rfName').value.trim();
-    if (!name) { toastError('规则名称必填'); return; }
-    const metricType = document.getElementById('rfMetricType').value;
-    const metric = metricType === 'log_keyword'
-      ? document.getElementById('rfLogKw').value.trim()
-      : document.getElementById('rfMetric').value;
-    const compare = document.getElementById('rfCompare').value;
-    const threshold = parseFloat(document.getElementById('rfThreshold').value) || 0;
-    const duration = parseInt(document.getElementById('rfDuration').value) || 300;
-    const severity = document.getElementById('rfSeverity').value;
-    const scopeType = document.getElementById('rfScopeType').value;
-    const scopeIdsRaw = document.getElementById('rfScopeIds').value.trim();
-    const scopeIds = scopeType === 'all' ? []
-      : scopeIdsRaw.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n));
-    const scope = {type: scopeType, ids: scopeIds};
-    const channels = [...document.querySelectorAll('#rfChannels input:checked')].map(c => c.value);
-    if (!channels.length) { toastError('至少选择一个通知渠道'); return; }
-    const escalationInterval = parseInt(document.getElementById('rfEscInt').value) || 30;
-    const enabled = document.getElementById('rfEnabled').checked;
-    const remark = document.getElementById('rfRemark').value.trim();
-    const payload = {name, metric_type: metricType, metric, compare, threshold,
-      duration_seconds: duration, scope, severity, channels, escalation_interval: escalationInterval,
-      enabled, remark};
+    const saveBtn = document.getElementById('rfSave');
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = '保存中…'; }
     try {
+      const name = document.getElementById('rfName').value.trim();
+      if (!name) { toastError('规则名称必填'); return; }
+      const metricType = document.getElementById('rfMetricType').value;
+      const metric = metricType === 'log_keyword'
+        ? document.getElementById('rfLogKw').value.trim()
+        : document.getElementById('rfMetric').value;
+      const compare = document.getElementById('rfCompare').value;
+      const threshold = parseFloat(document.getElementById('rfThreshold').value) || 0;
+      const duration = parseInt(document.getElementById('rfDuration').value) || 300;
+      const severity = document.getElementById('rfSeverity').value;
+      const scopeType = document.getElementById('rfScopeType').value;
+      const scopeIdsRaw = document.getElementById('rfScopeIds').value.trim();
+      const scopeIds = scopeType === 'all' ? []
+        : scopeIdsRaw.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n));
+      const scope = {type: scopeType, ids: scopeIds};
+      const channels = [...document.querySelectorAll('#rfChannels input:checked')].map(c => c.value);
+      if (!channels.length) { toastError('至少选择一个通知渠道'); return; }
+      const escalationInterval = parseInt(document.getElementById('rfEscInt').value) || 30;
+      const enabled = document.getElementById('rfEnabled').checked;
+      const remark = document.getElementById('rfRemark').value.trim();
+      const payload = {name, metric_type: metricType, metric, compare, threshold,
+        duration_seconds: duration, scope, severity, channels, escalation_interval: escalationInterval,
+        enabled, remark};
       if (editingRuleId) {
         await api(`/api/alerts/rules/${editingRuleId}`, {method:'PUT', body: JSON.stringify(payload)});
         toastSuccess('规则已更新');
@@ -460,10 +467,13 @@
         await api('/api/alerts/rules', {method:'POST', body: JSON.stringify(payload)});
         toastSuccess('规则已创建');
       }
-      const dr = document.getElementById('drawerRoot'); dr.classList.add('hidden'); dr.innerHTML = '';
+      const c = document.getElementById('dwClose');
+      if (c) c.click();
       loadRules();
     } catch(e) {
       toastError(e.message || '保存失败');
+    } finally {
+      if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '保存'; }
     }
   }
 
