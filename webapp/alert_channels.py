@@ -200,6 +200,16 @@ _CHANNEL_FUNCS = {"email": "_send_email", "wecom": "_send_wecom",
                   "webhook": "_send_webhook", "sms_aliyun": "_send_aliyun_sms",
                   "feishu": "_send_feishu", "dingtalk": "_send_dingtalk"}
 
+# 各渠道必需配置键（缺失即快速失败——重试对未配置无意义，避免每次告警空耗 3s）
+_REQUIRED = {
+    "email": ("host", "to_addrs"),
+    "wecom": ("webhook",),
+    "webhook": ("url",),
+    "sms_aliyun": ("access_key", "template"),
+    "feishu": ("webhook",),
+    "dingtalk": ("webhook",),
+}
+
 # 导入期校验：渠道函数名必须在模块中可解析，重命名时静默失败提前暴露
 _MISSING = [n for n in _CHANNEL_FUNCS.values()
             if not callable(getattr(sys.modules[__name__], n, None))]
@@ -222,15 +232,20 @@ def send_alert(db_path: str, alert: dict, channels: list) -> list:
         ok, detail = False, ""
         try:
             cfg = get_channel_config(db_path, channel)
-            for attempt in range(RETRIES + 1):
-                try:
-                    getattr(sys.modules[__name__], func_name)(cfg, text, alert)
-                    ok, detail = True, "ok"
-                    break
-                except Exception as e:
-                    detail = str(e)[:200]
-                    if attempt < RETRIES:
-                        time.sleep(2 ** attempt)
+            missing = [k for k in _REQUIRED.get(channel, ()) if not cfg.get(k)]
+            if missing:
+                # 渠道未配置：快速失败不重试，避免阻塞告警引擎评估线程
+                detail = "渠道未配置: " + ",".join(missing)
+            else:
+                for attempt in range(RETRIES + 1):
+                    try:
+                        getattr(sys.modules[__name__], func_name)(cfg, text, alert)
+                        ok, detail = True, "ok"
+                        break
+                    except Exception as e:
+                        detail = str(e)[:200]
+                        if attempt < RETRIES:
+                            time.sleep(2 ** attempt)
             dbm.create_record(db_path, "alert_events", dict(
                 alert_id=alert["id"], channel=channel, target="", payload="",
                 ok=1 if ok else 0, detail=detail, created_at=now))

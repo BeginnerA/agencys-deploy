@@ -207,6 +207,29 @@ class TestAlertEngine(unittest.TestCase):
                               self._metric_rule(metric="cpu", duration=0))
         self.assertFalse(e._silenced(rule, {}))
 
+    def test_silence_catchup_notify_after_window(self):
+        """窗口内首次触发不通知；窗口过期后仍在 firing → 补发一次"""
+        self._metric_rule(metric="cpu", threshold=80, duration=0)
+        self._silence()
+        e = self._engine(interval=30)
+        e._push_history((self.env_id, "h1", "cpu"), 95.0)
+        e._evaluate_metric_rules()
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["notify_count"], 0)
+        evs = dbm.list_records(self.db, "alert_events")
+        self.assertEqual(evs[0]["channel"], "silenced")
+        # 窗口过期后再评估一轮 → 补发通知
+        w = dbm.list_records(self.db, "silence_windows")[0]
+        dbm.update_record(self.db, "silence_windows", w["id"],
+                          {"end_at": str(int(time.time()) - 1)})
+        e._push_history((self.env_id, "h1", "cpu"), 95.0)
+        e._evaluate_metric_rules()
+        a = dbm.get_record(self.db, "alerts", alerts[0]["id"])
+        self.assertEqual(a["notify_count"], 1)
+        channels = [x["channel"] for x in dbm.list_records(self.db, "alert_events")]
+        self.assertIn("wecom", channels)
+
     # ---- 服务下线状态规则 ----
     def test_service_down_fires(self):
         dbm.create_record(self.db, "alert_rules", dict(

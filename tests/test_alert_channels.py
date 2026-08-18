@@ -75,8 +75,13 @@ class TestChannels(unittest.TestCase):
         self.assertEqual(ac._aliyun_sign(params, "sk"),
                          "CY44ypIgMTzw0KowWte6FyxSvIQ=")
 
+    def _seed_wecom(self):
+        dbm.create_record(self.db, "platform_settings", dict(
+            key="channel.wecom", value='{"webhook": "https://x"}', updated_at=1))
+
     def test_send_alert_retry_then_success(self):
         """第一次失败第二次成功：重试生效且结果记录 ok"""
+        self._seed_wecom()
         with mock.patch.object(ac, "_send_wecom") as sw:
             sw.side_effect = [RuntimeError("boom"), None]
             results = ac.send_alert(self.db, self.alert, ["wecom"])
@@ -88,12 +93,23 @@ class TestChannels(unittest.TestCase):
         self.assertEqual(evs[0]["ok"], 1)
 
     def test_send_alert_all_fail_records_fail(self):
+        self._seed_wecom()
         with mock.patch.object(ac, "_send_wecom",
                                side_effect=RuntimeError("boom")):
             results = ac.send_alert(self.db, self.alert, ["wecom"])
         self.assertFalse(results[0][1])
         evs = dbm.list_records(self.db, "alert_events")
         self.assertEqual(evs[0]["ok"], 0)
+
+    def test_send_alert_unconfigured_no_retry(self):
+        """渠道未配置：快速失败不重试（不阻塞告警引擎评估线程）"""
+        with mock.patch.object(ac, "_send_wecom") as sw:
+            results = ac.send_alert(self.db, self.alert, ["wecom"])
+        self.assertFalse(results[0][1])
+        sw.assert_not_called()
+        evs = dbm.list_records(self.db, "alert_events")
+        self.assertEqual(evs[0]["ok"], 0)
+        self.assertIn("未配置", evs[0]["detail"])
 
 
 if __name__ == "__main__":

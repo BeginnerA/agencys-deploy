@@ -8,6 +8,8 @@ AlertEvaluator 守护线程每 interval 秒一轮：
 
 收敛：alerts.fingerprint 唯一索引（部分索引，仅非 resolved），
 同指纹重复触发只更新 last_seen_at，不重复建告警。
+滑动窗口上限 _max_history 轮（@30s 约 20 分钟）：规则 duration_seconds 超过窗口
+覆盖范围时将永远无法触发，创建规则时应限制在窗口内（见 alert_routes._validate_rule）。
 """
 import sys
 import threading
@@ -148,15 +150,13 @@ class AlertEngine:
                  if r.get("enabled") and r.get("metric_type") == "metric"]
         if not rules or not self._monitor:
             return
-        # 1) 数据源：monitor 探测缓存 host_metrics → 灌入滑动窗口
-        #    （测试可直接 _push_history 注入后调用本方法完成评估）
+        # 1) 数据源：monitor 探测缓存 host_metrics → 灌入滑动窗口（按 metric 去重：
+        #    同 metric 多条规则不重复灌入，保证滑动窗口一轮一条，持续时间判定不失真）
+        metrics = {r.get("metric") or "cpu" for r in rules} & {"cpu", "mem", "disk", "load"}
         for env in dbm.list_records(self._db_path, "environments"):
             data = self._monitor.get_overview(env["project_id"], env["name"]) or {}
             for host, m in (data.get("host_metrics") or {}).items():
-                for rule in rules:
-                    metric = rule.get("metric") or "cpu"
-                    if metric not in ("cpu", "mem", "disk", "load"):
-                        continue
+                for metric in metrics:
                     self._push_history((env["id"], host, metric), m.get(metric))
         # 2) 评估滑动窗口（历史驱动：连续满足轮数 × interval ≥ duration 才触发）
         env_map = {e["id"]: e for e in dbm.list_records(self._db_path, "environments")}
@@ -208,13 +208,16 @@ class AlertEngine:
             finished = t.get("finished_at") or 0
             if finished <= self._last_task_scan:
                 continue
-            fp = f"task:{t['id']}"
-            if dbm.list_records(self._db_path, "alerts", "fingerprint=?", (fp,)):
-                continue
             rule = self._task_fail_rule()
             if not rule:
                 continue
-            self._fire(rule, fp,
+            # 守卫用完整指纹（{rule_id}:task:{id}），与 _fire 写入一致；
+            # 仅拦截非 resolved——解决后再失败视为新事件
+            fp = f"{rule['id']}:task:{t['id']}"
+            if dbm.list_records(self._db_path, "alerts",
+                                "fingerprint=? AND status != 'resolved'", (fp,)):
+                continue
+            self._fire(rule, f"task:{t['id']}",
                        subject=f"任务失败: {t['name']}",
                        description=f"任务 #{t['id']} {t['name']} [{t.get('env','')}] 执行失败",
                        target_info={"env": t.get("env", ""), "task_id": t["id"]})
@@ -235,9 +238,17 @@ class AlertEngine:
                                 "fingerprint=? AND status != 'resolved'", (fp,))
         now = int(time.time())
         if rows:
-            dbm.update_record(self._db_path, "alerts", rows[0]["id"],
-                              {"last_seen_at": now})
-            return rows[0]["id"]
+            a = rows[0]
+            # 静默期首次触发的告警：窗口已过期、仍在 firing 且从未通知 → 补发一次
+            if a["notify_count"] == 0 and not self._silenced(rule, target_info):
+                alert = dbm.get_record(self._db_path, "alerts", a["id"])
+                send_alert(self._db_path, alert, rule.get("channels") or [])
+                dbm.update_record(self._db_path, "alerts", a["id"],
+                                  {"notify_count": 1, "last_seen_at": now})
+            else:
+                dbm.update_record(self._db_path, "alerts", a["id"],
+                                  {"last_seen_at": now})
+            return a["id"]
         alert_id = dbm.create_record(self._db_path, "alerts", dict(
             rule_id=rule["id"], fingerprint=fp, status="firing",
             severity=rule.get("severity", "P2"), subject=subject,
