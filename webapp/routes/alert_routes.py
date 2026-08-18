@@ -119,28 +119,50 @@ def list_rules():
                                     "", (), "id"))
 
 
-def _validate_rule(body) -> str:
-    """规则校验；返回错误信息，空串=通过"""
-    if not (body.get("name") or "").strip():
+def _validate_rule(body, partial=False) -> str:
+    """规则校验；返回错误信息，空串=通过。partial=True 仅校验已出现的字段（局部更新）"""
+    def has(k):
+        return True if not partial else k in body
+
+    if has("name") and not (body.get("name") or "").strip():
         return "规则名称必填"
-    if body.get("metric_type") not in ("metric", "status", "log_keyword"):
+    if has("metric_type") and body.get("metric_type") not in (
+            "metric", "status", "log_keyword"):
         return "metric_type 非法"
-    if body.get("metric_type") == "metric" and body.get("metric") not in (
-            "cpu", "mem", "disk", "load"):
-        return "metric 非法"
-    if body.get("metric_type") == "status" and body.get("metric") not in (
-            "service_down", "task_failed"):
-        return "metric 非法"
-    if body.get("severity") not in SEVERITIES:
+    if has("metric"):
+        if body.get("metric_type") == "metric" and body.get("metric") not in (
+                "cpu", "mem", "disk", "load"):
+            return "metric 非法"
+        if body.get("metric_type") == "status" and body.get("metric") not in (
+                "service_down", "task_failed"):
+            return "metric 非法"
+    if has("severity") and body.get("severity") not in SEVERITIES:
         return "severity 非法"
-    if body.get("metric_type") == "metric":
+    if has("compare") and body.get("compare") not in ("<", "<=", ">", ">="):
+        return "compare 非法"
+    if has("threshold"):
         try:
-            if int(body.get("duration_seconds", 0)) > 1200:
-                return "duration_seconds 不能超过 1200 秒（滑动窗口上限 20 分钟）"
+            float(body.get("threshold", 0))
+        except (TypeError, ValueError):
+            return "threshold 必须为数字"
+    if has("duration_seconds"):
+        try:
+            duration = int(body.get("duration_seconds", 0))
         except (TypeError, ValueError):
             return "duration_seconds 非法"
-    if not body.get("channels"):
-        return "至少选择一个通知渠道"
+        if body.get("metric_type") == "metric" and duration > 1200:
+            return "duration_seconds 不能超过 1200 秒（滑动窗口上限 20 分钟）"
+    if has("escalation_interval"):
+        try:
+            int(body.get("escalation_interval", 30))
+        except (TypeError, ValueError):
+            return "escalation_interval 必须为数字"
+    if has("channels"):
+        channels = body.get("channels") or []
+        if not channels:
+            return "至少选择一个通知渠道"
+        if not set(channels) <= set(CHANNELS):
+            return "channels 包含非法渠道"
     return ""
 
 
@@ -172,23 +194,32 @@ def create_rule():
 @require_role("admin", "operator")
 def update_rule(rule_id):
     db = current_app.config["DB_PATH"]
-    if not dbm.get_record(db, "alert_rules", rule_id):
+    old = dbm.get_record(db, "alert_rules", rule_id)
+    if not old:
         return jsonify({"error": "规则不存在"}), 404
     body = request.get_json(silent=True) or {}
-    err = _validate_rule(body)
+    err = _validate_rule(body, partial=True)
     if err:
         return jsonify({"error": err}), 400
+    # 局部更新：未提供的字段保持原值，避免 PUT 部分提交静默重置配置
     dbm.update_record(db, "alert_rules", rule_id, dict(
-        name=body["name"].strip(), metric_type=body["metric_type"],
-        metric=body.get("metric", ""), compare=body.get("compare", ">"),
-        threshold=float(body.get("threshold", 0)),
-        duration_seconds=int(body.get("duration_seconds", 0)),
-        scope=body.get("scope") or {"type": "all", "ids": []},
-        severity=body["severity"], channels=body.get("channels") or [],
-        escalation_interval=int(body.get("escalation_interval", 30)),
-        enabled=1 if body.get("enabled", True) else 0,
-        remark=body.get("remark", ""), updated_at=int(time.time())))
-    audit("update_alert_rule", "alert_rule", rule_id, {"name": body["name"]})
+        name=(body.get("name") or old["name"]).strip(),
+        metric_type=body.get("metric_type", old["metric_type"]),
+        metric=body.get("metric", old["metric"]),
+        compare=body.get("compare", old["compare"]),
+        threshold=float(body.get("threshold", old["threshold"])),
+        duration_seconds=int(body.get("duration_seconds",
+                                      old["duration_seconds"])),
+        scope=body.get("scope", old["scope"]),
+        severity=body.get("severity", old["severity"]),
+        channels=body.get("channels", old["channels"]),
+        escalation_interval=int(body.get("escalation_interval",
+                                         old["escalation_interval"])),
+        enabled=1 if body.get("enabled", old["enabled"]) else 0,
+        remark=body.get("remark", old["remark"]),
+        updated_at=int(time.time())))
+    audit("update_alert_rule", "alert_rule", rule_id,
+          {"name": body.get("name", old["name"])})
     return jsonify({"ok": True})
 
 
@@ -212,9 +243,10 @@ def toggle_rule(rule_id):
     r = dbm.get_record(db, "alert_rules", rule_id)
     if not r:
         return jsonify({"error": "规则不存在"}), 404
-    dbm.update_record(db, "alert_rules", rule_id,
-                      {"enabled": 0 if r["enabled"] else 1})
-    return jsonify({"ok": True, "enabled": 0 if r["enabled"] else 1})
+    new_enabled = 0 if r["enabled"] else 1
+    dbm.update_record(db, "alert_rules", rule_id, {"enabled": new_enabled})
+    audit("toggle_alert_rule", "alert_rule", rule_id, {"enabled": new_enabled})
+    return jsonify({"ok": True, "enabled": new_enabled})
 
 
 # ---------- 静默窗口 CRUD ----------
@@ -260,18 +292,28 @@ def create_silence():
 @require_role("admin", "operator")
 def update_silence(silence_id):
     db = current_app.config["DB_PATH"]
-    if not dbm.get_record(db, "silence_windows", silence_id):
+    old = dbm.get_record(db, "silence_windows", silence_id)
+    if not old:
         return jsonify({"error": "窗口不存在"}), 404
     body = request.get_json(silent=True) or {}
+    wtype = body.get("type", old["type"])
+    if wtype not in ("one_time", "recurring"):
+        return jsonify({"error": "type 非法"}), 400
+    start_at = str(body.get("start_at", old["start_at"]))
+    end_at = str(body.get("end_at", old["end_at"]))
+    if wtype == "one_time":
+        try:
+            float(start_at); float(end_at)
+        except (TypeError, ValueError):
+            return jsonify({"error": "一次性窗口需 epoch 秒 start_at/end_at"}), 400
+    # 局部更新：未提供的字段保持原值，避免 PUT 部分提交静默重置配置
     dbm.update_record(db, "silence_windows", silence_id, dict(
-        name=(body.get("name") or "").strip() or "窗口",
-        type=body.get("type", "one_time"),
-        start_at=str(body.get("start_at", "0")),
-        end_at=str(body.get("end_at", "0")),
-        weekdays=body.get("weekdays") or [],
-        scope=body.get("scope") or {"rules": [], "envs": [], "servers": []},
-        enabled=1 if body.get("enabled", True) else 0,
-        remark=body.get("remark", "")))
+        name=(body.get("name") or old["name"]).strip(),
+        type=wtype, start_at=start_at, end_at=end_at,
+        weekdays=body.get("weekdays", old["weekdays"]),
+        scope=body.get("scope", old["scope"]),
+        enabled=1 if body.get("enabled", old["enabled"]) else 0,
+        remark=body.get("remark", old["remark"])))
     audit("update_silence", "silence", silence_id)
     return jsonify({"ok": True})
 
