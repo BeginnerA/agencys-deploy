@@ -69,7 +69,8 @@ class AlertEngine:
         # 滑动窗口：{(env_id, host, metric): deque[(ts, value)]}
         self._history = {}
         self._max_history = 40  # 40 轮 = 20 分钟 @30s
-        self._last_task_scan = 0.0
+        # 扫描基线=启动时刻：不回扫启动前已失败的历史任务（增量语义，避免首启刷陈旧告警）
+        self._last_task_scan = time.time()
         self._seed_rules()
 
     # ---------- 调度 ----------

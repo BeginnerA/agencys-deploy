@@ -259,13 +259,36 @@ class TestAlertEngine(unittest.TestCase):
             escalation_interval=30, enabled=1, remark="", created_at=1, updated_at=1))
         dbm.create_task(self.db, self.proj_id, "deploy", 1, "发布", "test",
                         "v1", "", 1)
-        dbm.update_task(self.db, 1, status="failed", finished_at=int(time.time()))
-        e = self._engine()
+        e = self._engine()  # 构造后再失败（启动后失败才告警）
+        dbm.update_task(self.db, 1, status="failed", finished_at=time.time())
         e._check_tasks()
         e._check_tasks()  # 重复扫描不重复告警
         alerts = dbm.list_records(self.db, "alerts")
         self.assertEqual(len(alerts), 1)
         self.assertIn("发布", alerts[0]["subject"])
+
+    def test_task_failed_no_retroactive_on_startup(self):
+        """首启不回扫历史失败任务（增量语义）；启动后失败的任务正常告警"""
+        dbm.create_record(self.db, "alert_rules", dict(
+            name="taskfail", metric_type="status", metric="task_failed",
+            compare=">", threshold=0, duration_seconds=0,
+            scope={"type": "all", "ids": []}, severity="P2", channels=["wecom"],
+            escalation_interval=30, enabled=1, remark="", created_at=1, updated_at=1))
+        # 引擎启动前已失败的历史任务（finished_at 远早于启动时刻）
+        dbm.create_task(self.db, self.proj_id, "deploy", 1, "旧发布", "test",
+                        "v0", "", 1)
+        dbm.update_task(self.db, 1, status="failed", finished_at=1)
+        e = self._engine()
+        e._check_tasks()
+        self.assertEqual(len(dbm.list_records(self.db, "alerts")), 0)
+        # 启动后失败的任务 → 正常触发
+        dbm.create_task(self.db, self.proj_id, "deploy", 1, "新发布", "test",
+                        "v1", "", 1)
+        dbm.update_task(self.db, 2, status="failed", finished_at=time.time())
+        e._check_tasks()
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("新发布", alerts[0]["subject"])
 
     # ---- 作用域 ----
     def test_scope_env_filter(self):
