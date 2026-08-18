@@ -287,7 +287,9 @@
       console.warn('loadRules failed', e);
       const box = document.getElementById('ruleListContainer');
       if (box) {
-        box.innerHTML = `<div class="panel">${errorState('规则加载失败')}</div>`;
+        box.innerHTML = `<div class="panel"><div class="error-state"><div class="e-ico">⚠️</div>
+          <div class="muted">规则加载失败</div>
+          <button class="btn sm e-btn">重试</button></div></div>`;
         box.querySelector('.e-btn')?.addEventListener('click', loadRules);
       }
     }
@@ -531,7 +533,9 @@
       console.warn('loadSilences failed', e);
       const box = document.getElementById('silenceListContainer');
       if (box) {
-        box.innerHTML = `<div class="panel">${errorState('静默窗口加载失败')}</div>`;
+        box.innerHTML = `<div class="panel"><div class="error-state"><div class="e-ico">⚠️</div>
+          <div class="muted">静默窗口加载失败</div>
+          <button class="btn sm e-btn">重试</button></div></div>`;
         box.querySelector('.e-btn')?.addEventListener('click', loadSilences);
       }
     }
