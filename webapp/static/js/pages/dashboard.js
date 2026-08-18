@@ -176,7 +176,7 @@
             .map(([id,name,val,color]) => `<div class="hm-gauge-box"><div id="${id}" style="height:140px"></div></div>`).join('')}
         </div>` : ''}
         <div class="tbl-wrap"><table class="tbl hm-tbl"><thead><tr>
-          <th style="width:160px">主机</th><th>SSH</th><th>容器</th><th>CPU</th><th>内存</th><th>磁盘</th><th>负载</th><th>最后探测</th></tr></thead><tbody>
+          <th style="width:200px">主机</th><th>SSH</th><th>容器</th><th>CPU</th><th>内存</th><th>磁盘</th><th>负载</th><th>最后探测</th></tr></thead><tbody>
           ${mergedServers.length ? mergedServers.map(sv => {
             const m = sv.hm;
             return `<tr>
