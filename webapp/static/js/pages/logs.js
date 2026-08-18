@@ -194,11 +194,13 @@
             <div class="muted" style="text-align:center;padding:40px">请输入检索条件</div>
           </div>
         </div>
-        <div id="svcLogContextDrawer" class="drawer-overlay" style="display:none">
-          <div class="drawer right" style="width:600px">
-            <div class="drawer-header">
-              <span>日志上下文</span>
-              <button class="btn sm" id="svcLogCtxClose">关闭</button>
+        <div id="svcLogContextDrawer" class="drawer-mask" style="display:none">
+          <div class="drawer" style="width:600px">
+            <div class="drawer-head">
+              <b>日志上下文</b>
+              <div class="dh-right">
+                <button class="btn sm ghost" id="svcLogCtxClose">关闭</button>
+              </div>
             </div>
             <div class="drawer-body">
               <pre id="svcLogCtxContent" class="log-console" style="height:500px;overflow:auto"></pre>
