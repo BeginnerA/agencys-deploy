@@ -794,6 +794,11 @@
 
     // 绑定事件：规则类型变更 → 更新指标选项 + scope 选项 + 可见性
     selType.onchange = () => { updateMetricOpts(); updateScopeTypeOpts(); updateFieldVis(); updateScopeVis(); };
+    // 绑定事件：作用域类型变更 → 清除目标选择 + 更新级联选择器可见性
+    selScope.onchange = () => {
+      scopeSelectedTargets.clear();  // 切换类型时清除已选目标（服务器/服务 ID 不通用）
+      updateScopeVis();
+    };
     // 初始化
     updateMetricOpts();
     // 回填 metric（编辑时）
