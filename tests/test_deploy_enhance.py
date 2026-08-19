@@ -136,3 +136,75 @@ class TestReleaseWindowCheck(unittest.TestCase):
             created_by=1, created_at=now - 200))
         result = check_release_window(self.db, self.proj_id)
         self.assertIsNone(result)
+
+
+class TestDeployScheduler(unittest.TestCase):
+    """DeployScheduler 调度逻辑"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "test.db")
+        dbm.init_db(self.db)
+        self.proj_id = dbm.create_record(self.db, "projects", dict(
+            name="p1", code="p1", description="", git_org="", created_at=1))
+        # 创建服务和环境（submit_task 需要）
+        self.svc_id = dbm.create_record(self.db, "services", dict(
+            project_id=self.proj_id, name="auth", image_name="auth",
+            service_name="hqb-auth", docker_context="", dockerfile="",
+            build_order="[]", nacos_groups="[]", dubbo_services="[]",
+            snailjob_group="", health_url="", health_port=0,
+            log_error_keywords="[]", clear_log_dir="", git_repo="", enabled=1))
+        self.env_id = dbm.create_record(self.db, "environments", dict(
+            project_id=self.proj_id, name="prod", is_default=1,
+            registry="{}", nacos="{}", mysql_snailjob="{}", ssh="{}",
+            build="{}", deploy="{}", monitor_enabled=1))
+
+    def test_once_schedule_becomes_disabled_after_run(self):
+        from webapp.deploy_scheduler import DeployScheduler
+        now = int(time.time())
+        sid = dbm.create_record(self.db, "deploy_schedules", dict(
+            project_id=self.proj_id, type="once", name="once test",
+            ref_type="project", ref_id=self.svc_id, env="prod",
+            version="1.0.0", previous_version="", extra="[]",
+            schedule_at=now - 1, cron_expr="",
+            enabled=1, last_run_at=0, next_run_at=now - 1,
+            created_by=1, created_at=now))
+        scheduler = DeployScheduler(self.db)
+        # 手动触发一轮扫描（不启动线程）
+        due = scheduler._find_due_schedules()
+        self.assertEqual(len(due), 1)
+        self.assertEqual(due[0]["id"], sid)
+
+    def test_cron_next_run_calculation(self):
+        from webapp.deploy_scheduler import DeployScheduler
+        scheduler = DeployScheduler(self.db)
+        # 每天凌晨 2 点
+        next_ts = scheduler._calc_next_run("cron", "0 2 * * *",
+                                            int(time.time()))
+        self.assertGreater(next_ts, time.time())
+
+    def test_block_window_skips_schedule(self):
+        from webapp.deploy_scheduler import DeployScheduler
+        now = int(time.time())
+        # 创建 block 窗口覆盖当前时间
+        dbm.create_record(self.db, "release_windows", dict(
+            project_id=0, name="封网期",
+            start_at=now - 100, end_at=now + 3600,
+            block_level="block", repeat_yearly=0,
+            created_by=1, created_at=now))
+        scheduler = DeployScheduler(self.db)
+        # 有到期计划但命中 block 窗口
+        sid = dbm.create_record(self.db, "deploy_schedules", dict(
+            project_id=self.proj_id, type="once", name="blocked",
+            ref_type="project", ref_id=self.svc_id, env="prod",
+            version="1.0.0", previous_version="", extra="[]",
+            schedule_at=now - 1, cron_expr="",
+            enabled=1, last_run_at=0, next_run_at=now - 1,
+            created_by=1, created_at=now))
+        due = scheduler._find_due_schedules()
+        self.assertEqual(len(due), 1)
+        # 执行周期处理：应跳过（不创建任务）
+        scheduler._process_due(due)
+        # once 计划被 _update_next_run 禁用（block 跳过执行但仍推进状态）
+        rec = dbm.get_record(self.db, "deploy_schedules", sid)
+        self.assertEqual(rec["enabled"], 0)
