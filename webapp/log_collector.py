@@ -296,7 +296,7 @@ class LogCollector:
                             rule, svc, env_name, content, ctx, env_id,
                             matched_keyword=kw,
                             entry_id=rowids[i] if rowids and i < len(rowids) else None,
-                            hit_ts=ts or None)
+                            hit_ts=ts if rowids else None)
                         break  # 本条日志只触发一次（取首个命中关键词）
                 else:
                     continue
