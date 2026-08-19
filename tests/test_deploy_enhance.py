@@ -72,3 +72,67 @@ class TestDeployEnhanceSchema(unittest.TestCase):
         # steps 在 JSON_FIELDS 中，get_record 已自动反序列化为 list
         parsed = rec["steps"] if isinstance(rec["steps"], list) else json.loads(rec["steps"])
         self.assertEqual(len(parsed), 1)
+
+
+class TestReleaseWindowCheck(unittest.TestCase):
+    """发布窗口检查逻辑"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "test.db")
+        dbm.init_db(self.db)
+        self.proj_id = dbm.create_record(self.db, "projects", dict(
+            name="p1", code="p1", description="", git_org="", created_at=1))
+
+    def test_no_windows_returns_none(self):
+        from webapp.deploy_scheduler import check_release_window
+        result = check_release_window(self.db, self.proj_id)
+        self.assertIsNone(result)
+
+    def test_block_window_detected(self):
+        from webapp.deploy_scheduler import check_release_window
+        now = int(time.time())
+        dbm.create_record(self.db, "release_windows", dict(
+            project_id=0, name="封网", start_at=now - 100, end_at=now + 100,
+            block_level="block", repeat_yearly=0, created_by=1, created_at=now))
+        result = check_release_window(self.db, self.proj_id)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["block_level"], "block")
+        self.assertEqual(result["name"], "封网")
+
+    def test_warn_window_detected(self):
+        from webapp.deploy_scheduler import check_release_window
+        now = int(time.time())
+        dbm.create_record(self.db, "release_windows", dict(
+            project_id=self.proj_id, name="警告窗口",
+            start_at=now - 50, end_at=now + 50,
+            block_level="warn", repeat_yearly=0,
+            created_by=1, created_at=now))
+        result = check_release_window(self.db, self.proj_id)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["block_level"], "warn")
+
+    def test_repeat_yearly_matches(self):
+        from webapp.deploy_scheduler import check_release_window
+        now = int(time.time())
+        # 创建去年同时间段的窗口（repeat_yearly=1）
+        one_year = 365 * 24 * 3600
+        dbm.create_record(self.db, "release_windows", dict(
+            project_id=0, name="春节封网",
+            start_at=now - one_year - 100, end_at=now - one_year + 100,
+            block_level="block", repeat_yearly=1,
+            created_by=1, created_at=now - one_year))
+        result = check_release_window(self.db, self.proj_id)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["name"], "春节封网")
+
+    def test_window_not_active(self):
+        from webapp.deploy_scheduler import check_release_window
+        now = int(time.time())
+        dbm.create_record(self.db, "release_windows", dict(
+            project_id=0, name="过期窗口",
+            start_at=now - 200, end_at=now - 100,
+            block_level="block", repeat_yearly=0,
+            created_by=1, created_at=now - 200))
+        result = check_release_window(self.db, self.proj_id)
+        self.assertIsNone(result)
