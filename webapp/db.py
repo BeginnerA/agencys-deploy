@@ -208,6 +208,64 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_log_scan_state_key
 CREATE VIRTUAL TABLE IF NOT EXISTS log_fts USING fts5(
     ts, env, service, content, content='log_entries', content_rowid='id'
 );
+CREATE TABLE IF NOT EXISTS deploy_schedules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    type TEXT NOT NULL DEFAULT 'once',
+    name TEXT NOT NULL,
+    ref_type TEXT DEFAULT 'project',
+    ref_id INTEGER DEFAULT 0,
+    env TEXT DEFAULT '',
+    version TEXT DEFAULT '',
+    previous_version TEXT DEFAULT '',
+    extra TEXT DEFAULT '[]',
+    schedule_at INTEGER DEFAULT 0,
+    cron_expr TEXT DEFAULT '',
+    enabled INTEGER DEFAULT 1,
+    last_run_at INTEGER DEFAULT 0,
+    next_run_at INTEGER DEFAULT 0,
+    created_by INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS release_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL DEFAULT 0,
+    name TEXT NOT NULL,
+    start_at INTEGER NOT NULL,
+    end_at INTEGER NOT NULL,
+    block_level TEXT NOT NULL DEFAULT 'warn',
+    repeat_yearly INTEGER DEFAULT 0,
+    created_by INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS service_dependencies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    source_service TEXT NOT NULL,
+    target_service TEXT NOT NULL,
+    dep_type TEXT NOT NULL DEFAULT 'manual',
+    created_at INTEGER NOT NULL,
+    UNIQUE(project_id, source_service, target_service)
+);
+CREATE TABLE IF NOT EXISTS deployment_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    env TEXT NOT NULL DEFAULT '',
+    task_id INTEGER DEFAULT 0,
+    version TEXT DEFAULT '',
+    image_versions TEXT DEFAULT '{}',
+    nacos_config_hash TEXT DEFAULT '',
+    env_vars_hash TEXT DEFAULT '',
+    deployed_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS canary_configs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL,
+    steps TEXT NOT NULL DEFAULT '[]',
+    is_default INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
 """
 
 # JSON 字段（读写时自动序列化/反序列化）
@@ -220,6 +278,9 @@ JSON_FIELDS = {
     "silence_windows": {"weekdays", "scope"},
     "tasks": {"extra"},
     "log_entries": {"keywords"},
+    "deploy_schedules": {"extra"},
+    "deployment_snapshots": {"image_versions"},
+    "canary_configs": {"steps"},
 }
 
 # 表名白名单（泛型 CRUD 的标识符护栏，防 SQL 注入）
@@ -227,7 +288,10 @@ TABLES = frozenset(("projects", "services", "environments", "servers",
                     "env_servers", "pipelines", "users", "tasks", "audit_logs",
                     "alert_rules", "alerts", "alert_events",
                     "silence_windows", "platform_settings",
-                    "log_entries", "log_scan_state"))
+                    "log_entries", "log_scan_state",
+                    "deploy_schedules", "release_windows",
+                    "service_dependencies", "deployment_snapshots",
+                    "canary_configs"))
 
 
 def _check_table(table: str):
