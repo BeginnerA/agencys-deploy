@@ -113,6 +113,129 @@ class TestAlertRoutes(unittest.TestCase):
         self.assertEqual(r.status_code, 400, r.get_data(as_text=True))
         self.assertIn("threshold", r.get_json()["error"])
 
+    def _setup_scope_data(self):
+        """插入 scope API 测试所需的项目/环境/服务器/服务数据（幂等）"""
+        h = self._h(self.token)
+        from webapp import db as dbm
+        from pathlib import Path
+        db_path = str(Path(_TMP) / "platform.db")
+        # 查找或创建项目
+        projects = self.c.get("/api/projects", headers=h).get_json()
+        existing = [p for p in projects if p["code"] == "scope-p1"]
+        if existing:
+            pid = existing[0]["id"]
+        else:
+            r = self.c.post("/api/projects", json={
+                "name": "scope-proj", "code": "scope-p1", "description": ""},
+                headers=h)
+            pid = r.get_json()["id"]
+        # 查找或创建环境
+        envs = self.c.get(f"/api/projects/{pid}/environments", headers=h).get_json()
+        env_names = {e["name"]: e["id"] for e in envs}
+        if "prod" in env_names:
+            env1 = env_names["prod"]
+        else:
+            r = self.c.post(f"/api/projects/{pid}/environments", json={
+                "name": "prod", "is_default": True}, headers=h)
+            env1 = r.get_json()["id"]
+        if "test" in env_names:
+            env2 = env_names["test"]
+        else:
+            r = self.c.post(f"/api/projects/{pid}/environments", json={
+                "name": "test", "is_default": False}, headers=h)
+            env2 = r.get_json()["id"]
+        # 创建服务器（直接写 DB，幂等：查找或创建）
+        conn = dbm.get_conn(db_path)
+        try:
+            row = conn.execute("SELECT id FROM servers WHERE host='10.0.0.1'").fetchone()
+            if row:
+                sid = row[0]
+            else:
+                sid = dbm.create_record(db_path, "servers", {"host": "10.0.0.1"})
+        finally:
+            conn.close()
+        dbm.bind_server(db_path, env1, sid)
+        # 创建服务（幂等：查找或创建）
+        svcs = dbm.list_records(db_path, "services", "project_id=? AND name=?",
+                                (pid, "scope-svc"))
+        if svcs:
+            svc_id = svcs[0]["id"]
+        else:
+            svc_id = dbm.create_record(db_path, "services", dict(
+                project_id=pid, name="scope-svc", image_name="scope-svc",
+                service_name="scope-svc"))
+        return env1, env2, sid, svc_id, pid
+
+    def test_scope_environments(self):
+        self._setup_scope_data()
+        r = self.c.get("/api/alerts/scope/environments",
+                        headers=self._h(self.token))
+        self.assertEqual(r.status_code, 200)
+        data = r.get_json()
+        self.assertGreaterEqual(len(data), 2)
+        self.assertIn("id", data[0])
+        self.assertIn("name", data[0])
+        self.assertIn("project_name", data[0])
+
+    def test_scope_servers_by_env(self):
+        env1, env2, sid, _, _ = self._setup_scope_data()
+        r = self.c.get(f"/api/alerts/scope/servers?env_ids={env1}",
+                        headers=self._h(self.token))
+        self.assertEqual(r.status_code, 200)
+        data = r.get_json()
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["id"], sid)
+        self.assertEqual(data[0]["host"], "10.0.0.1")
+        # 另一个环境无服务器
+        r = self.c.get(f"/api/alerts/scope/servers?env_ids={env2}",
+                        headers=self._h(self.token))
+        self.assertEqual(r.get_json(), [])
+
+    def test_scope_services_by_env(self):
+        env1, env2, _, svc_id, pid = self._setup_scope_data()
+        r = self.c.get(f"/api/alerts/scope/services?env_ids={env1}",
+                        headers=self._h(self.token))
+        self.assertEqual(r.status_code, 200)
+        data = r.get_json()
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["id"], svc_id)
+        self.assertEqual(data[0]["name"], "scope-svc")
+
+    def test_scope_no_env_ids_returns_empty(self):
+        r = self.c.get("/api/alerts/scope/servers",
+                        headers=self._h(self.token))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json(), [])
+
+    def test_create_rule_scope_invalid_type(self):
+        r = self._create_rule(scope={"type": "bogus", "ids": []})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("scope", r.get_json()["error"])
+
+    def test_create_rule_scope_env_ids_must_be_list(self):
+        r = self._create_rule(scope={"type": "server", "ids": [1], "env_ids": "bad"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("env_ids", r.get_json()["error"])
+
+    def test_create_rule_scope_metric_cannot_use_service(self):
+        """指标规则不能选「服务」作用域"""
+        r = self._create_rule(
+            metric_type="metric", metric="cpu",
+            scope={"type": "service", "ids": [1]})
+        self.assertEqual(r.status_code, 400)
+
+    def test_create_rule_scope_status_cannot_use_server(self):
+        """状态规则不能选「服务器」作用域"""
+        r = self._create_rule(
+            metric_type="status", metric="service_down",
+            scope={"type": "server", "ids": [1]})
+        self.assertEqual(r.status_code, 400)
+
+    def test_create_rule_scope_with_env_ids_ok(self):
+        r = self._create_rule(scope={
+            "type": "server", "ids": [1, 2], "env_ids": [1]})
+        self.assertEqual(r.status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

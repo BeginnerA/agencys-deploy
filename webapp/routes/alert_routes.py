@@ -172,6 +172,83 @@ def alert_batch():
     return jsonify({"ok": True, "success": success_count})
 
 
+# ---------- 作用域数据 API ----------
+
+@alert_bp.route("/alerts/scope/environments")
+@require_auth
+def scope_environments():
+    """全部环境列表（供级联选择第一级）"""
+    db = current_app.config["DB_PATH"]
+    conn = dbm.get_conn(db)
+    try:
+        rows = conn.execute(
+            "SELECT e.id, e.name, p.name as project_name "
+            "FROM environments e JOIN projects p ON e.project_id=p.id "
+            "ORDER BY p.name, e.name"
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@alert_bp.route("/alerts/scope/servers")
+@require_auth
+def scope_servers():
+    """指定环境下的服务器列表"""
+    env_ids_raw = request.args.get("env_ids", "")
+    if not env_ids_raw:
+        return jsonify([])
+    try:
+        env_ids = [int(x) for x in env_ids_raw.split(",") if x.strip()]
+    except ValueError:
+        return jsonify([])
+    if not env_ids:
+        return jsonify([])
+    db = current_app.config["DB_PATH"]
+    conn = dbm.get_conn(db)
+    try:
+        placeholders = ",".join("?" * len(env_ids))
+        rows = conn.execute(
+            f"SELECT DISTINCT s.id, s.host FROM servers s "
+            f"JOIN env_servers es ON es.server_id=s.id "
+            f"WHERE es.env_id IN ({placeholders}) AND s.enabled=1 "
+            f"ORDER BY s.host",
+            env_ids
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@alert_bp.route("/alerts/scope/services")
+@require_auth
+def scope_services():
+    """指定环境下的服务列表（通过环境→项目间接关联）"""
+    env_ids_raw = request.args.get("env_ids", "")
+    if not env_ids_raw:
+        return jsonify([])
+    try:
+        env_ids = [int(x) for x in env_ids_raw.split(",") if x.strip()]
+    except ValueError:
+        return jsonify([])
+    if not env_ids:
+        return jsonify([])
+    db = current_app.config["DB_PATH"]
+    conn = dbm.get_conn(db)
+    try:
+        placeholders = ",".join("?" * len(env_ids))
+        rows = conn.execute(
+            f"SELECT DISTINCT s.id, s.name FROM services s "
+            f"WHERE s.project_id IN ("
+            f"  SELECT DISTINCT project_id FROM environments WHERE id IN ({placeholders})"
+            f") ORDER BY s.name",
+            env_ids
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
 # ---------- 规则 CRUD ----------
 
 @alert_bp.route("/alerts/rules")
@@ -228,6 +305,22 @@ def _validate_rule(body, partial=False) -> str:
             int(body.get("escalation_interval", 30))
         except (TypeError, ValueError):
             return "escalation_interval 必须为数字"
+    if has("scope"):
+        scope = body.get("scope") or {}
+        if not isinstance(scope, dict):
+            return "scope 格式错误"
+        valid_types = ("all", "project", "env", "server", "service")
+        if scope.get("type") not in valid_types:
+            return "scope type 非法"
+        if not isinstance(scope.get("ids"), list):
+            return "scope.ids 需为列表"
+        if "env_ids" in scope and not isinstance(scope["env_ids"], list):
+            return "scope.env_ids 需为列表"
+        mt = body.get("metric_type")
+        if mt == "metric" and scope.get("type") == "service":
+            return "指标规则不能选择服务作用域"
+        if mt in ("status", "log_keyword") and scope.get("type") == "server":
+            return "状态/日志规则不能选择服务器作用域"
     if has("channels"):
         channels = body.get("channels") or []
         if not channels:
