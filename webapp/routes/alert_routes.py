@@ -188,9 +188,13 @@ def alert_logs(alert_id):
     finally:
         conn.close()
 
-    # 命中行已被清理（如超保留期）：用相邻行兜底标记，仍展示上下文
+    # 命中行已被清理（如超保留期）：用相邻行兜底标记，仍展示上下文。
+    # 兜底行需从原列表移除，避免同一行在 hit 与上下文列表重复出现
     if not hit:
-        hit = before[-1] if before else (after[0] if after else None)
+        if before:
+            hit = before.pop()
+        elif after:
+            hit = after.pop(0)
         if hit:
             hit["fallback"] = True
     if not hit and not before and not after:

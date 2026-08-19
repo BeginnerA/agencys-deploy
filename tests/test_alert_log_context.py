@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import webapp as webapp_pkg
 
 _TMP = tempfile.mkdtemp(prefix="alert_log_ctx_test_")
-webapp_pkg.DATA_DIR = Path(_TMP)
 
 from webapp import create_app
 from webapp import db as dbm
@@ -161,7 +160,7 @@ class TestAlertLogContext(unittest.TestCase):
         self.assertEqual(len(data["before"]), 3)
 
     def test_hit_missing_falls_back(self):
-        """命中行被清理：用 before 最后一行兜底并标记 fallback"""
+        """命中行被清理：用 before 最后一行兜底并标记 fallback（兜底行移出 before）"""
         rid = self._make_rule()
         rowids = self._seed_entries()
         hit_id = rowids[9]
@@ -178,7 +177,58 @@ class TestAlertLogContext(unittest.TestCase):
         self.assertTrue(data["available"])
         self.assertEqual(data["hit"]["id"], rowids[8])
         self.assertTrue(data["hit"].get("fallback"))
-        self.assertEqual([x["id"] for x in data["before"]], rowids[6:9])
+        # 兜底行已从 before 移除，不重复出现，且未泄漏 fallback 标记
+        self.assertEqual([x["id"] for x in data["before"]], rowids[6:8])
+        self.assertNotIn("fallback", data["before"][-1])
+
+    def test_hit_missing_after_fallback(self):
+        """命中行被清理且 before 为空：用 after 第一行兜底标记 fallback"""
+        rid = self._make_rule()
+        rowids = self._seed_entries()
+        hit_id = rowids[0]  # 第一行，before 天然为空
+        aid = self._make_alert(rid, {"env": "prod", "service": "svc-a",
+                                     "keyword": "ERROR", "entry_id": hit_id,
+                                     "hit_ts": 1787000000}, seq=10)
+        conn = dbm.get_conn(self._db_path())
+        try:
+            conn.execute("DELETE FROM log_entries WHERE id=?", (hit_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        data = self._get_logs(aid, lines=3).get_json()
+        self.assertTrue(data["available"])
+        self.assertEqual(data["hit"]["id"], rowids[1])
+        self.assertTrue(data["hit"].get("fallback"))
+        # after LIMIT 3 取 [rowids[1..3]]，兜底弹出 rowids[1]，剩余 2 行
+        self.assertEqual([x["id"] for x in data["after"]], rowids[2:4])
+
+    def test_env_service_filter(self):
+        """其他 env/service 的日志不混入上下文"""
+        rid = self._make_rule()
+        rowids = self._seed_entries()
+        hit_id = rowids[5]
+        # 插入干扰行：不同环境/服务的同 ts 日志
+        conn = dbm.get_conn(self._db_path())
+        try:
+            for i in range(3):
+                conn.execute(
+                    "INSERT INTO log_entries (ts, env, service, container, file_path, "
+                    "line_offset, line_count, content, keywords) "
+                    "VALUES (?, ?, ?, '', ?, ?, 1, ?, '[]')",
+                    (1787000000, "test", "svc-b", "/logs/test/svc-b/2026-08-18.log",
+                     i, f"intruder {i}"))
+            conn.commit()
+        finally:
+            conn.close()
+        aid = self._make_alert(rid, {"env": "prod", "service": "svc-a",
+                                     "keyword": "ERROR", "entry_id": hit_id,
+                                     "hit_ts": 1787000000}, seq=11)
+        data = self._get_logs(aid, lines=100).get_json()
+        ids = {x["id"] for x in data["before"] + [data["hit"]] + data["after"]}
+        self.assertEqual(data["hit"]["id"], hit_id)
+        # 所有上下文行都属于 prod/svc-a：干扰行 id 全部大于本用例插入的最大 rowid，
+        # 若过滤失效它们会进入 after（同 ts 且 id 更大，排在 ts+1 行之前）
+        self.assertLessEqual(max(ids), rowids[-1])
 
     def test_expired_when_all_gone(self):
         """before/after/hit 均无数据：reason=expired"""
