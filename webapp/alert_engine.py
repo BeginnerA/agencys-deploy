@@ -250,17 +250,26 @@ class AlertEngine:
         now = int(time.time())
         if rows:
             a = rows[0]
+            updates = {"last_seen_at": now}
+            # 位置刷新：收敛时若新命中携带 entry_id 且与既有不同，仅更新位置字段
+            # （entry_id/hit_ts），保留 context 等既有字段；非日志告警/旧调用
+            # （target_info 无 entry_id）路径不变，不清除已有位置信息
+            new_entry = target_info.get("entry_id")
+            old_ti = a.get("target_info") or {}
+            if new_entry is not None and old_ti.get("entry_id") != new_entry:
+                merged = dict(old_ti)
+                merged["entry_id"] = new_entry
+                if target_info.get("hit_ts") is not None:
+                    merged["hit_ts"] = target_info["hit_ts"]
+                updates["target_info"] = merged
             # 静默期首次触发的告警：窗口已过期、仍在 firing 且从未通知 → 补发一次
             # （acked/resolved 不再补发：ack 后停止重复通知）
             if (a["status"] == "firing" and a["notify_count"] == 0
                     and not self._silenced(rule, target_info)):
                 alert = dbm.get_record(self._db_path, "alerts", a["id"])
                 send_alert(self._db_path, alert, rule.get("channels") or [])
-                dbm.update_record(self._db_path, "alerts", a["id"],
-                                  {"notify_count": 1, "last_seen_at": now})
-            else:
-                dbm.update_record(self._db_path, "alerts", a["id"],
-                                  {"last_seen_at": now})
+                updates["notify_count"] = 1
+            dbm.update_record(self._db_path, "alerts", a["id"], updates)
             return a["id"]
         alert_id = dbm.create_record(self._db_path, "alerts", dict(
             rule_id=rule["id"], fingerprint=fp, status="firing",

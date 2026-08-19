@@ -92,6 +92,18 @@ class TestLogTables(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_log_entries_env_svc_ts_index(self):
+        """log_entries 复合索引 (env, service, ts, id)：日志上下文查询走索引"""
+        conn = dbm.get_conn(self.db)
+        try:
+            idx = [r["sql"] for r in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index'")
+                if r["sql"] and "idx_log_entries_env_svc_ts" in r["sql"]]
+        finally:
+            conn.close()
+        self.assertEqual(len(idx), 1)
+        self.assertIn("log_entries(env, service, ts, id)", idx[0])
+
     def test_log_scan_state_table_exists(self):
         conn = dbm.get_conn(self.db)
         try:

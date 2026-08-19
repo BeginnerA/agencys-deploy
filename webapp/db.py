@@ -191,6 +191,8 @@ CREATE TABLE IF NOT EXISTS log_entries (
     content TEXT NOT NULL DEFAULT '',
     keywords TEXT DEFAULT '[]'
 );
+CREATE INDEX IF NOT EXISTS idx_log_entries_env_svc_ts
+    ON log_entries(env, service, ts, id);
 CREATE TABLE IF NOT EXISTS log_scan_state (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     env TEXT NOT NULL DEFAULT '',

@@ -502,6 +502,36 @@ class TestAlertEngine(unittest.TestCase):
         # 但 last_seen_at 应更新
         self.assertGreaterEqual(alerts[0]["last_seen_at"], alerts[0]["first_seen_at"])
 
+    def test_trigger_log_alert_convergence_refreshes_position(self):
+        """收敛时刷新命中位置：entry_id 变化仅更新位置字段，保留 context 等既有字段；
+        旧路径（无 entry_id）不清除位置信息"""
+        rid = self._log_kw_rule(metric="ERROR")
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules", rid)
+        e.trigger_log_alert(rule, "api-svc", "prod", "ERROR crash 1",
+                            ["ctx-1"], self.env_id, matched_keyword="ERROR",
+                            entry_id=1, hit_ts=1787000000)
+        e.trigger_log_alert(rule, "api-svc", "prod", "ERROR crash 2",
+                            ["ctx-2"], self.env_id, matched_keyword="ERROR",
+                            entry_id=2, hit_ts=1787000060)
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 1)
+        ti = alerts[0]["target_info"]
+        # 位置字段已刷新为最新命中行
+        self.assertEqual(ti["entry_id"], 2)
+        self.assertEqual(ti["hit_ts"], 1787000060)
+        # 既有字段保留（首次命中的 context/env/service/keyword 不被覆盖）
+        self.assertEqual(ti["context"], ["ctx-1"])
+        self.assertEqual(ti["env"], "prod")
+        self.assertEqual(ti["service"], "api-svc")
+        self.assertEqual(ti["keyword"], "ERROR")
+        # 旧路径（再次触发不带 entry_id）：位置信息不被清除
+        e.trigger_log_alert(rule, "api-svc", "prod", "ERROR crash 3",
+                            ["ctx-3"], self.env_id, matched_keyword="ERROR")
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(alerts[0]["target_info"]["entry_id"], 2)
+        self.assertEqual(alerts[0]["target_info"]["hit_ts"], 1787000060)
+
     def test_trigger_log_alert_multi_keyword_different_fingerprints(self):
         """多关键词规则: 不同关键词产生不同指纹，分别告警"""
         rid = self._log_kw_rule(metric="ERROR,FATAL")
