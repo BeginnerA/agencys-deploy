@@ -1265,6 +1265,12 @@
           ${alert.ack_by ? `<div><span class="muted">确认人：</span>${esc(alert.ack_by)} ${fmtTime(alert.ack_at)}</div>` : ''}
           ${alert.resolved_by ? `<div><span class="muted">解决人：</span>${esc(alert.resolved_by)} ${fmtTime(alert.resolved_at)}</div>` : ''}
         </div>
+        <div class="alert-detail-section" id="alertLogCtxSection">
+          <div class="alert-detail-section-title">📜 日志上下文</div>
+          <div id="alertLogCtxList" class="alert-log-ctx">
+            <div class="muted" style="padding:12px">加载中...</div>
+          </div>
+        </div>
         <div class="alert-detail-section">
           <div class="alert-detail-section-title">📨 通知投递历史</div>
           <div id="alertEventsList" class="alert-events-list">
@@ -1307,6 +1313,76 @@
         const retryBtn = document.getElementById('evtRetryBtn');
         if (retryBtn) retryBtn.onclick = () => openAlertDetail(alertId);
       }
+    }
+    // 加载日志上下文（与投递历史并行）
+    loadAlertLogCtx(alertId);
+  }
+
+  // ---- 告警详情：日志上下文（命中行前后 N 行 + 高亮） ----
+
+  async function loadAlertLogCtx(alertId) {
+    const section = document.getElementById('alertLogCtxSection');
+    const el = document.getElementById('alertLogCtxList');
+    if (!section || !el) return;
+    try {
+      const data = await api(`/api/alerts/${alertId}/logs?lines=100`);
+      if (!data.available) {
+        // 非日志告警：不渲染该区块
+        if (data.reason === 'not_log_alert') { section.remove(); return; }
+        const msg = data.reason === 'no_position'
+          ? '该告警未记录日志位置，无法展示上下文'
+          : data.reason === 'expired'
+            ? '日志已超出保留期，无法展示上下文'
+            : '无法展示上下文';
+        el.innerHTML = `<div class="muted" style="padding:12px;text-align:center">${msg}</div>`;
+        return;
+      }
+      renderLogCtx(el, data);
+    } catch(e) {
+      console.warn('loadAlertLogCtx failed', e);
+      el.innerHTML = `<div style="padding:12px;text-align:center">
+        <div class="muted" style="color:var(--danger)">加载失败：${esc(e.message || '未知错误')}</div>
+        <button class="btn sm ghost" id="logCtxRetryBtn" style="margin-top:8px">重试</button>
+      </div>`;
+      const retryBtn = document.getElementById('logCtxRetryBtn');
+      if (retryBtn) retryBtn.onclick = () => loadAlertLogCtx(alertId);
+    }
+  }
+
+  function renderLogCtx(el, data) {
+    const rows = [...data.before, data.hit, ...data.after].filter(Boolean);
+    const hitId = data.hit && !data.hit.fallback ? data.hit.id : null;  // 兜底行不标命中
+    el.innerHTML = `
+      <div class="alert-log-ctx-info">
+        命中行前 ${data.before.length} 行${hitId ? ' · 命中行' : ''} · 后 ${data.after.length} 行
+      </div>
+      <div class="alert-log-ctx-lines">
+        ${rows.map(r => {
+          const isHit = hitId !== null && r.id === hitId;
+          return `<div class="alert-log-ctx-line${isHit ? ' hit' : ''}">
+            <span class="ctx-ts">${fmtHHMMSS(r.ts)}</span>
+            <span class="ctx-content">${highlightKw(esc(r.content || ''), data.keyword)}</span>
+          </div>`;
+        }).join('')}
+      </div>`;
+  }
+
+  // 秒级时间戳 → "HH:MM:SS"
+  function fmtHHMMSS(ts) {
+    if (!ts) return '';
+    const d = new Date(ts * 1000);
+    const p = n => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+
+  // 内容已 esc 转义，关键词同样先转义再匹配高亮（安全 + 特殊字符关键词可用）
+  function highlightKw(text, kw) {
+    if (!kw) return text;
+    const escKw = esc(kw).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    try {
+      return text.replace(new RegExp(`(${escKw})`, 'g'), '<mark>$1</mark>');
+    } catch(e) {
+      return text;
     }
   }
 

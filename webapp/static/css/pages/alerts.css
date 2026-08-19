@@ -141,6 +141,18 @@
 .evt-status.evt-fail{color:var(--danger)}
 .evt-detail{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--fs-11)}
 
+/* 告警详情-日志上下文 */
+.alert-log-ctx-info{font-size:var(--fs-12);color:var(--text-2);margin-bottom:8px}
+.alert-log-ctx-lines{max-height:340px;overflow-y:auto;border:1px solid var(--border);
+  border-radius:var(--r-ctl);background:rgba(17,34,65,.3);font-family:monospace;font-size:var(--fs-12)}
+.alert-log-ctx-line{display:flex;gap:10px;padding:3px 12px;border-left:3px solid transparent;
+  white-space:pre-wrap;word-break:break-all}
+.alert-log-ctx-line:hover{background:rgba(0,212,255,.05)}
+.alert-log-ctx-line.hit{background:rgba(255,193,7,.12);border-left-color:#ffc107}
+.ctx-ts{color:var(--text-2);font-family:var(--font-num);white-space:nowrap}
+.ctx-content{color:var(--text-1);flex:1}
+.alert-log-ctx-line mark{background:#ffc107;color:#1a1a1a;padding:0 2px;border-radius:2px}
+
 /* ==================== 作用域级联选择器 ==================== */
 .scope-tag-box{display:flex;flex-wrap:wrap;gap:6px;padding:4px 0}
 .scope-tag{display:inline-flex;align-items:center;padding:4px 10px;border-radius:var(--r-full);
