@@ -464,6 +464,30 @@ class TestAlertEngine(unittest.TestCase):
         self.assertIn("api-svc", alerts[0]["subject"])
         self.assertEqual(alerts[0]["status"], "firing")
 
+    def test_trigger_log_alert_records_position(self):
+        """trigger_log_alert: 命中行 entry_id/hit_ts 写入 target_info"""
+        rid = self._log_kw_rule(metric="ERROR")
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules", rid)
+        e.trigger_log_alert(rule, "api-svc", "prod", "ERROR: db timeout",
+                            ["ERROR: db timeout"], self.env_id,
+                            matched_keyword="ERROR", entry_id=42, hit_ts=1787000000)
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(alerts[0]["target_info"]["entry_id"], 42)
+        self.assertEqual(alerts[0]["target_info"]["hit_ts"], 1787000000)
+        # 未传位置参数时不写入（老调用向后兼容）：同指纹会收敛到已有告警
+        # （只刷 last_seen_at、不覆盖 target_info），故用不同服务触发新告警验证
+        e2 = self._engine()
+        e2.trigger_log_alert(rule, "api-svc-legacy", "prod", "ERROR: again",
+                             ["ERROR: again"], self.env_id,
+                             matched_keyword="ERROR")
+        alerts2 = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts2), 2)
+        legacy = next(a for a in alerts2
+                      if a["target_info"]["service"] == "api-svc-legacy")
+        self.assertNotIn("entry_id", legacy["target_info"])
+        self.assertNotIn("hit_ts", legacy["target_info"])
+
     def test_trigger_log_alert_convergence(self):
         """trigger_log_alert: 同规则+同服务+同关键词 不重复创建（指纹收敛）"""
         rid = self._log_kw_rule(metric="FATAL")

@@ -469,10 +469,13 @@ class AlertEngine:
 
     def trigger_log_alert(self, rule: dict, service: str, env_name: str,
                           line: str, context: list, env_id: int,
-                          matched_keyword: str = ""):
+                          matched_keyword: str = "", entry_id: int = None,
+                          hit_ts: int = None):
         """日志关键词命中：创建/更新日志告警（指纹含关键词，收敛由部分唯一索引保证）
 
         matched_keyword: 实际命中的那个关键词（多关键词场景下精确到单个词）
+        entry_id/hit_ts: 命中日志行在 log_entries 的 rowid 与其时间戳，
+        写入 target_info 供详情抽屉实时查询上下文（旧告警无此字段，向后兼容）
         """
         # 查询 env_id 对应的环境记录
         envs = dbm.list_records(self._db_path, "environments", "id=?", (env_id,))
@@ -489,11 +492,16 @@ class AlertEngine:
         # scope 检查
         if not self._in_scope(rule, env, service=service, service_id=service_id):
             return
+        target_info = {"env": env_name, "service": service,
+                       "keyword": keyword, "context": context[:5]}
+        if entry_id is not None:
+            target_info["entry_id"] = entry_id
+        if hit_ts:
+            target_info["hit_ts"] = hit_ts
         self._fire(rule, target,
                    subject=f"日志告警 [{keyword}]: {service}",
                    description=f"{env_name}/{service} 日志命中关键词 {keyword}:\n{line}",
-                   target_info={"env": env_name, "service": service,
-                                "keyword": keyword, "context": context[:5]})
+                   target_info=target_info)
 
 
 _engine = None

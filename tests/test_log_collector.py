@@ -203,6 +203,44 @@ class TestLogCollector(unittest.TestCase):
             # 不应抛异常
             self.collector._scan_keywords_in_entries(entries, "prod", 1)
 
+    def test_index_log_entries_returns_rowids(self):
+        """索引返回 rowid 列表，与 entries 一一对应"""
+        path = os.path.join(self.log_dir, "test.log")
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        entries = [
+            (1787049045, "prod", "api", "line1", path, 1, 1),
+            (1787049046, "prod", "api", "line2", path, 2, 1),
+        ]
+        rowids = self.collector._index_log_entries(entries)
+        self.assertEqual(len(rowids), 2)
+        self.assertGreater(rowids[1], rowids[0])
+        conn = dbm.get_conn(self.db)
+        try:
+            r = conn.execute(
+                "SELECT content FROM log_entries WHERE id=?", (rowids[1],)
+            ).fetchone()
+            self.assertEqual(r["content"], "line2")
+        finally:
+            conn.close()
+
+    def test_scan_keywords_passes_entry_id_and_ts(self):
+        """关键词命中：把命中行 entry_id + ts 传给 trigger_log_alert"""
+        self._make_kw_rule("ERROR")
+        path = os.path.join(self.log_dir, "test.log")
+        entries = [
+            (1787049045, "prod", "api", "INFO normal log", path, 0, 1),
+            (1787049046, "prod", "api", "ERROR something broke", path, 10, 1),
+        ]
+        rowids = self.collector._index_log_entries(entries)
+        from unittest.mock import MagicMock, patch
+        mock_engine = MagicMock()
+        with patch("webapp.log_collector.get_engine", return_value=mock_engine):
+            self.collector._current_kw_rules = self.collector._load_log_keyword_rules()
+            self.collector._scan_keywords_in_entries(entries, "prod", 1, rowids)
+        call_kwargs = mock_engine.trigger_log_alert.call_args[1]
+        self.assertEqual(call_kwargs["entry_id"], rowids[1])
+        self.assertEqual(call_kwargs["hit_ts"], 1787049046)
+
 
 if __name__ == "__main__":
     unittest.main()

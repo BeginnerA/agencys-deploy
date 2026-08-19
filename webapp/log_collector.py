@@ -215,8 +215,8 @@ class LogCollector:
             line_offset += len(raw_line.encode("utf-8", "ignore"))
 
         if entries:
-            self._index_log_entries(entries)
-            self._scan_keywords_in_entries(entries, env_name, env_id)
+            rowids = self._index_log_entries(entries)
+            self._scan_keywords_in_entries(entries, env_name, env_id, rowids)
             self._update_scan_state(env_name, host, container, service,
                                     last_line_ts or "", line_offset)
 
@@ -226,9 +226,10 @@ class LogCollector:
         with open(file_path, "a", encoding="utf-8") as f:
             f.writelines(lines)
 
-    def _index_log_entries(self, entries: list):
-        """批量写入 log_entries + 同步 FTS5"""
+    def _index_log_entries(self, entries: list) -> list:
+        """批量写入 log_entries + 同步 FTS5；返回每条日志的 rowid（与 entries 一一对应）"""
         conn = dbm.get_conn(self.db_path)
+        rowids = []
         try:
             for ts, env, service, content, file_path, offset, count in entries:
                 cursor = conn.execute(
@@ -237,12 +238,14 @@ class LogCollector:
                     (ts, env, service, file_path, offset, count, content)
                 )
                 rowid = cursor.lastrowid
+                rowids.append(rowid)
                 conn.execute(
                     "INSERT INTO log_fts (rowid, ts, env, service, content) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (rowid, str(ts), env, service, content)
                 )
             conn.commit()
+            return rowids
         finally:
             conn.close()
 
@@ -261,8 +264,13 @@ class LogCollector:
         except Exception:
             return []
 
-    def _scan_keywords_in_entries(self, entries: list, env_name: str, env_id: int):
-        """扫描日志条目中的关键词，命中时触发告警"""
+    def _scan_keywords_in_entries(self, entries: list, env_name: str, env_id: int,
+                                  rowids: list = None):
+        """扫描日志条目中的关键词，命中时触发告警
+
+        rowids: _index_log_entries 返回的 rowid 列表，与 entries 一一对应；
+        传入后命中行携带 entry_id/hit_ts，供告警详情展示日志上下文。
+        """
         rules = getattr(self, '_current_kw_rules', None)
         if not rules:
             return
@@ -278,7 +286,7 @@ class LogCollector:
             if not keywords:
                 continue
             # 扫描每条日志，找到第一个命中即触发（同规则同服务由指纹去重）
-            for ts, env, svc, content, file_path, offset, count in entries:
+            for i, (ts, env, svc, content, file_path, offset, count) in enumerate(entries):
                 if not content:
                     continue
                 for kw in keywords:
@@ -286,7 +294,9 @@ class LogCollector:
                         ctx = [content]
                         engine.trigger_log_alert(
                             rule, svc, env_name, content, ctx, env_id,
-                            matched_keyword=kw)
+                            matched_keyword=kw,
+                            entry_id=rowids[i] if rowids and i < len(rowids) else None,
+                            hit_ts=ts or None)
                         break  # 本条日志只触发一次（取首个命中关键词）
                 else:
                     continue
