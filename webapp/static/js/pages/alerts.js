@@ -27,6 +27,8 @@
   let editingRuleId = null;
   let ruleTypeFilter = 'all';
   let ruleSaving = false;
+  let scopeSelectedEnvs = new Set();
+  let scopeSelectedTargets = new Set();
 
   // ---- 静默窗口 Tab 状态 ----
   let silences = [];
@@ -54,6 +56,12 @@
   const COMPARE_OPS = [['<','<'],['<=','<='],['>','>'],['>=','>=']];
   const CHANNELS = [['email','邮件'],['wecom','企微'],['webhook','Webhook'],['sms_aliyun','阿里云短信'],['feishu','飞书'],['dingtalk','钉钉']];
   const SCOPE_TYPES = [['all','全部'],['project','项目'],['env','环境'],['server','服务器'],['service','服务']];
+  // 按规则类型筛选的可选作用域
+  const SCOPE_OPTIONS_BY_TYPE = {
+    metric: [['all','全部'],['project','项目'],['env','环境'],['server','服务器']],
+    status: [['all','全部'],['project','项目'],['env','环境'],['service','服务']],
+    log_keyword: [['all','全部'],['project','项目'],['env','环境'],['service','服务']]
+  };
   const SILENCE_TYPES = [['one_time','一次性'],['recurring','周期']];
   const WEEKDAY_LABELS = {1:'周一',2:'周二',3:'周三',4:'周四',5:'周五',6:'周六',7:'周日'};
   const MT_LABEL = {metric:'指标',status:'状态',log_keyword:'日志关键词'};
@@ -627,11 +635,20 @@
           <select id="rfSeverity">${SEVERITIES.map(([k,v]) =>
             `<option value="${k}" ${(r.severity||'P2')===k?'selected':''}>${v}</option>`).join('')}</select></div>
         <div class="field"><label>作用域</label>
-          <select id="rfScopeType">${SCOPE_TYPES.map(([k,v]) =>
-            `<option value="${k}" ${scope.type===k?'selected':''}>${v}</option>`).join('')}</select></div>
-        <div class="field" id="rfScopeIdsWrap" style="${scope.type==='all'?'display:none':''}">
+          <select id="rfScopeType"></select></div>
+        <div class="field" id="rfScopeIdsWrap" style="display:none">
           <label>作用域 IDs（逗号分隔）</label>
-          <input id="rfScopeIds" value="${esc((scope.ids||[]).join(','))}" placeholder="1,2,3"></div>
+          <input id="rfScopeIds" value="" placeholder="1,2,3"></div>
+        <div class="field full" id="rfScopeCascadeWrap" style="display:none">
+          <label>环境</label>
+          <div id="rfScopeEnvTags" class="scope-tag-box"></div>
+          <div id="rfScopeTargetWrap" style="margin-top:8px;display:none">
+            <label id="rfScopeTargetLabel">目标</label>
+            <div id="rfScopeTargetTags" class="scope-tag-box">
+              <div class="muted" style="font-size:12px">请先选择环境</div>
+            </div>
+          </div>
+        </div>
         <div class="field"><label>升级间隔（分钟）</label>
           <input id="rfEscInt" type="number" value="${r.escalation_interval ?? 30}" min="0"></div>
         <div class="field check"><input type="checkbox" id="rfEnabled" ${r.enabled !== 0 ? 'checked' : ''}>
@@ -670,16 +687,110 @@
       document.getElementById('rfMetricWrap').style.display = isLog ? 'none' : '';
       document.getElementById('rfLogKwWrap').style.display = isLog ? '' : 'none';
     }
-    selType.onchange = () => { updateMetricOpts(); updateFieldVis(); };
+    // ---- 作用域级联选择 ----
+    const selScope = document.getElementById('rfScopeType');
+    const cascadeWrap = document.getElementById('rfScopeCascadeWrap');
+    const envTagsEl = document.getElementById('rfScopeEnvTags');
+    const targetWrap = document.getElementById('rfScopeTargetWrap');
+    const targetTagsEl = document.getElementById('rfScopeTargetTags');
+    const targetLabel = document.getElementById('rfScopeTargetLabel');
+    let scopeEnvs = [];
+
+    // 根据规则类型筛选可选 scope type
+    function updateScopeTypeOpts() {
+      const mt = selType.value;
+      const opts = SCOPE_OPTIONS_BY_TYPE[mt] || SCOPE_OPTIONS_BY_TYPE.metric;
+      const curVal = selScope.value || scope.type || 'all';
+      selScope.innerHTML = opts.map(([k,v]) =>
+        `<option value="${k}" ${curVal===k?'selected':''}>${v}</option>`).join('');
+      if (![...opts.map(o=>o[0])].includes(selScope.value)) selScope.value = 'all';
+    }
+
+    function updateScopeVis() {
+      const st = selScope.value;
+      const needCascade = (st === 'server' || st === 'service');
+      cascadeWrap.style.display = needCascade ? '' : 'none';
+      const idsWrap = document.getElementById('rfScopeIdsWrap');
+      if (idsWrap) idsWrap.style.display = (st === 'project' || st === 'env') ? '' : 'none';
+      if (needCascade) {
+        targetLabel.textContent = st === 'server' ? '服务器' : '服务';
+        renderEnvTags();
+        if (scopeSelectedEnvs.size > 0) loadTargets();
+        else { targetWrap.style.display='none'; }
+      }
+    }
+
+    function renderEnvTags() {
+      if (!scopeEnvs.length) {
+        envTagsEl.innerHTML = '<div class="muted" style="font-size:12px">加载中...</div>';
+        return;
+      }
+      envTagsEl.innerHTML = scopeEnvs.map(e => {
+        const active = scopeSelectedEnvs.has(e.id) ? 'active' : '';
+        return `<span class="scope-tag ${active}" data-eid="${e.id}">${esc(e.project_name)}/${esc(e.name)}</span>`;
+      }).join('');
+      envTagsEl.querySelectorAll('.scope-tag').forEach(tag => {
+        tag.onclick = () => {
+          const eid = Number(tag.dataset.eid);
+          if (scopeSelectedEnvs.has(eid)) scopeSelectedEnvs.delete(eid);
+          else scopeSelectedEnvs.add(eid);
+          tag.classList.toggle('active');
+          if (scopeSelectedEnvs.size > 0) loadTargets();
+          else { targetWrap.style.display='none'; targetTagsEl.innerHTML=''; }
+        };
+      });
+    }
+
+    async function loadScopeEnvs() {
+      try {
+        scopeEnvs = await api('/api/alerts/scope/environments');
+        renderEnvTags();
+        if (scopeSelectedEnvs.size > 0) loadTargets();
+      } catch(e) {
+        envTagsEl.innerHTML = '<div class="muted" style="color:var(--danger);font-size:12px">环境加载失败</div>';
+      }
+    }
+
+    async function loadTargets() {
+      const st = selScope.value;
+      const ep = st === 'server' ? 'servers' : 'services';
+      const envIds = [...scopeSelectedEnvs].join(',');
+      targetWrap.style.display = '';
+      targetTagsEl.innerHTML = '<div class="muted" style="font-size:12px">加载中...</div>';
+      try {
+        const targets = await api(`/api/alerts/scope/${ep}?env_ids=${envIds}`);
+        if (!targets.length) {
+          targetTagsEl.innerHTML = '<div class="muted" style="font-size:12px">所选环境下无可用目标</div>';
+          return;
+        }
+        targetTagsEl.innerHTML = targets.map(t => {
+          const label = st === 'server' ? t.host : t.name;
+          const checked = scopeSelectedTargets.has(t.id) ? 'checked' : '';
+          return `<label class="scope-target-cb"><input type="checkbox" data-tid="${t.id}" ${checked}> ${esc(label)}</label>`;
+        }).join('');
+        targetTagsEl.querySelectorAll('input[data-tid]').forEach(cb => {
+          cb.onchange = () => {
+            const tid = Number(cb.dataset.tid);
+            if (cb.checked) scopeSelectedTargets.add(tid);
+            else scopeSelectedTargets.delete(tid);
+          };
+        });
+      } catch(e) {
+        targetTagsEl.innerHTML = '<div class="muted" style="color:var(--danger);font-size:12px">目标加载失败</div>';
+      }
+    }
+
+    // 绑定事件：规则类型变更 → 更新指标选项 + scope 选项 + 可见性
+    selType.onchange = () => { updateMetricOpts(); updateScopeTypeOpts(); updateFieldVis(); updateScopeVis(); };
+    // 初始化
     updateMetricOpts();
     // 回填 metric（编辑时）
     if (r.metric && (r.metric_type !== 'log_keyword')) selMetric.value = r.metric;
-    updateFieldVis();
-    // 作用域联动
-    const selScope = document.getElementById('rfScopeType');
-    selScope.onchange = () => {
-      document.getElementById('rfScopeIdsWrap').style.display = selScope.value === 'all' ? 'none' : '';
-    };
+    updateScopeTypeOpts();
+    updateScopeVis();
+    if (selScope.value === 'server' || selScope.value === 'service') {
+      loadScopeEnvs();
+    }
     // 按钮
     document.getElementById('rfCancel').onclick = () => {
       const c = document.getElementById('dwClose');
@@ -705,10 +816,20 @@
       const duration = parseInt(document.getElementById('rfDuration').value) || 300;
       const severity = document.getElementById('rfSeverity').value;
       const scopeType = document.getElementById('rfScopeType').value;
-      const scopeIdsRaw = document.getElementById('rfScopeIds').value.trim();
-      const scopeIds = scopeType === 'all' ? []
-        : scopeIdsRaw.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n));
+      let scopeIds, scopeEnvIds;
+      if (scopeType === 'server' || scopeType === 'service') {
+        scopeIds = [...scopeSelectedTargets];
+        scopeEnvIds = [...scopeSelectedEnvs];
+      } else if (scopeType === 'all') {
+        scopeIds = [];
+        scopeEnvIds = [];
+      } else {
+        const raw = (document.getElementById('rfScopeIds') || {}).value || '';
+        scopeIds = raw.trim() ? raw.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n)) : [];
+        scopeEnvIds = [];
+      }
       const scope = {type: scopeType, ids: scopeIds};
+      if (scopeEnvIds.length) scope.env_ids = scopeEnvIds;
       const channels = [...document.querySelectorAll('#rfChannels input:checked')].map(c => c.value);
       if (!channels.length) { toastError('至少选择一个通知渠道'); return; }
       const escalationInterval = parseInt(document.getElementById('rfEscInt').value) || 30;
@@ -757,11 +878,15 @@
   }
 
   function parseScope(raw){
-    if (!raw) return {type:'all', ids:[]};
+    if (!raw) return {type:'all', ids:[], env_ids:[]};
     if (typeof raw === 'string') {
-      try { raw = JSON.parse(raw); } catch(e) { return {type:'all', ids:[]}; }
+      try { raw = JSON.parse(raw); } catch(e) { return {type:'all', ids:[], env_ids:[]}; }
     }
-    return {type: raw.type || 'all', ids: raw.ids || []};
+    return {
+      type: raw.type || 'all',
+      ids: raw.ids || [],
+      env_ids: raw.env_ids || []
+    };
   }
 
   // ==================== 静默窗口 Tab ====================

@@ -140,3 +140,14 @@
 .evt-status.evt-ok{color:var(--success)}
 .evt-status.evt-fail{color:var(--danger)}
 .evt-detail{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--fs-11)}
+
+/* ==================== 作用域级联选择器 ==================== */
+.scope-tag-box{display:flex;flex-wrap:wrap;gap:6px;padding:4px 0}
+.scope-tag{display:inline-flex;align-items:center;padding:4px 10px;border-radius:var(--r-full);
+  font-size:var(--fs-12);cursor:pointer;transition:var(--t-fast);
+  background:rgba(0,212,255,.06);color:var(--text-2);border:1px solid var(--border);user-select:none}
+.scope-tag:hover{border-color:var(--primary);color:var(--text-1)}
+.scope-tag.active{background:rgba(0,212,255,.15);color:var(--primary);border-color:var(--primary)}
+.scope-target-cb{display:inline-flex;align-items:center;gap:5px;font-size:var(--fs-13);
+  color:var(--text-1);cursor:pointer;padding:3px 0}
+.scope-target-cb input{width:auto;margin:0}
