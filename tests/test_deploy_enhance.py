@@ -208,3 +208,180 @@ class TestDeployScheduler(unittest.TestCase):
         # once 计划被 _update_next_run 禁用（block 跳过执行但仍推进状态）
         rec = dbm.get_record(self.db, "deploy_schedules", sid)
         self.assertEqual(rec["enabled"], 0)
+
+
+class TestDeployEnhanceAPI(unittest.TestCase):
+    """发布增强 API 端点测试"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmp, "test.db")
+        dbm.init_db(self.db_path)
+        from webapp import create_app
+        self.app = create_app()
+        self.app.config["DB_PATH"] = self.db_path
+        self.app.config["TESTING"] = True
+        # 创建测试数据
+        with self.app.app_context():
+            self.proj_id = dbm.create_record(self.db_path, "projects", dict(
+                name="p1", code="p1", description="", git_org="", created_at=int(time.time())))
+            self.svc_id = dbm.create_record(self.db_path, "services", dict(
+                project_id=self.proj_id, name="auth", image_name="auth",
+                service_name="hqb-auth", docker_context="", dockerfile="",
+                build_order="[]", nacos_groups="[]", dubbo_services="[]",
+                snailjob_group="", health_url="", health_port=0,
+                log_error_keywords="[]", clear_log_dir="", git_repo="", enabled=1))
+            # 创建 admin 用户并获取 token
+            from werkzeug.security import generate_password_hash
+            dbm.create_record(self.db_path, "users", dict(
+                username="admin", password_hash=generate_password_hash("test123"),
+                role="admin", must_change_password=0, enabled=1,
+                created_at=int(time.time())))
+        self.client = self.app.test_client()
+        # 登录获取 token
+        resp = self.client.post("/api/auth/login", json={"username": "admin", "password": "test123"})
+        self.token = resp.get_json()["token"]
+        self.headers = {"Authorization": f"Bearer {self.token}"}
+
+    def test_list_schedules_empty(self):
+        resp = self.client.get("/api/deploy/schedules", headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), [])
+
+    def test_create_schedule(self):
+        resp = self.client.post("/api/deploy/schedules", headers=self.headers, json={
+            "project_id": self.proj_id, "type": "once", "name": "test",
+            "ref_type": "project", "ref_id": self.svc_id, "env": "prod",
+            "version": "1.0.0", "schedule_at": int(time.time()) + 3600
+        })
+        self.assertEqual(resp.status_code, 201)
+        data = resp.get_json()
+        self.assertIn("id", data)
+
+    def test_create_release_window(self):
+        now = int(time.time())
+        resp = self.client.post("/api/deploy/windows", headers=self.headers, json={
+            "project_id": 0, "name": "封网测试",
+            "start_at": now, "end_at": now + 3600,
+            "block_level": "block"
+        })
+        self.assertEqual(resp.status_code, 201)
+
+    def test_check_window_api(self):
+        now = int(time.time())
+        dbm.create_record(self.db_path, "release_windows", dict(
+            project_id=0, name="active", start_at=now - 10, end_at=now + 100,
+            block_level="warn", repeat_yearly=0, created_by=1, created_at=now))
+        resp = self.client.get("/api/deploy/windows/check?project_id=1",
+                               headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertIsNotNone(data)
+        self.assertEqual(data["block_level"], "warn")
+
+    def test_create_canary_config(self):
+        resp = self.client.post("/api/deploy/canary-configs", headers=self.headers, json={
+            "project_id": self.proj_id, "name": "default",
+            "steps": [{"batch": 1, "servers": 1, "observe_minutes": 5, "auto_advance": True}]
+        })
+        self.assertEqual(resp.status_code, 201)
+
+    def test_viewer_cannot_create(self):
+        from werkzeug.security import generate_password_hash
+        dbm.create_record(self.db_path, "users", dict(
+            username="viewer1", password_hash=generate_password_hash("test123"),
+            role="viewer", must_change_password=0, enabled=1,
+            created_at=int(time.time())))
+        resp = self.client.post("/api/auth/login", json={"username": "viewer1", "password": "test123"})
+        vtoken = resp.get_json()["token"]
+        resp = self.client.post("/api/deploy/schedules",
+                                headers={"Authorization": f"Bearer {vtoken}"},
+                                json={"project_id": self.proj_id, "type": "once", "name": "x"})
+        self.assertEqual(resp.status_code, 403)
+
+    def test_topology_crud(self):
+        resp = self.client.post("/api/deploy/topology", headers=self.headers, json={
+            "project_id": self.proj_id, "source_service": "gateway",
+            "target_service": "auth", "dep_type": "dubbo"
+        })
+        self.assertEqual(resp.status_code, 201)
+        dep_id = resp.get_json()["id"]
+        resp = self.client.get(f"/api/deploy/topology/{self.proj_id}", headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(len(data["edges"]), 1)
+        resp = self.client.delete(f"/api/deploy/topology/{dep_id}", headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_snapshots_and_compare(self):
+        now = int(time.time())
+        dbm.create_record(self.db_path, "deployment_snapshots", dict(
+            project_id=self.proj_id, env="prod", task_id=1,
+            version="1.0.0", image_versions='{"auth":"auth:1.0.0"}',
+            nacos_config_hash="aaa", env_vars_hash="eee",
+            deployed_at=now - 100))
+        dbm.create_record(self.db_path, "deployment_snapshots", dict(
+            project_id=self.proj_id, env="prod", task_id=2,
+            version="1.1.0", image_versions='{"auth":"auth:1.1.0"}',
+            nacos_config_hash="bbb", env_vars_hash="eee",
+            deployed_at=now))
+        resp = self.client.get(
+            f"/api/deploy/compare?project_id={self.proj_id}&env=prod",
+            headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["old"]["version"], "1.0.0")
+        self.assertEqual(data["new"]["version"], "1.1.0")
+
+    def test_impact_analysis(self):
+        env_id = dbm.create_record(self.db_path, "environments", dict(
+            project_id=self.proj_id, name="prod", is_default=1,
+            registry="{}", nacos="{}", mysql_snailjob="{}", ssh="{}",
+            build="{}", deploy="{}", monitor_enabled=1))
+        sid = dbm.create_record(self.db_path, "servers", dict(
+            host="10.0.0.1", ssh_port=22, ssh_user="root", ssh_password="x",
+            nacos_ip="", role="", remark="", enabled=1))
+        dbm.create_record(self.db_path, "env_servers", dict(
+            env_id=env_id, server_id=sid, order_no=0))
+        dbm.create_record(self.db_path, "service_dependencies", dict(
+            project_id=self.proj_id, source_service="gateway",
+            target_service="auth", dep_type="manual",
+            created_at=int(time.time())))
+        resp = self.client.get(
+            f"/api/deploy/impact/{self.proj_id}?env=prod&service=auth",
+            headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertIn("colocated", data)
+        self.assertIn("upstream", data)
+        self.assertIn("downstream", data)
+
+
+class TestCanaryAutoAdvance(unittest.TestCase):
+    """灰度分批逻辑测试（不实际 SSH，仅验证批次划分）"""
+
+    def test_batch_split(self):
+        """验证 canary steps 正确划分服务器批次"""
+        from webapp.deploy_scheduler import compute_canary_batches
+        steps = [
+            {"batch": 1, "servers": 1, "observe_minutes": 5, "auto_advance": True},
+            {"batch": 2, "servers": 2, "observe_minutes": 10, "auto_advance": True},
+            {"batch": 3, "servers": "all", "observe_minutes": 0, "auto_advance": False},
+        ]
+        total_servers = 5
+        batches = compute_canary_batches(steps, total_servers)
+        self.assertEqual(len(batches), 3)
+        self.assertEqual(batches[0]["server_count"], 1)
+        self.assertEqual(batches[1]["server_count"], 2)
+        self.assertEqual(batches[2]["server_count"], 2)  # 5 - 1 - 2 = 2
+
+    def test_batch_split_fewer_servers(self):
+        """服务器数少于批次配置时，合并到最后批次"""
+        from webapp.deploy_scheduler import compute_canary_batches
+        steps = [
+            {"batch": 1, "servers": 2, "observe_minutes": 5, "auto_advance": True},
+            {"batch": 2, "servers": "all", "observe_minutes": 0, "auto_advance": False},
+        ]
+        batches = compute_canary_batches(steps, 1)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0]["server_count"], 1)

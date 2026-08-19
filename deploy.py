@@ -537,42 +537,85 @@ class Deployer:
             log(">>> 步骤 2/5: 无需暂停 SnailJob")
 
         log(">>> 步骤 3/5: 滚动发布" + ("（金丝雀模式）" if self.canary else ""))
-        success_all = True
+        # canary batch: read from DB
+        canary_batches = None
+        if self.canary:
+            try:
+                from webapp.deploy_scheduler import compute_canary_batches
+                import sqlite3, json as _json
+                _db = Path(__file__).resolve().parent / "data" / "platform.db"
+                _conn = sqlite3.connect(str(_db))
+                _conn.row_factory = sqlite3.Row
+                try:
+                    _proj = _conn.execute("SELECT id FROM projects WHERE code=?", (self.project,)).fetchone()
+                    if _proj:
+                        _cfg = _conn.execute("SELECT steps FROM canary_configs WHERE project_id=? AND is_default=1 LIMIT 1", (_proj["id"],)).fetchone()
+                        if _cfg:
+                            canary_batches = compute_canary_batches(_json.loads(_cfg["steps"]), len(servers))
+                finally:
+                    _conn.close()
+            except Exception as e:
+                log(f"[canary] read config failed, fallback: {e}")
         try:
-            for idx, srv in enumerate(servers):
-                host = srv["ip"]
-                is_canary = (idx == 0)
-                ok = self.deploy_server(host, srv, is_canary=is_canary)
-                if not ok:
-                    success_all = False
-                    log("首台或中间服务器失败，停止继续滚动，请人工排查。")
-                    break
-                # 金丝雀模式：首台成功后暂停，等待人工确认
-                if self.canary and is_canary and idx < len(servers) - 1:
-                    decision = self._canary_prompt(host)
-                    if decision == "rollback":
-                        log(f">>> 回滚首台 {host} 到 {self.previous_version}")
-                        rollback_server = RemoteServer(host, merge_server_ssh(self.ssh_cfg, srv))
-                        try:
-                            nacos_ip = self._nacos_ip(srv)
-                            self.nacos_offline(nacos_ip)
-                            self.rollback_container(rollback_server)
-                            self.nacos_online(nacos_ip, weight=1.0)
-                            log(f"首台 {host} 已回滚")
-                        except Exception as re:
-                            log(f"首台回滚失败: {re}")
-                            try:
-                                self.nacos_online(nacos_ip, weight=1.0)
-                            except Exception:
-                                pass
-                        finally:
-                            rollback_server.close()
+            if canary_batches:
+                log(f">>> canary batches: {len(canary_batches)}")
+                for bi, batch in enumerate(canary_batches):
+                    log(f'--- batch {batch["batch"]}/{len(canary_batches)}: {batch["server_count"]} servers ---')
+                    batch_ok = True
+                    for si in batch["server_indices"]:
+                        srv = servers[si]
+                        host = srv["ip"]
+                        ok = self.deploy_server(host, srv, is_canary=(bi==0 and si==batch["server_indices"][0]))
+                        if not ok:
+                            success_all = False
+                            batch_ok = False
+                            break
+                    if not batch_ok:
+                        break
+                    if batch["observe_minutes"] > 0 and bi < len(canary_batches) - 1:
+                        if batch["auto_advance"]:
+                            time.sleep(batch["observe_minutes"] * 60)
+                        else:
+                            dec = self._canary_prompt(servers[batch["server_indices"][0]]["ip"])
+                            if dec != "continue":
+                                success_all = False
+                                break
+            else:
+            try:
+                for idx, srv in enumerate(servers):
+                    host = srv["ip"]
+                    is_canary = (idx == 0)
+                    ok = self.deploy_server(host, srv, is_canary=is_canary)
+                    if not ok:
                         success_all = False
+                        log("首台或中间服务器失败，停止继续滚动，请人工排查。")
                         break
-                    elif decision == "stop":
-                        log("已停止发布剩余服务器，首台保持新版本")
-                        break
-                    # continue → 继续发布剩余服务器
+                    # 金丝雀模式：首台成功后暂停，等待人工确认
+                    if self.canary and is_canary and idx < len(servers) - 1:
+                        decision = self._canary_prompt(host)
+                        if decision == "rollback":
+                            log(f">>> 回滚首台 {host} 到 {self.previous_version}")
+                            rollback_server = RemoteServer(host, merge_server_ssh(self.ssh_cfg, srv))
+                            try:
+                                nacos_ip = self._nacos_ip(srv)
+                                self.nacos_offline(nacos_ip)
+                                self.rollback_container(rollback_server)
+                                self.nacos_online(nacos_ip, weight=1.0)
+                                log(f"首台 {host} 已回滚")
+                            except Exception as re:
+                                log(f"首台回滚失败: {re}")
+                                try:
+                                    self.nacos_online(nacos_ip, weight=1.0)
+                                except Exception:
+                                    pass
+                            finally:
+                                rollback_server.close()
+                            success_all = False
+                            break
+                        elif decision == "stop":
+                            log("已停止发布剩余服务器，首台保持新版本")
+                            break
+                        # continue → 继续发布剩余服务器
         finally:
             # 无论发布成功/失败/异常，都必须恢复 SnailJob，避免任务组长期停留在暂停状态
             if group and not skip_snailjob:

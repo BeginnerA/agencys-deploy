@@ -5,6 +5,39 @@ import threading
 import time
 
 
+def compute_canary_batches(steps: list, total_servers: int) -> list:
+    """根据 canary_config.steps 和服务器总数，计算每批次的服务器数量。
+
+    steps 中 servers 字段：
+      - 整数：该批次的服务器数量
+      - "all"：剩余所有服务器
+    返回 [{"batch": int, "server_count": int, "observe_minutes": int,
+           "auto_advance": bool, "server_indices": [int, ...]}]
+    """
+    batches = []
+    assigned = 0
+    for step in steps:
+        srv_count = step["servers"]
+        if srv_count == "all":
+            count = total_servers - assigned
+        else:
+            count = min(int(srv_count), total_servers - assigned)
+        if count <= 0:
+            continue
+        indices = list(range(assigned, assigned + count))
+        batches.append({
+            "batch": step["batch"],
+            "server_count": count,
+            "observe_minutes": step.get("observe_minutes", 0),
+            "auto_advance": step.get("auto_advance", False),
+            "server_indices": indices,
+        })
+        assigned += count
+        if assigned >= total_servers:
+            break
+    return batches
+
+
 def check_release_window(db_path: str, project_id: int) -> dict | None:
     """检查当前是否命中发布窗口。
 
