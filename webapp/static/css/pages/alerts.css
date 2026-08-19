@@ -151,3 +151,7 @@
 .scope-target-cb{display:inline-flex;align-items:center;gap:5px;font-size:var(--fs-13);
   color:var(--text-1);cursor:pointer;padding:3px 0}
 .scope-target-cb input{width:auto;margin:0}
+
+/* 规则列表作用域摘要 */
+.rule-scope-summary{font-size:var(--fs-12);color:var(--text-2);
+  max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}

@@ -29,6 +29,7 @@
   let ruleSaving = false;
   let scopeSelectedEnvs = new Set();
   let scopeSelectedTargets = new Set();
+  let scopeNameCache = null;  // {servers: {id: host}, services: {id: name}}
 
   // ---- 静默窗口 Tab 状态 ----
   let silences = [];
@@ -525,6 +526,7 @@
     try {
       rules = await api('/api/alerts/rules');
       if (destroyed) return;
+      scopeNameCache = null;  // 清除缓存，renderRuleList 会重新加载
       renderRuleList();
     } catch(e) {
       console.warn('loadRules failed', e);
@@ -563,9 +565,11 @@
     loadRules();
   }
 
-  function renderRuleList(){
+  async function renderRuleList(){
     const box = document.getElementById('ruleListContainer');
     if (!box) return;
+    const names = await ensureScopeNames();
+    if (destroyed) return;
     const filtered = ruleTypeFilter === 'all' ? rules : rules.filter(r => r.metric_type === ruleTypeFilter);
     if (!filtered.length) {
       box.innerHTML = `<div class="panel">${emptyState('📏', '暂无规则')}</div>`;
@@ -573,9 +577,9 @@
     }
     box.innerHTML = `
       <div class="panel" style="padding:0"><div class="tbl-wrap"><table class="tbl rules-tbl">
-        <thead><tr><th>名称</th><th>类型</th><th>指标</th><th>条件</th><th>级别</th><th>渠道</th><th>状态</th><th>操作</th></tr></thead>
+        <thead><tr><th>名称</th><th>类型</th><th>指标</th><th>条件</th><th>作用域</th><th>级别</th><th>渠道</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>${filtered.map(r => {
-          const scope = parseScope(r.scope);
+          const scopeStr = scopeSummary(r.scope, names);
           const chList = (r.channels || []).map(c => CHANNELS.find(([k]) => k === c)?.[1] || c);
           let cond = '-';
           if (r.metric_type === 'metric') cond = `${CMP_LABEL[r.compare] || r.compare} ${r.threshold}`;
@@ -588,6 +592,7 @@
             <td><span class="rule-mt-badge mt-${esc(r.metric_type)}">${MT_LABEL[r.metric_type] || r.metric_type}</span></td>
             <td>${esc(r.metric || '-')}</td>
             <td class="num">${cond}${r.duration_seconds ? `<div class="rule-sub">持续 ${r.duration_seconds}s</div>` : ''}</td>
+            <td><span class="rule-scope-summary" title="${esc(scopeStr)}">${esc(scopeStr)}</span></td>
             <td><span class="badge ${esc(r.severity||'P2').toLowerCase()}">${esc(r.severity||'P2')}</span></td>
             <td><div class="rule-ch-list">${chList.map(c => `<span class="rule-ch-tag">${esc(c)}</span>`).join('')}</div></td>
             <td><span class="badge ${r.enabled ? 'success' : 'pending'}">${r.enabled ? '启用' : '停用'}</span></td>
@@ -897,6 +902,35 @@
       ids: raw.ids || [],
       env_ids: raw.env_ids || []
     };
+  }
+
+  async function ensureScopeNames() {
+    if (scopeNameCache) return scopeNameCache;
+    try {
+      const envs = await api('/api/alerts/scope/environments');
+      const envIds = envs.map(e => e.id).join(',');
+      const [servers, services] = await Promise.all([
+        envIds ? api(`/api/alerts/scope/servers?env_ids=${envIds}`) : [],
+        envIds ? api(`/api/alerts/scope/services?env_ids=${envIds}`) : []
+      ]);
+      scopeNameCache = {
+        servers: Object.fromEntries(servers.map(s => [s.id, s.host])),
+        services: Object.fromEntries(services.map(s => [s.id, s.name]))
+      };
+    } catch(e) {
+      scopeNameCache = {servers: {}, services: {}};
+    }
+    return scopeNameCache;
+  }
+
+  function scopeSummary(scopeRaw, names) {
+    const s = parseScope(scopeRaw);
+    const typeLabel = {all:'全部',project:'项目',env:'环境',server:'服务器',service:'服务'};
+    const label = typeLabel[s.type] || s.type;
+    if (s.type === 'all' || !s.ids || !s.ids.length) return label;
+    const nameMap = (s.type === 'server') ? names.servers : names.services;
+    const resolved = (s.ids || []).map(id => nameMap?.[id] || `#${id}`);
+    return `${label}(${s.ids.length}): ${resolved.slice(0, 3).join(', ')}${resolved.length > 3 ? '…' : ''}`;
   }
 
   // ==================== 静默窗口 Tab ====================
