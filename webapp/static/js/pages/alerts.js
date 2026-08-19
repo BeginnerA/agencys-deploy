@@ -1281,6 +1281,8 @@
 
     openDrawer({ title: `告警详情 #${alertId}`, body: bodyHTML, wide: true });
 
+    // 加载日志上下文（与投递历史并行）
+    loadAlertLogCtx(alertId);
     // 加载投递历史
     try {
       const events = await api(`/api/alerts/${alertId}/events`);
@@ -1314,8 +1316,6 @@
         if (retryBtn) retryBtn.onclick = () => openAlertDetail(alertId);
       }
     }
-    // 加载日志上下文（与投递历史并行）
-    loadAlertLogCtx(alertId);
   }
 
   // ---- 告警详情：日志上下文（命中行前后 N 行 + 高亮） ----
