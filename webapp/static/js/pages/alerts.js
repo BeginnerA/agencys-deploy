@@ -14,6 +14,9 @@
   let statusFilter = 'all';
   let keyword = '';
 
+  // 批量操作状态
+  let selectedIds = new Set();
+
   // 统计计数
   let firingCount = 0;
   let ackedCount = 0;
@@ -155,9 +158,17 @@
         <span style="flex:1"></span>
         <input class="alert-search" type="text" placeholder="搜索告警..." value="${esc(keyword)}" id="alertKeyword">
       </div>
+      <div id="alertBatchBar" class="alert-batch-bar" style="display:none">
+        <label class="alert-batch-check"><input type="checkbox" id="alertSelectAll"> 全选</label>
+        <span id="alertBatchCount" class="muted" style="font-size:12px"></span>
+        <span style="flex:1"></span>
+        <button class="btn sm" id="alertBatchAck">批量确认</button>
+        <button class="btn sm danger" id="alertBatchResolve">批量解决</button>
+      </div>
       <div id="alertList">${skeletonHTML(4)}</div>
       <div id="alertPagination"></div>`;
     bindToolbar();
+    bindBatchOps();
   }
 
   function bindToolbar(){
@@ -167,6 +178,7 @@
       c.onclick = () => {
         sevFilter = sevFilter === c.dataset.sev ? 'all' : c.dataset.sev;
         currentPage = 1;
+        selectedIds.clear();
         root.querySelectorAll('.chip[data-sev]').forEach(x =>
           x.classList.toggle('active', x.dataset.sev === sevFilter));
         loadAlerts();
@@ -177,6 +189,7 @@
       c.onclick = () => {
         statusFilter = statusFilter === c.dataset.st ? 'all' : c.dataset.st;
         currentPage = 1;
+        selectedIds.clear();
         root.querySelectorAll('.chip[data-st]').forEach(x =>
           x.classList.toggle('active', x.dataset.st === statusFilter));
         loadAlerts();
@@ -190,9 +203,59 @@
         searchTimer = setTimeout(() => {
           keyword = inp.value.trim();
           currentPage = 1;
+          selectedIds.clear();
           loadAlerts();
         }, 300);
       };
+    }
+  }
+
+  function bindBatchOps(){
+    const selAll = document.getElementById('alertSelectAll');
+    if (selAll) selAll.onchange = () => {
+      if (selAll.checked) {
+        alerts.forEach(a => { if (a.status !== 'resolved') selectedIds.add(a.id); });
+      } else {
+        selectedIds.clear();
+      }
+      renderList();
+      updateBatchBar();
+    };
+    const batchAck = document.getElementById('alertBatchAck');
+    if (batchAck) batchAck.onclick = () => batchAction('ack');
+    const batchResolve = document.getElementById('alertBatchResolve');
+    if (batchResolve) batchResolve.onclick = () => batchAction('resolve');
+  }
+
+  function updateBatchBar(){
+    const bar = document.getElementById('alertBatchBar');
+    const cnt = document.getElementById('alertBatchCount');
+    if (!bar) return;
+    const hasActions = alerts.some(a => a.status !== 'resolved');
+    bar.style.display = hasActions ? 'flex' : 'none';
+    if (cnt) cnt.textContent = selectedIds.size > 0 ? `已选 ${selectedIds.size} 条` : '';
+    const selAll = document.getElementById('alertSelectAll');
+    if (selAll) {
+      const actionable = alerts.filter(a => a.status !== 'resolved');
+      selAll.checked = actionable.length > 0 && actionable.every(a => selectedIds.has(a.id));
+    }
+  }
+
+  async function batchAction(action){
+    if (selectedIds.size === 0) { toastError('请先选择告警'); return; }
+    const label = action === 'ack' ? '确认' : '解决';
+    if (!await confirmDialog(`确认批量${label} ${selectedIds.size} 条告警？`)) return;
+    try {
+      const resp = await api('/api/alerts/batch', {
+        method: 'POST',
+        body: JSON.stringify({ action, ids: [...selectedIds] })
+      });
+      toastSuccess(`已${label} ${resp.success || 0} 条告警`);
+      selectedIds.clear();
+      loadAlerts();
+      loadAlertCounts();
+    } catch(e) {
+      toastError(e.message || '操作失败');
     }
   }
 
@@ -202,6 +265,7 @@
     if (!alerts.length) {
       box.innerHTML = `<div class="panel">${emptyState('🔕', '暂无告警')}</div>`;
       renderPagination();
+      updateBatchBar();
       return;
     }
     box.innerHTML = alerts.map(a => {
@@ -212,19 +276,23 @@
                   : a.status === 'acked' ? 'warning'
                   : 'success';
       const notifyCount = a.notify_count || 0;
+      const isActionable = a.status !== 'resolved';
+      const checked = selectedIds.has(a.id) ? 'checked' : '';
       return `
         <div class="alert-row ${esc(a.status)}" data-id="${a.id}">
+          ${isActionable ? `<label class="alert-row-check"><input type="checkbox" data-aid="${a.id}" ${checked}></label>` : '<span style="width:20px"></span>'}
           <span class="badge ${sevCls}">${esc(a.severity || 'P2')}</span>
           ${notifyCount > 0 ? `<span class="notify-count" title="通知次数">×${notifyCount}</span>` : ''}
-          <div class="ar-main">
+          <div class="ar-main" data-detail="${a.id}" style="cursor:pointer">
             <div class="ar-title">${esc(a.subject)}</div>
             <div class="ar-detail">${esc(a.description || '')}${target ? ' · ' + esc(target) : ''}</div>
           </div>
           <span class="badge ${stCls}" style="margin-right:8px">${stLabel}</span>
           <span class="ar-time" title="首次出现">${fmtTime(a.first_seen_at)}</span>
           <span class="ar-time" title="最近出现" style="margin-left:4px">${fmtTime(a.last_seen_at)}</span>
+          <button class="btn sm ghost" data-act="detail" style="margin-left:8px">详情</button>
           ${a.status === 'firing'
-            ? '<button class="btn sm primary" data-act="ack" style="margin-left:8px">确认</button>'
+            ? '<button class="btn sm primary" data-act="ack" style="margin-left:4px">确认</button>'
             : ''}
           ${a.status !== 'resolved'
             ? '<button class="btn sm danger" data-act="resolve" style="margin-left:4px">解决</button>'
@@ -236,6 +304,20 @@
     }).join('');
     // 绑定操作按钮（事件委托）
     box.onclick = (e) => {
+      // checkbox 变化
+      const chk = e.target.closest('[data-aid]');
+      if (chk) {
+        const aid = Number(chk.dataset.aid);
+        if (chk.checked) selectedIds.add(aid); else selectedIds.delete(aid);
+        updateBatchBar();
+        return;
+      }
+      // 详情点击
+      const detailArea = e.target.closest('[data-detail]');
+      if (detailArea) {
+        openAlertDetail(Number(detailArea.dataset.detail));
+        return;
+      }
       const btn = e.target.closest('[data-act]');
       if (!btn) return;
       const row = btn.closest('.alert-row');
@@ -244,8 +326,10 @@
       if (btn.dataset.act === 'ack') ackAlert(id);
       else if (btn.dataset.act === 'resolve') resolveAlert(id);
       else if (btn.dataset.act === 'silence') silenceAlert(id);
+      else if (btn.dataset.act === 'detail') openAlertDetail(id);
     };
     renderPagination();
+    updateBatchBar();
   }
 
   function renderPagination(){
@@ -487,7 +571,10 @@
           const chList = (r.channels || []).map(c => CHANNELS.find(([k]) => k === c)?.[1] || c);
           let cond = '-';
           if (r.metric_type === 'metric') cond = `${CMP_LABEL[r.compare] || r.compare} ${r.threshold}`;
-          else if (r.metric_type === 'log_keyword') cond = esc(r.metric || '');
+          else if (r.metric_type === 'log_keyword') {
+            const kws = (r.metric || '').split(',').map(k => k.trim()).filter(Boolean);
+            cond = kws.length ? kws.map(k => `<span class="rule-kw-tag">${esc(k)}</span>`).join('') : '-';
+          }
           return `<tr>
             <td><b>${esc(r.name)}</b>${r.remark ? `<div class="rule-remark">${esc(r.remark)}</div>` : ''}</td>
             <td><span class="rule-mt-badge mt-${esc(r.metric_type)}">${MT_LABEL[r.metric_type] || r.metric_type}</span></td>
@@ -554,7 +641,8 @@
             `<label class="rule-ch-cb"><input type="checkbox" value="${k}" ${channels.includes(k)?'checked':''}> ${v}</label>`
           ).join('')}</div></div>
         <div class="field full" id="rfLogKwWrap" style="display:none"><label>日志关键词</label>
-          <input id="rfLogKw" value="${esc(r.metric_type==='log_keyword' ? (r.metric||'') : '')}" placeholder="匹配日志中的关键词"></div>
+          <input id="rfLogKw" value="${esc(r.metric_type==='log_keyword' ? (r.metric||'') : '')}" placeholder="多个关键词用逗号分隔，如 ERROR,FATAL,Exception">
+          <div class="field-hint">采集器每轮扫描日志，命中任一关键词即触发告警；同一规则+服务由指纹去重不会重复告警</div></div>
         <div class="field full"><label>备注</label>
           <textarea id="rfRemark" rows="2">${esc(r.remark||'')}</textarea></div>
         <div class="full" style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
@@ -930,6 +1018,77 @@
       loadSilences();
     } catch(e) {
       toastError(e.message || '删除失败');
+    }
+  }
+
+  // ==================== 告警详情抽屉 ====================
+
+  async function openAlertDetail(alertId) {
+    const alert = alerts.find(a => a.id === alertId);
+    if (!alert) return;
+    const target = parseTarget(alert.target_info);
+    const sevCls = (alert.severity || 'P2').toLowerCase();
+    const stLabel = ST_LABEL[alert.status] || alert.status;
+
+    const bodyHTML = `
+      <div class="alert-detail">
+        <div class="alert-detail-head">
+          <span class="badge ${sevCls}" style="font-size:14px;padding:4px 12px">${esc(alert.severity || 'P2')}</span>
+          <b style="font-size:16px;margin-left:8px">${esc(alert.subject)}</b>
+          <span class="badge ${alert.status === 'firing' ? 'running' : alert.status === 'acked' ? 'warning' : 'success'}" style="margin-left:12px">${stLabel}</span>
+        </div>
+        <div class="alert-detail-meta">
+          <div><span class="muted">描述：</span>${esc(alert.description || '-')}</div>
+          <div><span class="muted">目标：</span>${esc(target || '-')}</div>
+          <div><span class="muted">首次出现：</span>${fmtTime(alert.first_seen_at)}</div>
+          <div><span class="muted">最近出现：</span>${fmtTime(alert.last_seen_at)}</div>
+          <div><span class="muted">通知次数：</span>${alert.notify_count || 0}</div>
+          <div><span class="muted">升级级别：</span>L${alert.escalation_level || 0}</div>
+          ${alert.ack_by ? `<div><span class="muted">确认人：</span>${esc(alert.ack_by)} ${fmtTime(alert.ack_at)}</div>` : ''}
+          ${alert.resolved_by ? `<div><span class="muted">解决人：</span>${esc(alert.resolved_by)} ${fmtTime(alert.resolved_at)}</div>` : ''}
+        </div>
+        <div class="alert-detail-section">
+          <div class="alert-detail-section-title">📨 通知投递历史</div>
+          <div id="alertEventsList" class="alert-events-list">
+            <div class="muted" style="padding:12px">加载中...</div>
+          </div>
+        </div>
+      </div>`;
+
+    openDrawer({ title: `告警详情 #${alertId}`, body: bodyHTML, wide: true });
+
+    // 加载投递历史
+    try {
+      const events = await api(`/api/alerts/${alertId}/events`);
+      const el = document.getElementById('alertEventsList');
+      if (!el) return;
+      if (!events.length) {
+        el.innerHTML = '<div class="muted" style="padding:12px;text-align:center">暂无投递记录</div>';
+        return;
+      }
+      const CH_LABEL = Object.fromEntries(CHANNELS);
+      el.innerHTML = events.map(ev => {
+        const okCls = ev.ok ? 'evt-ok' : 'evt-fail';
+        const okText = ev.ok ? '✓ 成功' : '✗ 失败';
+        return `<div class="alert-event-row ${okCls}">
+          <span class="evt-time">${fmtTime(ev.created_at)}</span>
+          <span class="evt-channel">${CH_LABEL[ev.channel] || esc(ev.channel)}</span>
+          <span class="evt-status ${okCls}">${okText}</span>
+          <span class="evt-detail muted">${esc(ev.detail || '')}</span>
+        </div>`;
+      }).join('');
+    } catch(e) {
+      console.warn('openAlertDetail events load failed', e);
+      const el = document.getElementById('alertEventsList');
+      if (el) {
+        const msg = e.message || '未知错误';
+        el.innerHTML = `<div style="padding:12px;text-align:center">
+          <div class="muted" style="color:var(--danger)">加载失败：${esc(msg)}</div>
+          <button class="btn sm ghost" id="evtRetryBtn" style="margin-top:8px">重试</button>
+        </div>`;
+        const retryBtn = document.getElementById('evtRetryBtn');
+        if (retryBtn) retryBtn.onclick = () => openAlertDetail(alertId);
+      }
     }
   }
 

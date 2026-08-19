@@ -38,7 +38,9 @@ def check_container_running(host: str, service_name: str, ssh_cfg: dict) -> bool
     """检查容器是否处于运行状态（docker ps 显示 Up），用于未配置 health_url 时的退化检查"""
     client = get_ssh_client(host, ssh_cfg)
     try:
-        cmd = "docker ps --filter 'name=^{}$' --format '{{.Status}}'".format(service_name)
+        # 注意：str.format 会把 {{ 转义为 {，Go 模板双大括号必须写成四层 {{{{，
+        # 否则 docker --format 收到无效模板 {.Status} 会原样输出导致永远判为未运行
+        cmd = "docker ps --filter 'name=^{}$' --format '{{{{.Status}}}}'".format(service_name)
         stdin, stdout, stderr = client.exec_command(cmd, timeout=30)
         status = stdout.read().decode("utf-8", errors="ignore").strip()
         if status.startswith("Up"):

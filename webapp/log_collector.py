@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import db as dbm
+from .alert_engine import get_engine
 
 # docker logs 时间戳解析正则
 _DOCKER_TS_RE = re.compile(
@@ -102,6 +103,8 @@ class LogCollector:
         """单轮采集：遍历所有启用了监控的环境 × 服务器 × 容器"""
         if not self.ssh_func:
             return
+        # 本轮启用的日志关键词规则（每轮加载一次，供所有容器复用）
+        self._current_kw_rules = self._load_log_keyword_rules()
         conn = dbm.get_conn(self.db_path)
         try:
             envs = conn.execute(
@@ -136,6 +139,7 @@ class LogCollector:
 
             for srv in servers:
                 self._collect_server(env_name, env_id, env_ssh, dict(srv))
+        self._current_kw_rules = None
 
     def _collect_server(self, env_name: str, env_id: int, env_ssh: dict, server: dict):
         """采集单台服务器的所有容器日志"""
@@ -175,9 +179,9 @@ class LogCollector:
         last_ts = state["last_ts"] if state else ""
         safe_container = shlex.quote(container)
         if last_ts:
-            cmd = f"docker logs --since '{last_ts}' -t --no-color {safe_container} 2>&1 | head -{self.max_lines}"
+            cmd = f"docker logs --since '{last_ts}' -t {safe_container} 2>&1 | head -{self.max_lines}"
         else:
-            cmd = f"docker logs --since 5m -t --no-color {safe_container} 2>&1 | head -{self.max_lines}"
+            cmd = f"docker logs --since 5m -t {safe_container} 2>&1 | head -{self.max_lines}"
 
         try:
             out = self.ssh_func(host, port, ssh_cfg, cmd, timeout=30)
@@ -212,6 +216,7 @@ class LogCollector:
 
         if entries:
             self._index_log_entries(entries)
+            self._scan_keywords_in_entries(entries, env_name, env_id)
             self._update_scan_state(env_name, host, container, service,
                                     last_line_ts or "", line_offset)
 
@@ -240,6 +245,52 @@ class LogCollector:
             conn.commit()
         finally:
             conn.close()
+
+    def _load_log_keyword_rules(self) -> list:
+        """加载所有已启用的 log_keyword 类型告警规则"""
+        try:
+            conn = dbm.get_conn(self.db_path)
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM alert_rules "
+                    "WHERE metric_type='log_keyword' AND enabled=1"
+                ).fetchall()
+            finally:
+                conn.close()
+            return [dbm._deserialize("alert_rules", dict(r)) for r in rows]
+        except Exception:
+            return []
+
+    def _scan_keywords_in_entries(self, entries: list, env_name: str, env_id: int):
+        """扫描日志条目中的关键词，命中时触发告警"""
+        rules = getattr(self, '_current_kw_rules', None)
+        if not rules:
+            return
+        engine = get_engine()
+        if engine is None:
+            return
+        service = entries[0][2] if entries else ""
+        for rule in rules:
+            metric_raw = (rule.get("metric") or "").strip()
+            if not metric_raw:
+                continue
+            keywords = [kw.strip() for kw in metric_raw.split(",") if kw.strip()]
+            if not keywords:
+                continue
+            # 扫描每条日志，找到第一个命中即触发（同规则同服务由指纹去重）
+            for ts, env, svc, content, file_path, offset, count in entries:
+                if not content:
+                    continue
+                for kw in keywords:
+                    if kw in content:
+                        ctx = [content]
+                        engine.trigger_log_alert(
+                            rule, svc, env_name, content, ctx, env_id,
+                            matched_keyword=kw)
+                        break  # 本条日志只触发一次（取首个命中关键词）
+                else:
+                    continue
+                break  # 本规则已触发，不再扫描后续日志行（指纹去重，同规则同服务只告警一次）
 
     def _update_scan_state(self, env: str, server: str, container: str,
                            service: str, last_ts: str, last_line: int):

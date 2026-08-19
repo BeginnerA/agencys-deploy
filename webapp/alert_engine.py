@@ -39,10 +39,10 @@ DEFAULT_RULES = [
          compare=">", threshold=0, duration_seconds=0,
          scope={"type": "all", "ids": []}, severity="P2",
          channels=["feishu"], escalation_interval=30, remark="内置默认规则"),
-    dict(name="日志错误关键词", metric_type="log_keyword", metric="",
+    dict(name="日志错误关键词", metric_type="log_keyword", metric="ERROR",
          compare=">", threshold=0, duration_seconds=0,
          scope={"type": "all", "ids": []}, severity="P3",
-         channels=["feishu"], escalation_interval=30, remark="内置默认规则（阶段三联动启用）"),
+         channels=["feishu"], escalation_interval=30, remark="内置默认规则（日志联动）"),
 ]
 
 # 自动恢复判定轮数（连续 N 轮正常才 resolved，避免单轮抖动误恢复）
@@ -435,12 +435,16 @@ class AlertEngine:
             if not self._silenced(rule, a.get("target_info") or {}):
                 send_alert(self._db_path, a, rule.get("channels") or [])
 
-    # ---------- 供日志联动调用（阶段三） ----------
+    # ---------- 供日志联动调用 ----------
 
     def trigger_log_alert(self, rule: dict, service: str, env_name: str,
-                          line: str, context: list, env_id: int):
-        """日志关键词命中：创建/更新日志告警（指纹含关键词，收敛由部分唯一索引保证）"""
-        keyword = rule.get("log_keyword") or "log"
+                          line: str, context: list, env_id: int,
+                          matched_keyword: str = ""):
+        """日志关键词命中：创建/更新日志告警（指纹含关键词，收敛由部分唯一索引保证）
+
+        matched_keyword: 实际命中的那个关键词（多关键词场景下精确到单个词）
+        """
+        keyword = matched_keyword or rule.get("metric") or "log"
         target = f"log:{env_id}:{service}:{keyword}"
         self._fire(rule, target,
                    subject=f"日志告警 [{keyword}]: {service}",

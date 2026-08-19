@@ -79,7 +79,8 @@ def create_task():
         extra.append("--rollback")
     task_id = dbm.create_task(current_app.config["DB_PATH"], project_id, type_,
                               ref_id, rec["name"], env, version,
-                              previous_version, g.user["id"])
+                              previous_version, g.user["id"], extra=extra,
+                              action='rollback' if rollback else 'deploy')
     task = dbm.get_task(current_app.config["DB_PATH"], task_id)
     submit_task(current_app.config["DB_PATH"], task, extra)
     detail_version = version or previous_version

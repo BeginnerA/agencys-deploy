@@ -120,6 +120,58 @@ def alert_stats():
     return jsonify(out)
 
 
+@alert_bp.route("/alerts/<int:alert_id>/events")
+@require_auth
+def alert_events(alert_id):
+    """告警通知投递历史"""
+    db = current_app.config["DB_PATH"]
+    conn = dbm.get_conn(db)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM alert_events WHERE alert_id=? ORDER BY id DESC",
+            (alert_id,)
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+@alert_bp.route("/alerts/batch", methods=["POST"])
+@require_auth
+def alert_batch():
+    """批量确认/解决告警"""
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")  # ack / resolve
+    ids = body.get("ids") or []
+    if action not in ("ack", "resolve"):
+        return jsonify({"error": "action 需为 ack 或 resolve"}), 400
+    if not ids or not isinstance(ids, list):
+        return jsonify({"error": "ids 不能为空"}), 400
+    if len(ids) > 100:
+        return jsonify({"error": "单次最多操作 100 条"}), 400
+    db = current_app.config["DB_PATH"]
+    now = int(time.time())
+    success_count = 0
+    for aid in ids:
+        a = dbm.get_record(db, "alerts", int(aid))
+        if not a:
+            continue
+        if action == "ack" and a["status"] == "firing":
+            rule = dbm.get_record(db, "alert_rules", a["rule_id"]) or {}
+            dbm.update_record(db, "alerts", int(aid), dict(
+                status="acked", ack_by=g.user["username"], ack_at=now,
+                escalation_at=now + int(rule.get("escalation_interval", 30)) * 60))
+            success_count += 1
+        elif action == "resolve" and a["status"] != "resolved":
+            dbm.update_record(db, "alerts", int(aid), dict(
+                status="resolved", resolved_by=g.user["username"],
+                resolved_at=now, resolved_type="manual"))
+            success_count += 1
+    audit(f"batch_{action}_alerts", "alert", 0,
+          {"ids": ids, "success": success_count})
+    return jsonify({"ok": True, "success": success_count})
+
+
 # ---------- 规则 CRUD ----------
 
 @alert_bp.route("/alerts/rules")
@@ -146,6 +198,15 @@ def _validate_rule(body, partial=False) -> str:
         if body.get("metric_type") == "status" and body.get("metric") not in (
                 "service_down", "task_failed"):
             return "metric 非法"
+        if body.get("metric_type") == "log_keyword":
+            kw_raw = (body.get("metric") or "").strip()
+            if not kw_raw:
+                return "日志关键词不能为空"
+            keywords = [k.strip() for k in kw_raw.split(",") if k.strip()]
+            if not keywords:
+                return "日志关键词不能为空"
+            if any(len(k) > 100 for k in keywords):
+                return "单个关键词长度不能超过 100"
     if has("severity") and body.get("severity") not in SEVERITIES:
         return "severity 非法"
     if has("compare") and body.get("compare") not in ("<", "<=", ">", ">="):

@@ -11,6 +11,7 @@
       return await window.cfgProject.render(root, pid, parts[3] || 'overview');
     }
     if (parts[1] === 'users') return await window.cfgHome.render(root, 'users');
+    if (parts[1] === 'channels') return await window.cfgHome.render(root, 'channels');
     if (parts[1] === 'servers'){
       // 平台级服务器入口（工作台统计卡）：跳转到第一个项目的服务器子页
       const ps = await api('/api/projects');

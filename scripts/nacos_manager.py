@@ -24,6 +24,9 @@ class NacosClient:
         # 下线实例快照：{(service_name, group, ip): [{port, cluster, ephemeral}]}
         # 实例被 enabled=false 后 list 接口不再返回它，上线必须依赖快照直接恢复
         self._snapshots = {}
+        # 记录哪些 (service_name, group, ip) 在 offline 时确实找到了实例
+        # 用于 online 时判断是否需要等待 Nacos 健康（未快照说明回滚前就未注册，无需等待）
+        self._snapshotted_keys = set()
 
     def _ensure_token(self):
         if not self.username:
@@ -108,14 +111,19 @@ class NacosClient:
                 found = True
         if found:
             self._snapshots[snap_key] = snapshots
+            self._snapshotted_keys.add(snap_key)
         else:
             log(f"Nacos [{service_name}/{grp}] 未找到 IP={ip} 的实例，可能已下线")
 
-    def online_ip(self, service_name: str, ip: str, weight: float = 1.0, group: str = None):
+    def online_ip(self, service_name: str, ip: str, weight: float = 1.0, group: str = None) -> bool:
         """把指定 IP 下的所有实例全部上线并设置权重
-
+    
         优先用下线时记录的快照直接恢复（实例下线后 list 接口不再返回它，
         靠 list 查找会永远找不到）；再用 list 兜底处理新注册的实例。
+    
+        Returns:
+            True  - 找到并恢复了实例（快照或 list 兜底）
+            False - 未找到任何实例（无快照且 list 中不可见），调用方不应等待健康检查
         """
         grp = group or self.group
         snap_key = (service_name, grp, ip)
@@ -131,6 +139,8 @@ class NacosClient:
                 restored += 1
         if restored == 0:
             log(f"Nacos [{service_name}/{grp}] 无下线快照且 list 中不可见 IP={ip} 的实例，未执行上线（可能尚未注册）")
+            return False
+        return True
 
     def wait_for_absence(self, service_name: str, ip: str, timeout: int = 60, group: str = None):
         """等待指定 IP 在该服务下无健康实例"""

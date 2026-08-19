@@ -5,6 +5,7 @@
   let overview = null;  // dashboard/overview 缓存
   let trendMode = 7;
   let destroyed = false; // 路由切换后丢弃 in-flight 响应，防覆盖新页面/泄漏轮询
+  let monReqSeq = 0;     // loadMonitor 请求序号，防竞态：只渲染最新请求的响应
 
   // ---- KPI 条（规格 §6.1）----
   function kpiRow(o){
@@ -67,6 +68,7 @@
     const rows = items.map(t => `
       <div class="list-item" data-task="${t.id}">
         <div class="li-main ellipsis">#${t.id} ${esc(t.name)}${t.env ? ' <span class="weak">['+esc(t.env)+']</span>' : ''}</div>
+        ${t.action === 'rollback' ? '<span class="tag tag-warn">回滚</span>' : ''}
         ${statusBadge(t.status)}
       </div>`).join('');
     return `<div class="panel"><div class="panel-title">${title}</div>
@@ -76,10 +78,23 @@
   // ---- 环境切换后重新加载监控数据 ----
   async function loadMonitor(){
     if (destroyed) return;
+    const seq = ++monReqSeq;
     try {
       const mon = await api(`/api/monitor/overview?project_id=${window._dashProjectId}&env=${window._dashCurEnv}`).catch(() => null);
-      if (!destroyed) renderAll(mon);
+      if (!destroyed && seq === monReqSeq) renderAll(mon);
     } catch(e) { /* ignore */ }
+  }
+
+  // ---- 项目切换 ----
+  async function switchProject(projectId) {
+    window._dashProjectId = projectId;
+    window._dashCurEnv = 'all';
+    // 加载新项目的环境列表
+    try {
+      const envs = await api(`/api/projects/${projectId}/environments`);
+      window._dashEnvs = envs;
+    } catch(e) { window._dashEnvs = []; }
+    await loadMonitor();
   }
 
   // ---- 模块导出（router 约定：render 返回定时器数组）----
@@ -93,14 +108,21 @@
           try{
             const projects = await api('/api/projects');
             if (projects.length){
-              window._dashProjectId = projects[0].id;
-              const envs = await api(`/api/projects/${projects[0].id}/environments`);
-              window._dashEnvs = envs;
-              if (!window._dashCurEnv || !envs.find(e => e.name === window._dashCurEnv)){
-                const def = envs.find(e => e.is_default) || envs[0];
-                window._dashCurEnv = def ? def.name : '';
+              // 保留上次选择的项目，如不存在则回退首个
+              const prevId = window._dashProjectId;
+              const matched = prevId && projects.find(p => p.id === Number(prevId));
+              if (!matched) window._dashProjectId = projects[0].id;
+              window._dashProjects = projects;
+              const curProject = projects.find(p => p.id === Number(window._dashProjectId));
+              if (curProject) {
+                const envs = await api(`/api/projects/${curProject.id}/environments`);
+                window._dashEnvs = envs;
+                // 默认选中“全部”，聚合所有环境的服务器
+                window._dashCurEnv = window._dashCurEnv && envs.find(e => e.name === window._dashCurEnv) ? window._dashCurEnv : 'all';
+                await loadMonitor();
+              } else if (!destroyed) {
+                renderAll(null);
               }
-              await loadMonitor();
             } else if (!destroyed) {
               renderAll(null);
             }
@@ -145,11 +167,21 @@
       ...allServers.map(s => ({host: s.host, ssh_ok: s.ssh_ok, containers: s.containers, ts: s.ts, error: s.error, hm: hmMap[s.host] || null})),
       ...hmEntries.filter(([h]) => !allServers.some(s => s.host === h)).map(([host, m]) => ({host, ssh_ok: false, containers: 0, ts: 0, error: '', hm: m}))
     ];
-    const curEnv = (mon && mon.env) || window._dashCurEnv || '';
-    const envOpts = (window._dashEnvs || []).map(e =>
-      `<option value="${esc(e.name)}" ${e.name===curEnv?'selected':''}>${esc(e.name)}</option>`).join('');
+    const curEnv = (mon && mon.env) || window._dashCurEnv || 'all';
+    const envOpts = `<option value="all" ${curEnv==='all'?'selected':''}>全部</option>` +
+      (window._dashEnvs || []).map(e =>
+        `<option value="${esc(e.name)}" ${e.name===curEnv?'selected':''}>${esc(e.name)}</option>`).join('');
+    // 项目切换下拉
+    const projects = window._dashProjects || [];
+    const projOpts = projects.map(p =>
+      `<option value="${p.id}" ${p.id === Number(window._dashProjectId) ? 'selected' : ''}>${esc(p.name)}</option>`
+    ).join('');
     root.innerHTML = `
       ${kpiRow(overview)}
+      <div class="dash-proj-bar">
+        <span class="weak" style="font-size:12px">项目</span>
+        <select class="filter-sel" id="dashProjSel">${projOpts}</select>
+      </div>
       <div class="dash-grid">
         <div class="panel chart-box"><div class="panel-title">雷达健康指数${radar.demo ? '<span class="demo-tag">演示数据</span>' : ''}</div>
           <div id="chartRadar" style="height:260px"></div></div>
@@ -194,6 +226,9 @@
         </tbody></table></div>
       </div>
     `;
+    // 项目切换
+    const projSel = document.getElementById('dashProjSel');
+    if (projSel) projSel.onchange = () => { switchProject(Number(projSel.value)); };
     // 环境切换
     const envSel = document.getElementById('envSwitch');
     if (envSel) envSel.onchange = () => { window._dashCurEnv = envSel.value; loadMonitor(); };

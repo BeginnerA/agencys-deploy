@@ -123,12 +123,25 @@
     if (destroyed) return; // 路由切换后在途响应丢弃，防新页面弹出旧抽屉
     const svc = services.find(s => s.id === sid);
     const envs = state.envs;
-    const body = openDrawer({ title: (rollback ? '回滚 ' : '发布 ') + (svc ? svc.name : ''), wide:false, body: `
+    // 回滚入口来自服务卡片：锁定服务发布类型与目标服务，仅需回滚目标版本。
+    // 版本号/自动版本号/跳过构建与回滚无关（--auto-version 与 --rollback 互斥、
+    // 回滚本身跳过构建、version 由后端兜底为目标版本），回滚表单不展示。
+    const body = openDrawer({ title: (rollback ? '回滚 ' : '发布 ') + (svc ? svc.name : ''), wide:false, body: rollback ? `
+      <div class="form-grid">
+        <div class="field full"><label>回滚服务</label>
+          <input value="${esc(svc ? svc.name : '')}" readonly></div>
+        <div class="field"><label>环境</label>
+          <select id="dpEnv">${envs.map(e => `<option ${e.name === state.currentEnv ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</select></div>
+        <div class="field"><label>回滚目标版本</label><input id="dpPrevVersion" placeholder="必填，回滚到的版本"></div>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:20px">
+        <button class="btn primary flex-1" id="dpSubmit">确认回滚</button>
+      </div>` : `
       <div class="form-grid">
         <div class="field full"><label>发布类型</label>
           <select id="dpType">
-            <option value="project" ${!rollback ? 'selected' : ''}>服务发布</option>
-            <option value="pipeline" ${rollback ? 'selected' : ''}>流水线发布</option>
+            <option value="project" selected>服务发布</option>
+            <option value="pipeline">流水线发布</option>
           </select></div>
         <div class="field full"><label>服务 / 流水线</label>
           <select id="dpRef"></select></div>
@@ -140,9 +153,26 @@
         <div class="field check"><label><input type="checkbox" id="dpSkip"> 跳过构建</label></div>
       </div>
       <div style="display:flex;gap:10px;margin-top:20px">
-        <button class="btn primary flex-1" id="dpSubmit">${rollback ? '确认回滚' : '确认发布'}</button>
+        <button class="btn primary flex-1" id="dpSubmit">确认发布</button>
       </div>` });
-    // 类型切换时联动刷新 ref 选项（回滚默认流水线，可切回服务发布）
+    if (rollback){
+      // 回滚提交：固定 type=project/ref_id=sid，version 留空由后端兜底为目标版本
+      document.getElementById('dpSubmit').onclick = async () => {
+        const env = document.getElementById('dpEnv').value;
+        const previous_version = document.getElementById('dpPrevVersion').value.trim();
+        try{
+          if (!previous_version) throw new Error('请填写回滚目标版本');
+          const resp = await api('/api/tasks', {method:'POST', body: JSON.stringify({
+            project_id: pid, type: 'project', ref_id: sid, env, version: '', previous_version,
+            rollback: true, auto_version: false, skip_build: false})});
+          toastSuccess(`任务 #${resp.id} 已创建`);
+          document.getElementById('drawerRoot').classList.add('hidden');
+          location.hash = '#/deploy';
+        }catch(e){ toastError(e.message); }
+      };
+      return;
+    }
+    // 发布：类型切换时联动刷新 ref 选项
     const refOpts = () => {
       const isPipe = document.getElementById('dpType').value === 'pipeline';
       return isPipe
@@ -162,7 +192,6 @@
       const skip_build = document.getElementById('dpSkip').checked;
       try{
         if (auto_version && (version || previous_version)) throw new Error('自动版本与显式版本互斥');
-        if (rollback && !version && !previous_version) throw new Error('回滚需指定版本');
         const [t, rid] = ref.split(':');
         const resp = await api('/api/tasks', {method:'POST', body: JSON.stringify({
           project_id: pid, type: t, ref_id: Number(rid), env, version, previous_version,

@@ -14,6 +14,11 @@
   let auditTotal = 0;
   const auditPageSize = 50;
 
+  // 服务日志分页状态
+  let svcLogPage = 1;
+  let svcLogTotal = 0;
+  const svcLogPageSize = 50;
+
   const ACTION_CN = {
     login:'登录', login_failed:'登录失败', change_password:'修改密码',
     create_user:'创建用户', update_user:'更新用户', delete_user:'删除用户',
@@ -176,7 +181,10 @@
       stopTail();
       body.innerHTML = `
         <div class="panel">
-          <div class="panel-title">服务日志</div>
+          <div class="panel-title">服务日志
+            <span style="flex:1"></span>
+            ${isAdmin() ? '<button class="btn sm ghost" id="svcLogSettingsBtn">⚙ 保留设置</button>' : ''}
+          </div>
           <div class="flex gap-3" style="margin-bottom:12px;flex-wrap:wrap;align-items:center">
             <span class="weak" style="font-size:12px">环境</span>
             <select class="filter-sel" id="svcLogEnvSel">
@@ -195,7 +203,7 @@
           </div>
         </div>
         <div id="svcLogContextDrawer" class="drawer-mask" style="display:none">
-          <div class="drawer" style="width:600px">
+          <div class="drawer" style="width:80vw;max-width:1000px">
             <div class="drawer-head">
               <b>日志上下文</b>
               <div class="dh-right">
@@ -203,15 +211,18 @@
               </div>
             </div>
             <div class="drawer-body">
-              <pre id="svcLogCtxContent" class="log-console" style="height:500px;overflow:auto"></pre>
+              <pre id="svcLogCtxContent" class="log-console" style="height:calc(100vh - 140px);overflow:auto"></pre>
             </div>
           </div>
         </div>`;
       loadServiceLogOptions();
-      document.getElementById('svcLogSearch').onclick = () => searchServiceLogs();
+      document.getElementById('svcLogSearch').onclick = () => { svcLogPage = 1; searchServiceLogs(); };
       document.getElementById('svcLogCtxClose').onclick = () => {
         document.getElementById('svcLogContextDrawer').style.display = 'none';
       };
+      if (isAdmin()) {
+        document.getElementById('svcLogSettingsBtn').onclick = () => openLogSettingsDrawer();
+      }
       return;
     }
     body.innerHTML = `
@@ -310,8 +321,10 @@
       if (env) params.set('env', env);
       if (service) params.set('service', service);
       if (keyword) params.set('keyword', keyword);
-      params.set('page_size', '100');
+      params.set('page', String(svcLogPage));
+      params.set('page_size', String(svcLogPageSize));
       const data = await api('/api/logs?' + params);
+      svcLogTotal = data.total || 0;
       renderServiceLogResults(data);
     } catch (e) {
       if (results) results.innerHTML = `<div class="panel">检索失败：${esc(e.message)}</div>`;
@@ -325,8 +338,9 @@
       results.innerHTML = '<div class="muted" style="text-align:center;padding:40px">无匹配结果</div>';
       return;
     }
+    const totalPages = Math.max(1, Math.ceil(svcLogTotal / svcLogPageSize));
     results.innerHTML = `
-      <div class="muted" style="font-size:12px;margin-bottom:8px">共 ${data.total} 条，显示前 ${data.rows.length} 条</div>
+      <div class="muted" style="font-size:12px;margin-bottom:8px">共 ${svcLogTotal} 条，第 ${svcLogPage}/${totalPages} 页</div>
       <div class="tbl-wrap">
         <table class="tbl">
           <thead><tr><th style="width:140px">时间</th><th style="width:80px">环境</th><th style="width:120px">服务</th><th>内容</th><th style="width:60px">操作</th></tr></thead>
@@ -342,7 +356,21 @@
             `).join('')}
           </tbody>
         </table>
-      </div>`;
+      </div>
+      <div id="svcLogPager" style="display:flex;gap:8px;align-items:center;justify-content:flex-end;padding:8px 0"></div>`;
+    // 分页控件
+    const pg = document.getElementById('svcLogPager');
+    if (pg && svcLogTotal > svcLogPageSize) {
+      pg.innerHTML = `
+        <span class="muted" style="font-size:12px">共 ${svcLogTotal} 条</span>
+        <button class="btn sm" ${svcLogPage <= 1 ? 'disabled' : ''} id="svcLogPgPrev">‹ 上一页</button>
+        <span class="muted" style="font-size:12px">${svcLogPage} / ${totalPages}</span>
+        <button class="btn sm" ${svcLogPage >= totalPages ? 'disabled' : ''} id="svcLogPgNext">下一页 ›</button>`;
+      const prev = document.getElementById('svcLogPgPrev');
+      const next = document.getElementById('svcLogPgNext');
+      if (prev) prev.onclick = () => { if (svcLogPage > 1) { svcLogPage--; searchServiceLogs(); } };
+      if (next) next.onclick = () => { if (svcLogPage < totalPages) { svcLogPage++; searchServiceLogs(); } };
+    }
     // 事件委托绑定上下文按钮
     results.onclick = async (e) => {
       const btn = e.target.closest('[data-ctx]');
@@ -354,7 +382,7 @@
       drawer.style.display = 'flex';
       content.textContent = '加载中...';
       try {
-        const ctxData = await api(`/api/logs/context?id=${entryId}&lines=10`);
+        const ctxData = await api(`/api/logs/context?id=${entryId}&lines=50`);
         if (ctxData.error) {
           content.textContent = ctxData.error;
           return;
@@ -363,6 +391,45 @@
       } catch (e) {
         content.textContent = '加载失败：' + e.message;
       }
+    };
+  }
+
+  // ---- 日志保留设置抽屉 ----
+  async function openLogSettingsDrawer() {
+    let settings = { log_retention_days: 7, log_archive_days: 30 };
+    try { settings = await api('/api/logs/settings'); } catch(e) { /* ignore */ }
+    const bodyHTML = `
+      <div class="form-grid">
+        <div class="field">
+          <label>日志保留天数</label>
+          <input type="number" id="logSetRetention" value="${settings.log_retention_days || 7}" min="1" max="365">
+          <div class="field-hint">超过该天数的日志文件将被自动归档压缩</div>
+        </div>
+        <div class="field">
+          <label>归档保留天数</label>
+          <input type="number" id="logSetArchive" value="${settings.log_archive_days || 30}" min="1" max="365">
+          <div class="field-hint">超过该天数的归档文件将被自动永久删除</div>
+        </div>
+        <div class="full" style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
+          <button class="btn" id="logSetCancel">取消</button>
+          <button class="btn primary" id="logSetSave">保存</button>
+        </div>
+      </div>`;
+    openDrawer({ title: '日志保留设置', body: bodyHTML });
+    document.getElementById('logSetCancel').onclick = () => {
+      const c = document.getElementById('dwClose'); if (c) c.click();
+    };
+    document.getElementById('logSetSave').onclick = async () => {
+      const retention = parseInt(document.getElementById('logSetRetention').value) || 7;
+      const archive = parseInt(document.getElementById('logSetArchive').value) || 30;
+      if (retention < 1 || retention > 365 || archive < 1 || archive > 365) {
+        toastError('天数需在 1~365 之间'); return;
+      }
+      try {
+        await api('/api/logs/settings', { method: 'PUT', body: JSON.stringify({ log_retention_days: retention, log_archive_days: archive }) });
+        toastSuccess('设置已保存');
+        const c = document.getElementById('dwClose'); if (c) c.click();
+      } catch(e) { toastError(e.message || '保存失败'); }
     };
   }
 

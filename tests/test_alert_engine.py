@@ -342,6 +342,68 @@ class TestAlertEngine(unittest.TestCase):
         rule["scope"] = {"type": "env", "ids": [self.env_id]}
         self.assertTrue(e._in_scope(rule, env, host="h1"))
 
+    # ---- 日志关键词联动 ----
+    def _log_kw_rule(self, metric="ERROR", **kw):
+        fields = dict(name="log kw test", metric_type="log_keyword", metric=metric,
+                      compare=">", threshold=0, duration_seconds=0,
+                      scope={"type": "all", "ids": []}, severity="P3",
+                      channels=["wecom"], escalation_interval=30, enabled=1,
+                      remark="", created_at=1, updated_at=1)
+        fields.update(kw)
+        return dbm.create_record(self.db, "alert_rules", fields)
+
+    def test_trigger_log_alert_creates_alert(self):
+        """trigger_log_alert: 命中关键词创建告警"""
+        rid = self._log_kw_rule(metric="ERROR")
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules", rid)
+        e.trigger_log_alert(rule, "api-svc", "prod", "ERROR: db timeout",
+                            ["ERROR: db timeout"], self.env_id,
+                            matched_keyword="ERROR")
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("ERROR", alerts[0]["subject"])
+        self.assertIn("api-svc", alerts[0]["subject"])
+        self.assertEqual(alerts[0]["status"], "firing")
+
+    def test_trigger_log_alert_convergence(self):
+        """trigger_log_alert: 同规则+同服务+同关键词 不重复创建（指纹收敛）"""
+        rid = self._log_kw_rule(metric="FATAL")
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules", rid)
+        e.trigger_log_alert(rule, "api-svc", "prod", "FATAL crash 1",
+                            ["FATAL crash 1"], self.env_id, matched_keyword="FATAL")
+        e.trigger_log_alert(rule, "api-svc", "prod", "FATAL crash 2",
+                            ["FATAL crash 2"], self.env_id, matched_keyword="FATAL")
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 1)
+        # 但 last_seen_at 应更新
+        self.assertGreaterEqual(alerts[0]["last_seen_at"], alerts[0]["first_seen_at"])
+
+    def test_trigger_log_alert_multi_keyword_different_fingerprints(self):
+        """多关键词规则: 不同关键词产生不同指纹，分别告警"""
+        rid = self._log_kw_rule(metric="ERROR,FATAL")
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules", rid)
+        e.trigger_log_alert(rule, "svc", "prod", "ERROR happened",
+                            ["ERROR happened"], self.env_id, matched_keyword="ERROR")
+        e.trigger_log_alert(rule, "svc", "prod", "FATAL happened",
+                            ["FATAL happened"], self.env_id, matched_keyword="FATAL")
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 2)
+
+    def test_trigger_log_alert_uses_matched_keyword_over_metric(self):
+        """matched_keyword 优先于 metric 字段作为告警关键词"""
+        rid = self._log_kw_rule(metric="ERROR,FATAL")
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules", rid)
+        e.trigger_log_alert(rule, "svc", "prod", "OOM killed",
+                            ["OOM killed"], self.env_id, matched_keyword="OOM")
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("OOM", alerts[0]["subject"])
+        self.assertIn("OOM", alerts[0]["description"])
+
 
 if __name__ == "__main__":
     unittest.main()

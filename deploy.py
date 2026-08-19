@@ -329,9 +329,15 @@ class Deployer:
                 self.nacos.wait_for_absence(svc, host, timeout=60, group=grp)
 
     def nacos_online(self, host: str, weight: float = 1.0):
+        """上线 Nacos 实例并等待健康；若 online_ip 返回 False（无快照且 list 不可见），跳过该服务/分组的等待"""
+        restored_any = False
         for svc in self.service_names():
             for grp in self.nacos_groups():
-                self.nacos.online_ip(svc, host, weight, group=grp)
+                ok = self.nacos.online_ip(svc, host, weight, group=grp)
+                if ok:
+                    restored_any = True
+        if not restored_any:
+            return  # 所有服务/分组均未找到实例，无需等待健康检查
         for svc in self.service_names():
             for grp in self.nacos_groups():
                 self.nacos.wait_for_healthy(svc, host, timeout=120, group=grp)
@@ -634,21 +640,56 @@ class Deployer:
                 ssh_cfg = merge_server_ssh(self.ssh_cfg, srv)
                 server = RemoteServer(host, ssh_cfg)
                 nacos_ip = self._nacos_ip(srv)
+                snapshotted = False
+                container_rolled_back = False
                 try:
                     self.nacos_offline(nacos_ip)
+                    # 记录回滚前 Nacos 是否确实有该服务的实例（用于后续判断是否需要等待 Nacos 上线）
+                    snapshotted = any(
+                        (svc, grp, nacos_ip) in self.nacos._snapshotted_keys
+                        for svc in self.service_names()
+                        for grp in self.nacos_groups()
+                    )
                     self.rollback_container(server)
+                    container_rolled_back = True  # rollback_container 成功即标记
                     wait_for_healthy(host, self.project, ssh_override=srv, env=self.env)
-                    self.nacos_online(nacos_ip, weight=1.0)
+                    # 容器回滚成功 + 健康检查通过
+                    if snapshotted:
+                        # 回滚前服务在 Nacos 有注册，需要恢复上线并等待健康
+                        try:
+                            self.nacos_online(nacos_ip, weight=1.0)
+                        except Exception as ne:
+                            # 容器已回滚成功，仅 Nacos 上线失败，记为警告而非失败
+                            log(f"[{host}] 警告: 容器回滚成功，但 Nacos 上线异常: {ne}")
+                    else:
+                        # 回滚前服务就未在 Nacos 注册，尝试上线但不等待健康
+                        try:
+                            self.nacos_online(nacos_ip, weight=1.0)
+                        except Exception:
+                            pass
                     log(f"========== {host} 回滚成功 ==========")
                     rollback_results[host] = True
                 except Exception as e:
                     log(f"[{host}] 回滚异常: {e}")
-                    try:
-                        self.nacos_online(nacos_ip, weight=1.0)
-                    except Exception:
-                        pass
-                    log(f"========== {host} 回滚失败 ==========")
-                    rollback_results[host] = False
+                    if container_rolled_back:
+                        # 容器已成功回滚到目标版本，仅 Nacos 等后续步骤失败
+                        log(f"[{host}] 警告: 容器已回滚到 {self.previous_version}，但后续步骤异常: {e}")
+                        if snapshotted:
+                            try:
+                                self.nacos_online(nacos_ip, weight=1.0)
+                            except Exception:
+                                pass
+                        log(f"========== {host} 回滚成功（容器已回滚，Nacos 待恢复） ==========")
+                        rollback_results[host] = True
+                    else:
+                        # 容器未成功回滚
+                        if snapshotted:
+                            try:
+                                self.nacos_online(nacos_ip, weight=1.0)
+                            except Exception:
+                                pass
+                        log(f"========== {host} 回滚失败 ==========")
+                        rollback_results[host] = False
                 finally:
                     server.close()
         finally:

@@ -71,6 +71,13 @@
 /* 规则条件次级文本 */
 .rule-sub{font-size:var(--fs-11);color:var(--text-3);margin-top:2px}
 
+/* 日志关键词标签（规则列表内） */
+.rule-kw-tag{display:inline-block;padding:1px 7px;border-radius:var(--r-full);font-size:var(--fs-11);
+  background:rgba(254,176,25,.10);color:var(--warning);border:1px solid rgba(254,176,25,.30);margin:1px 2px}
+
+/* 表单字段提示 */
+.field-hint{font-size:var(--fs-11);color:var(--text-3);margin-top:4px;line-height:1.5}
+
 /* 渠道标签列表 */
 .rule-ch-list{display:flex;flex-wrap:wrap;gap:4px}
 .rule-ch-tag{display:inline-block;padding:1px 6px;border-radius:var(--r-full);font-size:var(--fs-11);
@@ -103,3 +110,33 @@
 #statsChartWrap .error-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:var(--sp-7) var(--sp-5)}
 #statsChartWrap .error-state .e-ico{font-size:var(--fs-32);margin-bottom:var(--sp-3)}
 #statsChartWrap .error-state .muted{color:var(--text-2);font-size:var(--fs-13);margin-bottom:var(--sp-4)}
+
+/* ==================== 批量操作栏 ==================== */
+.alert-batch-bar{display:flex;align-items:center;gap:var(--sp-3);margin-bottom:var(--sp-3);padding:8px 14px;
+  background:rgba(0,212,255,.04);border:1px solid var(--border);border-radius:var(--r-card)}
+.alert-batch-check{display:inline-flex;align-items:center;gap:6px;font-size:var(--fs-13);cursor:pointer;color:var(--text-1)}
+.alert-batch-check input{width:auto;margin:0}
+.alert-row-check{display:inline-flex;align-items:center;cursor:pointer}
+.alert-row-check input{width:auto;margin:0}
+
+/* ==================== 告警详情抽屉 ==================== */
+.alert-detail{padding:4px 0}
+.alert-detail-head{display:flex;align-items:center;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.alert-detail-meta{display:grid;grid-template-columns:1fr 1fr;gap:8px 24px;margin-bottom:20px;
+  padding:14px 16px;background:rgba(0,212,255,.03);border:1px solid var(--border);border-radius:var(--r-card);
+  font-size:var(--fs-13)}
+.alert-detail-meta .muted{font-size:var(--fs-12)}
+.alert-detail-section{margin-top:16px}
+.alert-detail-section-title{font-size:var(--fs-14);font-weight:600;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+
+/* 通知投递历史列表 */
+.alert-events-list{display:flex;flex-direction:column;gap:6px}
+.alert-event-row{display:flex;align-items:center;gap:12px;padding:8px 12px;
+  border:1px solid var(--border);border-radius:var(--r-ctl);font-size:var(--fs-12);
+  background:rgba(17,34,65,.3)}
+.evt-time{font-family:var(--font-num);color:var(--text-2);white-space:nowrap;min-width:100px}
+.evt-channel{min-width:60px;font-weight:500}
+.evt-status{min-width:50px;font-weight:600}
+.evt-status.evt-ok{color:var(--success)}
+.evt-status.evt-fail{color:var(--danger)}
+.evt-detail{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--fs-11)}

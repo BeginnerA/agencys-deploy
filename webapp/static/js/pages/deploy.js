@@ -5,6 +5,7 @@
   let statusFilter = 'all';
   let projFilter = 'all'; // all / 项目 id
   let envFilter = 'all';  // all / 环境名
+  let actionFilter = 'all'; // all / deploy / rollback
   let projects = [];
   let envs = [];
   let tasks = [];
@@ -34,16 +35,18 @@
     const root = document.getElementById('pageRoot');
     const list = tasks.filter(t => statusFilter === 'all' || t.status === statusFilter)
       .filter(t => (projFilter === 'all' || t.project_id === Number(projFilter)) &&
-                   (envFilter === 'all' || t.env === envFilter));
+                   (envFilter === 'all' || t.env === envFilter))
+      .filter(t => actionFilter === 'all' || (t.action || 'deploy') === actionFilter);
     const box = root.querySelector('#taskBox');
     if (!box) return;
     box.innerHTML = list.length ? `
       <div class="panel" style="padding:0">
         <div class="tbl-wrap"><table class="tbl task-tbl"><thead><tr>
-          <th>#</th><th>任务</th><th>类型</th><th>环境</th><th>版本</th><th>状态</th><th>启动时间</th><th>耗时</th></tr></thead><tbody>
+          <th>#</th><th>任务</th><th>操作</th><th>类型</th><th>环境</th><th>版本</th><th>状态</th><th>启动时间</th><th>耗时</th></tr></thead><tbody>
           ${list.map(t => `<tr>
             <td class="num">${t.id}</td>
             <td><span class="task-name" data-task="${t.id}">${esc(t.name)}</span></td>
+            <td>${t.action === 'rollback' ? '<span class="tag tag-warn">回滚</span>' : '<span class="tag tag-ok">发布</span>'}</td>
             <td>${t.type === 'pipeline' ? '流水线' : '服务'}</td>
             <td>${esc(t.env || '-')}</td>
             <td class="num">${esc(t.version || t.previous_version || '-')}</td>
@@ -67,9 +70,10 @@
     const body = openDrawer({ title: `任务 #${id} ${task.name}`, wide: true, onClose: () => { if (stopStream) stopStream(); }, body: `
       <div class="detail-grid">
         <div><div class="dg-label">状态</div><div style="margin-top:2px" id="taskStatusBadge">${statusBadge(task.status)}</div></div>
+        <div><div class="dg-label">操作</div><div style="margin-top:2px">${task.action === 'rollback' ? '<span class="tag tag-warn">回滚</span>' : '<span class="tag tag-ok">发布</span>'}</div></div>
         <div><div class="dg-label">类型</div><div style="margin-top:2px">${task.type === 'pipeline' ? '流水线' : '服务'}</div></div>
         <div><div class="dg-label">环境</div><div class="num" style="margin-top:2px">${esc(task.env || '-')}</div></div>
-        <div><div class="dg-label">版本 → 回滚目标</div><div class="num" style="margin-top:2px">${esc(task.version || '-')} → ${esc(task.previous_version || '-')}</div></div>
+        <div><div class="dg-label">发布版本</div><div class="num" style="margin-top:2px">${task.action === 'rollback' ? esc(task.version || task.previous_version || '-') : esc(task.previous_version || '-') + ' → ' + esc(task.version || '-')}</div></div>
         <div><div class="dg-label">启动</div><div class="num" style="margin-top:2px">${fmtTime(task.started_at)}</div></div>
       </div>
       <div class="log-console" id="taskLog">加载中...</div>
@@ -172,6 +176,9 @@
   async function rerunTask(task){
     if (!await confirmDialog(`确认使用相同参数重新运行任务 #${task.id}（${task.name}）？`)) return;
     try{
+      // 执行参数持久化于 task.extra（--skip-build/--rollback/--auto-version）；
+      // 旧任务无 extra 记录时回退到版本字段推断 auto_version
+      const extra = Array.isArray(task.extra) ? task.extra : [];
       const resp = await api('/api/tasks', {method:'POST', body: JSON.stringify({
         project_id: task.project_id,
         type: task.type,
@@ -179,9 +186,9 @@
         env: task.env || '',
         version: task.version || '',
         previous_version: task.previous_version || '',
-        rollback: false,
-        auto_version: !task.version && !task.previous_version,
-        skip_build: false,
+        rollback: extra.includes('--rollback'),
+        auto_version: extra.includes('--auto-version') || (!task.version && !task.previous_version),
+        skip_build: extra.includes('--skip-build'),
       })});
       toastSuccess(`任务 #${resp.id} 已创建，开始重新运行`);
       await loadTasks();
@@ -224,6 +231,9 @@
           <span style="width:1px;height:20px;background:var(--border);margin:0 4px"></span>
           <span class="weak" style="font-size:12px">状态</span>
           ${statuses.map(([k, v]) => `<span class="chip ${k === statusFilter ? 'active' : ''}" data-st="${k}">${v}</span>`).join('')}
+          <span style="width:1px;height:20px;background:var(--border);margin:0 4px"></span>
+          <span class="weak" style="font-size:12px">操作</span>
+          ${[['all','全部'],['deploy','发布'],['rollback','回滚']].map(([k, v]) => `<span class="chip ${k === actionFilter ? 'active' : ''}" data-act="${k}">${v}</span>`).join('')}
           <span style="flex:1"></span>
           ${canDeploy() ? '<button class="btn primary" id="newTaskBtn">+ 新建发布</button>' : ''}
         </div>
@@ -231,6 +241,11 @@
       root.querySelectorAll('.chip[data-st]').forEach(c => c.onclick = () => {
         statusFilter = c.dataset.st;
         document.querySelectorAll('.chip[data-st]').forEach(x => x.classList.toggle('active', x === c));
+        renderTable();
+      });
+      root.querySelectorAll('.chip[data-act]').forEach(c => c.onclick = () => {
+        actionFilter = c.dataset.act;
+        document.querySelectorAll('.chip[data-act]').forEach(x => x.classList.toggle('active', x === c));
         renderTable();
       });
       const nb = document.getElementById('newTaskBtn');

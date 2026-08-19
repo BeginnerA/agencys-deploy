@@ -1,5 +1,6 @@
 """后台任务执行器：单 worker 串行；--config-source db --project-id 调用 deploy.py"""
 import os
+import re
 import signal
 import sys
 import time
@@ -37,6 +38,54 @@ def build_cli(task: dict, extra_args: list = None) -> list:
     return cmd
 
 
+def _backfill_auto_versions(db_path: str, task_id: int, log_file: str):
+    """自动版本号场景：从日志解析子进程实际解析的版本号并回写到任务记录。
+
+    deploy.py / deploy_pipeline.py 在 --auto-version 模式下会输出如下日志：
+      自动版本: 当前线上 1.0.29 → 新版本 1.0.30
+      [svc-name] 自动版本: 当前线上 1.0.29 → 新版本 1.0.30
+    取第一条匹配作为任务级版本号（单服务即唯一；流水线取首个服务代表）。
+    """
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except OSError:
+        return
+    m = re.search(
+        r"(?:^|\n)(?:\[[\w-]+\]\s*)?自动版本:\s*当前线上\s+(\S+)\s*→\s*新版本\s+(\S+)",
+        content
+    )
+    if m:
+        previous_version, version = m.group(1), m.group(2)
+        update_task(db_path, task_id, version=version, previous_version=previous_version)
+
+
+def backfill_existing_auto_versions(db_path: str):
+    """一次性回填历史自动版本任务：扫描 extra 含 --auto-version 且 version 为空的记录，
+    从对应日志文件解析实际版本号并回写。幂等，已回填的任务不会重复处理。"""
+    from .db import get_conn
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id, log_file FROM tasks "
+            "WHERE extra LIKE '%--auto-version%' "
+            "AND (version IS NULL OR version = '')"
+        ).fetchall()
+    finally:
+        conn.close()
+    count = 0
+    for row in rows:
+        log_file = row["log_file"]
+        if not log_file:
+            continue
+        _backfill_auto_versions(db_path, row["id"], log_file)
+        count += 1
+    if count:
+        import logging
+        logging.getLogger(__name__).info(
+            "[platform] 历史自动版本任务回填完成，处理 %d 条", count)
+
+
 def submit_task(db_path: str, task: dict, extra_args: list = None):
     fut = _executor.submit(_run_task, db_path, task, extra_args or [])
     # 登记 Future 占位：kill_task 在排队窗口期（Popen 之前）也能取消。
@@ -49,9 +98,14 @@ def _run_task(db_path, task, extra_args):
     log_file = LOG_DIR / f"task_{task['id']}.log"
     try:
         update_task(db_path, task["id"], status="running", log_file=str(log_file))
-        cmd = build_cli(task, extra_args)
+        # 执行参数以持久化到任务记录的 extra 为准（submit 传入值与其一致），
+        # 保证重新运行时恢复的参数与原始执行一致
+        extra = extra_args if extra_args else (task.get("extra") or [])
+        cmd = build_cli(task, extra)
         env_map = dict(os.environ)
         with open(log_file, "w", encoding="utf-8") as f:
+            # 日志开头记录实际命令行，便于核对参数（如 --skip-build）是否生效
+            f.write("[platform] 执行命令: " + " ".join(cmd) + "\n")
             proc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT,
                                     env=env_map, cwd=str(DEPLOY_ROOT),
                                     start_new_session=True,
@@ -60,6 +114,9 @@ def _run_task(db_path, task, extra_args):
         _task_registry[task["id"]] = proc  # 覆盖排队期 Future 占位
         rc = proc.wait()
         _task_registry.pop(task["id"], None)
+        # 自动版本号场景：子进程已解析实际版本并写入日志，回写到任务记录
+        if "--auto-version" in extra:
+            _backfill_auto_versions(db_path, task["id"], str(log_file))
         update_task(db_path, task["id"], status="success" if rc == 0 else "failed",
                     finished_at=time.time())
     except Exception as exc:

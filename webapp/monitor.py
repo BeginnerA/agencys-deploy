@@ -368,12 +368,62 @@ class MonitorScheduler:
         with self._lock:
             self._cache[env["id"]] = result
 
+    def _aggregate_all_env(self, project_id: int) -> dict:
+        """聚合项目下所有环境的探测缓存，用于"全部"视图
+        服务器按 host 去重（取最新 ts），服务取最佳状态，指标合并。"""
+        envs = dbm.list_environments(self._db_path, project_id)
+        if not envs:
+            return {"services": {}, "servers": [], "ts": 0, "env": "",
+                    "resources": {}, "health_checks": {},
+                    "security": {"score": 95, "key_ratio": 1.0, "total": 0},
+                    "host_metrics": {}}
+        all_servers = {}  # host -> entry (取最新 ts)
+        all_services = {}
+        all_resources = {}
+        all_health = {}
+        all_hm = {}
+        latest_ts = 0
+        for env_obj in envs:
+            with self._lock:
+                data = self._cache.get(env_obj["id"])
+            if not data:
+                continue
+            latest_ts = max(latest_ts, data.get("ts", 0))
+            # 服务器按 host 去重，保留最新
+            for sv in data.get("servers", []):
+                h = sv["host"]
+                if h not in all_servers or sv.get("ts", 0) > all_servers[h].get("ts", 0):
+                    all_servers[h] = sv
+            # 服务状态合并：online > probe_failed > not_deployed
+            for svc_name, svc_data in data.get("services", {}).items():
+                existing = all_services.get(svc_name)
+                if existing is None or self._svc_priority(svc_data) > self._svc_priority(existing):
+                    all_services[svc_name] = svc_data
+            all_resources.update(data.get("resources", {}))
+            all_health.update(data.get("health_checks", {}))
+            all_hm.update(data.get("host_metrics", {}))
+        return {"services": all_services, "servers": list(all_servers.values()),
+                "ts": latest_ts, "env": "",
+                "resources": all_resources, "health_checks": all_health,
+                "security": {"score": 95, "key_ratio": 1.0, "total": len(all_servers)},
+                "host_metrics": all_hm}
+
+    @staticmethod
+    def _svc_priority(svc_data: dict) -> int:
+        """服务状态优先级：online=2, probe_failed=1, not_deployed=0"""
+        st = svc_data.get("status", "")
+        return 2 if st == "online" else 1 if st == "probe_failed" else 0
+
     def get_overview(self, project_id: int, env: str = None) -> dict:
-        """组装大屏数据：{services: {name: {...}}, servers: [...]}；无缓存时返回空结构"""
+        """组装大屏数据：{services: {name: {...}}, servers: [...]}；无缓存时返回空结构
+        env 为空或 'all' 时聚合全部环境。"""
         envs = dbm.list_environments(self._db_path, project_id)
         if not envs:
             return {"services": {}, "servers": [], "ts": 0}
-        env_obj = next((e for e in envs if e["name"] == env), None) if env else None
+        # "全部"视图：聚合所有环境
+        if not env or env == "all":
+            return self._aggregate_all_env(project_id)
+        env_obj = next((e for e in envs if e["name"] == env), None)
         if env_obj is None:
             env_obj = next((e for e in envs if e["is_default"]), envs[0])
         with self._lock:

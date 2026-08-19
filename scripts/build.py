@@ -150,7 +150,8 @@ def build_project(project_name: str, version: str, env: str = None):
     profile = get_maven_profile(config, env)
     project_root = Path(config["deploy"]["project_root"]).expanduser()
     if not project_root.exists():
-        fail(f"项目根目录不存在: {project_root}")
+        log(f"警告: 项目根目录不存在: {project_root}（Docker 部署时请勾选「跳过构建」，或在宿主机上确认路径存在）")
+        return
 
     if mode == "push":
         docker_login(registry)

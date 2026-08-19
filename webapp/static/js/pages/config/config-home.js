@@ -28,6 +28,7 @@
         { ico:'🔁', num: total.pipelines, label:'流水线', tip:'全部项目流水线总数', go: () => { if (firstPid) location.hash = '#/config/p/' + firstPid + '/pipelines'; } },
         { ico:'🖥️', num: servers.length, label:'服务器', sub: `SSH 正常 ${okCnt}${errCnt ? ' · 异常 ' + errCnt : ''}`, tip:'平台级资源，环境中选择绑定', go: () => { location.hash = '#/config/servers'; } },
         { ico:'👤', num: users.length, label:'用户', tip:'账号与角色管理', go: () => { location.hash = '#/config/users'; } },
+        { ico:'📡', num: '-', label:'通知渠道', sub:'6 种渠道', tip:'告警通知发送配置', go: () => { location.hash = '#/config/channels'; } },
       ];
 
       // 快速开始跳转：需项目上下文；无项目时引导新建
@@ -211,6 +212,107 @@
       }catch(err){ toastError(err.message); }
     };
   }
+  // ---- 通知渠道配置视图（#/config/channels） ----
+  const CHANNEL_META = {
+    email:      { ico:'📧', name:'邮件', desc:'SMTP 邮件通知' },
+    wecom:      { ico:'💬', name:'企业微信', desc:'企业微信机器人' },
+    webhook:    { ico:'🔗', name:'通用 Webhook', desc:'HTTP POST 回调' },
+    sms_aliyun: { ico:'📱', name:'阿里云短信', desc:'阿里云 SMS 服务' },
+    feishu:     { ico:'🐦', name:'飞书', desc:'飞书机器人' },
+    dingtalk:   { ico:'🔔', name:'钉钉', desc:'钉钉机器人' },
+  };
+  // 各渠道表单字段定义：{key, label, type, placeholder, required}
+  const CHANNEL_FIELDS = {
+    email: [
+      { key:'host', label:'SMTP 服务器', placeholder:'smtp.example.com' },
+      { key:'port', label:'端口', placeholder:'465', type:'number' },
+      { key:'user', label:'用户名', placeholder:'user@example.com' },
+      { key:'password', label:'密码', type:'password', masked:true },
+      { key:'from_addr', label:'发件人', placeholder:'noreply@example.com' },
+      { key:'to_addrs', label:'收件人', placeholder:'a@example.com,b@example.com' },
+    ],
+    wecom: [
+      { key:'webhook', label:'Webhook URL', placeholder:'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...' },
+    ],
+    webhook: [
+      { key:'url', label:'回调 URL', placeholder:'https://your-server/webhook' },
+    ],
+    sms_aliyun: [
+      { key:'access_key', label:'AccessKey ID', type:'password', masked:true },
+      { key:'secret', label:'AccessKey Secret', type:'password', masked:true },
+      { key:'sign', label:'签名', placeholder:'短信签名' },
+      { key:'template', label:'模板 CODE', placeholder:'SMS_123456' },
+      { key:'phones', label:'手机号', placeholder:'13800001111,13900002222' },
+      { key:'region', label:'地域', placeholder:'cn-hangzhou' },
+    ],
+    feishu: [
+      { key:'webhook', label:'Webhook URL', placeholder:'https://open.feishu.cn/open-apis/bot/v2/hook/...' },
+    ],
+    dingtalk: [
+      { key:'webhook', label:'Webhook URL', placeholder:'https://oapi.dingtalk.com/robot/send?access_token=...' },
+      { key:'secret', label:'加签密钥', type:'password', masked:true },
+    ],
+  };
+
+  async function renderChannels(root){
+    root.innerHTML = '<div class="cfg-home">' + skeletonHTML(4) + '</div>';
+    try{
+      const cfgs = await api('/api/alerts/channels');
+      root.innerHTML = `<div class="cfg-home">
+        <div style="display:flex;align-items:center;gap:12px">
+          <div class="page-title">通知渠道配置</div>
+          <button class="btn sm ghost" onclick="location.hash='#/config'">← 返回工作台</button>
+        </div>
+        <div class="page-sub">配置告警通知发送渠道，敏感字段（密码/密钥）打码显示，编辑时留空则保留原值</div>
+        <div class="ch-grid" id="chGrid"></div>
+        <div style="display:flex;justify-content:flex-end;margin-top:var(--sp-4)">
+          <button class="btn primary" id="chSaveAll">💾 保存全部渠道</button>
+        </div>
+      </div>`;
+      const grid = document.getElementById('chGrid');
+      for (const [ch, meta] of Object.entries(CHANNEL_META)){
+        const cfg = cfgs[ch] || {};
+        const fields = CHANNEL_FIELDS[ch] || [];
+        const hasData = Object.values(cfg).some(v => v && v !== '******');
+        const card = document.createElement('div');
+        card.className = 'ch-card' + (hasData ? ' configured' : '');
+        card.dataset.channel = ch;
+        card.innerHTML = `
+          <div class="ch-head">
+            <span class="ch-ico">${meta.ico}</span>
+            <div><div class="ch-name">${meta.name}</div><div class="ch-desc">${meta.desc}</div></div>
+            ${hasData ? '<span class="badge success">已配置</span>' : '<span class="badge">未配置</span>'}
+          </div>
+          <div class="form-grid">${fields.map(f => {
+            const v = cfg[f.key] || '';
+            const isMasked = f.masked && v === '******';
+            const displayVal = isMasked ? '' : esc(v);
+            const ph = isMasked ? '已配置，留空保留原值' : esc(f.placeholder || '');
+            return `<div class="field">
+              <label>${esc(f.label)}${f.masked ? ' <span class="weak">（留空保留原值）</span>' : ''}</label>
+              <input data-ch="${ch}" data-key="${f.key}" type="${f.type === 'password' ? 'password' : f.type === 'number' ? 'number' : 'text'}" placeholder="${ph}" value="${displayVal}">
+            </div>`;
+          }).join('')}</div>`;
+        grid.appendChild(card);
+      }
+      document.getElementById('chSaveAll').onclick = async () => {
+        const payload = {};
+        grid.querySelectorAll('input[data-ch]').forEach(inp => {
+          const ch = inp.dataset.ch, key = inp.dataset.key;
+          if (!payload[ch]) payload[ch] = {};
+          payload[ch][key] = inp.value;
+        });
+        try{
+          await api('/api/alerts/channels', { method:'PUT', body: JSON.stringify(payload) });
+          toastSuccess('渠道配置已保存');
+          await renderChannels(root);
+        }catch(e){ toastError(e.message); }
+      };
+    }catch(e){
+      root.innerHTML = errorState('渠道配置加载失败：' + esc(e.message), 'navRetry');
+    }
+  }
+
   // 局部工具（与旧 config.js 同款，避免依赖被删文件）
   function val(id){ return document.getElementById(id).value; }
   function chk(id){ return document.getElementById(id).checked; }
@@ -218,8 +320,9 @@
   window.cfgHome = {
     render: async function(root, view){
       if (view === 'users'){ await renderUsers(root); return []; }
+      if (view === 'channels'){ await renderChannels(root); return []; }
       await renderHome(root);
-      return [];
+      return []; 
     },
   };
 })();

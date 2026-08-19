@@ -45,3 +45,5 @@
 .rlist .list-item{border-bottom:1px solid rgba(0,212,255,.06)}
 .rlist .list-item:last-child{border-bottom:none}
 .tbl-wrap{overflow-x:auto}
+/* 项目切换栏 */
+.dash-proj-bar{display:flex;align-items:center;gap:var(--sp-3);margin-bottom:var(--sp-4)}
