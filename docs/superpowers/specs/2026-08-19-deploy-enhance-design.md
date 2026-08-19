@@ -67,14 +67,21 @@
 
 UNIQUE(source_service, target_service, project_id)
 
-### 2.4 `deployment_snapshots` — 发布快照（扩展）
+### 2.4 `deployment_snapshots` — 发布快照（新建）
 
-在现有基础上增加 `nacos_config_hash` 字段，用于记录发布时的 Nacos 配置摘要。
+新建表，用于记录每次发布成功后的状态快照，支撑发布对比功能。
 
-| 新增字段 | 类型 | 说明 |
-|----------|------|------|
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | INTEGER PK | 自增主键 |
+| project_id | INTEGER FK | 所属项目 |
+| env | TEXT | 目标环境 |
+| task_id | INTEGER FK → tasks | 关联的发布任务 |
+| version | TEXT | 发布版本号 |
+| image_versions | TEXT (JSON) | 各服务的 docker image tag |
 | nacos_config_hash | TEXT | 发布时 Nacos 配置的 MD5 摘要 |
 | env_vars_hash | TEXT | 环境变量的 MD5 摘要 |
+| deployed_at | INTEGER | 发布时间戳 |
 
 ### 2.5 `canary_configs` — 灰度策略配置
 
@@ -143,6 +150,12 @@ POST /api/deploy/webhook
     "extra": {}               // 可选
   }
   → 验证 token → 检查 release_windows → 创建任务 → 返回 task_id
+```
+
+Webhook token 存储在 `config/deploy.yaml` 中：
+```yaml
+deploy:
+  webhook_token: "your-secret-token-here"
 ```
 
 ---
@@ -345,8 +358,8 @@ POST /api/deploy/webhook
 
 | 文件 | 修改内容 |
 |------|---------|
-| `webapp/db.py` | 新增 5 张表的建表语句 + migration |
-| `webapp/task_manager.py` | 新增 `scheduled` / `canary_waiting` / `paused` 状态处理 |
+| `webapp/db.py` | 新增 5 张表的建表语句 + migration（deploy_schedules, release_windows, service_dependencies, deployment_snapshots, canary_configs） |
+| `webapp/task_manager.py` | 新增 `scheduled` / `canary_waiting` / `paused` 状态处理；tasks.extra JSON 中增加 `forced` 标记 |
 | `deploy_pipeline.py` | Deployer 增加灰度自动推进逻辑 |
 | `webapp/app.py` | 注册新路由 + 启动 DeployScheduler |
 | `webapp/static/js/app.js` | 添加"发布中心"导航入口 |
