@@ -25,6 +25,32 @@ def _valid_scope(scope) -> bool:
                     for k in ("rules", "envs", "servers")))
 
 
+def _project_alert_filter(project_id=0):
+    """按项目 ID 构建告警 WHERE 子句（匹配 target_info 中的 project 字段）
+    project_id=0 时匹配所有已配置项目（排除不属于任何项目的孤立告警）
+    返回 (sql_fragment, params)"""
+    db = current_app.config["DB_PATH"]
+    conn = dbm.get_conn(db)
+    try:
+        if project_id:
+            rows = conn.execute(
+                "SELECT code FROM projects WHERE id=?", (project_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT code FROM projects").fetchall()
+    finally:
+        conn.close()
+    codes = [r["code"] for r in rows if r["code"]]
+    if not codes:
+        return "1=0", []
+    clauses = []
+    params = []
+    for code in codes:
+        clauses.append("(target_info LIKE ? OR target_info LIKE ?)")
+        params += [f'%"project":"{code}"%', f'%"project": "{code}"%']
+    return "(" + " OR ".join(clauses) + ")", params
+
+
 def _paged():
     page = max(1, request.args.get("page", 1, type=int))
     page_size = min(200, max(1, request.args.get("page_size", 20, type=int)))
@@ -48,6 +74,21 @@ def list_alerts():
     if kw:
         where.append("(subject LIKE ? OR description LIKE ?)")
         params += [f"%{kw}%"] * 2
+    # 项目筛选：始终过滤，仅显示已配置项目的告警（排除孤立告警）
+    project_id = request.args.get("project_id", 0, type=int)
+    pf, pp = _project_alert_filter(project_id)
+    if pf:
+        where.append(pf); params.extend(pp)
+    # 环境筛选
+    env_val = (request.args.get("env") or "").strip()
+    if env_val:
+        where.append("(target_info LIKE ? OR target_info LIKE ?)")
+        params += [f'%"env":"{env_val}"%', f'%"env": "{env_val}"%']
+    # 服务筛选
+    svc_val = (request.args.get("service") or "").strip()
+    if svc_val:
+        where.append("(target_info LIKE ? OR target_info LIKE ?)")
+        params += [f'%"service":"{svc_val}"%', f'%"service": "{svc_val}"%']
     page, page_size = _paged()
     conn = dbm.get_conn(db)
     try:
@@ -61,8 +102,42 @@ def list_alerts():
     return jsonify({"rows": items, "total": total, "page": page, "page_size": page_size})
 
 
+@alert_bp.route("/alerts/filter-options")
+@require_auth
+def alert_filter_options():
+    """从告警 target_info 提取环境/服务筛选选项（按项目分组）"""
+    db = current_app.config["DB_PATH"]
+    conn = dbm.get_conn(db)
+    try:
+        rows = conn.execute(
+            "SELECT target_info FROM alerts WHERE target_info IS NOT NULL"
+        ).fetchall()
+    finally:
+        conn.close()
+    # {project_code: {envs: set, services: set}}
+    by_proj = {}
+    for r in rows:
+        try:
+            ti = json.loads(r["target_info"]) if r["target_info"] else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        pc = ti.get("project", "")
+        if not pc:
+            continue
+        bucket = by_proj.setdefault(pc, {"envs": set(), "services": set()})
+        if ti.get("env"):
+            bucket["envs"].add(ti["env"])
+        if ti.get("service"):
+            bucket["services"].add(ti["service"])
+    return jsonify({
+        pc: {"envs": sorted(d["envs"]), "services": sorted(d["services"])}
+        for pc, d in by_proj.items()
+    })
+
+
 @alert_bp.route("/alerts/<int:alert_id>/ack", methods=["POST"])
 @require_auth
+@require_role("admin", "operator")
 def ack_alert(alert_id):
     db = current_app.config["DB_PATH"]
     a = dbm.get_record(db, "alerts", alert_id)
@@ -80,6 +155,7 @@ def ack_alert(alert_id):
 
 @alert_bp.route("/alerts/<int:alert_id>/resolve", methods=["POST"])
 @require_auth
+@require_role("admin", "operator")
 def resolve_alert(alert_id):
     db = current_app.config["DB_PATH"]
     a = dbm.get_record(db, "alerts", alert_id)
@@ -94,6 +170,22 @@ def resolve_alert(alert_id):
     return jsonify({"ok": True})
 
 
+@alert_bp.route("/alerts/<int:alert_id>/delete", methods=["DELETE"])
+@require_auth
+@require_role("admin", "operator")
+def delete_alert(alert_id):
+    """删除已确认或已解决的告警"""
+    db = current_app.config["DB_PATH"]
+    a = dbm.get_record(db, "alerts", alert_id)
+    if not a:
+        return jsonify({"error": "告警不存在"}), 404
+    if a["status"] not in ("acked", "resolved"):
+        return jsonify({"error": "仅可删除已确认或已解决的告警"}), 400
+    dbm.delete_record(db, "alerts", alert_id)
+    audit("delete_alert", "alert", alert_id, {"subject": a["subject"]})
+    return jsonify({"ok": True})
+
+
 @alert_bp.route("/alerts/stats")
 @require_auth
 def alert_stats():
@@ -101,12 +193,18 @@ def alert_stats():
     db = current_app.config["DB_PATH"]
     days = min(30, max(1, request.args.get("days", 7, type=int)))
     since = int(time.time()) - days * 86400
+    # 项目筛选
+    project_id = request.args.get("project_id", 0, type=int)
+    pf, pp = _project_alert_filter(project_id)
+    extra_where = ""
+    if pf:
+        extra_where = f" AND {pf}"
     conn = dbm.get_conn(db)
     try:
         rows = conn.execute(
             "SELECT strftime('%m-%d', first_seen_at, 'unixepoch', 'localtime') d, "
-            "severity, COUNT(*) n FROM alerts WHERE first_seen_at >= ? "
-            "GROUP BY d, severity", (since,)).fetchall()
+            "severity, COUNT(*) n FROM alerts WHERE first_seen_at >= ?" + extra_where +
+            " GROUP BY d, severity", (since,) + tuple(pp)).fetchall()
     finally:
         conn.close()
     by_day = {}
@@ -210,13 +308,14 @@ def alert_logs(alert_id):
 
 @alert_bp.route("/alerts/batch", methods=["POST"])
 @require_auth
+@require_role("admin", "operator")
 def alert_batch():
-    """批量确认/解决告警"""
+    """批量确认/解决/删除告警"""
     body = request.get_json(silent=True) or {}
-    action = body.get("action")  # ack / resolve
+    action = body.get("action")  # ack / resolve / delete
     ids = body.get("ids") or []
-    if action not in ("ack", "resolve"):
-        return jsonify({"error": "action 需为 ack 或 resolve"}), 400
+    if action not in ("ack", "resolve", "delete"):
+        return jsonify({"error": "action 需为 ack、resolve 或 delete"}), 400
     if not ids or not isinstance(ids, list):
         return jsonify({"error": "ids 不能为空"}), 400
     if len(ids) > 100:
@@ -238,6 +337,9 @@ def alert_batch():
             dbm.update_record(db, "alerts", int(aid), dict(
                 status="resolved", resolved_by=g.user["username"],
                 resolved_at=now, resolved_type="manual"))
+            success_count += 1
+        elif action == "delete" and a["status"] in ("acked", "resolved"):
+            dbm.delete_record(db, "alerts", int(aid))
             success_count += 1
     audit(f"batch_{action}_alerts", "alert", 0,
           {"ids": ids, "success": success_count})

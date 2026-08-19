@@ -18,6 +18,7 @@
   let svcLogPage = 1;
   let svcLogTotal = 0;
   const svcLogPageSize = 50;
+  let svcProjFilter = 'all'; // 服务日志项目筛选
 
   const ACTION_CN = {
     login:'登录', login_failed:'登录失败', change_password:'修改密码',
@@ -186,6 +187,8 @@
             ${isAdmin() ? '<button class="btn sm ghost" id="svcLogSettingsBtn">⚙ 保留设置</button>' : ''}
           </div>
           <div class="flex gap-3" style="margin-bottom:12px;flex-wrap:wrap;align-items:center">
+            <span class="weak" style="font-size:12px">项目</span>
+            <select class="filter-sel" id="svcLogProjSel"></select>
             <span class="weak" style="font-size:12px">环境</span>
             <select class="filter-sel" id="svcLogEnvSel">
               <option value="">全部环境</option>
@@ -219,6 +222,10 @@
       document.getElementById('svcLogSearch').onclick = () => { svcLogPage = 1; searchServiceLogs(); };
       document.getElementById('svcLogCtxClose').onclick = () => {
         document.getElementById('svcLogContextDrawer').style.display = 'none';
+      };
+      document.getElementById('svcLogProjSel').onchange = () => {
+        svcProjFilter = document.getElementById('svcLogProjSel').value;
+        loadServiceLogOptions();
       };
       if (isAdmin()) {
         document.getElementById('svcLogSettingsBtn').onclick = () => openLogSettingsDrawer();
@@ -291,18 +298,31 @@
 
   // ---- 服务日志 Tab ----
   async function loadServiceLogOptions() {
-    const services = await api('/api/logs/services').catch(() => []);
+    const q = svcProjFilter !== 'all' ? `?project_id=${svcProjFilter}` : '';
+    const services = await api('/api/logs/services' + q).catch(() => []);
+    const projSel = document.getElementById('svcLogProjSel');
     const envSel = document.getElementById('svcLogEnvSel');
     const svcSel = document.getElementById('svcLogSvcSel');
-    if (!envSel || !svcSel) return;
+    if (!projSel || !envSel || !svcSel) return;
+    // 项目下拉（仅初始化一次，避免丢失用户选择）
+    if (projSel.options.length <= 1) {
+      projSel.innerHTML = '<option value="all">全部项目</option>' +
+        projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+      projSel.value = svcProjFilter;
+    }
     const envSet = new Set(services.map(s => s.env));
     envSel.innerHTML = '<option value="">全部环境</option>' +
-      [...envSet].map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join('');
+      [...envSet].sort().map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join('');
+    const svcSet = new Set(services.map(s => s.service));
+    svcSel.innerHTML = '<option value="">全部服务</option>' +
+      [...svcSet].sort().map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+    // 环境变化时过滤服务列表
     envSel.onchange = () => {
       const env = envSel.value;
       const filtered = env ? services.filter(s => s.env === env) : services;
+      const filteredSvcSet = new Set(filtered.map(s => s.service));
       svcSel.innerHTML = '<option value="">全部服务</option>' +
-        filtered.map(s => `<option value="${esc(s.service)}">${esc(s.service)}</option>`).join('');
+        [...filteredSvcSet].sort().map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
     };
   }
 

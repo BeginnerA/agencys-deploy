@@ -146,6 +146,17 @@ class AlertEngine:
 
     # ---------- 指标规则 ----------
 
+    def _enabled_env_ids(self):
+        """返回启用项目的环境 ID 集合，避免为禁用/未配置项目产生告警"""
+        enabled_pids = {p["id"] for p in dbm.list_records(self._db_path, "projects")
+                        if p.get("enabled", 1)}
+        return {e["id"] for e in dbm.list_records(self._db_path, "environments")
+                if e["project_id"] in enabled_pids}
+
+    def _project_code_map(self):
+        """返回 project_id → project_code 映射"""
+        return {p["id"]: p.get("code", "") for p in dbm.list_records(self._db_path, "projects")}
+
     def _evaluate_metric_rules(self):
         rules = [r for r in dbm.list_records(self._db_path, "alert_rules")
                  if r.get("enabled") and r.get("metric_type") == "metric"]
@@ -162,9 +173,13 @@ class AlertEngine:
         host_to_sid = {}
         for s in dbm.list_records(self._db_path, "servers"):
             host_to_sid[s["host"]] = s["id"]
-        # 3) 评估滑动窗口
+        # 3) 评估滑动窗口（仅处理启用项目的环境）
         env_map = {e["id"]: e for e in dbm.list_records(self._db_path, "environments")}
+        enabled_env_ids = self._enabled_env_ids()
+        pcode_map = self._project_code_map()
         for (env_id, host, metric) in list(self._history):
+            if env_id not in enabled_env_ids:
+                continue
             env = env_map.get(env_id)
             if env is None:
                 continue
@@ -182,7 +197,7 @@ class AlertEngine:
                            subject=f"{host} {metric.upper()} 过高",
                            description=f"当前 {value}%，阈值 {rule['compare']}{rule['threshold']}%，"
                                        f"持续 {rule['duration_seconds']}s",
-                           target_info={"env": env["name"], "host": host})
+                           target_info={"project": pcode_map.get(env["project_id"], ""), "env": env["name"], "host": host})
 
     # ---------- 状态规则 ----------
 
@@ -195,7 +210,11 @@ class AlertEngine:
         name_to_sid = {}
         for s in dbm.list_records(self._db_path, "services"):
             name_to_sid[(s["project_id"], s["name"])] = s["id"]
+        enabled_env_ids = self._enabled_env_ids()
+        pcode_map = self._project_code_map()
         for env in dbm.list_records(self._db_path, "environments"):
+            if env["id"] not in enabled_env_ids:
+                continue
             data = self._monitor.get_overview(env["project_id"], env["name"]) or {}
             for name, st in (data.get("services") or {}).items():
                 for rule in rules:
@@ -208,13 +227,14 @@ class AlertEngine:
                         self._fire(rule, f"service:{env['id']}:{name}",
                                    subject=f"服务下线: {name}",
                                    description=f"服务 {name} 在环境 {env['name']} 未部署或已停止",
-                                   target_info={"env": env["name"], "service": name})
+                                   target_info={"project": pcode_map.get(env["project_id"], ""), "env": env["name"], "service": name})
 
     def _check_tasks(self):
         """扫描最近失败任务（增量：finished_at > 上次扫描点）触发任务失败告警"""
         now = time.time()
         rows = dbm.list_records(self._db_path, "tasks", "status='failed'",
                                 (), "finished_at DESC")[:20]
+        pcode_map = self._project_code_map()
         for t in rows:
             finished = t.get("finished_at") or 0
             if finished <= self._last_task_scan:
@@ -231,7 +251,7 @@ class AlertEngine:
             self._fire(rule, f"task:{t['id']}",
                        subject=f"任务失败: {t['name']}",
                        description=f"任务 #{t['id']} {t['name']} [{t.get('env','')}] 执行失败",
-                       target_info={"env": t.get("env", ""), "task_id": t["id"]})
+                       target_info={"project": t.get("project_code", "") or pcode_map.get(t.get("project_id", 0), ""), "env": t.get("env", ""), "task_id": t["id"]})
         self._last_task_scan = now
 
     def _task_fail_rule(self):
@@ -501,7 +521,8 @@ class AlertEngine:
         # scope 检查
         if not self._in_scope(rule, env, service=service, service_id=service_id):
             return
-        target_info = {"env": env_name, "service": service,
+        pcode_map = self._project_code_map()
+        target_info = {"project": pcode_map.get(env["project_id"], ""), "env": env_name, "service": service,
                        "keyword": keyword, "context": context[:5]}
         if entry_id is not None:
             target_info["entry_id"] = entry_id

@@ -141,13 +141,23 @@ def log_context():
 @log_bp.route("/logs/services")
 @require_auth
 def log_services():
-    """服务列表：返回所有已采集的环境 × 服务组合"""
+    """服务列表：从项目配置表返回环境 × 服务组合（支持 project_id 过滤）"""
+    project_id = request.args.get("project_id", 0, type=int)
     db_path = current_app.config["DB_PATH"]
     conn = dbm.get_conn(db_path)
     try:
-        rows = conn.execute(
-            "SELECT DISTINCT env, service FROM log_entries ORDER BY env, service"
-        ).fetchall()
+        sql = (
+            "SELECT DISTINCT e.name AS env, s.service_name AS service "
+            "FROM services s "
+            "JOIN environments e ON s.project_id = e.project_id "
+            "WHERE s.enabled = 1"
+        )
+        params = []
+        if project_id:
+            sql += " AND s.project_id = ?"
+            params.append(project_id)
+        sql += " ORDER BY e.name, s.service_name"
+        rows = conn.execute(sql, params).fetchall()
         return jsonify([dict(r) for r in rows])
     finally:
         conn.close()

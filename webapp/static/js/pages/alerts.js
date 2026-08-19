@@ -13,9 +13,16 @@
   let sevFilter = 'all';
   let statusFilter = 'all';
   let keyword = '';
+  let projFilter = 'all';
+  let projects = [];
+  let envFilter = 'all';
+  let svcFilter = 'all';
+  let filterOptions = {};  // {project_code: {envs: [], services: []}}
 
   // 批量操作状态
   let selectedIds = new Set();
+
+  function canManageAlerts(){ return ['admin','operator'].includes(currentUser().role); }
 
   // 统计计数
   let firingCount = 0;
@@ -77,6 +84,9 @@
       if (sevFilter !== 'all') q.set('severity', sevFilter);
       if (statusFilter !== 'all') q.set('status', statusFilter);
       if (keyword) q.set('keyword', keyword);
+      if (projFilter !== 'all') q.set('project_id', projFilter);
+      if (envFilter !== 'all') q.set('env', envFilter);
+      if (svcFilter !== 'all') q.set('service', svcFilter);
       const data = await api('/api/alerts?' + q);
       if (destroyed) return;
       alerts = data.rows || [];
@@ -88,12 +98,21 @@
     }
   }
 
+  function _filterQs(){
+    const parts = [];
+    if (projFilter !== 'all') parts.push('project_id=' + projFilter);
+    if (envFilter !== 'all') parts.push('env=' + encodeURIComponent(envFilter));
+    if (svcFilter !== 'all') parts.push('service=' + encodeURIComponent(svcFilter));
+    return parts.length ? '&' + parts.join('&') : '';
+  }
+
   async function loadAlertCounts(){
     try {
+      const qs = _filterQs();
       const [f, a, r] = await Promise.all([
-        api('/api/alerts?status=firing&page_size=1').catch(() => ({total:0})),
-        api('/api/alerts?status=acked&page_size=1').catch(() => ({total:0})),
-        api('/api/alerts?status=resolved&page_size=1').catch(() => ({total:0})),
+        api('/api/alerts?status=firing&page_size=1' + qs).catch(() => ({total:0})),
+        api('/api/alerts?status=acked&page_size=1' + qs).catch(() => ({total:0})),
+        api('/api/alerts?status=resolved&page_size=1' + qs).catch(() => ({total:0})),
       ]);
       if (destroyed) return;
       firingCount = f.total || 0;
@@ -158,6 +177,13 @@
         <div class="alert-stat resolved"><div class="as-num" id="statResolved">0</div><div class="as-label">已解决</div></div>
       </div>
       <div class="alert-toolbar deploy-toolbar">
+        <span class="weak" style="font-size:12px">项目</span>
+        <select class="filter-sel" id="alertProjSel"><option value="all">全部项目</option></select>
+        <span class="weak" style="font-size:12px;margin-left:6px">环境</span>
+        <select class="filter-sel" id="alertEnvSel"><option value="all">全部环境</option></select>
+        <span class="weak" style="font-size:12px;margin-left:6px">服务</span>
+        <select class="filter-sel" id="alertSvcSel"><option value="all">全部服务</option></select>
+        <span style="width:1px;height:20px;background:var(--border);margin:0 4px"></span>
         <span class="weak" style="font-size:12px">级别</span>
         ${SEVERITIES.map(([k, v]) =>
           `<span class="chip ${k === sevFilter ? 'active' : ''}" data-sev="${k}">${v}</span>`).join('')}
@@ -174,15 +200,114 @@
         <span style="flex:1"></span>
         <button class="btn sm" id="alertBatchAck">批量确认</button>
         <button class="btn sm danger" id="alertBatchResolve">批量解决</button>
+        <button class="btn sm danger" id="alertBatchDelete" style="margin-left:4px">批量删除</button>
       </div>
       <div id="alertList">${skeletonHTML(4)}</div>
       <div id="alertPagination"></div>`;
     bindToolbar();
     bindBatchOps();
+    // 加载项目 + 筛选选项
+    loadProjectsForFilter();
+    loadFilterOptions();
+  }
+
+  async function loadFilterOptions(){
+    try {
+      filterOptions = await api('/api/alerts/filter-options').catch(() => ({}));
+      populateEnvOptions();
+      populateSvcOptions();
+    } catch(e) { /* 不阻塞 */ }
+  }
+
+  function _projCode(){
+    if (projFilter === 'all') return null;
+    const p = projects.find(p => String(p.id) === String(projFilter));
+    return p ? p.code : null;
+  }
+
+  function populateEnvOptions(){
+    const sel = document.getElementById('alertEnvSel');
+    if (!sel) return;
+    const pc = _projCode();
+    let envs = new Set();
+    if (pc && filterOptions[pc]) {
+      filterOptions[pc].envs.forEach(e => envs.add(e));
+    } else if (!pc) {
+      Object.values(filterOptions).forEach(d => d.envs.forEach(e => envs.add(e)));
+    }
+    sel.innerHTML = '<option value="all">全部环境</option>' +
+      [...envs].sort().map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join('');
+    sel.value = envs.has(envFilter) ? envFilter : 'all';
+  }
+
+  function populateSvcOptions(){
+    const sel = document.getElementById('alertSvcSel');
+    if (!sel) return;
+    const pc = _projCode();
+    let svcs = new Set();
+    if (pc && filterOptions[pc]) {
+      filterOptions[pc].services.forEach(s => svcs.add(s));
+    } else if (!pc) {
+      Object.values(filterOptions).forEach(d => d.services.forEach(s => svcs.add(s)));
+    }
+    // 如果已选环境，进一步限定服务列表
+    if (envFilter !== 'all') {
+      const filtered = new Set();
+      alerts.forEach(a => {
+        const ti = a.target_info || {};
+        if (ti.env === envFilter && ti.service) filtered.add(ti.service);
+      });
+      svcs = new Set([...svcs].filter(s => filtered.has(s)));
+    }
+    sel.innerHTML = '<option value="all">全部服务</option>' +
+      [...svcs].sort().map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+    sel.value = svcs.has(svcFilter) ? svcFilter : 'all';
+  }
+
+  async function loadProjectsForFilter(){
+    try {
+      projects = await api('/api/projects').catch(() => []);
+      const sel = document.getElementById('alertProjSel');
+      if (!sel) return;
+      sel.innerHTML = '<option value="all">全部项目</option>' +
+        projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('');
+      sel.value = projFilter;
+      sel.onchange = () => {
+        projFilter = sel.value;
+        envFilter = 'all';
+        svcFilter = 'all';
+        currentPage = 1;
+        selectedIds.clear();
+        populateEnvOptions();
+        populateSvcOptions();
+        loadAlerts();
+        loadAlertCounts();
+      };
+    } catch(e) { /* 项目加载失败不阻塞 */ }
   }
 
   function bindToolbar(){
     const root = document.getElementById('pageRoot');
+    // 环境筛选
+    const envSel = document.getElementById('alertEnvSel');
+    if (envSel) envSel.onchange = () => {
+      envFilter = envSel.value;
+      svcFilter = 'all';
+      currentPage = 1;
+      selectedIds.clear();
+      populateSvcOptions();
+      loadAlerts();
+      loadAlertCounts();
+    };
+    // 服务筛选
+    const svcSel = document.getElementById('alertSvcSel');
+    if (svcSel) svcSel.onchange = () => {
+      svcFilter = svcSel.value;
+      currentPage = 1;
+      selectedIds.clear();
+      loadAlerts();
+      loadAlertCounts();
+    };
     // 级别筛选
     root.querySelectorAll('.chip[data-sev]').forEach(c => {
       c.onclick = () => {
@@ -235,14 +360,17 @@
     if (batchAck) batchAck.onclick = () => batchAction('ack');
     const batchResolve = document.getElementById('alertBatchResolve');
     if (batchResolve) batchResolve.onclick = () => batchAction('resolve');
+    const batchDelete = document.getElementById('alertBatchDelete');
+    if (batchDelete) batchDelete.onclick = () => batchAction('delete');
   }
 
   function updateBatchBar(){
     const bar = document.getElementById('alertBatchBar');
     const cnt = document.getElementById('alertBatchCount');
     if (!bar) return;
-    const hasActions = alerts.some(a => a.status !== 'resolved');
-    bar.style.display = hasActions ? 'flex' : 'none';
+    const canManage = canManageAlerts();
+    const hasActions = canManage && alerts.some(a => a.status !== 'resolved');
+    bar.style.display = (canManage && hasActions) ? 'flex' : 'none';
     if (cnt) cnt.textContent = selectedIds.size > 0 ? `已选 ${selectedIds.size} 条` : '';
     const selAll = document.getElementById('alertSelectAll');
     if (selAll) {
@@ -253,7 +381,7 @@
 
   async function batchAction(action){
     if (selectedIds.size === 0) { toastError('请先选择告警'); return; }
-    const label = action === 'ack' ? '确认' : '解决';
+    const label = action === 'ack' ? '确认' : action === 'resolve' ? '解决' : '删除';
     if (!await confirmDialog(`确认批量${label} ${selectedIds.size} 条告警？`)) return;
     try {
       const resp = await api('/api/alerts/batch', {
@@ -278,6 +406,7 @@
       updateBatchBar();
       return;
     }
+    const canManage = canManageAlerts();
     box.innerHTML = alerts.map(a => {
       const target = parseTarget(a.target_info);
       const sevCls = (a.severity || 'P2').toLowerCase();
@@ -288,9 +417,10 @@
       const notifyCount = a.notify_count || 0;
       const isActionable = a.status !== 'resolved';
       const checked = selectedIds.has(a.id) ? 'checked' : '';
+      const canDelete = a.status === 'acked' || a.status === 'resolved';
       return `
         <div class="alert-row ${esc(a.status)}" data-id="${a.id}">
-          ${isActionable ? `<label class="alert-row-check"><input type="checkbox" data-aid="${a.id}" ${checked}></label>` : '<span style="width:20px"></span>'}
+          ${isActionable && canManage ? `<label class="alert-row-check"><input type="checkbox" data-aid="${a.id}" ${checked}></label>` : '<span style="width:20px"></span>'}
           <span class="badge ${sevCls}">${esc(a.severity || 'P2')}</span>
           ${notifyCount > 0 ? `<span class="notify-count" title="通知次数">×${notifyCount}</span>` : ''}
           <div class="ar-main" data-detail="${a.id}" style="cursor:pointer">
@@ -301,13 +431,16 @@
           <span class="ar-time" title="首次出现">${fmtTime(a.first_seen_at)}</span>
           <span class="ar-time" title="最近出现" style="margin-left:4px">${fmtTime(a.last_seen_at)}</span>
           <button class="btn sm ghost" data-act="detail" style="margin-left:8px">详情</button>
-          ${a.status === 'firing'
+          ${canManage && a.status === 'firing'
             ? '<button class="btn sm primary" data-act="ack" style="margin-left:4px">确认</button>'
             : ''}
-          ${a.status !== 'resolved'
+          ${canManage && a.status !== 'resolved'
             ? '<button class="btn sm danger" data-act="resolve" style="margin-left:4px">解决</button>'
             : ''}
-          ${a.status === 'firing'
+          ${canManage && canDelete
+            ? '<button class="btn sm danger" data-act="delete" style="margin-left:4px">删除</button>'
+            : ''}
+          ${canManage && a.status === 'firing'
             ? '<button class="btn sm ghost" data-act="silence" style="margin-left:4px">静默 24h</button>'
             : ''}
         </div>`;
@@ -335,6 +468,7 @@
       const id = Number(row.dataset.id);
       if (btn.dataset.act === 'ack') ackAlert(id);
       else if (btn.dataset.act === 'resolve') resolveAlert(id);
+      else if (btn.dataset.act === 'delete') deleteAlert(id);
       else if (btn.dataset.act === 'silence') silenceAlert(id);
       else if (btn.dataset.act === 'detail') openAlertDetail(id);
     };
@@ -382,6 +516,18 @@
       loadAlertCounts();
     } catch(e) {
       toastError(e.message || '操作失败');
+    }
+  }
+
+  async function deleteAlert(id){
+    if (!await confirmDialog('确认删除此告警？删除后不可恢复。')) return;
+    try {
+      await api(`/api/alerts/${id}/delete`, {method:'DELETE'});
+      toastSuccess('已删除');
+      loadAlerts();
+      loadAlertCounts();
+    } catch(e) {
+      toastError(e.message || '删除失败');
     }
   }
 
@@ -1407,6 +1553,7 @@
   window.alerts = {
     render: async function(root){
       destroyed = false;
+      await loadProjectsForFilter();
       renderPage();
       if (currentTab === 'alerts') {
         await Promise.all([loadAlertCounts(), loadAlerts()]);
