@@ -342,6 +342,104 @@ class TestAlertEngine(unittest.TestCase):
         rule["scope"] = {"type": "env", "ids": [self.env_id]}
         self.assertTrue(e._in_scope(rule, env, host="h1"))
 
+    def test_scope_server_by_id(self):
+        rid = self._metric_rule(metric="cpu", duration=0,
+                                scope={"type": "server", "ids": [10], "env_ids": []})
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules", rid)
+        env = {"id": self.env_id, "project_id": self.proj_id, "name": "test"}
+        self.assertTrue(e._in_scope(rule, env, server_id=10))
+        self.assertFalse(e._in_scope(rule, env, server_id=20))
+
+    def test_scope_server_with_env_ids_filter(self):
+        rid = self._metric_rule(metric="cpu", duration=0,
+                                scope={"type": "server", "ids": [10], "env_ids": [self.env_id]})
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules", rid)
+        env = {"id": self.env_id, "project_id": self.proj_id, "name": "test"}
+        self.assertTrue(e._in_scope(rule, env, server_id=10))
+        # env 不匹配
+        other_env = {"id": 999, "project_id": self.proj_id, "name": "other"}
+        self.assertFalse(e._in_scope(rule, other_env, server_id=10))
+
+    def test_scope_service_by_id(self):
+        rid = self._metric_rule(metric="cpu", duration=0,
+                                scope={"type": "service", "ids": [5], "env_ids": []})
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules", rid)
+        env = {"id": self.env_id, "project_id": self.proj_id, "name": "test"}
+        self.assertTrue(e._in_scope(rule, env, service_id=5))
+        self.assertFalse(e._in_scope(rule, env, service_id=6))
+
+    def test_scope_backward_compat_string_ids(self):
+        """旧规则 ids 为字符串（hostname）时降级为字符串匹配"""
+        rid = self._metric_rule(metric="cpu", duration=0,
+                                scope={"type": "server", "ids": ["host-a"]})
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules", rid)
+        env = {"id": self.env_id, "project_id": self.proj_id, "name": "test"}
+        self.assertTrue(e._in_scope(rule, env, host="host-a"))
+        self.assertFalse(e._in_scope(rule, env, host="host-b"))
+
+    def test_scope_backward_compat_service_string(self):
+        rid = self._metric_rule(metric="cpu", duration=0,
+                                scope={"type": "service", "ids": ["my-svc"]})
+        e = self._engine()
+        rule = dbm.get_record(self.db, "alert_rules", rid)
+        env = {"id": self.env_id, "project_id": self.proj_id, "name": "test"}
+        self.assertTrue(e._in_scope(rule, env, service="my-svc"))
+        self.assertFalse(e._in_scope(rule, env, service="other"))
+
+    def test_metric_rule_scope_by_server_id(self):
+        """指标规则 scope=server 按 server_id 匹配"""
+        sid = dbm.create_record(self.db, "servers",
+                                dict(host="scope-host", enabled=1))
+        dbm.bind_server(self.db, self.env_id, sid)
+        self._metric_rule(metric="cpu", duration=0,
+                          scope={"type": "server", "ids": [sid], "env_ids": []})
+        e = self._engine(overviews={
+            (self.proj_id, "test"): {"services": {},
+                                     "host_metrics": {"scope-host": {"cpu": 95}}}
+        })
+        e._evaluate_metric_rules()
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 1)
+
+    def test_metric_rule_scope_excludes_other_server(self):
+        """指标规则 scope=server 不匹配其他 server_id"""
+        sid1 = dbm.create_record(self.db, "servers",
+                                 dict(host="inc-host", enabled=1))
+        sid2 = dbm.create_record(self.db, "servers",
+                                 dict(host="exc-host", enabled=1))
+        dbm.bind_server(self.db, self.env_id, sid1)
+        dbm.bind_server(self.db, self.env_id, sid2)
+        self._metric_rule(metric="cpu", duration=0,
+                          scope={"type": "server", "ids": [sid1], "env_ids": []})
+        e = self._engine(overviews={
+            (self.proj_id, "test"): {"services": {},
+                                     "host_metrics": {"exc-host": {"cpu": 95}}}
+        })
+        e._evaluate_metric_rules()
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 0)
+
+    def test_status_rule_scope_by_service_id(self):
+        """状态规则 scope=service 按 service_id 匹配"""
+        svc_id = dbm.create_record(self.db, "services", dict(
+            project_id=self.proj_id, name="scope-svc",
+            image_name="scope-svc", service_name="scope-svc"))
+        self._metric_rule(duration=0,
+                          metric_type="status", metric="service_down",
+                          scope={"type": "service", "ids": [svc_id], "env_ids": []})
+        e = self._engine(overviews={
+            (self.proj_id, "test"): {
+                "services": {"scope-svc": {"status": "not_deployed"}},
+                "host_metrics": {}}
+        })
+        e._evaluate_status_rules()
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 1)
+
     # ---- 日志关键词联动 ----
     def _log_kw_rule(self, metric="ERROR", **kw):
         fields = dict(name="log kw test", metric_type="log_keyword", metric=metric,

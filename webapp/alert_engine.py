@@ -151,15 +151,18 @@ class AlertEngine:
                  if r.get("enabled") and r.get("metric_type") == "metric"]
         if not rules or not self._monitor:
             return
-        # 1) 数据源：monitor 探测缓存 host_metrics → 灌入滑动窗口（按 metric 去重：
-        #    同 metric 多条规则不重复灌入，保证滑动窗口一轮一条，持续时间判定不失真）
+        # 1) 数据源：monitor 探测缓存 → 灌入滑动窗口
         metrics = {r.get("metric") or "cpu" for r in rules} & {"cpu", "mem", "disk", "load"}
         for env in dbm.list_records(self._db_path, "environments"):
             data = self._monitor.get_overview(env["project_id"], env["name"]) or {}
             for host, m in (data.get("host_metrics") or {}).items():
                 for metric in metrics:
                     self._push_history((env["id"], host, metric), m.get(metric))
-        # 2) 评估滑动窗口（历史驱动：连续满足轮数 × interval ≥ duration 才触发）
+        # 2) 构建 hostname → server_id 映射
+        host_to_sid = {}
+        for s in dbm.list_records(self._db_path, "servers"):
+            host_to_sid[s["host"]] = s["id"]
+        # 3) 评估滑动窗口
         env_map = {e["id"]: e for e in dbm.list_records(self._db_path, "environments")}
         for (env_id, host, metric) in list(self._history):
             env = env_map.get(env_id)
@@ -167,12 +170,13 @@ class AlertEngine:
                 continue
             key = (env_id, host, metric)
             value = self._history[key][-1][1]
+            server_id = host_to_sid.get(host)
             for rule in rules:
                 if (rule.get("metric") or "cpu") != metric:
                     continue
                 if not self._duration_hit(rule, key):
                     continue
-                if not self._in_scope(rule, env, host=host):
+                if not self._in_scope(rule, env, host=host, server_id=server_id):
                     continue
                 self._fire(rule, f"host:{env_id}:{host}",
                            subject=f"{host} {metric.upper()} 过高",
@@ -187,13 +191,19 @@ class AlertEngine:
                  if r.get("enabled") and r.get("metric_type") == "status"]
         if not rules or not self._monitor:
             return
+        # 构建 service name → service_id 映射
+        name_to_sid = {}
+        for s in dbm.list_records(self._db_path, "services"):
+            name_to_sid[s["name"]] = s["id"]
         for env in dbm.list_records(self._db_path, "environments"):
             data = self._monitor.get_overview(env["project_id"], env["name"]) or {}
             for name, st in (data.get("services") or {}).items():
                 for rule in rules:
                     metric = rule.get("metric", "service_down")
                     if metric == "service_down" and st.get("status") == "not_deployed":
-                        if not self._in_scope(rule, env, service=name):
+                        service_id = name_to_sid.get(name)
+                        if not self._in_scope(rule, env, service=name,
+                                              service_id=service_id):
                             continue
                         self._fire(rule, f"service:{env['id']}:{name}",
                                    subject=f"服务下线: {name}",
@@ -325,12 +335,19 @@ class AlertEngine:
     # ---------- 作用域 ----------
 
     def _in_scope(self, rule: dict, env: dict, host: str = None,
-                  service: str = None) -> bool:
-        """规则作用域：all/project/env/server/service；ids 为对应 id/名称列表"""
+                  service: str = None, server_id: int = None,
+                  service_id: int = None) -> bool:
+        """规则作用域：all/project/env/server/service
+
+        优先使用数字 ID（server_id/service_id）匹配；
+        向后兼容：ids 含字符串元素时降级为 hostname/service name 匹配。
+        env_ids 非空时额外检查当前环境是否在列表中。
+        """
         scope = rule.get("scope") or {"type": "all", "ids": []}
         if not isinstance(scope, dict):
-            return True  # 脏数据：非法 scope 按全局放行，宁可多告警不漏告警
+            return True  # 脏数据：非法 scope 按全局放行
         t, ids = scope.get("type", "all"), scope.get("ids") or []
+        env_ids = scope.get("env_ids") or []
         if t == "all":
             return True
         if t == "project":
@@ -338,9 +355,22 @@ class AlertEngine:
         if t == "env":
             return env["id"] in ids
         if t == "server":
-            return host in ids
+            if env_ids and env["id"] not in env_ids:
+                return False
+            # 向后兼容：ids 含字符串 → 按 hostname 匹配
+            if ids and isinstance(ids[0], str):
+                return host in ids
+            if server_id is not None:
+                return server_id in ids
+            return host in ids  # server_id 未传，降级
         if t == "service":
-            return service in ids
+            if env_ids and env["id"] not in env_ids:
+                return False
+            if ids and isinstance(ids[0], str):
+                return service in ids
+            if service_id is not None:
+                return service_id in ids
+            return service in ids  # service_id 未传，降级
         return True
 
     # ---------- 自动恢复 ----------
@@ -444,8 +474,19 @@ class AlertEngine:
 
         matched_keyword: 实际命中的那个关键词（多关键词场景下精确到单个词）
         """
+        # 查询 service name → service_id
+        service_id = None
+        svcs = dbm.list_records(self._db_path, "services", "name=?", (service,))
+        if svcs:
+            service_id = svcs[0]["id"]
+        # 查询 env_id 对应的环境记录
+        envs = dbm.list_records(self._db_path, "environments", "id=?", (env_id,))
+        env = envs[0] if envs else {"id": env_id, "project_id": 0, "name": env_name}
         keyword = matched_keyword or rule.get("metric") or "log"
         target = f"log:{env_id}:{service}:{keyword}"
+        # scope 检查
+        if not self._in_scope(rule, env, service=service, service_id=service_id):
+            return
         self._fire(rule, target,
                    subject=f"日志告警 [{keyword}]: {service}",
                    description=f"{env_name}/{service} 日志命中关键词 {keyword}:\n{line}",
