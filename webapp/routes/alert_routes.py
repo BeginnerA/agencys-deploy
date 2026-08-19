@@ -136,6 +136,74 @@ def alert_events(alert_id):
         conn.close()
 
 
+@alert_bp.route("/alerts/<int:alert_id>/logs")
+@require_auth
+def alert_logs(alert_id):
+    """告警日志上下文：按 (ts, id) 复合游标实时查 log_entries，取命中行前后 N 行
+
+    复合游标必要性：ts 秒级精度，同秒多条日志靠 id 自增保持稳定次序；
+    按 env+service 过滤避免其他容器日志混入。不可用场景返回 reason 供前端分发。
+    """
+    db = current_app.config["DB_PATH"]
+    a = dbm.get_record(db, "alerts", alert_id)
+    if not a:
+        return jsonify({"error": "告警不存在"}), 404
+    rule = dbm.get_record(db, "alert_rules", a["rule_id"]) or {}
+    if rule.get("metric_type") != "log_keyword":
+        return jsonify({"available": False, "reason": "not_log_alert"})
+    info = a.get("target_info") or {}
+    entry_id = info.get("entry_id")
+    hit_ts = info.get("hit_ts")
+    if not entry_id or not hit_ts:
+        return jsonify({"available": False, "reason": "no_position"})
+    env = info.get("env") or ""
+    service = info.get("service") or ""
+    keyword = info.get("keyword") or ""
+    lines = min(200, max(1, request.args.get("lines", 100, type=int)))
+
+    conn = dbm.get_conn(db)
+    try:
+        # before：倒序取 lines 条再翻转回正序
+        before_rows = conn.execute(
+            "SELECT id, ts, content FROM log_entries "
+            "WHERE env=? AND service=? AND (ts < ? OR (ts = ? AND id < ?)) "
+            "ORDER BY ts DESC, id DESC LIMIT ?",
+            (env, service, hit_ts, hit_ts, entry_id, lines)
+        ).fetchall()
+        before = [dict(r) for r in reversed(before_rows)]
+        # hit：精确取命中行
+        hit_row = conn.execute(
+            "SELECT id, ts, content FROM log_entries WHERE id=?",
+            (entry_id,)
+        ).fetchone()
+        hit = dict(hit_row) if hit_row else None
+        # after：正序取 lines 条
+        after_rows = conn.execute(
+            "SELECT id, ts, content FROM log_entries "
+            "WHERE env=? AND service=? AND (ts > ? OR (ts = ? AND id > ?)) "
+            "ORDER BY ts ASC, id ASC LIMIT ?",
+            (env, service, hit_ts, hit_ts, entry_id, lines)
+        ).fetchall()
+        after = [dict(r) for r in after_rows]
+    finally:
+        conn.close()
+
+    # 命中行已被清理（如超保留期）：用相邻行兜底标记，仍展示上下文
+    if not hit:
+        hit = before[-1] if before else (after[0] if after else None)
+        if hit:
+            hit["fallback"] = True
+    if not hit and not before and not after:
+        return jsonify({"available": False, "reason": "expired",
+                        "env": env, "service": service, "keyword": keyword,
+                        "hit": None, "before": [], "after": [], "lines": lines})
+    return jsonify({
+        "available": True, "env": env, "service": service,
+        "keyword": keyword, "hit": hit, "before": before, "after": after,
+        "lines": lines,
+    })
+
+
 @alert_bp.route("/alerts/batch", methods=["POST"])
 @require_auth
 def alert_batch():

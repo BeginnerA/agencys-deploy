@@ -20,6 +20,8 @@ class TestAlertRoutes(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # 执行期绑定临时目录：避免与其它测试文件的模块级 DATA_DIR 重绑定互相覆盖
+        webapp_pkg.DATA_DIR = Path(_TMP)
         cls.app = create_app()
         cls.c = cls.app.test_client()
         token = cls._login(cls.c, "admin", "admin")
