@@ -175,6 +175,7 @@ class TestAlertRoutes(unittest.TestCase):
         self.assertGreaterEqual(len(data), 2)
         self.assertIn("id", data[0])
         self.assertIn("name", data[0])
+        self.assertIn("project_id", data[0])
         self.assertIn("project_name", data[0])
 
     def test_scope_servers_by_env(self):

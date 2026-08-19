@@ -182,7 +182,7 @@ def scope_environments():
     conn = dbm.get_conn(db)
     try:
         rows = conn.execute(
-            "SELECT e.id, e.name, p.name as project_name "
+            "SELECT e.id, e.name, e.project_id, p.name as project_name "
             "FROM environments e JOIN projects p ON e.project_id=p.id "
             "ORDER BY p.name, e.name"
         ).fetchall()

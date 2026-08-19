@@ -27,9 +27,10 @@
   let editingRuleId = null;
   let ruleTypeFilter = 'all';
   let ruleSaving = false;
-  let scopeSelectedEnvs = new Set();
-  let scopeSelectedTargets = new Set();
-  let scopeNameCache = null;  // {servers: {id: host}, services: {id: name}}
+  let scopeSelectedProjects = new Set();  // 项目作用域已选项目 ID
+  let scopeSelectedEnvs = new Set();      // 环境/服务器/服务作用域已选环境 ID
+  let scopeSelectedTargets = new Set();   // 服务器/服务作用域已选目标 ID
+  let scopeNameCache = null;  // {projects: {id: name}, envs: {id: name}, servers: {id: host}, services: {id: name}}
 
   // ---- 静默窗口 Tab 状态 ----
   let silences = [];
@@ -617,13 +618,18 @@
 
   function openRuleDrawer(rule){
     editingRuleId = rule ? rule.id : null;
+    scopeSelectedProjects.clear();
     scopeSelectedEnvs.clear();
     scopeSelectedTargets.clear();
     const title = rule ? '编辑规则' : '新建规则';
     const r = rule || {};
     const scope = parseScope(r.scope);
-    // 回填已保存的级联选择数据
-    if (scope.type === 'server' || scope.type === 'service') {
+    // 回填已保存的作用域选择数据
+    if (scope.type === 'project') {
+      (scope.ids || []).forEach(id => scopeSelectedProjects.add(id));
+    } else if (scope.type === 'env') {
+      (scope.ids || []).forEach(id => scopeSelectedEnvs.add(id));
+    } else if (scope.type === 'server' || scope.type === 'service') {
       (scope.env_ids || []).forEach(id => scopeSelectedEnvs.add(id));
       (scope.ids || []).forEach(id => scopeSelectedTargets.add(id));
     }
@@ -648,12 +654,9 @@
             `<option value="${k}" ${(r.severity||'P2')===k?'selected':''}>${v}</option>`).join('')}</select></div>
         <div class="field"><label>作用域</label>
           <select id="rfScopeType"></select></div>
-        <div class="field" id="rfScopeIdsWrap" style="display:none">
-          <label>作用域 IDs（逗号分隔）</label>
-          <input id="rfScopeIds" value="" placeholder="1,2,3"></div>
-        <div class="field full" id="rfScopeCascadeWrap" style="display:none">
-          <label>环境</label>
-          <div id="rfScopeEnvTags" class="scope-tag-box"></div>
+        <div class="field full" id="rfScopePickWrap" style="display:none">
+          <label id="rfScopePickLabel">选择目标</label>
+          <div id="rfScopePickTags" class="scope-tag-box"></div>
           <div id="rfScopeTargetWrap" style="margin-top:8px;display:none">
             <label id="rfScopeTargetLabel">目标</label>
             <div id="rfScopeTargetTags" class="scope-tag-box">
@@ -699,10 +702,11 @@
       document.getElementById('rfMetricWrap').style.display = isLog ? 'none' : '';
       document.getElementById('rfLogKwWrap').style.display = isLog ? '' : 'none';
     }
-    // ---- 作用域级联选择 ----
+    // ---- 作用域选择（标签点选 + 服务器/服务级联） ----
     const selScope = document.getElementById('rfScopeType');
-    const cascadeWrap = document.getElementById('rfScopeCascadeWrap');
-    const envTagsEl = document.getElementById('rfScopeEnvTags');
+    const scopePickWrap = document.getElementById('rfScopePickWrap');
+    const scopePickLabel = document.getElementById('rfScopePickLabel');
+    const scopePickTags = document.getElementById('rfScopePickTags');
     const targetWrap = document.getElementById('rfScopeTargetWrap');
     const targetTagsEl = document.getElementById('rfScopeTargetTags');
     const targetLabel = document.getElementById('rfScopeTargetLabel');
@@ -718,48 +722,75 @@
       if (![...opts.map(o=>o[0])].includes(selScope.value)) selScope.value = 'all';
     }
 
-    function updateScopeVis() {
+    // 第一级标签：项目（project 类型）或 环境（env/server/service 类型）
+    function renderScopePick() {
       const st = selScope.value;
-      const needCascade = (st === 'server' || st === 'service');
-      cascadeWrap.style.display = needCascade ? '' : 'none';
-      const idsWrap = document.getElementById('rfScopeIdsWrap');
-      if (idsWrap) idsWrap.style.display = (st === 'project' || st === 'env') ? '' : 'none';
-      if (needCascade) {
-        targetLabel.textContent = st === 'server' ? '服务器' : '服务';
-        renderEnvTags();
-        if (scopeSelectedEnvs.size > 0) loadTargets();
-        else { targetWrap.style.display='none'; }
+      if (!scopeEnvs.length) {
+        scopePickTags.innerHTML = '<div class="muted" style="font-size:12px">加载中...</div>';
+        return;
+      }
+      if (st === 'project') {
+        // 从环境列表按 project_id 分组去重出项目列表
+        const seen = new Map();
+        scopeEnvs.forEach(e => { if (!seen.has(e.project_id)) seen.set(e.project_id, e.project_name); });
+        scopePickLabel.textContent = '项目（可多选）';
+        scopePickTags.innerHTML = [...seen.entries()].map(([pid, pname]) =>
+          `<span class="scope-tag ${scopeSelectedProjects.has(pid)?'active':''}" data-pid="${pid}">${esc(pname)}</span>`
+        ).join('');
+        scopePickTags.querySelectorAll('.scope-tag[data-pid]').forEach(tag => {
+          tag.onclick = () => {
+            const pid = Number(tag.dataset.pid);
+            if (scopeSelectedProjects.has(pid)) scopeSelectedProjects.delete(pid);
+            else scopeSelectedProjects.add(pid);
+            tag.classList.toggle('active');
+          };
+        });
+      } else {
+        scopePickLabel.textContent = '环境（可多选）';
+        scopePickTags.innerHTML = scopeEnvs.map(e => {
+          const active = scopeSelectedEnvs.has(e.id) ? 'active' : '';
+          return `<span class="scope-tag ${active}" data-eid="${e.id}">${esc(e.project_name)}/${esc(e.name)}</span>`;
+        }).join('');
+        scopePickTags.querySelectorAll('.scope-tag[data-eid]').forEach(tag => {
+          tag.onclick = () => {
+            const eid = Number(tag.dataset.eid);
+            if (scopeSelectedEnvs.has(eid)) scopeSelectedEnvs.delete(eid);
+            else scopeSelectedEnvs.add(eid);
+            tag.classList.toggle('active');
+            // 服务器/服务：选中环境后加载目标列表
+            if (st === 'server' || st === 'service') {
+              if (scopeSelectedEnvs.size > 0) loadTargets();
+              else { targetWrap.style.display='none'; targetTagsEl.innerHTML=''; }
+            }
+          };
+        });
       }
     }
 
-    function renderEnvTags() {
-      if (!scopeEnvs.length) {
-        envTagsEl.innerHTML = '<div class="muted" style="font-size:12px">加载中...</div>';
-        return;
-      }
-      envTagsEl.innerHTML = scopeEnvs.map(e => {
-        const active = scopeSelectedEnvs.has(e.id) ? 'active' : '';
-        return `<span class="scope-tag ${active}" data-eid="${e.id}">${esc(e.project_name)}/${esc(e.name)}</span>`;
-      }).join('');
-      envTagsEl.querySelectorAll('.scope-tag').forEach(tag => {
-        tag.onclick = () => {
-          const eid = Number(tag.dataset.eid);
-          if (scopeSelectedEnvs.has(eid)) scopeSelectedEnvs.delete(eid);
-          else scopeSelectedEnvs.add(eid);
-          tag.classList.toggle('active');
+    function updateScopeVis() {
+      const st = selScope.value;
+      const needCascade = (st === 'server' || st === 'service');
+      const needPick = (st === 'project' || st === 'env' || needCascade);
+      scopePickWrap.style.display = needPick ? '' : 'none';
+      if (!needCascade) targetWrap.style.display = 'none';
+      if (needPick) {
+        renderScopePick();
+        if (needCascade) {
+          targetLabel.textContent = st === 'server' ? '服务器' : '服务';
           if (scopeSelectedEnvs.size > 0) loadTargets();
-          else { targetWrap.style.display='none'; targetTagsEl.innerHTML=''; }
-        };
-      });
+          else targetWrap.style.display = 'none';
+        }
+      }
     }
 
     async function loadScopeEnvs() {
       try {
         scopeEnvs = await api('/api/alerts/scope/environments');
-        renderEnvTags();
-        if (scopeSelectedEnvs.size > 0) loadTargets();
+        renderScopePick();
+        const st = selScope.value;
+        if ((st === 'server' || st === 'service') && scopeSelectedEnvs.size > 0) loadTargets();
       } catch(e) {
-        envTagsEl.innerHTML = '<div class="muted" style="color:var(--danger);font-size:12px">环境加载失败</div>';
+        scopePickTags.innerHTML = '<div class="muted" style="color:var(--danger);font-size:12px">环境加载失败</div>';
       }
     }
 
@@ -794,9 +825,10 @@
 
     // 绑定事件：规则类型变更 → 更新指标选项 + scope 选项 + 可见性
     selType.onchange = () => { updateMetricOpts(); updateScopeTypeOpts(); updateFieldVis(); updateScopeVis(); };
-    // 绑定事件：作用域类型变更 → 清除目标选择 + 更新级联选择器可见性
+    // 绑定事件：作用域类型变更 → 清除已选 + 更新选择区可见性
     selScope.onchange = () => {
-      scopeSelectedTargets.clear();  // 切换类型时清除已选目标（服务器/服务 ID 不通用）
+      scopeSelectedProjects.clear();
+      scopeSelectedTargets.clear();  // 切换类型时清除已选（不同类型 ID 不通用）
       updateScopeVis();
     };
     // 初始化
@@ -805,9 +837,7 @@
     if (r.metric && (r.metric_type !== 'log_keyword')) selMetric.value = r.metric;
     updateScopeTypeOpts();
     updateScopeVis();
-    if (selScope.value === 'server' || selScope.value === 'service') {
-      loadScopeEnvs();
-    }
+    loadScopeEnvs();  // 统一预加载环境列表，供项目/环境/服务器/服务共用
     // 按钮
     document.getElementById('rfCancel').onclick = () => {
       const c = document.getElementById('dwClose');
@@ -834,21 +864,27 @@
       const severity = document.getElementById('rfSeverity').value;
       const scopeType = document.getElementById('rfScopeType').value;
       let scopeIds, scopeEnvIds;
-      if (scopeType === 'server' || scopeType === 'service') {
+      if (scopeType === 'project') {
+        scopeIds = [...scopeSelectedProjects];
+        scopeEnvIds = [];
+      } else if (scopeType === 'env') {
+        scopeIds = [...scopeSelectedEnvs];
+        scopeEnvIds = [];
+      } else if (scopeType === 'server' || scopeType === 'service') {
         scopeIds = [...scopeSelectedTargets];
         scopeEnvIds = [...scopeSelectedEnvs];
-      } else if (scopeType === 'all') {
-        scopeIds = [];
-        scopeEnvIds = [];
       } else {
-        const raw = (document.getElementById('rfScopeIds') || {}).value || '';
-        scopeIds = raw.trim() ? raw.split(',').map(s => s.trim()).filter(Boolean).map(Number).filter(n => !isNaN(n)) : [];
+        scopeIds = [];
         scopeEnvIds = [];
       }
       const scope = {type: scopeType, ids: scopeIds};
       if (scopeEnvIds.length) scope.env_ids = scopeEnvIds;
-      if ((scopeType === 'server' || scopeType === 'service') && scopeIds.length === 0) {
-        toastError('请至少选择一个目标'); return;
+      if ((scopeType === 'project' || scopeType === 'env' ||
+           scopeType === 'server' || scopeType === 'service') && scopeIds.length === 0) {
+        const label = scopeType === 'project' ? '项目'
+                    : scopeType === 'env' ? '环境'
+                    : scopeType === 'server' ? '服务器' : '服务';
+        toastError(`请至少选择一个${label}`); return;
       }
       const channels = [...document.querySelectorAll('#rfChannels input:checked')].map(c => c.value);
       if (!channels.length) { toastError('至少选择一个通知渠道'); return; }
@@ -918,12 +954,16 @@
         envIds ? api(`/api/alerts/scope/servers?env_ids=${envIds}`) : [],
         envIds ? api(`/api/alerts/scope/services?env_ids=${envIds}`) : []
       ]);
+      const projects = {};
+      envs.forEach(e => { projects[e.project_id] = e.project_name; });
       scopeNameCache = {
+        projects,
+        envs: Object.fromEntries(envs.map(e => [e.id, e.name])),
         servers: Object.fromEntries(servers.map(s => [s.id, s.host])),
         services: Object.fromEntries(services.map(s => [s.id, s.name]))
       };
     } catch(e) {
-      scopeNameCache = {servers: {}, services: {}};
+      scopeNameCache = {projects: {}, envs: {}, servers: {}, services: {}};
     }
     return scopeNameCache;
   }
@@ -933,7 +973,11 @@
     const typeLabel = {all:'全部',project:'项目',env:'环境',server:'服务器',service:'服务'};
     const label = typeLabel[s.type] || s.type;
     if (s.type === 'all' || !s.ids || !s.ids.length) return label;
-    const nameMap = (s.type === 'server') ? names.servers : (s.type === 'service') ? names.services : null;
+    const nameMap = (s.type === 'server') ? names.servers
+      : (s.type === 'service') ? names.services
+      : (s.type === 'project') ? names.projects
+      : (s.type === 'env') ? names.envs
+      : null;
     const resolved = (s.ids || []).map(id => nameMap?.[id] || `#${id}`);
     return `${label}(${s.ids.length}): ${resolved.slice(0, 3).join(', ')}${resolved.length > 3 ? '…' : ''}`;
   }
