@@ -612,9 +612,16 @@
 
   function openRuleDrawer(rule){
     editingRuleId = rule ? rule.id : null;
+    scopeSelectedEnvs.clear();
+    scopeSelectedTargets.clear();
     const title = rule ? '编辑规则' : '新建规则';
     const r = rule || {};
     const scope = parseScope(r.scope);
+    // 回填已保存的级联选择数据
+    if (scope.type === 'server' || scope.type === 'service') {
+      (scope.env_ids || []).forEach(id => scopeSelectedEnvs.add(id));
+      (scope.ids || []).forEach(id => scopeSelectedTargets.add(id));
+    }
     const channels = r.channels || [];
     const bodyHTML = `
       <div class="form-grid" id="ruleForm">
@@ -830,6 +837,9 @@
       }
       const scope = {type: scopeType, ids: scopeIds};
       if (scopeEnvIds.length) scope.env_ids = scopeEnvIds;
+      if ((scopeType === 'server' || scopeType === 'service') && scopeIds.length === 0) {
+        toastError('请至少选择一个目标'); return;
+      }
       const channels = [...document.querySelectorAll('#rfChannels input:checked')].map(c => c.value);
       if (!channels.length) { toastError('至少选择一个通知渠道'); return; }
       const escalationInterval = parseInt(document.getElementById('rfEscInt').value) || 30;
