@@ -928,7 +928,7 @@
     const typeLabel = {all:'全部',project:'项目',env:'环境',server:'服务器',service:'服务'};
     const label = typeLabel[s.type] || s.type;
     if (s.type === 'all' || !s.ids || !s.ids.length) return label;
-    const nameMap = (s.type === 'server') ? names.servers : names.services;
+    const nameMap = (s.type === 'server') ? names.servers : (s.type === 'service') ? names.services : null;
     const resolved = (s.ids || []).map(id => nameMap?.[id] || `#${id}`);
     return `${label}(${s.ids.length}): ${resolved.slice(0, 3).join(', ')}${resolved.length > 3 ? '…' : ''}`;
   }
