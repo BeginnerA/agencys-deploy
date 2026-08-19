@@ -191,17 +191,17 @@ class AlertEngine:
                  if r.get("enabled") and r.get("metric_type") == "status"]
         if not rules or not self._monitor:
             return
-        # 构建 service name → service_id 映射
+        # 构建 service name → service_id 映射（复合键：project_id + name）
         name_to_sid = {}
         for s in dbm.list_records(self._db_path, "services"):
-            name_to_sid[s["name"]] = s["id"]
+            name_to_sid[(s["project_id"], s["name"])] = s["id"]
         for env in dbm.list_records(self._db_path, "environments"):
             data = self._monitor.get_overview(env["project_id"], env["name"]) or {}
             for name, st in (data.get("services") or {}).items():
                 for rule in rules:
                     metric = rule.get("metric", "service_down")
                     if metric == "service_down" and st.get("status") == "not_deployed":
-                        service_id = name_to_sid.get(name)
+                        service_id = name_to_sid.get((env["project_id"], name))
                         if not self._in_scope(rule, env, service=name,
                                               service_id=service_id):
                             continue
@@ -474,14 +474,16 @@ class AlertEngine:
 
         matched_keyword: 实际命中的那个关键词（多关键词场景下精确到单个词）
         """
-        # 查询 service name → service_id
-        service_id = None
-        svcs = dbm.list_records(self._db_path, "services", "name=?", (service,))
-        if svcs:
-            service_id = svcs[0]["id"]
         # 查询 env_id 对应的环境记录
         envs = dbm.list_records(self._db_path, "environments", "id=?", (env_id,))
         env = envs[0] if envs else {"id": env_id, "project_id": 0, "name": env_name}
+        # 查询 service name → service_id（按项目精确匹配）
+        service_id = None
+        svcs = dbm.list_records(self._db_path, "services",
+                                "name=? AND project_id=?",
+                                (service, env["project_id"]))
+        if svcs:
+            service_id = svcs[0]["id"]
         keyword = matched_keyword or rule.get("metric") or "log"
         target = f"log:{env_id}:{service}:{keyword}"
         # scope 检查
