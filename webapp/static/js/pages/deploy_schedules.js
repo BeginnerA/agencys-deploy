@@ -1,0 +1,126 @@
+// pages/deploy_schedules.js — 定时发布计划管理
+(function(){
+  let timer = null;
+  let destroyed = false;
+  let schedules = [];
+  let projects = [];
+
+  async function loadData(){
+    projects = await api('/api/projects').catch(() => []);
+    schedules = await api('/api/deploy/schedules').catch(() => []);
+  }
+
+  function renderTable(){
+    const root = document.getElementById('pageRoot');
+    const box = root.querySelector('#schedBox');
+    if (!box) return;
+    const projMap = {};
+    projects.forEach(p => projMap[p.id] = p.name);
+    box.innerHTML = schedules.length ? `
+      <div class="panel" style="padding:0"><div class="tbl-wrap"><table class="tbl">
+        <thead><tr><th>#</th><th>名称</th><th>类型</th><th>项目</th><th>环境</th><th>版本</th><th>下次执行</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>${schedules.map(s => `<tr>
+          <td class="num">${s.id}</td>
+          <td>${esc(s.name)}</td>
+          <td>${s.type === 'cron' ? '🔄 周期' : '⏰ 一次'}</td>
+          <td>${esc(projMap[s.project_id] || '-')}</td>
+          <td>${esc(s.env || '-')}</td>
+          <td class="num">${esc(s.version || '-')}</td>
+          <td class="num muted">${s.next_run_at ? fmtTime(s.next_run_at) : (s.type === 'cron' ? esc(s.cron_expr) : '-')}</td>
+          <td>${s.enabled ? '<span class="tag tag-ok">启用</span>' : '<span class="tag">停用</span>'}</td>
+          <td>
+            <button class="btn ghost sm" data-toggle="${s.id}">${s.enabled ? '停用' : '启用'}</button>
+            <button class="btn ghost sm" data-run="${s.id}">执行</button>
+            <button class="btn danger ghost sm" data-del="${s.id}">删除</button>
+          </td>
+        </tr>`).join('')}</tbody></table></div></div>`
+      : `<div class="panel">${emptyState('📅', '暂无定时计划')}</div>`;
+    box.querySelectorAll('[data-toggle]').forEach(btn => btn.onclick = async () => {
+      await api(`/api/deploy/schedules/${btn.dataset.toggle}/toggle`, {method:'POST'});
+      await loadData(); renderTable();
+    });
+    box.querySelectorAll('[data-run]').forEach(btn => btn.onclick = async () => {
+      if (!await confirmDialog('确认立即执行此计划？')) return;
+      try {
+        const r = await api(`/api/deploy/schedules/${btn.dataset.run}/run`, {method:'POST'});
+        toastSuccess(`任务 #${r.id} 已创建`);
+      } catch(e) { toastError(e.message); }
+    });
+    box.querySelectorAll('[data-del]').forEach(btn => btn.onclick = async () => {
+      if (!await confirmDialog('确认删除此计划？')) return;
+      await api(`/api/deploy/schedules/${btn.dataset.del}`, {method:'DELETE'});
+      await loadData(); renderTable();
+      toastSuccess('已删除');
+    });
+  }
+
+  function openCreateForm(){
+    openDrawer({ title: '新建定时计划', body: `
+      <div style="display:flex;flex-direction:column;gap:12px">
+        <div><label class="dg-label">名称</label><input id="schedName" class="inp" placeholder="如：每日凌晨发布"></div>
+        <div><label class="dg-label">类型</label>
+          <select id="schedType" class="inp"><option value="once">一次性</option><option value="cron">周期性</option></select></div>
+        <div><label class="dg-label">项目</label>
+          <select id="schedProj" class="inp">${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
+        <div><label class="dg-label">环境</label><input id="schedEnv" class="inp" placeholder="prod"></div>
+        <div><label class="dg-label">版本</label><input id="schedVer" class="inp" placeholder="1.0.0"></div>
+        <div id="schedTimeWrap">
+          <label class="dg-label">执行时间</label>
+          <input id="schedAt" type="datetime-local" class="inp">
+        </div>
+        <div id="schedCronWrap" style="display:none">
+          <label class="dg-label">CRON 表达式</label>
+          <input id="schedCron" class="inp" placeholder="0 2 * * *（每天凌晨2点）">
+        </div>
+        <button class="btn primary" id="schedSave">保存</button>
+      </div>`});
+    document.getElementById('schedType').onchange = (e) => {
+      document.getElementById('schedTimeWrap').style.display = e.target.value === 'once' ? '' : 'none';
+      document.getElementById('schedCronWrap').style.display = e.target.value === 'cron' ? '' : 'none';
+    };
+    document.getElementById('schedSave').onclick = async () => {
+      const type = document.getElementById('schedType').value;
+      const body = {
+        project_id: Number(document.getElementById('schedProj').value),
+        type, name: document.getElementById('schedName').value,
+        env: document.getElementById('schedEnv').value,
+        version: document.getElementById('schedVer').value,
+        ref_type: 'project', ref_id: Number(document.getElementById('schedProj').value),
+      };
+      if (type === 'once') {
+        const dt = document.getElementById('schedAt').value;
+        if (!dt) { toastError('请选择执行时间'); return; }
+        body.schedule_at = Math.floor(new Date(dt).getTime() / 1000);
+      } else {
+        body.cron_expr = document.getElementById('schedCron').value;
+        if (!body.cron_expr) { toastError('请输入 CRON 表达式'); return; }
+      }
+      try {
+        await api('/api/deploy/schedules', {method:'POST', body:JSON.stringify(body)});
+        toastSuccess('计划已创建');
+        document.getElementById('dwClose').click();
+        await loadData(); renderTable();
+      } catch(e) { toastError(e.message); }
+    };
+  }
+
+  window.deploy_schedules = {
+    render: async function(root){
+      destroyed = false;
+      await loadData();
+      if (destroyed) return [];
+      root.innerHTML = `
+        <div class="deploy-toolbar">
+          <span style="flex:1"></span>
+          ${canDeploy() ? '<button class="btn primary" id="newSchedBtn">+ 新建计划</button>' : ''}
+        </div>
+        <div id="schedBox"></div>`;
+      const nb = document.getElementById('newSchedBtn');
+      if (nb) nb.onclick = openCreateForm;
+      renderTable();
+      timer = setInterval(async () => { await loadData(); if (!destroyed) renderTable(); }, 10000);
+      return [timer];
+    },
+    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; }
+  };
+})();
