@@ -79,3 +79,116 @@
 .impact-item .impact-icon { font-size:16px; }
 .impact-item .impact-name { font-weight:500; }
 .impact-item .impact-detail { font-size:12px; color:var(--text-2); }
+
+/* 灰度策略预览条形图 */
+.canary-preview {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  height: 80px;
+  padding: 8px 0;
+}
+.preview-bar {
+  flex: 1;
+  min-width: 32px;
+  max-width: 60px;
+  background: var(--primary, #4f8cff);
+  border-radius: 4px 4px 0 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 4px 2px;
+  position: relative;
+  opacity: 0.8;
+}
+.preview-label {
+  font-size: 10px;
+  color: #fff;
+  white-space: nowrap;
+}
+.preview-time {
+  font-size: 9px;
+  color: rgba(255,255,255,0.7);
+  margin-top: 2px;
+}
+
+/* 模板胶囊按钮 */
+.template-pills {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.template-pills .pill {
+  padding: 4px 14px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.template-pills .pill:hover {
+  border-color: var(--primary, #4f8cff);
+}
+.template-pills .pill.active {
+  background: var(--primary, #4f8cff);
+  color: #fff;
+  border-color: var(--primary, #4f8cff);
+}
+
+/* 快照选择面板 */
+.snap-panel {
+  display: flex;
+  gap: 16px;
+  padding: 16px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+.snap-col {
+  flex: 1;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.snap-env-group {
+  margin-bottom: 8px;
+}
+.snap-env-label {
+  font-size: 11px;
+  color: var(--text-2);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+  padding: 2px 6px;
+  background: var(--surface-2);
+  border-radius: 4px;
+  display: inline-block;
+}
+.snap-radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.snap-radio:hover {
+  background: var(--surface-2);
+}
+.snap-radio input[type="radio"] {
+  margin: 0;
+}
+.snap-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.snap-info strong {
+  font-size: 13px;
+}
+.snap-info .muted {
+  font-size: 11px;
+}
