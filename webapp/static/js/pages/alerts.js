@@ -200,6 +200,7 @@
         <span style="flex:1"></span>
         <button class="btn sm" id="alertBatchAck">批量确认</button>
         <button class="btn sm danger" id="alertBatchResolve">批量解决</button>
+        <button class="btn sm" id="alertBatchReopen" style="margin-left:4px">批量重新打开</button>
         <button class="btn sm danger" id="alertBatchDelete" style="margin-left:4px">批量删除</button>
       </div>
       <div id="alertList">${skeletonHTML(4)}</div>
@@ -349,7 +350,7 @@
     const selAll = document.getElementById('alertSelectAll');
     if (selAll) selAll.onchange = () => {
       if (selAll.checked) {
-        alerts.forEach(a => { if (a.status !== 'resolved') selectedIds.add(a.id); });
+        alerts.forEach(a => selectedIds.add(a.id));
       } else {
         selectedIds.clear();
       }
@@ -362,6 +363,8 @@
     if (batchResolve) batchResolve.onclick = () => batchAction('resolve');
     const batchDelete = document.getElementById('alertBatchDelete');
     if (batchDelete) batchDelete.onclick = () => batchAction('delete');
+    const batchReopen = document.getElementById('alertBatchReopen');
+    if (batchReopen) batchReopen.onclick = () => batchAction('reopen');
   }
 
   function updateBatchBar(){
@@ -369,19 +372,19 @@
     const cnt = document.getElementById('alertBatchCount');
     if (!bar) return;
     const canManage = canManageAlerts();
-    const hasActions = canManage && alerts.some(a => a.status !== 'resolved');
+    const hasActions = canManage && alerts.some(a => true);
     bar.style.display = (canManage && hasActions) ? 'flex' : 'none';
     if (cnt) cnt.textContent = selectedIds.size > 0 ? `已选 ${selectedIds.size} 条` : '';
     const selAll = document.getElementById('alertSelectAll');
     if (selAll) {
-      const actionable = alerts.filter(a => a.status !== 'resolved');
+      const actionable = alerts.filter(a => true);
       selAll.checked = actionable.length > 0 && actionable.every(a => selectedIds.has(a.id));
     }
   }
 
   async function batchAction(action){
     if (selectedIds.size === 0) { toastError('请先选择告警'); return; }
-    const label = action === 'ack' ? '确认' : action === 'resolve' ? '解决' : '删除';
+    const label = action === 'ack' ? '确认' : action === 'resolve' ? '解决' : action === 'reopen' ? '重新打开' : '删除';
     if (!await confirmDialog(`确认批量${label} ${selectedIds.size} 条告警？`)) return;
     try {
       const resp = await api('/api/alerts/batch', {
@@ -415,12 +418,12 @@
                   : a.status === 'acked' ? 'warning'
                   : 'success';
       const notifyCount = a.notify_count || 0;
-      const isActionable = a.status !== 'resolved';
+      const canSelect = canManage;
       const checked = selectedIds.has(a.id) ? 'checked' : '';
       const canDelete = a.status === 'acked' || a.status === 'resolved';
       return `
         <div class="alert-row ${esc(a.status)}" data-id="${a.id}">
-          ${isActionable && canManage ? `<label class="alert-row-check"><input type="checkbox" data-aid="${a.id}" ${checked}></label>` : '<span style="width:20px"></span>'}
+          ${canSelect ? `<label class="alert-row-check"><input type="checkbox" data-aid="${a.id}" ${checked}></label>` : '<span style="width:20px"></span>'}
           <span class="badge ${sevCls}">${esc(a.severity || 'P2')}</span>
           ${notifyCount > 0 ? `<span class="notify-count" title="通知次数">×${notifyCount}</span>` : ''}
           <div class="ar-main" data-detail="${a.id}" style="cursor:pointer">
@@ -436,6 +439,9 @@
             : ''}
           ${canManage && a.status !== 'resolved'
             ? '<button class="btn sm danger" data-act="resolve" style="margin-left:4px">解决</button>'
+            : ''}
+          ${canManage && a.status === 'resolved'
+            ? '<button class="btn sm" data-act="reopen" style="margin-left:4px">重新打开</button>'
             : ''}
           ${canManage && canDelete
             ? '<button class="btn sm danger" data-act="delete" style="margin-left:4px">删除</button>'
@@ -468,6 +474,7 @@
       const id = Number(row.dataset.id);
       if (btn.dataset.act === 'ack') ackAlert(id);
       else if (btn.dataset.act === 'resolve') resolveAlert(id);
+      else if (btn.dataset.act === 'reopen') reopenAlert(id);
       else if (btn.dataset.act === 'delete') deleteAlert(id);
       else if (btn.dataset.act === 'silence') silenceAlert(id);
       else if (btn.dataset.act === 'detail') openAlertDetail(id);
@@ -512,6 +519,18 @@
     try {
       await api(`/api/alerts/${id}/resolve`, {method:'POST'});
       toastSuccess('已解决');
+      loadAlerts();
+      loadAlertCounts();
+    } catch(e) {
+      toastError(e.message || '操作失败');
+    }
+  }
+
+  async function reopenAlert(id){
+    if (!await confirmDialog('确认将此告警重新打开为活跃状态？')) return;
+    try {
+      await api(`/api/alerts/${id}/reopen`, {method:'POST'});
+      toastSuccess('已重新打开');
       loadAlerts();
       loadAlertCounts();
     } catch(e) {

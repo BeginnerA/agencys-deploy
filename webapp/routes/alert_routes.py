@@ -170,6 +170,26 @@ def resolve_alert(alert_id):
     return jsonify({"ok": True})
 
 
+@alert_bp.route("/alerts/<int:alert_id>/reopen", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def reopen_alert(alert_id):
+    """将已解决的告警重新打开为 firing 状态"""
+    db = current_app.config["DB_PATH"]
+    a = dbm.get_record(db, "alerts", alert_id)
+    if not a:
+        return jsonify({"error": "告警不存在"}), 404
+    if a["status"] != "resolved":
+        return jsonify({"error": "仅已解决告警可重新打开"}), 400
+    now = int(time.time())
+    dbm.update_record(db, "alerts", alert_id, dict(
+        status="firing", resolved_by="", resolved_at=None,
+        resolved_type="", first_seen_at=now, last_seen_at=now,
+        notify_count=0, escalation_level=0))
+    audit("reopen_alert", "alert", alert_id, {"subject": a["subject"]})
+    return jsonify({"ok": True})
+
+
 @alert_bp.route("/alerts/<int:alert_id>/delete", methods=["DELETE"])
 @require_auth
 @require_role("admin", "operator")
@@ -314,8 +334,8 @@ def alert_batch():
     body = request.get_json(silent=True) or {}
     action = body.get("action")  # ack / resolve / delete
     ids = body.get("ids") or []
-    if action not in ("ack", "resolve", "delete"):
-        return jsonify({"error": "action 需为 ack、resolve 或 delete"}), 400
+    if action not in ("ack", "resolve", "delete", "reopen"):
+        return jsonify({"error": "action 需为 ack、resolve、delete 或 reopen"}), 400
     if not ids or not isinstance(ids, list):
         return jsonify({"error": "ids 不能为空"}), 400
     if len(ids) > 100:
@@ -340,6 +360,13 @@ def alert_batch():
             success_count += 1
         elif action == "delete" and a["status"] in ("acked", "resolved"):
             dbm.delete_record(db, "alerts", int(aid))
+            success_count += 1
+        elif action == "reopen" and a["status"] == "resolved":
+            now_ts = int(time.time())
+            dbm.update_record(db, "alerts", int(aid), dict(
+                status="firing", resolved_by="", resolved_at=None,
+                resolved_type="", first_seen_at=now_ts, last_seen_at=now_ts,
+                notify_count=0, escalation_level=0))
             success_count += 1
     audit(f"batch_{action}_alerts", "alert", 0,
           {"ids": ids, "success": success_count})

@@ -54,7 +54,14 @@
     });
   }
 
-  function openCreateForm(){
+  async function loadEnvsForProj(projId){
+    if (!projId) return [];
+    return await api(`/api/projects/${projId}/environments`).catch(() => []);
+  }
+
+  async function openCreateForm(){
+    const defaultProjId = projects.length ? projects[0].id : null;
+    const initEnvs = defaultProjId ? await loadEnvsForProj(defaultProjId) : [];
     openDrawer({ title: '新建定时计划', body: `
       <div class="form-grid">
         <div class="field full"><label>名称</label><input id="schedName" placeholder="如：每日凌晨发布"></div>
@@ -62,7 +69,8 @@
           <select id="schedType">${[['once','一次性'],['cron','周期性']].map(o=>`<option value="${o[0]}">${o[1]}</option>`).join('')}</select></div>
         <div class="field"><label>项目</label>
           <select id="schedProj">${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
-        <div class="field"><label>环境</label><input id="schedEnv" placeholder="prod"></div>
+        <div class="field"><label>环境</label>
+          <select id="schedEnv">${initEnvs.map(e => `<option value="${esc(e.name)}">${esc(e.name)}</option>`).join('')}</select></div>
         <div class="field"><label>版本</label><input id="schedVer" placeholder="1.0.0"></div>
         <div class="field full" id="schedTimeWrap"><label>执行时间</label>
           <input id="schedAt" type="datetime-local"></div>
@@ -70,6 +78,12 @@
           <input id="schedCron" placeholder="0 2 * * *（每天凌晨2点）"></div>
       </div>
       <div style="display:flex;gap:10px;margin-top:20px"><button class="btn primary flex-1" id="schedSave">保存</button></div>`});
+    // 项目切换时刷新环境下拉
+    document.getElementById('schedProj').onchange = async (e) => {
+      const envs = await loadEnvsForProj(Number(e.target.value));
+      const sel = document.getElementById('schedEnv');
+      sel.innerHTML = envs.map(e => `<option value="${esc(e.name)}">${esc(e.name)}</option>`).join('');
+    };
     document.getElementById('schedType').onchange = (e) => {
       document.getElementById('schedTimeWrap').style.display = e.target.value === 'once' ? '' : 'none';
       document.getElementById('schedCronWrap').style.display = e.target.value === 'cron' ? '' : 'none';

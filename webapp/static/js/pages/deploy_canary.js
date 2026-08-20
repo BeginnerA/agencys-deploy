@@ -145,9 +145,10 @@
           <thead><tr><th style="width:40px">#</th><th>服务器数量</th><th>观察时间(分钟)</th><th>推进方式</th><th style="width:40px"></th></tr></thead>
           <tbody>${batchRows.map((r, i) => `<tr>
             <td class="num">${i + 1}</td>
-            <td>${r.servers === 'all'
-              ? '<input type="number" class="batch-srv" data-i="' + i + '" value="" placeholder="全部" min="1" style="width:80px"> <select class="batch-all-sel" data-i="' + i + '"><option value="all" selected>全部</option><option value="num">指定数量</option></select>'
-              : '<input type="number" class="batch-srv" data-i="' + i + '" value="' + r.servers + '" min="1" style="width:80px"> <select class="batch-all-sel" data-i="' + i + '"><option value="num" selected>指定数量</option><option value="all">全部</option></select>'}</td>
+            <td><select class="batch-srv" data-i="${i}">
+              ${[1,2,3,4,5,6,7,8,9,10].map(n => `<option value="${n}" ${r.servers === n ? 'selected' : ''}>${n} 台</option>`).join('')}
+              <option value="all" ${r.servers === 'all' ? 'selected' : ''}>全部</option>
+            </select></td>
             <td><input type="number" class="batch-obs" data-i="${i}" value="${r.observe_minutes}" min="0" style="width:80px"></td>
             <td><select class="batch-adv" data-i="${i}">
               <option value="true" ${r.auto_advance ? 'selected' : ''}>自动推进</option>
@@ -159,18 +160,10 @@
         <button class="btn ghost sm" id="addBatchBtn">+ 添加批次</button>`;
       }
       // 绑定事件
-      editor.querySelectorAll('.batch-srv').forEach(inp => {
-        inp.oninput = () => { batchRows[Number(inp.dataset.i)].servers = Number(inp.value) || 1; updatePreview(); };
-      });
-      editor.querySelectorAll('.batch-all-sel').forEach(sel => {
+      editor.querySelectorAll('.batch-srv').forEach(sel => {
         sel.onchange = () => {
           const idx = Number(sel.dataset.i);
-          if (sel.value === 'all') {
-            batchRows[idx].servers = 'all';
-          } else {
-            batchRows[idx].servers = 1;
-          }
-          renderBatchEditor();
+          batchRows[idx].servers = sel.value === 'all' ? 'all' : Number(sel.value);
           updatePreview();
         };
       });
