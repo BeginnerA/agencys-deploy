@@ -15,9 +15,10 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import wait
 
 from . import db as dbm
-from .alert_channels import send_alert
+from .alert_channels import send_alert_async
 
 SEVERITY_ORDER = ("P0", "P1", "P2", "P3")
 
@@ -30,6 +31,22 @@ DEFAULT_RULES = [
     dict(name="磁盘使用率过高", metric_type="metric", metric="disk",
          compare=">", threshold=90, duration_seconds=300,
          scope={"type": "all", "ids": []}, severity="P2",
+         channels=["feishu"], escalation_interval=30, remark="内置默认规则"),
+    dict(name="Swap 使用率过高", metric_type="metric", metric="swap",
+         compare=">", threshold=80, duration_seconds=300,
+         scope={"type": "all", "ids": []}, severity="P2",
+         channels=["feishu"], escalation_interval=30, remark="内置默认规则"),
+    dict(name="容器重启频繁", metric_type="metric", metric="restart_count",
+         compare=">", threshold=3, duration_seconds=0,
+         scope={"type": "all", "ids": []}, severity="P2",
+         channels=["feishu"], escalation_interval=30, remark="内置默认规则"),
+    dict(name="CLOSE_WAIT 连接过多", metric_type="metric", metric="tcp_close_wait",
+         compare=">", threshold=50, duration_seconds=300,
+         scope={"type": "all", "ids": []}, severity="P2",
+         channels=["feishu"], escalation_interval=30, remark="内置默认规则"),
+    dict(name="SSL 证书即将到期", metric_type="metric", metric="ssl_days",
+         compare="<", threshold=7, duration_seconds=0,
+         scope={"type": "all", "ids": []}, severity="P1",
          channels=["feishu"], escalation_interval=30, remark="内置默认规则"),
     dict(name="服务下线", metric_type="status", metric="service_down",
          compare=">", threshold=0, duration_seconds=0,
@@ -71,6 +88,9 @@ class AlertEngine:
         self._max_history = 40  # 40 轮 = 20 分钟 @30s
         # 扫描基线=启动时刻：不回扫启动前已失败的历史任务（增量语义，避免首启刷陈旧告警）
         self._last_task_scan = time.time()
+        # 异步通知 futures 登记表：评估线程不被渠道网络超时阻塞；
+        # 列表仅保留未完成项（_notify 提交时顺带清理），供 flush_notifications 等待
+        self._pending_notifies = []
         self._seed_rules()
 
     # ---------- 调度 ----------
@@ -95,11 +115,36 @@ class AlertEngine:
             self._stop.wait(self._interval)
 
     def _cycle(self):
-        self._evaluate_metric_rules()
-        self._evaluate_status_rules()
-        self._check_tasks()
-        self._auto_resolve()
-        self._escalate()
+        # 每轮只加载一次配置快照，评估全程复用（避免各评估方法重复全表查询 + 重复建连）
+        snap = self._load_snapshot()
+        self._evaluate_metric_rules(snap)
+        self._evaluate_status_rules(snap)
+        self._check_tasks(snap)
+        self._auto_resolve(snap)
+        self._escalate(snap)
+
+    def _load_snapshot(self) -> dict:
+        """一轮评估的配置快照：规则/项目/环境/服务器/服务/静默窗口各加载一次
+
+        评估全程复用快照，避免各评估方法各自 list_records（每调用一次新建
+        SQLite 连接 + PRAGMA，高频轮询下累积明显）。
+        """
+        rules = dbm.list_records(self._db_path, "alert_rules")
+        return {
+            "rules": rules,
+            "metric_rules": [r for r in rules
+                             if r.get("enabled") and r.get("metric_type") == "metric"],
+            "status_rules": [r for r in rules
+                             if r.get("enabled") and r.get("metric_type") == "status"],
+            "task_fail_rule": next((r for r in rules
+                                    if r.get("enabled") and r.get("metric") == "task_failed"),
+                                   None),
+            "projects": dbm.list_records(self._db_path, "projects"),
+            "envs": dbm.list_records(self._db_path, "environments"),
+            "servers": dbm.list_records(self._db_path, "servers"),
+            "services": dbm.list_records(self._db_path, "services"),
+            "windows": dbm.list_records(self._db_path, "silence_windows"),
+        }
 
     # ---------- 种子规则 ----------
 
@@ -146,37 +191,56 @@ class AlertEngine:
 
     # ---------- 指标规则 ----------
 
-    def _enabled_env_ids(self):
+    def _enabled_env_ids(self, snap=None):
         """返回启用项目的环境 ID 集合，避免为禁用/未配置项目产生告警"""
-        enabled_pids = {p["id"] for p in dbm.list_records(self._db_path, "projects")
-                        if p.get("enabled", 1)}
-        return {e["id"] for e in dbm.list_records(self._db_path, "environments")
-                if e["project_id"] in enabled_pids}
+        projects = snap["projects"] if snap else dbm.list_records(self._db_path, "projects")
+        envs = snap["envs"] if snap else dbm.list_records(self._db_path, "environments")
+        enabled_pids = {p["id"] for p in projects if p.get("enabled", 1)}
+        return {e["id"] for e in envs if e["project_id"] in enabled_pids}
 
-    def _project_code_map(self):
+    def _project_code_map(self, snap=None):
         """返回 project_id → project_code 映射"""
-        return {p["id"]: p.get("code", "") for p in dbm.list_records(self._db_path, "projects")}
+        projects = snap["projects"] if snap else dbm.list_records(self._db_path, "projects")
+        return {p["id"]: p.get("code", "") for p in projects}
 
-    def _evaluate_metric_rules(self):
-        rules = [r for r in dbm.list_records(self._db_path, "alert_rules")
-                 if r.get("enabled") and r.get("metric_type") == "metric"]
+    # 基础指标（host_metrics）与扩展指标（extended_metrics）的指标名集合
+    _HOST_METRICS = {"cpu", "mem", "disk", "load"}
+    _EXT_METRICS = {"swap", "restart_count", "tcp_close_wait", "ssl_days",
+                    "net_rx", "net_tx", "disk_read", "disk_write"}
+
+    def _evaluate_metric_rules(self, snap=None):
+        if snap is None:
+            snap = self._load_snapshot()
+        rules = snap["metric_rules"]
         if not rules or not self._monitor:
             return
         # 1) 数据源：monitor 探测缓存 → 灌入滑动窗口
-        metrics = {r.get("metric") or "cpu" for r in rules} & {"cpu", "mem", "disk", "load"}
-        for env in dbm.list_records(self._db_path, "environments"):
+        rule_metrics = {r.get("metric") or "cpu" for r in rules}
+        host_metrics = rule_metrics & self._HOST_METRICS
+        ext_metrics = rule_metrics & self._EXT_METRICS
+        for env in snap["envs"]:
             data = self._monitor.get_overview(env["project_id"], env["name"]) or {}
-            for host, m in (data.get("host_metrics") or {}).items():
-                for metric in metrics:
-                    self._push_history((env["id"], host, metric), m.get(metric))
+            # 基础指标（cpu/mem/disk/load）
+            if host_metrics:
+                for host, m in (data.get("host_metrics") or {}).items():
+                    for metric in host_metrics:
+                        self._push_history((env["id"], host, metric), m.get(metric))
+            # 扩展指标（swap/restart_count/tcp_close_wait/ssl_days/...）
+            if ext_metrics:
+                for host, ext in (data.get("extended_metrics") or {}).items():
+                    for metric in ext_metrics:
+                        val = ext.get(metric)
+                        # tcp_close_wait 需要从 tcp 子字典提取
+                        if val is None and metric == "tcp_close_wait":
+                            val = (ext.get("tcp") or {}).get("CLOSE_WAIT")
+                        if val is not None:
+                            self._push_history((env["id"], host, metric), val)
         # 2) 构建 hostname → server_id 映射
-        host_to_sid = {}
-        for s in dbm.list_records(self._db_path, "servers"):
-            host_to_sid[s["host"]] = s["id"]
+        host_to_sid = {s["host"]: s["id"] for s in snap["servers"]}
         # 3) 评估滑动窗口（仅处理启用项目的环境）
-        env_map = {e["id"]: e for e in dbm.list_records(self._db_path, "environments")}
-        enabled_env_ids = self._enabled_env_ids()
-        pcode_map = self._project_code_map()
+        env_map = {e["id"]: e for e in snap["envs"]}
+        enabled_env_ids = self._enabled_env_ids(snap)
+        pcode_map = self._project_code_map(snap)
         for (env_id, host, metric) in list(self._history):
             if env_id not in enabled_env_ids:
                 continue
@@ -193,26 +257,63 @@ class AlertEngine:
                     continue
                 if not self._in_scope(rule, env, host=host, server_id=server_id):
                     continue
+                # 根据指标类型生成可读的告警描述
+                subject, desc = self._metric_alert_text(metric, value, rule)
                 self._fire(rule, f"host:{env_id}:{host}",
-                           subject=f"{host} {metric.upper()} 过高",
-                           description=f"当前 {value}%，阈值 {rule['compare']}{rule['threshold']}%，"
-                                       f"持续 {rule['duration_seconds']}s",
-                           target_info={"project": pcode_map.get(env["project_id"], ""), "env": env["name"], "host": host})
+                           subject=subject.format(host=host),
+                           description=desc,
+                           target_info={"project": pcode_map.get(env["project_id"], ""), "env": env["name"], "host": host},
+                           windows=snap["windows"])
+
+    # ---------- 指标告警文本 ----------
+
+    @staticmethod
+    def _metric_alert_text(metric: str, value, rule: dict) -> tuple:
+        """根据指标类型生成可读的告警 (subject_template, description)"""
+        op = rule.get("compare", ">")
+        thr = rule.get("threshold", 0)
+        dur = rule.get("duration_seconds", 0)
+        # 百分比类指标
+        if metric in ("cpu", "mem", "disk", "load", "swap"):
+            return (f"{{host}} {metric.upper()} 过高",
+                    f"当前 {value}%，阈值 {op}{thr}%，持续 {dur}s")
+        if metric == "restart_count":
+            return ("{host} 容器重启频繁",
+                    f"已重启 {int(value)} 次，阈值 {op}{thr}，持续 {dur}s")
+        if metric == "tcp_close_wait":
+            return ("{host} CLOSE_WAIT 连接过多",
+                    f"当前 {int(value)} 个，阈值 {op}{thr}，持续 {dur}s")
+        if metric == "tcp_time_wait":
+            return ("{host} TIME_WAIT 连接过多",
+                    f"当前 {int(value)} 个，阈值 {op}{thr}，持续 {dur}s")
+        if metric == "ssl_days":
+            return ("{host} SSL 证书即将到期",
+                    f"剩余 {int(value)} 天，阈值 {op}{thr} 天")
+        if metric in ("net_rx", "net_tx"):
+            unit = "KB/s"
+            v = value / 1024 if value else 0
+            return (f"{{host}} 网络{('接收' if metric == 'net_rx' else '发送')}流量异常",
+                    f"当前 {v:.1f} {unit}，阈值 {op}{thr}，持续 {dur}s")
+        if metric in ("disk_read", "disk_write"):
+            return (f"{{host}} 磁盘 IO({'读' if metric == 'disk_read' else '写'})异常",
+                    f"当前 {value} sectors/s，阈值 {op}{thr}，持续 {dur}s")
+        # 默认
+        return (f"{{host}} {metric.upper()} 异常",
+                f"当前 {value}，阈值 {op}{thr}，持续 {dur}s")
 
     # ---------- 状态规则 ----------
 
-    def _evaluate_status_rules(self):
-        rules = [r for r in dbm.list_records(self._db_path, "alert_rules")
-                 if r.get("enabled") and r.get("metric_type") == "status"]
+    def _evaluate_status_rules(self, snap=None):
+        if snap is None:
+            snap = self._load_snapshot()
+        rules = snap["status_rules"]
         if not rules or not self._monitor:
             return
         # 构建 service name → service_id 映射（复合键：project_id + name）
-        name_to_sid = {}
-        for s in dbm.list_records(self._db_path, "services"):
-            name_to_sid[(s["project_id"], s["name"])] = s["id"]
-        enabled_env_ids = self._enabled_env_ids()
-        pcode_map = self._project_code_map()
-        for env in dbm.list_records(self._db_path, "environments"):
+        name_to_sid = {(s["project_id"], s["name"]): s["id"] for s in snap["services"]}
+        enabled_env_ids = self._enabled_env_ids(snap)
+        pcode_map = self._project_code_map(snap)
+        for env in snap["envs"]:
             if env["id"] not in enabled_env_ids:
                 continue
             data = self._monitor.get_overview(env["project_id"], env["name"]) or {}
@@ -227,20 +328,24 @@ class AlertEngine:
                         self._fire(rule, f"service:{env['id']}:{name}",
                                    subject=f"服务下线: {name}",
                                    description=f"服务 {name} 在环境 {env['name']} 未部署或已停止",
-                                   target_info={"project": pcode_map.get(env["project_id"], ""), "env": env["name"], "service": name})
+                                   target_info={"project": pcode_map.get(env["project_id"], ""), "env": env["name"], "service": name},
+                                   windows=snap["windows"])
 
-    def _check_tasks(self):
+    def _check_tasks(self, snap=None):
         """扫描最近失败任务（增量：finished_at > 上次扫描点）触发任务失败告警"""
+        if snap is None:
+            snap = self._load_snapshot()
         now = time.time()
         rows = dbm.list_records(self._db_path, "tasks", "status='failed'",
                                 (), "finished_at DESC")[:20]
-        pcode_map = self._project_code_map()
+        rule = snap["task_fail_rule"]
+        if not rule:
+            self._last_task_scan = now
+            return
+        pcode_map = self._project_code_map(snap)
         for t in rows:
             finished = t.get("finished_at") or 0
             if finished <= self._last_task_scan:
-                continue
-            rule = self._task_fail_rule()
-            if not rule:
                 continue
             # 守卫用完整指纹（{rule_id}:task:{id}），与 _fire 写入一致；
             # 仅拦截非 resolved——解决后再失败视为新事件
@@ -251,7 +356,8 @@ class AlertEngine:
             self._fire(rule, f"task:{t['id']}",
                        subject=f"任务失败: {t['name']}",
                        description=f"任务 #{t['id']} {t['name']} [{t.get('env','')}] 执行失败",
-                       target_info={"project": t.get("project_code", "") or pcode_map.get(t.get("project_id", 0), ""), "env": t.get("env", ""), "task_id": t["id"]})
+                       target_info={"project": t.get("project_code", "") or pcode_map.get(t.get("project_id", 0), ""), "env": t.get("env", ""), "task_id": t["id"]},
+                       windows=snap["windows"])
         self._last_task_scan = now
 
     def _task_fail_rule(self):
@@ -262,7 +368,7 @@ class AlertEngine:
     # ---------- 触发与收敛 ----------
 
     def _fire(self, rule: dict, target: str, subject: str,
-              description: str, target_info: dict) -> int:
+              description: str, target_info: dict, windows: list = None) -> int:
         """创建或更新告警（收敛）；新告警首次触发时通知（静默窗口内不通知）
 
         收敛策略：
@@ -292,9 +398,9 @@ class AlertEngine:
             # 静默期首次触发的告警：窗口已过期、仍在 firing 且从未通知 → 补发一次
             # （acked/resolved 不再补发：ack 后停止重复通知）
             if (a["status"] == "firing" and a["notify_count"] == 0
-                    and not self._silenced(rule, target_info)):
+                    and not self._silenced(rule, target_info, windows)):
                 alert = dbm.get_record(self._db_path, "alerts", a["id"])
-                send_alert(self._db_path, alert, rule.get("channels") or [])
+                self._notify(alert, rule.get("channels") or [])
                 updates["notify_count"] = 1
             dbm.update_record(self._db_path, "alerts", a["id"], updates)
             return a["id"]
@@ -322,12 +428,12 @@ class AlertEngine:
             }
             dbm.update_record(self._db_path, "alerts", a["id"], updates)
             alert = dbm.get_record(self._db_path, "alerts", a["id"])
-            if self._silenced(rule, target_info):
+            if self._silenced(rule, target_info, windows):
                 dbm.create_record(self._db_path, "alert_events", dict(
                     alert_id=a["id"], channel="silenced", target="", payload="",
                     ok=1, detail="静默窗口内，未发送通知", created_at=now))
             else:
-                send_alert(self._db_path, alert, rule.get("channels") or [])
+                self._notify(alert, rule.get("channels") or [])
                 dbm.update_record(self._db_path, "alerts", a["id"],
                                   {"notify_count": 1})
             return a["id"]
@@ -340,22 +446,41 @@ class AlertEngine:
             escalation_level=0,
             escalation_at=now + int(rule.get("escalation_interval", 30)) * 60))
         alert = dbm.get_record(self._db_path, "alerts", alert_id)
-        if self._silenced(rule, target_info):
+        if self._silenced(rule, target_info, windows):
             dbm.create_record(self._db_path, "alert_events", dict(
                 alert_id=alert_id, channel="silenced", target="", payload="",
                 ok=1, detail="静默窗口内，未发送通知", created_at=now))
         else:
-            send_alert(self._db_path, alert, rule.get("channels") or [])
+            self._notify(alert, rule.get("channels") or [])
             dbm.update_record(self._db_path, "alerts", alert_id,
                               {"notify_count": 1})
         return alert_id
 
+    # ---------- 异步通知 ----------
+
+    def _notify(self, alert: dict, channels: list):
+        """异步投递通知并登记 future；引擎评估线程不被渠道超时/重试阻塞"""
+        self._pending_notifies = [f for f in self._pending_notifies if not f.done()]
+        self._pending_notifies.append(send_alert_async(self._db_path, alert, channels))
+
+    def flush_notifications(self, timeout: int = 30):
+        """等待所有已提交的通知发送完成（测试/优雅停止用）；不阻塞评估循环"""
+        if not self._pending_notifies:
+            return
+        wait(self._pending_notifies, timeout=timeout)
+        self._pending_notifies = [f for f in self._pending_notifies if not f.done()]
+
     # ---------- 静默窗口 ----------
 
-    def _silenced(self, rule: dict, target_info: dict) -> bool:
-        """命中任一启用窗口（作用域：规则/环境/服务器，空作用域=全局）"""
+    def _silenced(self, rule: dict, target_info: dict, windows: list = None) -> bool:
+        """命中任一启用窗口（作用域：规则/环境/服务器，空作用域=全局）
+
+        windows 传评估轮快照，避免每次触发都重新全表查询（_fire 热路径）
+        """
         now = time.time()
-        for w in dbm.list_records(self._db_path, "silence_windows"):
+        if windows is None:
+            windows = dbm.list_records(self._db_path, "silence_windows")
+        for w in windows:
             if not w.get("enabled") or not self._window_active(w, now):
                 continue
             scope = w.get("scope") or {}
@@ -445,12 +570,15 @@ class AlertEngine:
 
     # ---------- 自动恢复 ----------
 
-    def _auto_resolve(self):
+    def _auto_resolve(self, snap=None):
         """指标类告警：连续 RECOVER_ROUNDS 轮恢复 → resolved(auto)；
         服务下线告警：服务重新在线 → resolved(auto)；任务失败不自动恢复"""
+        if snap is None:
+            snap = self._load_snapshot()
+        rules_by_id = {r["id"]: r for r in snap["rules"]}
         for a in dbm.list_records(self._db_path, "alerts",
                                   "status IN ('firing','acked')", (), "id"):
-            rule = dbm.get_record(self._db_path, "alert_rules", a["rule_id"]) or {}
+            rule = rules_by_id.get(a["rule_id"]) or {}
             if rule.get("metric_type") == "metric":
                 if self._metric_recovered(rule, a):
                     self._resolve(a, "auto")
@@ -512,13 +640,16 @@ class AlertEngine:
 
     # ---------- 升级 ----------
 
-    def _escalate(self):
+    def _escalate(self, snap=None):
         """acked 超时未解决 → 级别提升一级（最多 P0），按新级别重新通知"""
+        if snap is None:
+            snap = self._load_snapshot()
+        rules_by_id = {r["id"]: r for r in snap["rules"]}
         now = int(time.time())
         for a in dbm.list_records(self._db_path, "alerts",
                                   "status='acked' AND escalation_at IS NOT NULL "
                                   "AND escalation_at <= ?", (now,), "id"):
-            rule = dbm.get_record(self._db_path, "alert_rules", a["rule_id"]) or {}
+            rule = rules_by_id.get(a["rule_id"]) or {}
             sev = a.get("severity", "P2")
             if sev not in SEVERITY_ORDER:
                 continue
@@ -532,8 +663,8 @@ class AlertEngine:
                 escalation_level=a.get("escalation_level", 0) + 1,
                 escalation_at=now + interval))
             a["severity"] = new_sev
-            if not self._silenced(rule, a.get("target_info") or {}):
-                send_alert(self._db_path, a, rule.get("channels") or [])
+            if not self._silenced(rule, a.get("target_info") or {}, snap["windows"]):
+                self._notify(a, rule.get("channels") or [])
 
     # ---------- 供日志联动调用 ----------
 

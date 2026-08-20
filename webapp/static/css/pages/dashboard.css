@@ -1,5 +1,5 @@
 /* dashboard.css — 监控大屏 */
-.kpi-row{display:grid;grid-template-columns:repeat(6,1fr);gap:var(--sp-3);margin-bottom:var(--sp-4)}
+.kpi-row{display:grid;grid-template-columns:repeat(8,1fr);gap:var(--sp-3);margin-bottom:var(--sp-4)}
 .kpi-card{
   background:linear-gradient(180deg,rgba(17,34,65,.6),rgba(13,27,51,.9));
   border:1px solid var(--border);border-radius:var(--r-card);padding:14px 16px;
@@ -14,6 +14,7 @@
   background:linear-gradient(90deg,var(--primary),transparent);opacity:.7;
 }
 .dash-grid{display:grid;grid-template-columns:340px 1fr 300px;gap:var(--sp-4);margin-bottom:var(--sp-4)}
+.dash-grid+.panel{margin-top:0}
 .dash-grid .chart-box{min-height:300px}
 .env-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--sp-3);margin-bottom:var(--sp-4)}
 .env-card{height:190px}
@@ -22,11 +23,6 @@
 .hm-gauge-box{text-align:center}
 .hm-warn-tag{display:inline-block;padding:1px 8px;border-radius:var(--r-full);font-size:10px;
   background:rgba(255,69,96,.15);color:#FF4560;border:1px solid rgba(255,69,96,.4);margin-left:8px}
-/* 环境切换下拉 */
-.env-sel{padding:3px 10px;font-size:12px;border:1px solid var(--border);border-radius:var(--r-ctl);
-  background:rgba(0,212,255,.04);color:var(--text-1);outline:none;cursor:pointer;transition:var(--t-fast)}
-.env-sel:focus{border-color:var(--primary);box-shadow:var(--shadow-glow)}
-.env-sel option{background:#0d1b33;color:var(--text-1)}
 /* 服务器状态 + 资源明细合并表格 */
 .hm-tbl td{padding:8px 10px !important;vertical-align:middle}
 .hm-bar-wrap{position:relative;height:20px;background:rgba(0,212,255,.06);border-radius:3px;overflow:hidden;min-width:80px}
@@ -45,5 +41,3 @@
 .rlist .list-item{border-bottom:1px solid rgba(0,212,255,.06)}
 .rlist .list-item:last-child{border-bottom:none}
 .tbl-wrap{overflow-x:auto}
-/* 项目切换栏 */
-.dash-proj-bar{display:flex;align-items:center;gap:var(--sp-3);margin-bottom:var(--sp-4)}

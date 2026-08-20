@@ -9,6 +9,11 @@ from ..auth import require_auth, require_role
 
 dash_bp = Blueprint("dash", __name__)
 
+# overview 聚合缓存：大屏 5s 轮询下，TTL 内直接返回缓存，
+# 消除每轮 N+1 查询（每项目 services/environments）与 7/30 天 trend 全量重算
+_OVERVIEW_TTL = 2.5
+_overview_cache = {"ts": 0.0, "payload": None}
+
 
 def _day_start(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%m-%d")
@@ -38,6 +43,11 @@ def _trend(tasks: list, days: int) -> dict:
 @dash_bp.route("/dashboard/overview")
 @require_auth
 def overview():
+    now = time.time()
+    cache = _overview_cache
+    # TTL 内直接返回上次结果（任务/配置变更的可见延迟 ≤ TTL，大屏可接受）
+    if now - cache["ts"] < _OVERVIEW_TTL and cache["payload"] is not None:
+        return jsonify(cache["payload"])
     db = current_app.config["DB_PATH"]
     projects = dbm.list_records(db, "projects")
     # 统计窗口为最近 500 条任务（list_tasks 上限约定），高频率发布下 7/30 天窗口早期可能被截断
@@ -69,6 +79,8 @@ def overview():
                     "status": t["status"], "started_at": t["started_at"]}
                    for t in tasks[:10]],
     }
+    _overview_cache["ts"] = now
+    _overview_cache["payload"] = out
     return jsonify(out)
 
 
@@ -92,8 +104,6 @@ def monitor_overview():
     from ..monitor import get_monitor
     project_id = request.args.get("project_id", type=int)
     env = request.args.get("env", "")
-    if not project_id:
-        return jsonify({"error": "project_id 必填"}), 400
     mon = get_monitor()
     data = mon.get_overview(project_id, env) if mon else {"services": {}, "servers": [], "ts": 0}
     return jsonify(data)
@@ -108,3 +118,28 @@ def monitor_refresh():
     if mon:
         mon.refresh()
     return jsonify({"ok": True})
+
+
+@dash_bp.route("/monitor/response_times")
+@require_auth
+def monitor_response_times():
+    """查询服务响应时间历史（默认最近 24h）"""
+    db = current_app.config["DB_PATH"]
+    env_id = request.args.get("env_id", type=int)
+    service = request.args.get("service", "")
+    hours = request.args.get("hours", 24, type=int)
+    hours = max(1, min(hours, 168))  # 最多 7 天
+    rows = dbm.get_response_time_history(db, env_id, service or None, hours)
+    return jsonify({"rows": rows, "hours": hours})
+
+
+@dash_bp.route("/monitor/snapshots")
+@require_auth
+def monitor_snapshots():
+    """查询最新监控快照（扩展指标：swap/网络/diskIO/TCP/重启/docker_df/SSL）"""
+    db = current_app.config["DB_PATH"]
+    env_id = request.args.get("env_id", type=int)
+    hours = request.args.get("hours", 24, type=int)
+    hours = max(1, min(hours, 72))
+    rows = dbm.get_monitor_latest(db, env_id, hours)
+    return jsonify({"rows": rows, "hours": hours})

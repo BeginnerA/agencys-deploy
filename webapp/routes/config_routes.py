@@ -550,6 +550,14 @@ def create_server():
         nacos_ip=body.get("nacos_ip", ""),
         remark=body.get("remark", ""),
         enabled=1 if enabled else 0))
+    # 自动绑定到所有已启用监控的环境，确保新服务器立即出现在监控中心
+    db = current_app.config["DB_PATH"]
+    for proj in dbm.list_records(db, "projects"):
+        for env in dbm.list_environments(db, proj["id"]):
+            if env.get("monitor_enabled"):
+                existing = dbm.list_env_servers(db, env["id"])
+                order = len(existing)
+                dbm.bind_server(db, env["id"], sid, order)
     audit("create_server", "server", sid, {"host": host})
     return _ok({"id": sid}), 201
 

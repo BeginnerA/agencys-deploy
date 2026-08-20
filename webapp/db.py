@@ -266,6 +266,39 @@ CREATE TABLE IF NOT EXISTS canary_configs (
     is_default INTEGER DEFAULT 0,
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS response_time_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    env_id INTEGER NOT NULL DEFAULT 0,
+    service TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    response_ms REAL NOT NULL DEFAULT 0,
+    ok INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rth_env_svc_ts
+    ON response_time_history(env_id, service, created_at);
+CREATE TABLE IF NOT EXISTS monitor_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    env_id INTEGER NOT NULL DEFAULT 0,
+    host TEXT NOT NULL DEFAULT '',
+    swap REAL,
+    net_rx REAL,
+    net_tx REAL,
+    disk_read REAL,
+    disk_write REAL,
+    tcp_established INTEGER,
+    tcp_time_wait INTEGER,
+    tcp_close_wait INTEGER,
+    restart_count INTEGER DEFAULT 0,
+    uptime_hours REAL,
+    docker_images_bytes INTEGER,
+    docker_containers_bytes INTEGER,
+    docker_volumes_bytes INTEGER,
+    ssl_days REAL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ms_env_host_ts
+    ON monitor_snapshots(env_id, host, created_at);
 """
 
 # JSON 字段（读写时自动序列化/反序列化）
@@ -291,7 +324,8 @@ TABLES = frozenset(("projects", "services", "environments", "servers",
                     "log_entries", "log_scan_state",
                     "deploy_schedules", "release_windows",
                     "service_dependencies", "deployment_snapshots",
-                    "canary_configs"))
+                    "canary_configs",
+                    "response_time_history", "monitor_snapshots"))
 
 
 def _check_table(table: str):
@@ -303,12 +337,18 @@ def get_conn(db_path: str):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL 下并发读写（采集线程写 + 前端查询读）互不阻塞；
+    # busy_timeout 避免多线程瞬时写冲突直接抛 SQLITE_BUSY
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
 def init_db(db_path: str):
     conn = get_conn(db_path)
     try:
+        # WAL 为数据库级持久设置（写入库文件头），初始化时开启一次即可
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
         _migrate(conn)
         conn.commit()
@@ -701,5 +741,111 @@ def project_count(db_path: str) -> int:
     conn = get_conn(db_path)
     try:
         return conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    finally:
+        conn.close()
+
+
+# ---------- 监控时序数据 ----------
+
+def save_response_time(db_path: str, env_id: int, service: str,
+                       host: str, response_ms: float, ok: bool):
+    """持久化健康检查响应时间（保留 7 天，每次写入清理过期）"""
+    now = int(time.time())
+    conn = get_conn(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO response_time_history"
+            " (env_id, service, host, response_ms, ok, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (env_id, service, host, response_ms, int(ok), now))
+        conn.execute(
+            "DELETE FROM response_time_history WHERE created_at < ?",
+            (now - 7 * 86400,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_response_time_history(db_path: str, env_id: int = None,
+                            service: str = None, hours: int = 24) -> list:
+    """查询响应时间历史（默认最近 24h）"""
+    since = int(time.time()) - hours * 3600
+    where_parts = ["created_at >= ?"]
+    params = [since]
+    if env_id:
+        where_parts.append("env_id = ?")
+        params.append(env_id)
+    if service:
+        where_parts.append("service = ?")
+        params.append(service)
+    where = " AND ".join(where_parts)
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM response_time_history WHERE {where}"
+            " ORDER BY created_at DESC LIMIT 500", params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def save_monitor_snapshot(db_path: str, env_id: int, host: str, data: dict):
+    """保存一轮监控快照（新指标：swap/network/diskio/tcp/restart/docker_df/ssl）"""
+    now = int(time.time())
+    conn = get_conn(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO monitor_snapshots"
+            " (env_id, host, swap, net_rx, net_tx, disk_read, disk_write,"
+            " tcp_established, tcp_time_wait, tcp_close_wait,"
+            " restart_count, uptime_hours,"
+            " docker_images_bytes, docker_containers_bytes, docker_volumes_bytes,"
+            " ssl_days, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (env_id, host,
+             data.get("swap"), data.get("net_rx"), data.get("net_tx"),
+             data.get("disk_read"), data.get("disk_write"),
+             data.get("tcp", {}).get("ESTABLISHED"),
+             data.get("tcp", {}).get("TIME_WAIT"),
+             data.get("tcp", {}).get("CLOSE_WAIT"),
+             data.get("restart_count", 0), data.get("uptime_hours"),
+             data.get("docker_df", {}).get("images"),
+             data.get("docker_df", {}).get("containers"),
+             data.get("docker_df", {}).get("volumes"),
+             data.get("ssl_days"), now))
+        # 保留 3 天
+        conn.execute(
+            "DELETE FROM monitor_snapshots WHERE created_at < ?",
+            (now - 3 * 86400,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_monitor_latest(db_path: str, env_id: int = None,
+                       hours: int = 24) -> list:
+    """查询最新监控快照（每个 host 取最新一条）"""
+    since = int(time.time()) - hours * 3600
+    conn = get_conn(db_path)
+    try:
+        if env_id:
+            rows = conn.execute(
+                "SELECT m.* FROM monitor_snapshots m"
+                " INNER JOIN ("
+                "   SELECT host, MAX(created_at) AS max_ts"
+                "   FROM monitor_snapshots WHERE created_at >= ? AND env_id = ?"
+                "   GROUP BY host"
+                ") t ON m.host = t.host AND m.created_at = t.max_ts"
+                " ORDER BY m.host", (since, env_id)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT m.* FROM monitor_snapshots m"
+                " INNER JOIN ("
+                "   SELECT host, MAX(created_at) AS max_ts"
+                "   FROM monitor_snapshots WHERE created_at >= ?"
+                "   GROUP BY host"
+                ") t ON m.host = t.host AND m.created_at = t.max_ts"
+                " ORDER BY m.host", (since,)).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()

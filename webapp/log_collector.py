@@ -7,6 +7,7 @@ import shutil
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -137,59 +138,108 @@ class LogCollector:
             finally:
                 conn.close()
 
-            for srv in servers:
-                self._collect_server(env_name, env_id, env_ssh, dict(srv))
+            # 环境串联、服务器并发批量采集：
+            # 整轮时长 ≈ 最慢服务器（原实现为所有服务器 SSH 时长之和）。
+            # 每环境并发上限 8（SSH 连接限流，防连接风暴）；
+            # _fail_counts 的 key 含 host，各 key 仅由对应服务器线程读写，
+            # 且修改在 _lock 内完成（get+1+set 非原子）
+            with ThreadPoolExecutor(max_workers=min(8, len(servers))) as pool:
+                futures = [pool.submit(self._collect_server, env_name, env_id,
+                                       env_ssh, dict(srv)) for srv in servers]
+                for fut in futures:
+                    try:
+                        # _collect_server 内部各 SSH 命令已有超时，此处仅防意外
+                        fut.result(timeout=60)
+                    except Exception:
+                        pass
         self._current_kw_rules = None
 
     def _collect_server(self, env_name: str, env_id: int, env_ssh: dict, server: dict):
-        """采集单台服务器的所有容器日志"""
-        from .monitor import _merge_server_ssh
+        """采集单台服务器：一次 SSH 连接完成 docker ps + 所有容器增量日志
+
+        相比逐容器各自连接，每服务器每轮只建 1 次连接
+        （TCP 握手 + paramiko 认证是采集热路径的主要开销）
+        """
+        from .monitor import _merge_server_ssh, _ssh_exec_multi
         ssh_cfg = _merge_server_ssh(env_ssh, server)
         host = server["host"]
         port = server.get("ssh_port") or 22
         try:
-            out = self.ssh_func(host, port, ssh_cfg,
-                                "docker ps --format '{{.Names}}|{{.Image}}'", timeout=10)
+            outs = _ssh_exec_multi(host, port, ssh_cfg,
+                                   ["docker ps --format '{{.Names}}|{{.Image}}'"],
+                                   timeout=10)
         except Exception:
             return
         containers = []
-        for line in out.splitlines():
+        for line in outs[0].splitlines():
             if "|" in line:
                 name = line.split("|", 1)[0].strip()
                 if name:
                     containers.append(name)
-
+        if not containers:
+            return
+        # 批量读取所有容器采集游标（1 次连接），构建各容器增量命令
+        states = self._load_scan_states(env_name, host)
+        cmds, metas = [], []
         for container in containers:
-            self._collect_container(env_name, env_id, host, ssh_cfg, container, port)
+            last_ts = states.get(container, "")
+            safe_container = shlex.quote(container)
+            if last_ts:
+                cmd = f"docker logs --since '{last_ts}' -t {safe_container} 2>&1 | head -{self.max_lines}"
+            else:
+                cmd = f"docker logs --since 5m -t {safe_container} 2>&1 | head -{self.max_lines}"
+            cmds.append(cmd)
+            metas.append((container, last_ts))
+        try:
+            # 单连接顺序执行（每条命令独立 timeout）；任一失败整批标记，下轮重试
+            outs = _ssh_exec_multi(host, port, ssh_cfg, cmds, timeout=30)
+            for (container, last_ts), out in zip(metas, outs):
+                with self._lock:
+                    self._fail_counts.pop((env_name, host, container), None)
+                self._collect_container_output(env_name, env_id, host, container,
+                                               out, last_ts)
+        except Exception:
+            with self._lock:
+                for container, _ in metas:
+                    self._fail_counts[(env_name, host, container)] = \
+                        self._fail_counts.get((env_name, host, container), 0) + 1
 
-    def _collect_container(self, env_name: str, env_id: int, host: str,
-                           ssh_cfg: dict, container: str, port: int):
-        """采集单个容器：增量 docker logs --since"""
-        key = (env_name, host, container)
+    def _load_scan_states(self, env_name: str, host: str) -> dict:
+        """批量读取服务器所有容器采集游标：{container: last_ts}（1 次连接）"""
         conn = dbm.get_conn(self.db_path)
         try:
-            state = conn.execute(
-                "SELECT last_ts, last_line FROM log_scan_state "
-                "WHERE env=? AND server=? AND container=?",
-                (env_name, host, container)
-            ).fetchone()
+            rows = conn.execute(
+                "SELECT container, last_ts FROM log_scan_state "
+                "WHERE env=? AND server=?",
+                (env_name, host)
+            ).fetchall()
+            return {r["container"]: r["last_ts"] or "" for r in rows}
         finally:
             conn.close()
 
-        last_ts = state["last_ts"] if state else ""
+    def _collect_container(self, env_name: str, env_id: int, host: str,
+                           ssh_cfg: dict, container: str, port: int):
+        """采集单个容器（独立 SSH，兼容单容器路径）；批量采集走 _collect_server"""
+        key = (env_name, host, container)
+        last_ts = self._load_scan_states(env_name, host).get(container, "")
         safe_container = shlex.quote(container)
         if last_ts:
             cmd = f"docker logs --since '{last_ts}' -t {safe_container} 2>&1 | head -{self.max_lines}"
         else:
             cmd = f"docker logs --since 5m -t {safe_container} 2>&1 | head -{self.max_lines}"
-
         try:
             out = self.ssh_func(host, port, ssh_cfg, cmd, timeout=30)
-            self._fail_counts.pop(key, None)
+            with self._lock:
+                self._fail_counts.pop(key, None)
         except Exception:
-            self._fail_counts[key] = self._fail_counts.get(key, 0) + 1
+            with self._lock:
+                self._fail_counts[key] = self._fail_counts.get(key, 0) + 1
             return
+        self._collect_container_output(env_name, env_id, host, container, out, last_ts)
 
+    def _collect_container_output(self, env_name: str, env_id: int, host: str,
+                                  container: str, out: str, last_ts: str):
+        """处理单容器采集输出：解析行 → 归档文件 → FTS 索引 → 关键词扫描 → 游标"""
         if not out or not out.strip():
             return
 
@@ -227,9 +277,14 @@ class LogCollector:
             f.writelines(lines)
 
     def _index_log_entries(self, entries: list) -> list:
-        """批量写入 log_entries + 同步 FTS5；返回每条日志的 rowid（与 entries 一一对应）"""
+        """批量写入 log_entries + 同步 FTS5；返回每条日志的 rowid（与 entries 一一对应）
+
+        FTS 行用 executemany 一次提交，减少 Python→SQLite 往返次数
+        （log_entries 需逐条 INSERT 取 lastrowid）
+        """
         conn = dbm.get_conn(self.db_path)
         rowids = []
+        fts_rows = []
         try:
             for ts, env, service, content, file_path, offset, count in entries:
                 cursor = conn.execute(
@@ -237,13 +292,13 @@ class LogCollector:
                     "VALUES (?, ?, ?, '', ?, ?, ?, ?, '[]')",
                     (ts, env, service, file_path, offset, count, content)
                 )
-                rowid = cursor.lastrowid
-                rowids.append(rowid)
-                conn.execute(
-                    "INSERT INTO log_fts (rowid, ts, env, service, content) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (rowid, str(ts), env, service, content)
-                )
+                rowids.append(cursor.lastrowid)
+                fts_rows.append((cursor.lastrowid, str(ts), env, service, content))
+            conn.executemany(
+                "INSERT INTO log_fts (rowid, ts, env, service, content) "
+                "VALUES (?, ?, ?, ?, ?)",
+                fts_rows
+            )
             conn.commit()
             return rowids
         finally:

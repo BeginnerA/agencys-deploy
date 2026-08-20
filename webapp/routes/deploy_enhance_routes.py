@@ -518,7 +518,11 @@ def impact_analysis(project_id):
     return jsonify({"service": service_name, "upstream": upstream,
                     "downstream": downstream,
                     "indirect_upstream": sorted(indirect_up),
-                    "indirect_downstream": sorted(indirect_down)})
+                    "indirect_downstream": sorted(indirect_down),
+                    # 同机部署服务（契约字段）：服务-服务器映射仅运行时
+                    # （monitor docker ps 探测）可知，DB 模型（services 仅绑定
+                    # 项目）无法精确计算，暂返回空列表，后续可接入探测数据填充
+                    "colocated": []})
 
 
 # ========== 发布顺序建议 ==========

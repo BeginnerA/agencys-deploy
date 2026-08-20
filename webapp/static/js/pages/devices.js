@@ -5,6 +5,7 @@
   let monitorCache = null;
   let tasksCache = [];
   let reqSeq = 0; // 丢弃过期响应（快速切换项目/环境时防乱序覆盖）
+  let lastSig = null; // 3s 轮询数据签名：无变化时跳过卡片墙/服务器表全量重建
   let destroyed = false; // 路由切换后丢弃 in-flight 响应，防覆盖新页面/泄漏轮询
 
   // 服务卡片：状态灯优先级 发布中 > 探测结果（沿用旧 dotClass 语义）
@@ -53,9 +54,14 @@
       api(`/api/monitor/overview?project_id=${state.currentProject.id}&env=${state.currentEnv||''}`).catch(() => null),
     ]);
     if (destroyed || seq !== reqSeq) return; // 过期响应丢弃
-    monitorCache = monitor;
-    tasksCache = await api(`/api/tasks?project_id=${state.currentProject.id}&limit=20`).catch(() => []);
+    const tasks = await api(`/api/tasks?project_id=${state.currentProject.id}&limit=20`).catch(() => []);
     if (destroyed || seq !== reqSeq) return;
+    // 3s 轮询签名：数据无变化时跳过全量重建（卡片墙/服务器表 innerHTML 是主要开销）
+    const sig = JSON.stringify({s: services, m: monitor, t: tasks});
+    if (lastSig === sig) return;
+    lastSig = sig;
+    monitorCache = monitor;
+    tasksCache = tasks;
     renderCards(services);
     renderServers();
   }
@@ -99,12 +105,13 @@
     box.innerHTML = servers.length
       ? `<div class="panel"><div class="panel-title">服务器列表（${servers.length}）</div>
           <div class="tbl-wrap"><table class="tbl"><thead><tr>
-            <th>主机</th><th>SSH</th><th>容器数</th><th>最后探测</th></tr></thead><tbody>
+            <th>主机</th><th>SSH</th><th>容器数</th><th>最后探测</th><th>备注</th></tr></thead><tbody>
             ${servers.map(s => `<tr>
               <td><span class="dot ${s.ssh_ok ? 'ok' : 'bad'}"></span><span class="num">${esc(s.host)}</span></td>
               <td>${s.ssh_ok ? '<span class="ok">连通</span>' : '<span class="err">失败</span>'}</td>
               <td class="num">${s.containers ?? '-'}</td>
-              <td class="muted">${s.error ? esc(s.error) : fmtTime(s.ts)}</td></tr>`).join('')}
+              <td class="muted">${s.error ? esc(s.error) : fmtTime(s.ts)}</td>
+              <td class="muted">${esc(s.remark || '')}</td></tr>`).join('')}
           </tbody></table></div></div>`
       : `<div class="panel"><div class="panel-title">服务器列表</div>
           <div class="empty-state"><div class="e-ico">🖥️</div><div>实时探测未启用或暂无数据</div></div></div>`;
@@ -213,11 +220,12 @@
       if (destroyed) return [];
       return timer ? [timer] : [];
     },
-    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; },
+    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; lastSig = null; },
   };
 
   async function render(){
     if (destroyed) return;
+    lastSig = null; // 整页重建后强制首帧渲染（防止签名跳过导致新容器留空）
     const root = document.getElementById('pageRoot');
     root.innerHTML = `
       <div class="panel" style="margin-bottom:var(--sp-4);padding:12px 16px">

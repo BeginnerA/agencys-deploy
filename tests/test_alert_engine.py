@@ -256,6 +256,7 @@ class TestAlertEngine(unittest.TestCase):
         e._evaluate_metric_rules()
         a = dbm.get_record(self.db, "alerts", alerts[0]["id"])
         self.assertEqual(a["notify_count"], 1)
+        e.flush_notifications()  # 通知为异步投递，等待落库后再断言
         channels = [x["channel"] for x in dbm.list_records(self.db, "alert_events")]
         self.assertIn("wecom", channels)
 
@@ -279,6 +280,7 @@ class TestAlertEngine(unittest.TestCase):
         e._evaluate_metric_rules()
         a = dbm.get_record(self.db, "alerts", alerts[0]["id"])
         self.assertEqual(a["notify_count"], 0)
+        e.flush_notifications()  # 等待在途异步通知落库，避免残留事件干扰断言
         channels = [x["channel"] for x in dbm.list_records(self.db, "alert_events")]
         self.assertNotIn("wecom", channels)
 

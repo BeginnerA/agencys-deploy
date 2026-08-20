@@ -4,6 +4,7 @@
   let destroyed = false;
   let schedules = [];
   let projects = [];
+  let lastSig = null; // 10s 轮询数据签名：无变化时跳过表格全量重建
 
   async function loadData(){
     projects = await api('/api/projects').catch(() => []);
@@ -79,7 +80,17 @@
     });
   }
 
-  async function loadEnvsForProj(projId){
+  async function refresh(){
+      await loadData();
+      if (destroyed) return;
+      // 10s 轮询签名：计划数据无变化时跳过表格全量重建（buildSvcMap + innerHTML）
+      const sig = JSON.stringify(schedules);
+      if (lastSig === sig) return;
+      lastSig = sig;
+      await renderTable();
+    }
+  
+    async function loadEnvsForProj(projId){
     if (!projId) return [];
     return await api(`/api/projects/${projId}/environments`).catch(() => []);
   }
@@ -169,9 +180,9 @@
       const nb = document.getElementById('newSchedBtn');
       if (nb) nb.onclick = openCreateForm;
       renderTable();
-      timer = setInterval(async () => { await loadData(); if (!destroyed) renderTable(); }, 10000);
+      timer = setInterval(refresh, 10000);
       return [timer];
     },
-    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; }
+    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; lastSig = null; }
   };
 })();

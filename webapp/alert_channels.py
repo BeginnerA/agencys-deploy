@@ -21,6 +21,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from email.header import Header
 from email.mime.text import MIMEText
 
@@ -30,6 +31,9 @@ from . import db as dbm
 
 # 发送失败重试次数（指数退避：1s、2s）
 RETRIES = 2
+
+# 异步通知线程池：告警引擎评估线程不被渠道网络超时/重试阻塞
+_notify_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="alert-notify")
 
 CHANNELS = ("email", "wecom", "webhook", "sms_aliyun", "feishu", "dingtalk")
 
@@ -215,6 +219,11 @@ _MISSING = [n for n in _CHANNEL_FUNCS.values()
             if not callable(getattr(sys.modules[__name__], n, None))]
 if _MISSING:
     raise ImportError(f"渠道发送函数未定义: {_MISSING}")
+
+
+def send_alert_async(db_path: str, alert: dict, channels: list) -> Future:
+    """异步发送告警通知（引擎线程不阻塞）；返回 Future，结果语义与 send_alert 一致"""
+    return _notify_executor.submit(send_alert, db_path, alert, channels)
 
 
 def send_alert(db_path: str, alert: dict, channels: list) -> list:

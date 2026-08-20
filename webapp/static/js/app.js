@@ -11,4 +11,9 @@
     const tasks = await api('/api/tasks?limit=1');
     renderMarquee(tasks[0]);
   }, 3000);
+  // 全局告警角标：15s 轮询活跃告警数，无论当前页面均实时更新
+  poll(async () => {
+    const data = await api('/api/alerts/badge').catch(() => null);
+    if (data) updateAlertBadge(data.firing || 0);
+  }, 15000);
 })();

@@ -30,12 +30,31 @@ def search_logs():
         conditions = []
         params = []
 
-        if env:
-            conditions.append("le.env = ?")
-            params.append(env)
-        if service:
-            conditions.append("le.service = ?")
-            params.append(service)
+        if keyword:
+            # FTS5 检索（仅搜索 content 列，避免匹配服务名/环境名）；
+            # 用 IN 子查询而非展开 rowid 列表：命中结果可能超过
+            # SQLITE_MAX_VARIABLE_NUMBER(999)，展开会报 "too many SQL variables"。
+            # env/service 下推进 FTS 子查询（TEXT 相等比较），缩小中间集合；
+            # 时间范围保留外层 le.ts 数值比较（FTS 表 ts 为文本列）
+            fts_where = ["log_fts MATCH ?"]
+            fts_params = [f"content:{keyword}"]
+            if env:
+                fts_where.append("env = ?")
+                fts_params.append(env)
+            if service:
+                fts_where.append("service = ?")
+                fts_params.append(service)
+            conditions.append(
+                f"le.id IN (SELECT rowid FROM log_fts WHERE {' AND '.join(fts_where)})")
+            params.extend(fts_params)
+        else:
+            if env:
+                conditions.append("le.env = ?")
+                params.append(env)
+            if service:
+                conditions.append("le.service = ?")
+                params.append(service)
+
         if from_ts:
             conditions.append("le.ts >= ?")
             params.append(from_ts)
@@ -43,25 +62,15 @@ def search_logs():
             conditions.append("le.ts <= ?")
             params.append(to_ts)
 
-        if keyword:
-            # FTS5 检索（仅搜索 content 列，避免匹配服务名/环境名）
-            try:
-                fts_sql = "SELECT rowid FROM log_fts WHERE log_fts MATCH ?"
-                fts_rows = conn.execute(fts_sql, (f"content:{keyword}",)).fetchall()
-            except Exception:
-                return jsonify({"rows": [], "total": 0, "error": "搜索关键词包含非法字符"})
-            if not fts_rows:
-                return jsonify({"rows": [], "total": 0})
-            rowids = [r["rowid"] for r in fts_rows]
-            placeholders = ",".join("?" * len(rowids))
-            conditions.append(f"le.id IN ({placeholders})")
-            params.extend(rowids)
-
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        total = conn.execute(
-            f"SELECT COUNT(*) FROM log_entries le WHERE {where_clause}", params
-        ).fetchone()[0]
+        try:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM log_entries le WHERE {where_clause}", params
+            ).fetchone()[0]
+        except Exception:
+            # FTS5 非法字符（未配对引号等）在子查询执行时才暴露
+            return jsonify({"rows": [], "total": 0, "error": "搜索关键词包含非法字符"})
 
         offset = (page - 1) * page_size
         rows = conn.execute(
@@ -111,21 +120,47 @@ def log_context():
         if not os.path.isfile(real_path):
             return jsonify({"error": "日志文件不存在", "file": file_path}), 404
 
-        with open(real_path, "r", encoding="utf-8", errors="ignore") as f:
-            all_lines = f.readlines()
-
         offset = entry["line_offset"]
-        byte_pos = 0
-        target_line = 0
-        for i, line in enumerate(all_lines):
-            if byte_pos >= offset:
-                target_line = i
-                break
-            byte_pos += len(line.encode("utf-8", "ignore"))
+        # 按行定位读取目标行前后文，避免 readlines 全量读入内存
+        # （大日志文件可达数十 MB~上百 MB）。
+        # line_offset 是“逻辑字节偏移”（采集端按 Linux 源行长度累加，无 \r）；
+        # Windows 文本模式追加会把 \n 写为 \r\n，故按行读取时需补偿行尾 \r，
+        # 保证与 line_offset 同单位定位（跨平台自洽）
+        try:
+            target_line = 0
+            context_lines = []
+            with open(real_path, "rb") as f:
+                prev = []
+                pos = 0
+                while True:
+                    if pos >= offset:
+                        break
+                    line = f.readline()
+                    if not line:
+                        break
+                    pos += len(line) - (1 if line.endswith(b"\r\n") else 0)
+                    target_line += 1
+                    if len(prev) >= lines:
+                        prev.pop(0)
+                    prev.append(line)
+                # 目标行（循环 break 时尚未读入）+ 后 N 行
+                tail = []
+                target = f.readline()
+                if target:
+                    tail.append(target)
+                for _ in range(lines):
+                    line = f.readline()
+                    if not line:
+                        break
+                    tail.append(line)
+            # 前 N 行（prev 尾部）+ 目标行 + 后 N 行；target_line = 目标行行号（0 基）
+            context_lines = [l.decode("utf-8", "ignore")
+                             for l in prev[-lines:] + tail]
+        except (ValueError, OSError):
+            return jsonify({"error": "日志文件读取失败"}), 500
 
         start = max(0, target_line - lines)
-        end = min(len(all_lines), target_line + lines + 1)
-        context_lines = all_lines[start:end]
+        end = start + len(context_lines)
 
         return jsonify({
             "file": file_path,

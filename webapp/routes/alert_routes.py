@@ -206,6 +206,24 @@ def delete_alert(alert_id):
     return jsonify({"ok": True})
 
 
+@alert_bp.route("/alerts/badge")
+@require_auth
+def alert_badge():
+    """轻量级活跃告警计数（全局角标轮询用，无筛选/分页）"""
+    db = current_app.config["DB_PATH"]
+    conn = dbm.get_conn(db)
+    try:
+        firing = conn.execute(
+            "SELECT COUNT(*) FROM alerts WHERE status='firing'"
+        ).fetchone()[0]
+        acked = conn.execute(
+            "SELECT COUNT(*) FROM alerts WHERE status='acked'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return jsonify({"firing": firing, "acked": acked})
+
+
 @alert_bp.route("/alerts/stats")
 @require_auth
 def alert_stats():

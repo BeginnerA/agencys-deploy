@@ -6,6 +6,7 @@
   let trendMode = 7;
   let destroyed = false; // 路由切换后丢弃 in-flight 响应，防覆盖新页面/泄漏轮询
   let monReqSeq = 0;     // loadMonitor 请求序号，防竞态：只渲染最新请求的响应
+  let lastSig = null;    // 上次渲染数据签名：5s 轮询数据无变化时跳过全量重建
 
   // ---- KPI 条（规格 §6.1）----
   function kpiRow(o){
@@ -13,6 +14,8 @@
       ['🗂️', o.projects, '项目'], ['🧩', o.services, '服务'], ['🌐', o.environments, '环境'],
       ['🖥️', o.servers, '服务器'], ['📋', o.tasks_total, '任务总数'],
       ['📈', o.success_rate === null ? '—' : o.success_rate + '%', '发布成功率'],
+      ['🚀', o.tasks_total || 0, '部署频次'],
+      ['⏱️', o.tasks_avg_duration ? Math.round(o.tasks_avg_duration) + 's' : '—', '平均耗时'],
     ];
     return `<div class="kpi-row">${items.map(([ico, v, label]) => `
       <div class="kpi-card"><span class="k-ico">${ico}</span>
@@ -75,26 +78,30 @@
       <div class="rlist">${rows || `<div class="empty-state" style="padding:20px 0"><div class="e-ico">📭</div><div>${emptyTxt}</div></div>`}</div></div>`;
   }
 
-  // ---- 环境切换后重新加载监控数据 ----
+  // ---- 加载监控数据（全量，无项目/环境筛选）----
   async function loadMonitor(){
     if (destroyed) return;
     const seq = ++monReqSeq;
     try {
-      const mon = await api(`/api/monitor/overview?project_id=${window._dashProjectId}&env=${window._dashCurEnv}`).catch(() => null);
+      const mon = await api(`/api/monitor/overview`).catch(() => null);
       if (!destroyed && seq === monReqSeq) renderAll(mon);
+      if (!destroyed && seq === monReqSeq) loadResponseTrend();
     } catch(e) { /* ignore */ }
   }
 
-  // ---- 项目切换 ----
-  async function switchProject(projectId) {
-    window._dashProjectId = projectId;
-    window._dashCurEnv = 'all';
-    // 加载新项目的环境列表
-    try {
-      const envs = await api(`/api/projects/${projectId}/environments`);
-      window._dashEnvs = envs;
-    } catch(e) { window._dashEnvs = []; }
-    await loadMonitor();
+  // ---- 格式化工具 ----
+  function fmtBytes(b){
+    if (b == null || isNaN(b)) return '—';
+    if (b < 1024) return b + 'B';
+    if (b < 1024*1024) return (b/1024).toFixed(1) + 'KB';
+    if (b < 1024*1024*1024) return (b/1024/1024).toFixed(1) + 'MB';
+    return (b/1024/1024/1024).toFixed(2) + 'GB';
+  }
+  function fmtRate(bps){
+    if (bps == null || isNaN(bps)) return '—';
+    if (bps < 1024) return bps.toFixed(0) + 'B/s';
+    if (bps < 1024*1024) return (bps/1024).toFixed(1) + 'KB/s';
+    return (bps/1024/1024).toFixed(2) + 'MB/s';
   }
 
   // ---- 模块导出（router 约定：render 返回定时器数组）----
@@ -105,28 +112,7 @@
       const load = async () => {
         try{
           overview = await api('/api/dashboard/overview');
-          try{
-            const projects = await api('/api/projects');
-            if (projects.length){
-              // 保留上次选择的项目，如不存在则回退首个
-              const prevId = window._dashProjectId;
-              const matched = prevId && projects.find(p => p.id === Number(prevId));
-              if (!matched) window._dashProjectId = projects[0].id;
-              window._dashProjects = projects;
-              const curProject = projects.find(p => p.id === Number(window._dashProjectId));
-              if (curProject) {
-                const envs = await api(`/api/projects/${curProject.id}/environments`);
-                window._dashEnvs = envs;
-                // 默认选中“全部”，聚合所有环境的服务器
-                window._dashCurEnv = window._dashCurEnv && envs.find(e => e.name === window._dashCurEnv) ? window._dashCurEnv : 'all';
-                await loadMonitor();
-              } else if (!destroyed) {
-                renderAll(null);
-              }
-            } else if (!destroyed) {
-              renderAll(null);
-            }
-          }catch(e){ /* ignore */ }
+          await loadMonitor();
         }catch(e){ if (!destroyed) root.innerHTML = errorState('监控数据加载失败：' + e.message, 'navigate'); }
       };
       await load();
@@ -136,6 +122,7 @@
     },
     destroy: function(){
       destroyed = true;
+      lastSig = null; // 重置签名缓存，重进页面时强制首屏渲染
       Object.values(charts).forEach(c => { try{ c.dispose(); }catch(e){} });
       charts = {};
       if (dataTimer) clearInterval(dataTimer);
@@ -145,6 +132,10 @@
 
   function renderAll(mon){
     if (destroyed) return;
+    // 5s 轮询无变化时跳过全量重建（echarts dispose/重建 + innerHTML 是主要开销）
+    const sig = JSON.stringify({o: overview, m: mon});
+    if (lastSig === sig) return;
+    lastSig = sig;
     // 先释放旧 echarts 实例，防止 5s 轮询全量重渲染时实例泄漏
     Object.values(charts).forEach(c => { try{ c.dispose(); }catch(e){} });
     charts = {};
@@ -160,28 +151,26 @@
       load: +(hmEntries.reduce((s, [, v]) => s + (v.load || 0), 0) / hmEntries.length).toFixed(1),
     } : null;
     const hmWarn = hasHM ? hmEntries.filter(([, v]) => (v.cpu||0)>80||(v.mem||0)>80||(v.disk||0)>80||(v.load||0)>80).length : 0;
+    // 扩展指标
+    const extMap = mon && mon.extended_metrics || {};
+    const extEntries = Object.entries(extMap).filter(([h, v]) => h && typeof v === 'object');
+    const hasExt = extEntries.length > 0;
+    // 扩展指标汇总
+    const extAvg = hasExt ? {
+      swap: (() => { const vals = extEntries.map(([,v]) => v.swap).filter(x => x != null); return vals.length ? +(vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(1) : null; })(),
+      restarts: extEntries.reduce((s, [,v]) => s + ((v.container_status && Object.values(v.container_status).reduce((a, c) => a + (c.restart_count||0), 0)) || 0), 0),
+      tcpCW: extEntries.reduce((s, [,v]) => s + ((v.tcp && v.tcp.CLOSE_WAIT) || 0), 0),
+      sslMin: (() => { const vals = extEntries.map(([,v]) => v.ssl_days).filter(x => x != null); return vals.length ? Math.min(...vals) : null; })(),
+    } : null;
     // 合并服务器状态 + 资源明细为统一列表
     const allServers = (mon && mon.servers) || [];
     const hmMap = Object.fromEntries(hmEntries);
     const mergedServers = [
-      ...allServers.map(s => ({host: s.host, ssh_ok: s.ssh_ok, containers: s.containers, ts: s.ts, error: s.error, hm: hmMap[s.host] || null})),
-      ...hmEntries.filter(([h]) => !allServers.some(s => s.host === h)).map(([host, m]) => ({host, ssh_ok: false, containers: 0, ts: 0, error: '', hm: m}))
+      ...allServers.map(s => ({host: s.host, ssh_ok: s.ssh_ok, containers: s.containers, ts: s.ts, error: s.error, hm: hmMap[s.host] || null, ext: extMap[s.host] || null})),
+      ...hmEntries.filter(([h]) => !allServers.some(s => s.host === h)).map(([host, m]) => ({host, ssh_ok: false, containers: 0, ts: 0, error: '', hm: m, ext: extMap[host] || null}))
     ];
-    const curEnv = (mon && mon.env) || window._dashCurEnv || 'all';
-    const envOpts = `<option value="all" ${curEnv==='all'?'selected':''}>全部</option>` +
-      (window._dashEnvs || []).map(e =>
-        `<option value="${esc(e.name)}" ${e.name===curEnv?'selected':''}>${esc(e.name)}</option>`).join('');
-    // 项目切换下拉
-    const projects = window._dashProjects || [];
-    const projOpts = projects.map(p =>
-      `<option value="${p.id}" ${p.id === Number(window._dashProjectId) ? 'selected' : ''}>${esc(p.name)}</option>`
-    ).join('');
     root.innerHTML = `
       ${kpiRow(overview)}
-      <div class="dash-proj-bar">
-        <span class="weak" style="font-size:12px">项目</span>
-        <select class="filter-sel" id="dashProjSel">${projOpts}</select>
-      </div>
       <div class="dash-grid">
         <div class="panel chart-box"><div class="panel-title">雷达健康指数${radar.demo ? '<span class="demo-tag">演示数据</span>' : ''}</div>
           <div id="chartRadar" style="height:260px"></div></div>
@@ -199,7 +188,8 @@
         <div class="panel-title">服务器状态
           <span class="muted" style="font-weight:400;font-size:12px">（${mergedServers.length} 台）</span>
           ${hmWarn > 0 ? `<span class="hm-warn-tag">${hmWarn} 台超阈值</span>` : ''}
-          ${envOpts ? `<span class="pt-right"><select class="env-sel" id="envSwitch">${envOpts}</select></span>` : ''}
+          ${extAvg && extAvg.tcpCW > 50 ? `<span class="hm-warn-tag">CLOSE_WAIT ${extAvg.tcpCW}</span>` : ''}
+          ${extAvg && extAvg.sslMin != null && extAvg.sslMin < 14 ? `<span class="hm-warn-tag">SSL ≤${Math.round(extAvg.sslMin)}天</span>` : ''}
         </div>
         ${hasHM ? `
         <div class="hm-summary-row">
@@ -208,9 +198,31 @@
             .map(([id,name,val,color]) => `<div class="hm-gauge-box"><div id="${id}" style="height:140px"></div></div>`).join('')}
         </div>` : ''}
         <div class="tbl-wrap"><table class="tbl hm-tbl"><thead><tr>
-          <th style="width:200px">主机</th><th>SSH</th><th>容器</th><th>CPU</th><th>内存</th><th>磁盘</th><th>负载</th><th>最后探测</th></tr></thead><tbody>
+          <th style="width:180px">主机</th><th>SSH</th><th>容器</th><th>CPU</th><th>内存</th><th>磁盘</th><th>负载</th><th>Swap</th><th>重启</th><th>运行时长</th><th>网络</th><th>TCP</th><th>磁盘IO</th><th>Docker存储</th><th>SSL到期</th><th>健康检查</th><th>最后探测</th></tr></thead><tbody>
           ${mergedServers.length ? mergedServers.map(sv => {
             const m = sv.hm;
+            const ext = sv.ext || {};
+            // 重启次数（取所有容器总和）
+            const csObj = ext.container_status || {};
+            const restarts = Object.values(csObj).reduce((a, c) => a + (c.restart_count||0), 0);
+            // TCP
+            const tcp = ext.tcp || {};
+            const tcpCW = tcp.CLOSE_WAIT || 0;
+            const tcpEST = tcp.ESTABLISHED || 0;
+            // 运行时长
+            const uptimes = Object.values(csObj).map(c => c.uptime_hours).filter(h => h >= 0);
+            const minUp = uptimes.length ? Math.min(...uptimes) : -1;
+            // Docker 磁盘
+            const ddf = ext.docker_df || {};
+            const dockerTotal = (ddf.images||0) + (ddf.containers||0) + (ddf.volumes||0);
+            // 健康检查延迟（取该服务器上在线服务的健康检查结果）
+            const hcData = mon && mon.health_checks || {};
+            let hcMs = null;
+            for (const [sn, hd] of Object.entries(hcData)) {
+              if (csObj[sn] || Object.keys(csObj).length === 0) {
+                if (hd.ms > 0) { hcMs = hd.ms; break; }
+              }
+            }
             return `<tr>
               <td><span class="dot ${sv.ssh_ok?'ok':'bad'}"></span><span class="num">${esc(sv.host)}</span></td>
               <td>${sv.ssh_ok ? '<span class="ok">连通</span>' : '<span class="err">失败</span>'}</td>
@@ -221,17 +233,22 @@
                 return `<td><div class="hm-bar-wrap"><div class="hm-bar ${cls}" style="width:${Math.min(100,val)}%"></div>
                   <span class="hm-bar-val">${val.toFixed(1)}%</span></div></td>`;
               }).join('') : '<td colspan="4" class="muted" style="text-align:center">—</td>'}
+              <td class="num">${ext.swap != null ? `<span class="${ext.swap>80?'hm-high':ext.swap>50?'hm-mid':'hm-low'}">${ext.swap.toFixed(1)}%</span>` : '<span class="muted">—</span>'}</td>
+              <td class="num">${restarts > 0 ? `<span class="${restarts>3?'hm-high':'hm-low'}">${restarts}</span>` : '<span class="muted">0</span>'}</td>
+              <td class="num" style="font-size:11px">${ext.net_rx != null ? `↓${fmtRate(ext.net_rx)}` : '<span class="muted">—</span>'}${ext.net_tx != null ? `<br>↑${fmtRate(ext.net_tx)}` : ''}</td>
+              <td class="num" style="font-size:11px">${tcpEST > 0 ? `E:${tcpEST}` : ''}${tcpCW > 0 ? ` <span class="${tcpCW>50?'hm-high':'hm-mid'}">CW:${tcpCW}</span>` : ''}${tcpEST === 0 && tcpCW === 0 ? '<span class="muted">—</span>' : ''}</td>
+              <td class="num" style="font-size:11px">${minUp >= 0 ? (minUp >= 24 ? Math.floor(minUp/24) + '天' + Math.floor(minUp%24) + '时' : Math.floor(minUp) + '时') : '<span class="muted">—</span>'}</td>
+              <td class="num" style="font-size:11px">${ext.disk_read != null ? `R:${fmtRate(ext.disk_read*512)}` : ''}${ext.disk_write != null ? `<br>W:${fmtRate(ext.disk_write*512)}` : ''}${ext.disk_read == null && ext.disk_write == null ? '<span class="muted">—</span>' : ''}</td>
+              <td class="num" style="font-size:11px">${dockerTotal > 0 ? fmtBytes(dockerTotal) : '<span class="muted">—</span>'}</td>
+              <td class="num">${ext.ssl_days != null ? `<span class="${ext.ssl_days<7?'hm-high':ext.ssl_days<30?'hm-mid':'hm-low'}">${Math.round(ext.ssl_days)}天</span>` : '<span class="muted">—</span>'}</td>
+              <td class="num">${hcMs != null && hcMs > 0 ? `<span class="${hcMs>1000?'hm-high':hcMs>500?'hm-mid':'hm-low'}">${hcMs}ms</span>` : '<span class="muted">—</span>'}</td>
               <td class="muted">${sv.error ? esc(sv.error) : (sv.ts ? fmtTime(sv.ts) : '—')}</td></tr>`;
-          }).join('') : `<tr><td colspan="8" class="muted" style="text-align:center;padding:20px">暂无服务器数据</td></tr>`}
+          }).join('') : `<tr><td colspan="17" class="muted" style="text-align:center;padding:20px">暂无服务器数据</td></tr>`}
         </tbody></table></div>
       </div>
+      <div class="panel"><div class="panel-title">响应时间趋势</div>
+        <div id="chartRespTime" style="height:220px"></div></div>
     `;
-    // 项目切换
-    const projSel = document.getElementById('dashProjSel');
-    if (projSel) projSel.onchange = () => { switchProject(Number(projSel.value)); };
-    // 环境切换
-    const envSel = document.getElementById('envSwitch');
-    if (envSel) envSel.onchange = () => { window._dashCurEnv = envSel.value; loadMonitor(); };
     // 趋势 tab 切换
     root.querySelectorAll('.trend-tabs .tab-btn').forEach(b => b.onclick = () => {
       trendMode = Number(b.dataset.days);
@@ -278,5 +295,42 @@
   function renderTrend(){
     const trend = trendMode === 7 ? (overview.trend7 || {}) : (overview.trend30 || {});
     charts.trend.setOption(trendOption(trend));
+  }
+
+  // ---- 响应时间趋势图 ----
+  async function loadResponseTrend(){
+    if (destroyed) return;
+    const el = document.getElementById('chartRespTime');
+    if (!el) return;
+    try {
+      const resp = await api('/api/monitor/response_times?hours=24').catch(() => null);
+      if (destroyed || !resp || !resp.rows) return;
+      const bySvc = {};
+      (resp.rows || []).forEach(r => {
+        const s = r.service || 'unknown';
+        if (!bySvc[s]) bySvc[s] = [];
+        bySvc[s].push({t: r.created_at, v: r.response_ms});
+      });
+      const series = Object.entries(bySvc).map(([name, pts]) => {
+        pts.sort((a, b) => a.t - b.t);
+        return {
+          name, type: 'line', smooth: true, symbol: 'none',
+          lineStyle: {width: 1.5}, areaStyle: {opacity: 0.08},
+          data: pts.map(p => [new Date(p.t * 1000).toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'}), Math.round(p.v)])
+        };
+      });
+      if (!charts.respTime) charts.respTime = echarts.init(el);
+      charts.respTime.setOption({
+        tooltip: {trigger:'axis', backgroundColor:'#112241', borderColor:'rgba(0,212,255,.3)',
+                   textStyle:{color:'#E6F1FF', fontSize:12}},
+        legend: {data: Object.keys(bySvc), textStyle:{color:'#8FA8C8'}, top:0, type:'scroll'},
+        grid: {left:8, right:16, top:30, bottom:4, containLabel:true},
+        xAxis: {type:'category', axisLine:{lineStyle:{color:'rgba(0,212,255,.2)'}},
+                axisLabel:{color:'#8FA8C8', fontSize:10}},
+        yAxis: {type:'value', name:'ms', nameTextStyle:{color:'#8FA8C8'},
+                splitLine:{lineStyle:{color:'rgba(0,212,255,.07)'}}, axisLabel:{color:'#8FA8C8'}},
+        series
+      }, true);
+    } catch(e) { /* ignore */ }
   }
 })();

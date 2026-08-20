@@ -22,12 +22,18 @@
     }
     if (envFilter !== 'all' && !envs.some(e => e.name === envFilter)) envFilter = 'all';
   }
+  let lastSig = null; // 5s 轮询数据签名：无变化时跳过全量 innerHTML 重建
   async function loadTasks(){
     try{
       const q = new URLSearchParams({limit:'200'});
       if (projFilter !== 'all') q.set('project_id', projFilter);
-      tasks = await api('/api/tasks?' + q);
+      const data = await api('/api/tasks?' + q);
       if (destroyed) return;
+      // 轮询无变化时跳过重建（任务列表高频轮询下 innerHTML 全量重建是主要开销）
+      const sig = JSON.stringify(data);
+      if (lastSig === sig) return;
+      lastSig = sig;
+      tasks = data;
       renderTable();
     }catch(e){ /* 轮询失败静默（列表保留旧数据，与 alerts 轮询一致） */ }
   }
