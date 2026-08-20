@@ -143,10 +143,16 @@ class DeployScheduler:
                 extra = json.loads(sched.get("extra") or "[]")
                 if forced:
                     extra.append("--force-window")
+                # ref_type=service 时，解析服务名作为任务名
+                task_name = sched["name"]
+                if sched.get("ref_type") == "service" and sched.get("ref_id"):
+                    svc = dbm.get_record(self._db_path, "services", sched["ref_id"])
+                    if svc:
+                        task_name = svc["name"]
                 task_id = dbm.create_task(
                     self._db_path, sched["project_id"],
                     sched["ref_type"], sched["ref_id"],
-                    sched["name"], sched["env"],
+                    task_name, sched["env"],
                     sched["version"], sched["previous_version"],
                     sched["created_by"], extra=extra)
                 # 提交任务执行

@@ -62,6 +62,7 @@ def create_schedule():
 
     ref_type = body.get("ref_type", "project")
     ref_id = body.get("ref_id", 0)
+    service_id = body.get("service_id")  # 可选：指定服务级别定时发布
     env = body.get("env", "")
     version = body.get("version", "")
     previous_version = body.get("previous_version", "")
@@ -70,6 +71,11 @@ def create_schedule():
         extra = json.dumps(extra, ensure_ascii=False)
     schedule_at = body.get("schedule_at", 0)
     cron_expr = body.get("cron_expr", "")
+
+    # 指定服务时，覆盖 ref_type/ref_id
+    if service_id and isinstance(service_id, int) and service_id > 0:
+        ref_type = "service"
+        ref_id = service_id
 
     if type_ == "cron":
         if not cron_expr:
@@ -115,6 +121,14 @@ def update_schedule(sid):
             fields[k] = body[k]
     if "ref_id" in body:
         fields["ref_id"] = body["ref_id"]
+    if "service_id" in body:
+        svc_id = body["service_id"]
+        if isinstance(svc_id, int) and svc_id > 0:
+            fields["ref_type"] = "service"
+            fields["ref_id"] = svc_id
+        else:
+            fields["ref_type"] = "project"
+            fields["ref_id"] = rec["project_id"]
     if "schedule_at" in body:
         fields["schedule_at"] = int(body["schedule_at"])
         fields["next_run_at"] = int(body["schedule_at"])
@@ -172,10 +186,16 @@ def run_schedule(sid):
             extra = []
     if window and window["block_level"] == "warn":
         extra.append("--force-window")
+    # ref_type=service 时，解析服务名作为任务名
+    task_name = rec["name"]
+    if rec.get("ref_type") == "service" and rec.get("ref_id"):
+        svc = dbm.get_record(_db_path(), "services", rec["ref_id"])
+        if svc:
+            task_name = svc["name"]
     task_id = dbm.create_task(
         _db_path(), rec["project_id"],
         rec["ref_type"], rec["ref_id"],
-        rec["name"], rec["env"],
+        task_name, rec["env"],
         rec["version"], rec["previous_version"],
         g.user["id"], extra=extra)
     from .. import task_manager
