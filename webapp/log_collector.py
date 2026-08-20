@@ -271,7 +271,9 @@ class LogCollector:
         rowids: _index_log_entries 返回的 rowid 列表，与 entries 一一对应；
         传入后命中行携带 entry_id/hit_ts，供告警详情展示日志上下文。
 
-        排除关键词：命中包含关键词后，若同一行也命中任一排除关键词，则跳过不告警。
+        排除关键词：命中包含关键词后，检查当前行及邻近行（上下文窗口 ±5 条），
+        若窗口内任一条目命中排除关键词则跳过不告警。
+        这样可正确处理多行堆栈跟踪中异常信息与排除词分布在不同行的场景。
         """
         rules = getattr(self, '_current_kw_rules', None)
         if not rules:
@@ -280,6 +282,8 @@ class LogCollector:
         if engine is None:
             return
         service = entries[0][2] if entries else ""
+        # 排除关键词上下文窗口大小（检查前后各 _EXCLUDE_CTX 条）
+        _EXCLUDE_CTX = 5
         for rule in rules:
             metric_raw = (rule.get("metric") or "").strip()
             if not metric_raw:
@@ -298,10 +302,13 @@ class LogCollector:
                 excluded = False
                 for kw in keywords:
                     if kw in content:
-                        # 检查排除关键词：同一行命中任一排除词则跳过
-                        if exclude_kws and any(ekw in content for ekw in exclude_kws):
-                            excluded = True
-                            break
+                        # 检查排除关键词：当前行 + 邻近行（上下文窗口）
+                        if exclude_kws:
+                            lo = max(0, i - _EXCLUDE_CTX)
+                            hi = min(len(entries), i + _EXCLUDE_CTX + 1)
+                            if any(ekw in entries[j][3] for j in range(lo, hi) for ekw in exclude_kws):
+                                excluded = True
+                                break
                         matched_kw = kw
                         break
                 if excluded:

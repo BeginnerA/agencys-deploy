@@ -269,11 +269,15 @@ class TestLogCollector(unittest.TestCase):
         mock_engine.trigger_log_alert.assert_called_once()
 
     def test_scan_keywords_exclude_continues_to_next_line(self):
-        """第一行被排除后，继续扫描后续行，命中则触发"""
+        """第一行被排除后，继续扫描后续行，命中则触发（排除窗口外）"""
         self._make_kw_rule("ERROR", exclude_keyword="heartbeat")
+        # 中间填充 6 条无关日志，使两条 ERROR 间隔超过上下文窗口 ±5
+        padding = [(1787049046 + i, "prod", "api", "INFO normal log",
+                    "/tmp/f", 10 + i * 50, 1) for i in range(6)]
         entries = [
             (1787049045, "prod", "api", "ERROR heartbeat check", "/tmp/f", 0, 1),
-            (1787049046, "prod", "api", "ERROR real failure", "/tmp/f", 10, 1),
+            *padding,
+            (1787049052, "prod", "api", "ERROR real failure", "/tmp/f", 500, 1),
         ]
         from unittest.mock import MagicMock, patch
         mock_engine = MagicMock()
@@ -283,6 +287,24 @@ class TestLogCollector(unittest.TestCase):
         mock_engine.trigger_log_alert.assert_called_once()
         call_kwargs = mock_engine.trigger_log_alert.call_args[1]
         self.assertEqual(call_kwargs["matched_keyword"], "ERROR")
+
+    def test_scan_keywords_exclude_context_window_stacktrace(self):
+        """多行堆栈跟踪：排除词在首行，后续行也含关键词 → 上下文窗口内一并排除"""
+        self._make_kw_rule("Exception", exclude_keyword="已被冻结")
+        entries = [
+            (1787049045, "prod", "auth",
+             "cn.dev33.satoken.exception.NotLoginException: token 已被冻结",
+             "/tmp/f", 0, 1),
+            (1787049045, "prod", "auth",
+             "\tat cn.dev33.satoken.exception.NotLoginException.newInstance(NotLoginException.java:134)",
+             "/tmp/f", 50, 1),
+        ]
+        from unittest.mock import MagicMock, patch
+        mock_engine = MagicMock()
+        with patch("webapp.log_collector.get_engine", return_value=mock_engine):
+            self.collector._current_kw_rules = self.collector._load_log_keyword_rules()
+            self.collector._scan_keywords_in_entries(entries, "prod", 1)
+        mock_engine.trigger_log_alert.assert_not_called()
 
 
 if __name__ == "__main__":
