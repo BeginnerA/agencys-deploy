@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8099)
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--monitor-interval", type=int, default=30,
+    parser.add_argument("--monitor-interval", type=int, default=60,
                         help="实时探测周期（秒），0 关闭监控")
     args = parser.parse_args()
     if args.monitor_interval > 0:

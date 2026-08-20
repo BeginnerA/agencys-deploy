@@ -235,9 +235,9 @@
               }).join('') : '<td colspan="4" class="muted" style="text-align:center">—</td>'}
               <td class="num">${ext.swap != null ? `<span class="${ext.swap>80?'hm-high':ext.swap>50?'hm-mid':'hm-low'}">${ext.swap.toFixed(1)}%</span>` : '<span class="muted">—</span>'}</td>
               <td class="num">${restarts > 0 ? `<span class="${restarts>3?'hm-high':'hm-low'}">${restarts}</span>` : '<span class="muted">0</span>'}</td>
+              <td class="num" style="font-size:11px">${minUp >= 0 ? (minUp >= 24 ? Math.floor(minUp/24) + '天' + Math.floor(minUp%24) + '时' : Math.floor(minUp) + '时') : '<span class="muted">—</span>'}</td>
               <td class="num" style="font-size:11px">${ext.net_rx != null ? `↓${fmtRate(ext.net_rx)}` : '<span class="muted">—</span>'}${ext.net_tx != null ? `<br>↑${fmtRate(ext.net_tx)}` : ''}</td>
               <td class="num" style="font-size:11px">${tcpEST > 0 ? `E:${tcpEST}` : ''}${tcpCW > 0 ? ` <span class="${tcpCW>50?'hm-high':'hm-mid'}">CW:${tcpCW}</span>` : ''}${tcpEST === 0 && tcpCW === 0 ? '<span class="muted">—</span>' : ''}</td>
-              <td class="num" style="font-size:11px">${minUp >= 0 ? (minUp >= 24 ? Math.floor(minUp/24) + '天' + Math.floor(minUp%24) + '时' : Math.floor(minUp) + '时') : '<span class="muted">—</span>'}</td>
               <td class="num" style="font-size:11px">${ext.disk_read != null ? `R:${fmtRate(ext.disk_read*512)}` : ''}${ext.disk_write != null ? `<br>W:${fmtRate(ext.disk_write*512)}` : ''}${ext.disk_read == null && ext.disk_write == null ? '<span class="muted">—</span>' : ''}</td>
               <td class="num" style="font-size:11px">${dockerTotal > 0 ? fmtBytes(dockerTotal) : '<span class="muted">—</span>'}</td>
               <td class="num">${ext.ssl_days != null ? `<span class="${ext.ssl_days<7?'hm-high':ext.ssl_days<30?'hm-mid':'hm-low'}">${Math.round(ext.ssl_days)}天</span>` : '<span class="muted">—</span>'}</td>

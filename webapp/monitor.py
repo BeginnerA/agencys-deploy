@@ -14,39 +14,122 @@ from . import db as dbm
 _NACOS_TOKEN_CACHE = {}
 
 
-def _ssh_exec_multi(host: str, port: int, ssh_cfg: dict, cmds: list, timeout: int = 10) -> list:
-    """一次 SSH 连接顺序执行多条命令，返回各命令 stdout 列表；失败抛异常
+class _SSHConnectionPool:
+    """SSH 连接池：复用 paramiko 客户端，避免每次调用都进行 TCP 握手 + SSH 认证
 
-    探测热路径用：相比每条命令独立连接，省去 N-1 次 TCP 握手/认证（主要开销）。
+    连接按 (host, port, username) 缓存，同一服务器的多次调用复用同一连接。
+    每次取用时检查连接活性，死亡连接自动重建。
+    线程安全：per-host 锁保证同一服务器不会并发创建多个连接。
     """
-    import os
-    import pathlib
-    import paramiko
-    password = ssh_cfg.get("password", "") or None
-    key_file = ssh_cfg.get("key_file", "") or None
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kw = dict(hostname=host, port=int(port or 22), username=ssh_cfg.get("user", "root"),
-              timeout=timeout)
-    if password:
-        kw["password"] = password
-    if key_file:
-        # paramiko 5.x 加载不存在的 key 文件直接抛异常，会跳过本可用的密码认证；
-        # 故 key 文件不存在时跳过密钥，仅用密码（与 scripts/common.py 密钥回退语义一致）
-        key_file = str(key_file).replace("~", str(pathlib.Path.home()))
-        if os.path.isfile(key_file):
-            kw["key_filename"] = key_file
-    try:
-        client.connect(**kw)
-        outs = []
-        for cmd in cmds:
-            _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-            out = stdout.read().decode("utf-8", "ignore")
-            err = stderr.read().decode("utf-8", "ignore")
-            outs.append(out or err)
-        return outs
-    finally:
-        client.close()
+
+    def __init__(self, max_age=300, cleanup_interval=60):
+        self._clients = {}      # {(host, port, user): {"client": SSHClient, "ts": float}}
+        self._locks = {}        # {(host, port, user): Lock}
+        self._pool_lock = threading.Lock()  # 保护 _locks 字典本身
+        self._max_age = max_age  # 连接最大存活秒数（超过后强制重建，防止僵死）
+        self._cleanup_interval = cleanup_interval
+        self._last_cleanup = time.time()
+
+    def get_client(self, host, port, ssh_cfg, timeout=10):
+        """获取或创建到指定服务器的 SSH 客户端（复用已有连接）"""
+        import os
+        import pathlib
+        import paramiko
+
+        user = ssh_cfg.get("user", "root")
+        key = (host, int(port or 22), user)
+
+        # 确保 per-host 锁存在
+        with self._pool_lock:
+            if key not in self._locks:
+                self._locks[key] = threading.Lock()
+        host_lock = self._locks[key]
+
+        with host_lock:
+            entry = self._clients.get(key)
+            if entry:
+                age = time.time() - entry["ts"]
+                client = entry["client"]
+                transport = client.get_transport()
+                # 复用条件：连接活跃 + 未超时
+                if transport and transport.is_active() and age < self._max_age:
+                    entry["ts"] = time.time()  # 刷新使用时间
+                    return client
+                # 连接已死或过期 → 清理
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                del self._clients[key]
+
+            # 创建新连接
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            kw = dict(hostname=host, port=int(port or 22),
+                      username=user, timeout=timeout)
+            password = ssh_cfg.get("password", "") or None
+            key_file = ssh_cfg.get("key_file", "") or None
+            if password:
+                kw["password"] = password
+            if key_file:
+                key_file = str(key_file).replace("~", str(pathlib.Path.home()))
+                if os.path.isfile(key_file):
+                    kw["key_filename"] = key_file
+            client.connect(**kw)
+            self._clients[key] = {"client": client, "ts": time.time()}
+
+            # 定期清理过期/死亡连接（避免内存泄漏）
+            now = time.time()
+            if now - self._last_cleanup > self._cleanup_interval:
+                self._do_cleanup()
+                self._last_cleanup = now
+
+            return client
+
+    def _do_cleanup(self):
+        """清理所有过期或死亡连接（在调用者持有的锁保护下执行）"""
+        stale_keys = []
+        for k, entry in list(self._clients.items()):
+            transport = entry["client"].get_transport()
+            if not transport or not transport.is_active() or \
+               time.time() - entry["ts"] > self._max_age:
+                stale_keys.append(k)
+        for k in stale_keys:
+            entry = self._clients.pop(k, None)
+            if entry:
+                try:
+                    entry["client"].close()
+                except Exception:
+                    pass
+
+    def close_all(self):
+        """关闭所有缓存连接（应用关闭时调用）"""
+        with self._pool_lock:
+            for entry in self._clients.values():
+                try:
+                    entry["client"].close()
+                except Exception:
+                    pass
+            self._clients.clear()
+
+
+_ssh_pool = _SSHConnectionPool()
+
+
+def _ssh_exec_multi(host: str, port: int, ssh_cfg: dict, cmds: list, timeout: int = 10) -> list:
+    """复用 SSH 连接顺序执行多条命令，返回各命令 stdout 列表；失败抛异常
+
+    通过 _ssh_pool 复用 paramiko 客户端，同一服务器的多次调用共享连接，
+    省去重复的 TCP 握手 + SSH 认证开销（探测热路径的主要开销）。
+    """
+    client = _ssh_pool.get_client(host, port, ssh_cfg, timeout)
+    outs = []
+    for cmd in cmds:
+        _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+        out = stdout.read().decode("utf-8", "ignore")
+        err = stderr.read().decode("utf-8", "ignore")
+        outs.append(out or err)
+    return outs
 
 
 def _ssh_exec(host: str, port: int, ssh_cfg: dict, cmd: str, timeout: int = 10) -> str:
@@ -69,16 +152,18 @@ def _merge_server_ssh(env_ssh: dict, s: dict) -> dict:
 
 
 def _probe_server_full(host: str, port: int, ssh_cfg: dict, services: list,
-                       timeout: int = 10, health_hosts: dict = None) -> dict:
+                       timeout: int = 10, health_hosts: dict = None,
+                       skip_extended: bool = False) -> dict:
     """单连接探测整台服务器：容器镜像 + docker stats 资源 + 主机指标 + 扩展指标
 
-    返回 {ssh_ok, containers, resources, host_metrics, extended, error}。
+    返回 {ssh_ok, containers, container_list, resources, host_metrics, extended, error}。
     第一轮：3 条命令（ps/stats/主机指标），1 次 SSH 连接；
     第二轮：扩展指标（容器详情/swap/网络/diskIO/TCP/docker_df/SSL），1 次 SSH 连接。
     共 2 次连接，避免逐命令独立认证（探测热路径的主要开销）。
+    skip_extended=True 时跳过第二轮（节流，降低 SSH 频率）。
     """
-    result = {"ssh_ok": False, "containers": {}, "resources": {},
-              "host_metrics": {}, "extended": {}, "error": ""}
+    result = {"ssh_ok": False, "containers": {}, "container_list": [],
+              "resources": {}, "host_metrics": {}, "extended": {}, "error": ""}
     try:
         # 第一轮：基础指标（ps + stats + 主机指标）
         ps_out, stats_out, hm_out = _ssh_exec_multi(
@@ -92,37 +177,43 @@ def _probe_server_full(host: str, port: int, ssh_cfg: dict, services: list,
              "df -P / | tail -1"],
             timeout=timeout)
         containers = {}
+        container_names = []
         for line in ps_out.splitlines():
             if "|" not in line:
                 continue
             name, image = line.split("|", 1)
+            name = name.strip()
+            container_names.append(name)
             for s in services:
-                if name.strip() == s["service_name"]:
+                if name == s["service_name"]:
                     containers[s["service_name"]] = image.strip()
                     break
         result["containers"] = containers
+        result["container_list"] = container_names
         result["resources"] = _parse_docker_resources(stats_out, services)
         result["host_metrics"] = _parse_host_metrics(hm_out)
         result["ssh_ok"] = True
         # 第二轮：扩展指标（容器详情/swap/网络/diskIO/TCP/docker_df/SSL）
-        try:
-            ext_cmds = _build_extended_cmds(services, health_hosts or {})
-            (cs_out, sw_out, net_out,
-             dio_out, tcp_out, ddf_out, ssl_out) = _ssh_exec_multi(
-                host, port, ssh_cfg, ext_cmds, timeout=25)
-            result["extended"] = {
-                "container_status": _parse_container_status(cs_out, services),
-                "swap": _parse_swap(sw_out),
-                **_parse_network(net_out),
-                **_parse_diskio(dio_out),
-                "tcp": _parse_tcp(tcp_out),
-                "docker_df": _parse_docker_df(ddf_out),
-                "ssl_days": _parse_ssl_days(ssl_out),
-            }
-        except Exception as ext_err:
-            import sys
-            print(f"[monitor] 扩展指标采集失败({host}): {ext_err!r}",
-                  file=sys.stderr)  # 扩展指标失败不影响基础探测
+        # skip_extended 时节流跳过，降低 SSH 频率（每 N 轮才采集一次）
+        if not skip_extended:
+            try:
+                ext_cmds = _build_extended_cmds(services, health_hosts or {})
+                (cs_out, sw_out, net_out,
+                 dio_out, tcp_out, ddf_out, ssl_out) = _ssh_exec_multi(
+                    host, port, ssh_cfg, ext_cmds, timeout=25)
+                result["extended"] = {
+                    "container_status": _parse_container_status(cs_out, services),
+                    "swap": _parse_swap(sw_out),
+                    **_parse_network(net_out),
+                    **_parse_diskio(dio_out),
+                    "tcp": _parse_tcp(tcp_out),
+                    "docker_df": _parse_docker_df(ddf_out),
+                    "ssl_days": _parse_ssl_days(ssl_out),
+                }
+            except Exception as ext_err:
+                import sys
+                print(f"[monitor] 扩展指标采集失败({host}): {ext_err!r}",
+                      file=sys.stderr)  # 扩展指标失败不影响基础探测
     except Exception as e:
         result["error"] = str(e)[:120]
     return result
@@ -307,19 +398,29 @@ def _build_extended_cmds(services: list, health_hosts: dict) -> list:
     c4 = ("grep -E 'sd[a-z]+|vd[a-z]+|xvd[a-z]+' /proc/diskstats 2>/dev/null; "
           "sleep 1; "
           "grep -E 'sd[a-z]+|vd[a-z]+|xvd[a-z]+' /proc/diskstats 2>/dev/null")
-    # 5. TCP 连接状态分布
-    c5 = ("ss -tan state established 2>/dev/null | tail -n +2; "
-          "ss -tan state time-wait 2>/dev/null | tail -n +2; "
-          "ss -tan state close-wait 2>/dev/null | tail -n +2")
+    # 5. TCP 连接状态分布（输出带标签的计数，便于解析）
+    c5 = ("echo ESTABLISHED:$(ss -tan state established 2>/dev/null | tail -n +2 | wc -l); "
+          "echo TIME_WAIT:$(ss -tan state time-wait 2>/dev/null | tail -n +2 | wc -l); "
+          "echo CLOSE_WAIT:$(ss -tan state close-wait 2>/dev/null | tail -n +2 | wc -l)")
     # 6. Docker 磁盘占用
     c6 = "docker system df 2>/dev/null || true"
-    # 7. SSL 证书到期（仅对有 health_port 的服务主机检查）
+    # 7. SSL 证书到期（自动检测 HTTPS 端口：先试 443，否则从 openresty/nginx 容器找）
     ssl_hosts = list({h for hosts in (health_hosts or {}).values() for h in hosts[:1]})[:3]
     if ssl_hosts:
-        targets = " ".join(f"{h}:443" for h in ssl_hosts)
-        c7 = (f"for h in {targets}; do "
-              "echo \"$h|$(echo | openssl s_client -connect $h -servername $(echo $h | cut -d: -f1) "
-              "2>/dev/null | openssl x509 -noout -enddate 2>/dev/null)\"; done || true")
+        targets = " ".join(ssl_hosts)
+        c7 = ("for h in " + targets + "; do "
+              "port=443; "
+              # 先测 443 是否可达
+              "if ! echo | timeout 2 bash -c \"cat < /dev/tcp/$h/443\" 2>/dev/null; then "
+              # 443 不通，从 openresty/nginx 容器找 443 映射
+              "eport=$(docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null "
+              "| grep -iE 'openresty|nginx' | head -1 "
+              "| grep -oE '[0-9]+->443/tcp' | cut -d'>' -f1); "
+              "if [ -n \"$eport\" ]; then port=$eport; fi; "
+              "fi; "
+              "echo \"$h:$port|$(echo | openssl s_client -connect $h:$port "
+              "-servername $h 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null)\"; "
+              "done || true")
     else:
         c7 = "true"
     return [c1, c2, c3, c4, c5, c6, c7]
@@ -345,16 +446,27 @@ def _parse_container_status(out: str, services: list) -> dict:
             m = re.search(r'restarted?\s+(\d+)', status_lower)
             if m:
                 info["restart_count"] = int(m.group(1))
-            # 解析 uptime
+            # 解析 uptime（status_lower 已转小写，故用 'up' 而非 'Up'）
+            # Docker 输出格式：Up X years/months/weeks/days/hours/minutes
             m2 = re.search(
-                r'Up\s+(?:(\d+)\s+weeks?)?[\s,]*(?:(\d+)\s+days?)?[\s,]*(?:(\d+)\s+hours?)?[\s,]*(?:(\d+)\s+mins?)?',
+                r'up\s+'
+                r'(?:(\d+)\s+years?)?[\s,]*'
+                r'(?:(\d+)\s+months?)?[\s,]*'
+                r'(?:(\d+)\s+weeks?)?[\s,]*'
+                r'(?:(\d+)\s+days?)?[\s,]*'
+                r'(?:(\d+)\s+hours?)?[\s,]*'
+                r'(?:(\d+)\s+mins?)?',
                 status_lower)
             if m2:
-                weeks = int(m2.group(1) or 0)
-                days = int(m2.group(2) or 0)
-                hours = int(m2.group(3) or 0)
-                mins = int(m2.group(4) or 0)
-                info["uptime_hours"] = round(weeks * 168 + days * 24 + hours + mins / 60, 1)
+                years = int(m2.group(1) or 0)
+                months = int(m2.group(2) or 0)
+                weeks = int(m2.group(3) or 0)
+                days = int(m2.group(4) or 0)
+                hours = int(m2.group(5) or 0)
+                mins = int(m2.group(6) or 0)
+                info["uptime_hours"] = round(
+                    years * 8760 + months * 720 + weeks * 168 +
+                    days * 24 + hours + mins / 60, 1)
         else:
             info["restart_count"] = 1  # 容器不在运行状态
             info["uptime_hours"] = 0
@@ -468,14 +580,18 @@ def _parse_diskio(out: str) -> dict:
 
 def _parse_tcp(out: str) -> dict:
     """解析 TCP 连接状态分布
-    返回 {"ESTABLISHED": n, "TIME_WAIT": n, "CLOSE_WAIT": n}"""
+    命令输出格式：ESTABLISHED:N\nTIME_WAIT:N\nCLOSE_WAIT:N"""
     counts = {"ESTABLISHED": 0, "TIME_WAIT": 0, "CLOSE_WAIT": 0}
     for line in out.splitlines():
-        line_upper = line.strip().upper()
-        for state in counts:
-            if state in line_upper:
-                counts[state] += 1
-                break
+        line = line.strip()
+        if ":" in line:
+            state, _, count_str = line.partition(":")
+            state = state.strip().upper()
+            if state in counts:
+                try:
+                    counts[state] = int(count_str.strip())
+                except ValueError:
+                    pass
     return counts
 
 
@@ -532,9 +648,11 @@ class MonitorScheduler:
         self._db_path = db_path
         self._interval = max(10, int(interval))
         self._cache = {}
+        self._server_containers = {}  # {host: [container_name, ...]} 供日志采集复用
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self._round = 0  # 探测轮次计数器（扩展指标节流用）
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -545,6 +663,7 @@ class MonitorScheduler:
 
     def stop(self):
         self._stop.set()
+        _ssh_pool.close_all()  # 关闭所有缓存 SSH 连接
 
     def _loop(self):
         while not self._stop.is_set():
@@ -556,6 +675,7 @@ class MonitorScheduler:
             self._stop.wait(self._interval)
 
     def _cycle(self):
+        self._round += 1
         projects = dbm.list_records(self._db_path, "projects")
         tasks = []
         for proj in projects:
@@ -593,15 +713,18 @@ class MonitorScheduler:
         health_hosts = {}  # {svc_name: [host, ...]} 用于健康检查
         per_server_metrics = {}  # {host: {cpu, mem, disk, load}} 按服务器存储主机指标
         per_server_extended = {}  # {host: {swap, net_rx, ...}} 扩展指标
+        # 扩展指标节流：每 5 轮采集一次（@60s 间隔 ≈ 5 分钟一次），
+        # 大幅减少 SSH 连接数（跳过时每台服务器每轮仅 1 次连接而非 2 次）
+        skip_extended = (self._round % 5) != 0
         # 每台服务器整体一个任务（单连接内串行 ps/stats/主机指标，任务间全并发）：
         # 避免旧实现中 stats/指标在调度线程串行执行，整轮时长随服务器数线性增长
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(_probe_server_full, s["host"], s["ssh_port"],
                                    _merge_server_ssh(ssh_cfg, s), services,
-                                   10, health_hosts): s for s in servers}
+                                   10, health_hosts, skip_extended): s for s in servers}
             for fut, s in futures.items():
                 try:
-                    r = fut.result(timeout=50)  # 基础 10s + 扩展 25s + 余量
+                    r = fut.result(timeout=30 if skip_extended else 50)
                 except Exception:
                     # 与 Nacos 分支对齐：单服务器超时降级，不中断整轮探测
                     r = {"ssh_ok": False, "containers": {}, "resources": {},
@@ -617,6 +740,12 @@ class MonitorScheduler:
                     ext = r.get("extended") or {}
                     if ext:
                         per_server_extended[s["host"]] = ext
+                    # 缓存容器列表供日志采集复用（省去 log_collector 独立 docker ps SSH）
+                    if r.get("container_list"):
+                        self._server_containers[s["host"]] = {
+                            "containers": r["container_list"],
+                            "ts": time.time()
+                        }
                     for svc in services:
                         image = r["containers"].get(svc["service_name"])
                         st = result["services"].setdefault(svc["name"],

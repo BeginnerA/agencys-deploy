@@ -63,12 +63,14 @@ class LogCollector:
     """日志采集器（后台守护线程）"""
 
     def __init__(self, db_path: str, log_dir: str, interval: int = 30,
-                 ssh_func=None, max_lines_per_container: int = 5000):
+                 ssh_func=None, max_lines_per_container: int = 5000,
+                 monitor=None):
         self.db_path = db_path
         self.log_dir = log_dir
         self.interval = interval
         self.ssh_func = ssh_func  # 可注入测试 mock；生产环境用 monitor._ssh_exec
         self.max_lines = max_lines_per_container
+        self.monitor = monitor  # MonitorScheduler 实例，复用其容器列表缓存
         self._stop = threading.Event()
         self._thread = None
         self._lock = threading.Lock()
@@ -155,27 +157,35 @@ class LogCollector:
         self._current_kw_rules = None
 
     def _collect_server(self, env_name: str, env_id: int, env_ssh: dict, server: dict):
-        """采集单台服务器：一次 SSH 连接完成 docker ps + 所有容器增量日志
+        """采集单台服务器：一次 SSH 连接完成所有容器增量日志
 
-        相比逐容器各自连接，每服务器每轮只建 1 次连接
-        （TCP 握手 + paramiko 认证是采集热路径的主要开销）
+        优先复用 monitor 探测缓存的容器列表（省去独立 docker ps SSH 连接）；
+        缓存不可用时退化为自己执行 docker ps。
         """
         from .monitor import _merge_server_ssh, _ssh_exec_multi
         ssh_cfg = _merge_server_ssh(env_ssh, server)
         host = server["host"]
         port = server.get("ssh_port") or 22
-        try:
-            outs = _ssh_exec_multi(host, port, ssh_cfg,
-                                   ["docker ps --format '{{.Names}}|{{.Image}}'"],
-                                   timeout=10)
-        except Exception:
-            return
-        containers = []
-        for line in outs[0].splitlines():
-            if "|" in line:
-                name = line.split("|", 1)[0].strip()
-                if name:
-                    containers.append(name)
+        # 优先复用 monitor 探测缓存的容器列表（省去独立 docker ps SSH 连接）
+        containers = None
+        if self.monitor:
+            cached = self.monitor._server_containers.get(host)
+            if cached and (time.time() - cached["ts"]) < self.interval * 2:
+                containers = cached["containers"]
+        if containers is None:
+            # 缓存不可用（首轮或 monitor 未覆盖此服务器），退化为自己 docker ps
+            try:
+                outs = _ssh_exec_multi(host, port, ssh_cfg,
+                                       ["docker ps --format '{{.Names}}|{{.Image}}'"],
+                                       timeout=10)
+            except Exception:
+                return
+            containers = []
+            for line in outs[0].splitlines():
+                if "|" in line:
+                    name = line.split("|", 1)[0].strip()
+                    if name:
+                        containers.append(name)
         if not containers:
             return
         # 批量读取所有容器采集游标（1 次连接），构建各容器增量命令
@@ -500,14 +510,15 @@ def get_collector() -> "LogCollector":
 
 
 def init_collector(app) -> None:
-    """启动日志采集器（依赖 monitor 的 SSH 函数）"""
+    """启动日志采集器（依赖 monitor 的 SSH 函数，复用其容器缓存）"""
     global _collector
     if _collector is not None:
         return
-    from .monitor import _ssh_exec
+    from .monitor import _ssh_exec, get_monitor
     log_dir = str(Path(app.root_path).parent / "data" / "logs")
-    interval = app.config.get("MONITOR_INTERVAL", 30)
-    _collector = LogCollector(app.config["DB_PATH"], log_dir, interval=interval,
-                              ssh_func=_ssh_exec)
+    mon_interval = app.config.get("MONITOR_INTERVAL", 60)
+    log_interval = mon_interval * 2  # 日志采集频率为监控的一半，减少 SSH 连接数
+    _collector = LogCollector(app.config["DB_PATH"], log_dir, interval=log_interval,
+                              ssh_func=_ssh_exec, monitor=get_monitor())
     _collector.start()
-    print(f"[log-collector] 日志采集器已启动，采集周期 {interval}s")
+    print(f"[log-collector] 日志采集器已启动，采集周期 {log_interval}s")
