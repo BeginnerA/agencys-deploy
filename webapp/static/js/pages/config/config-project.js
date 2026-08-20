@@ -156,7 +156,7 @@
           ${binds.map(({env: e, list, failed}) => `<tr>
             <td>${esc(e.name)}</td>
             <td>${e.is_default ? '<span class="badge success">默认</span>' : '-'}</td>
-            <td class="num">${list.length ? `${list.length} 台 <span class="weak">(${esc(list.map(s => s.role === 'first' ? '首台' : '跟随').join('/') || '未设角色')})</span>` : (failed ? '<span class="weak">加载失败</span>' : '<span class="err">未绑定</span>')}</td>
+            <td class="num">${list.length ? `${list.length} 台 <span class="weak">(${esc(list.map((s, i) => i === 0 ? '首台' : '跟随').join('/'))})</span>` : (failed ? '<span class="weak">加载失败</span>' : '<span class="err">未绑定</span>')}</td>
             <td class="num">${esc(e.docker_compose_path || '-')}</td>
             <td class="num">${esc(e.maven_profile || '-')}</td>
             <td><button class="btn sm ghost" data-bind="${e.id}">绑定服务器</button>
@@ -222,12 +222,11 @@
           <button class="btn sm primary" id="addSrv">+ 新建服务器</button>
         </div>
         <div class="panel" style="padding:0">${svs.length ? `<div class="tbl-wrap"><table class="tbl"><thead><tr>
-          <th>主机</th><th>端口</th><th>用户</th><th>角色</th><th>Nacos IP</th><th>连接状态</th><th>备注</th><th>启用</th><th>操作</th></tr></thead><tbody>
+          <th>主机</th><th>端口</th><th>用户</th><th>Nacos IP</th><th>连接状态</th><th>备注</th><th>启用</th><th>操作</th></tr></thead><tbody>
           ${svs.map(s => `<tr>
             <td class="num">${esc(s.host)}</td>
             <td class="num">${s.ssh_port ?? '-'}</td>
             <td class="num">${esc(s.ssh_user || '-')}</td>
-            <td>${s.role === 'first' ? '<span class="badge success">first 首台</span>' : (s.role === 'follower' ? '<span class="badge">follower</span>' : esc(s.role || '-'))}</td>
             <td class="num">${esc(s.nacos_ip || '-')}</td>
             <td>${connBadge(s)}</td>
             <td class="muted">${esc(s.remark || '-')}</td>

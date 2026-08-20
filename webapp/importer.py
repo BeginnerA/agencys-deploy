@@ -139,7 +139,6 @@ def _import_servers(db_path: str, path: Path, env_name: str) -> tuple:
                 ssh_password=ssh_cfg.get("password"),
                 ssh_key_file=ssh_cfg.get("key_file"),
                 nacos_ip=s.get("nacos_ip", ""),
-                role=s.get("role", "") or "",
                 remark=s.get("remark", "") or "", enabled=1))
         else:
             sid = row["id"]

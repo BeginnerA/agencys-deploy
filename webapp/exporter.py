@@ -116,7 +116,7 @@ def export_env_yaml(db_path: str, env: dict) -> str:
 def export_servers_yaml(db_path: str, env: dict) -> str:
     servers = []
     env_ssh = dict(env.get("ssh") or {})
-    for idx, s in enumerate(dbm.list_env_servers(db_path, env["id"])):
+    for s in dbm.list_env_servers(db_path, env["id"]):
         # 服务器级 SSH 覆盖优先于环境级：DB 为 NULL（未配置）才继承环境级，
         # 显式值（含空串 = 禁用密码认证）一律覆盖
         ssh = dict(env_ssh)
@@ -128,8 +128,7 @@ def export_servers_yaml(db_path: str, env: dict) -> str:
             ssh["password"] = s["ssh_password"]
         if s["ssh_key_file"] is not None:
             ssh["key_file"] = s["ssh_key_file"]
-        # role：DB 显式配置优先，缺省按旧格式语义回退（首台 first / 其余 follower）
-        entry = {"ip": s["host"], "role": s["role"] or ("first" if idx == 0 else "follower")}
+        entry = {"ip": s["host"]}
         if s["nacos_ip"]:
             entry["nacos_ip"] = s["nacos_ip"]
         if s["remark"]:

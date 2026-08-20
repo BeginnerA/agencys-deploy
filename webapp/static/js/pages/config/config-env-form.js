@@ -297,19 +297,19 @@
       const bound = st.boundIds.map(id => st.servers.find(s => s.id === id)).filter(Boolean);
       const unbound = st.servers.filter(s => !st.boundIds.includes(s.id));
       body.innerHTML = `
-        <div class="f-hint" style="margin-bottom:10px">勾选 = 绑定到本环境；顺序即发布顺序（first 首台灰度 → follower 按序跟随）。角色在服务器列表中维护，这里仅选择与排序。</div>
+        <div class="f-hint" style="margin-bottom:10px">勾选 = 绑定到本环境；顺序即发布顺序（首台灰度 → 其余按序跟随）。</div>
         <div class="cfg-section"><div class="cs-head"><span class="cs-ico">📌</span><span class="cs-title">已绑定（${bound.length} 台）</span></div><div class="cs-body" id="boundList">
           ${bound.length ? bound.map((s, i) => boundRow(s, i)).join('') : '<div class="weak" style="font-size:12px">尚未绑定任何服务器，从下方勾选添加</div>'}
         </div></div>
         <div class="cfg-section"><div class="cs-head"><span class="cs-ico">🖥️</span><span class="cs-title">平台服务器（${unbound.length} 台未绑定）</span></div><div class="cs-body">
           ${unbound.length ? `<div class="form-grid">${unbound.map(s => `
             <label class="field check" style="grid-column:1/-1;margin:0"><input type="checkbox" class="bindChk" value="${s.id}">
-              ${esc(s.host)} <span class="weak">${esc(s.role === 'first' ? 'first 首台' : (s.role === 'follower' ? 'follower' : ''))}</span>
+              ${esc(s.host)}
               ${s.conn ? (s.conn.ok ? '<span class="ok">SSH 正常</span>' : '<span class="err">SSH 异常</span>') : '<span class="weak">SSH 未知</span>'}
               ${s.enabled ? '' : '<span class="weak">（停用）</span>'}</label>`).join('')}</div>`
           : '<div class="weak" style="font-size:12px">平台暂无其它服务器；可到服务器页先添加</div>'}
         </div></div>
-        <div class="f-hint">同一环境建议至少 1 台 first（首台灰度观察无异常后再发布其余）。</div>`;
+        <div class="f-hint">同一环境建议至少 1 台服务器（首台灰度观察无异常后再发布其余）。</div>`;
       body.querySelectorAll('.bindChk').forEach(c => c.onchange = () => {
         const id = Number(c.value);
         if (c.checked) st.boundIds.push(id);
@@ -324,7 +324,7 @@
       return `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px dashed var(--border)">
         <span class="stp-n" style="width:22px;height:22px;border-radius:50%;border:1px solid var(--primary);color:var(--primary);display:inline-flex;align-items:center;justify-content:center;font-size:11px;flex-shrink:0">${i + 1}</span>
         <span style="font-size:13px">${esc(s.host)}</span>
-        <span class="weak" style="font-size:11px">${s.role === 'first' ? 'first 首台' : (s.role === 'follower' ? 'follower 跟随' : '未设角色')}</span>
+        <span class="weak" style="font-size:11px">${i === 0 ? '首台' : '跟随'}</span>
         <span style="flex:1"></span>
         <button class="btn sm ghost" data-bup="${s.id}" ${i === 0 ? 'disabled' : ''}>↑</button>
         <button class="btn sm ghost" data-bdown="${s.id}" ${i === boundListLen() - 1 ? 'disabled' : ''}>↓</button>

@@ -381,7 +381,7 @@ class TestDeployEnhanceAPI(unittest.TestCase):
             build="{}", deploy="{}", monitor_enabled=1))
         sid = dbm.create_record(self.db_path, "servers", dict(
             host="10.0.0.1", ssh_port=22, ssh_user="root", ssh_password="x",
-            nacos_ip="", role="", remark="", enabled=1))
+            nacos_ip="", remark="", enabled=1))
         dbm.create_record(self.db_path, "env_servers", dict(
             env_id=env_id, server_id=sid, order_no=0))
         dbm.create_record(self.db_path, "service_dependencies", dict(

@@ -57,7 +57,6 @@ CREATE TABLE IF NOT EXISTS servers (
     ssh_password TEXT,
     ssh_key_file TEXT,
     nacos_ip TEXT DEFAULT '',
-    role TEXT DEFAULT '',
     remark TEXT DEFAULT '',
     enabled INTEGER DEFAULT 1,
     UNIQUE(host)
@@ -318,10 +317,8 @@ def init_db(db_path: str):
 
 
 def _migrate(conn):
-    """存量库结构迁移（幂等）：services 补日志相关列，servers 补 role 列。
-    services 加列先于 role 迁移执行，避免提前 return 跳过加列。
-    role 迁移：旧版 importer 将 YAML role 写入 remark，故迁移时把存量 remark 迁入 role 并清空
-    （备注留空给用户做说明，角色归角色）。"""
+    """存量库结构迁移（幂等）：services 补日志相关列，tasks 补列，log_entries 补 content 列等。
+    services 加列先于其余迁移执行，避免提前 return 跳过加列。"""
     srv_cols = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
     if "log_retention_days" not in srv_cols:
         conn.execute("ALTER TABLE services ADD COLUMN log_retention_days INTEGER")
@@ -350,12 +347,10 @@ def _migrate(conn):
     ar_cols = {r["name"] for r in conn.execute("PRAGMA table_info(alert_rules)")}
     if "exclude_keyword" not in ar_cols:
         conn.execute("ALTER TABLE alert_rules ADD COLUMN exclude_keyword TEXT DEFAULT ''")
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(servers)")}
-    if "role" in cols:
-        return
-    conn.execute("ALTER TABLE servers ADD COLUMN role TEXT DEFAULT ''")
-    conn.execute("UPDATE servers SET role = remark, remark = '' "
-                 "WHERE remark IS NOT NULL AND remark != ''")
+    # servers 表 role 列已废弃（发布顺序由 env_servers.order_no 决定），存量库删除该列
+    srv_cols_now = {r["name"] for r in conn.execute("PRAGMA table_info(servers)")}
+    if "role" in srv_cols_now:
+        conn.execute("ALTER TABLE servers DROP COLUMN role")
 
 
 def _serialize(table: str, fields: dict) -> dict:

@@ -1,4 +1,4 @@
-// config-server-form.js — 服务器新增/编辑：凭据继承开关 + 角色卡片 + 就地校验 + 保存并测试 SSH
+// config-server-form.js — 服务器新增/编辑：凭据继承开关 + 就地校验 + 保存并测试 SSH
 (function(){
   'use strict';
   const H = window.cfgHelpers;
@@ -6,7 +6,6 @@
   function open(container, srv, onSaved){
     const st = {
       container, onSaved, srv,
-      role: (srv && srv.role) || 'first',
       // 覆盖形态含 ssh_port 单独覆盖与密码禁用（''）：缺失判据会误判继承并在保存时静默清空
       inherit: !(srv && (srv.ssh_user || srv.ssh_key_file ||
         (srv.ssh_password ?? null) !== null || (srv.ssh_port ?? null) !== null)),
@@ -47,17 +46,6 @@
           ${H.field({ label:'服务器 IP', required:true, tip:'SSH 连接用地址，全平台唯一', input:`<input id="sHost" value="${esc(srv ? srv.host : '')}" placeholder="如 10.0.0.11">` })}
           ${H.field({ label:'Nacos 注册 IP（nacos_ip）', tip:'NAT 环境下与外网 IP 不同才填', input:`<input id="sNacosIp" value="${esc(srv ? srv.nacos_ip || '' : '')}" placeholder="留空 = 使用服务器 IP">`, hint:'NAT 环境下服务在 Nacos 中注册的内网 IP，与上方 IP 相同则留空' })}
         </div>
-        <div class="f-label">角色 * <span class="q" title="first = 最先发布并灰度观察；follower = 按绑定顺序跟随">?</span></div>
-        <div class="role-cards">
-          <div class="role-card ${st.role === 'first' ? 'sel' : ''}" data-role="first">
-            <div class="rc-title">first 首台<span class="rc-key">first</span></div>
-            <div class="rc-desc">最先发布，灰度观察无异常后再发布其余服务器。同一环境至少 1 台。</div>
-          </div>
-          <div class="role-card ${st.role === 'follower' ? 'sel' : ''}" data-role="follower">
-            <div class="rc-title">follower 后续<span class="rc-key">follower</span></div>
-            <div class="rc-desc">按绑定顺序跟随发布，用于集群扩容。</div>
-          </div>
-        </div>
         <div class="cfg-section"><div class="cs-head"><span class="cs-ico">🔑</span><span class="cs-title">SSH 连接凭据</span><span class="cs-desc">大部分服务器共用环境级凭据</span></div>
           <div class="cs-body">
             <label class="mode-switch" style="margin-bottom:10px"><input type="checkbox" id="sInherit" ${st.inherit ? 'checked' : ''}> 使用环境级凭据（不单独配置）</label>
@@ -72,7 +60,6 @@
           <button class="btn ghost" id="srvRetest" style="display:none">重新测试</button>
         </div>`;
 
-      bodyEl.querySelectorAll('.role-card').forEach(c => c.onclick = () => { st.role = c.dataset.role; render(); });
       document.getElementById('sInherit').onchange = e => { st.inherit = e.target.checked; render(); };
       const auth = document.getElementById('sAuth');
       if (auth) auth.onchange = e => { st.authMode = e.target.value; render(); };
@@ -106,7 +93,7 @@
 
     // ---- 收集提交载荷（对齐后端三态：不传/NULL = 继承环境级） ----
     function collectPayload(){
-      const p = { host: val('sHost').trim(), role: st.role, nacos_ip: val('sNacosIp').trim(), remark: val('sRemark').trim() };
+      const p = { host: val('sHost').trim(), nacos_ip: val('sNacosIp').trim(), remark: val('sRemark').trim() };
       if (st.inherit){
         // 从覆盖切回继承：显式置 null 清空覆盖（后端为字段级更新，不提交不会清除）
         p.ssh_user = null; p.ssh_port = null; p.ssh_password = null; p.ssh_key_file = null;

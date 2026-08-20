@@ -50,7 +50,7 @@
           <td>${esc(projMap[s.project_id] || '-')}</td>
           <td>${s.ref_type === 'service' ? '<span class="tag tag-ok">' + esc(svcMap[s.id] || '指定服务') + '</span>' : '<span class="muted">全量</span>'}</td>
           <td>${esc(s.env || '-')}</td>
-          <td class="num">${esc(s.version || '-')}</td>
+          <td class="num">${(()=>{ const ex = typeof s.extra === 'string' ? JSON.parse(s.extra||'[]') : (s.extra||[]); return ex.includes('--auto-version') ? '<span class="tag tag-ok">自动</span>' : esc(s.version || '-'); })()}</td>
           <td class="num muted">${s.next_run_at ? fmtTime(s.next_run_at) : (s.type === 'cron' ? esc(s.cron_expr) : '-')}</td>
           <td>${s.enabled ? '<span class="tag tag-ok">启用</span>' : '<span class="tag">停用</span>'}</td>
           <td>
@@ -102,7 +102,9 @@
           </select></div>
         <div class="field"><label>环境</label>
           <select id="schedEnv">${initEnvs.map(e => `<option value="${esc(e.name)}">${esc(e.name)}</option>`).join('')}</select></div>
-        <div class="field"><label>版本</label><input id="schedVer" placeholder="1.0.0"></div>
+        <div class="field"><label>版本模式</label>
+          <select id="schedVerMode"><option value="auto">自动版本</option><option value="manual">指定版本</option></select></div>
+        <div class="field" id="schedVerWrap" style="display:none"><label>版本号</label><input id="schedVer" placeholder="1.0.0"></div>
         <div class="field full" id="schedTimeWrap"><label>执行时间</label>
           <input id="schedAt" type="datetime-local"></div>
         <div class="field full" id="schedCronWrap" style="display:none"><label>CRON 表达式</label>
@@ -116,6 +118,9 @@
       document.getElementById('schedEnv').innerHTML = envs.map(e => `<option value="${esc(e.name)}">${esc(e.name)}</option>`).join('');
       document.getElementById('schedSvc').innerHTML = '<option value="">全量发布</option>' + svcs.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join('');
     };
+    document.getElementById('schedVerMode').onchange = (e) => {
+      document.getElementById('schedVerWrap').style.display = e.target.value === 'manual' ? '' : 'none';
+    };
     document.getElementById('schedType').onchange = (e) => {
       document.getElementById('schedTimeWrap').style.display = e.target.value === 'once' ? '' : 'none';
       document.getElementById('schedCronWrap').style.display = e.target.value === 'cron' ? '' : 'none';
@@ -123,11 +128,13 @@
     document.getElementById('schedSave').onclick = async () => {
       const type = document.getElementById('schedType').value;
       const svcVal = document.getElementById('schedSvc').value;
+      const verMode = document.getElementById('schedVerMode').value;
       const body = {
         project_id: Number(document.getElementById('schedProj').value),
         type, name: document.getElementById('schedName').value,
         env: document.getElementById('schedEnv').value,
-        version: document.getElementById('schedVer').value,
+        version: verMode === 'manual' ? document.getElementById('schedVer').value : '',
+        extra: verMode === 'auto' ? ['--auto-version'] : [],
       };
       // 指定服务时传 service_id
       if (svcVal) body.service_id = Number(svcVal);

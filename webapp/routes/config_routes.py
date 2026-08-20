@@ -537,7 +537,7 @@ def create_server():
     if ssh_port is not None and (not isinstance(ssh_port, int)
                                  or isinstance(ssh_port, bool)):
         return _err("ssh_port 必须为整数")
-    for k in ("nacos_ip", "role", "remark"):
+    for k in ("nacos_ip", "remark"):
         if k in body and not isinstance(body[k], str):
             return _err(f"{k} 必须为字符串")
     sid = dbm.create_record(current_app.config["DB_PATH"], "servers", dict(
@@ -547,7 +547,7 @@ def create_server():
         ssh_user=body.get("ssh_user"),
         ssh_password=body.get("ssh_password"),
         ssh_key_file=body.get("ssh_key_file"),
-        nacos_ip=body.get("nacos_ip", ""), role=body.get("role", ""),
+        nacos_ip=body.get("nacos_ip", ""),
         remark=body.get("remark", ""),
         enabled=1 if enabled else 0))
     audit("create_server", "server", sid, {"host": host})
@@ -572,11 +572,11 @@ def update_server(sid):
             if s["host"] == host and s["id"] != sid:
                 return _err("服务器已存在")
     allowed = ("host", "ssh_port", "ssh_user", "ssh_password", "ssh_key_file",
-               "nacos_ip", "role", "remark")
+               "nacos_ip", "remark")
     if "ssh_port" in body and body["ssh_port"] is not None and (
             not isinstance(body["ssh_port"], int) or isinstance(body["ssh_port"], bool)):
         return _err("ssh_port 必须为整数")
-    for k in ("nacos_ip", "role", "remark"):
+    for k in ("nacos_ip", "remark"):
         if k in body and not isinstance(body[k], str):
             return _err(f"{k} 必须为字符串")
     fields = {k: v for k, v in body.items() if k in allowed}
