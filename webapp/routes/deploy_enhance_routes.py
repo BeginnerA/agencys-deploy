@@ -1,0 +1,597 @@
+"""发布增强路由：定时计划 / 发布窗口 / 灰度策略 / 依赖拓扑 / 快照对比 / Webhook"""
+import json
+import time
+from pathlib import Path
+
+import yaml
+from flask import Blueprint, request, jsonify, current_app, g
+
+from .. import db as dbm
+from ..auth import require_auth, require_role, audit
+from ..deploy_scheduler import check_release_window
+
+deploy_enhance_bp = Blueprint("deploy_enhance", __name__)
+
+CONFIG_DIR = Path(__file__).resolve().parent.parent.parent / "config"
+
+
+def _json_body():
+    """解析 JSON 请求体；非对象返回 None"""
+    body = request.get_json(silent=True)
+    return body if isinstance(body, dict) else None
+
+
+def _db_path():
+    return current_app.config["DB_PATH"]
+
+
+# ========== 定时发布计划 ==========
+
+@deploy_enhance_bp.route("/deploy/schedules", methods=["GET"])
+@require_auth
+def list_schedules():
+    raw_pid = request.args.get("project_id")
+    if raw_pid is not None:
+        try:
+            project_id = int(raw_pid)
+        except (TypeError, ValueError):
+            return jsonify({"error": "project_id 必须为整数"}), 400
+        rows = dbm.list_records(_db_path(), "deploy_schedules",
+                                "project_id=?", (project_id,), "id DESC")
+    else:
+        rows = dbm.list_records(_db_path(), "deploy_schedules", "", (), "id DESC")
+    return jsonify(rows)
+
+
+@deploy_enhance_bp.route("/deploy/schedules", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def create_schedule():
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    project_id = body.get("project_id")
+    name = body.get("name", "")
+    type_ = body.get("type", "once")
+    if not isinstance(project_id, int) or isinstance(project_id, bool):
+        return jsonify({"error": "project_id 必须为整数"}), 400
+    if not isinstance(name, str) or not name.strip():
+        return jsonify({"error": "name 必填"}), 400
+    if type_ not in ("once", "cron"):
+        return jsonify({"error": "type 必须为 once 或 cron"}), 400
+
+    ref_type = body.get("ref_type", "project")
+    ref_id = body.get("ref_id", 0)
+    env = body.get("env", "")
+    version = body.get("version", "")
+    previous_version = body.get("previous_version", "")
+    extra = body.get("extra", [])
+    if isinstance(extra, list):
+        extra = json.dumps(extra, ensure_ascii=False)
+    schedule_at = body.get("schedule_at", 0)
+    cron_expr = body.get("cron_expr", "")
+
+    if type_ == "cron":
+        if not cron_expr:
+            return jsonify({"error": "cron 类型必须提供 cron_expr"}), 400
+        try:
+            from croniter import croniter
+            from datetime import datetime
+            cron = croniter(cron_expr, datetime.now())
+            next_run_at = int(cron.get_next())
+        except (ImportError, ValueError, KeyError) as e:
+            return jsonify({"error": f"cron 表达式无效: {e}"}), 400
+    else:
+        if not schedule_at:
+            return jsonify({"error": "once 类型必须提供 schedule_at"}), 400
+        next_run_at = int(schedule_at)
+
+    sid = dbm.create_record(_db_path(), "deploy_schedules", dict(
+        project_id=project_id, type=type_, name=name.strip(),
+        ref_type=ref_type, ref_id=ref_id, env=env,
+        version=version, previous_version=previous_version,
+        extra=extra if isinstance(extra, str) else json.dumps(extra),
+        schedule_at=int(schedule_at), cron_expr=cron_expr,
+        enabled=1, last_run_at=0, next_run_at=next_run_at,
+        created_by=g.user["id"], created_at=int(time.time())))
+    audit("create_schedule", "deploy_schedule", sid,
+          {"name": name, "type": type_, "project_id": project_id})
+    return jsonify({"id": sid}), 201
+
+
+@deploy_enhance_bp.route("/deploy/schedules/<int:sid>", methods=["PUT"])
+@require_auth
+@require_role("admin", "operator")
+def update_schedule(sid):
+    rec = dbm.get_record(_db_path(), "deploy_schedules", sid)
+    if not rec:
+        return jsonify({"error": "计划不存在"}), 404
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    fields = {}
+    for k in ("name", "env", "version", "previous_version", "cron_expr"):
+        if k in body:
+            fields[k] = body[k]
+    if "ref_id" in body:
+        fields["ref_id"] = body["ref_id"]
+    if "schedule_at" in body:
+        fields["schedule_at"] = int(body["schedule_at"])
+        fields["next_run_at"] = int(body["schedule_at"])
+    if "extra" in body:
+        extra = body["extra"]
+        fields["extra"] = json.dumps(extra, ensure_ascii=False) if isinstance(extra, list) else extra
+    if fields:
+        dbm.update_record(_db_path(), "deploy_schedules", sid, fields)
+    audit("update_schedule", "deploy_schedule", sid, fields)
+    return jsonify({"ok": True})
+
+
+@deploy_enhance_bp.route("/deploy/schedules/<int:sid>", methods=["DELETE"])
+@require_auth
+@require_role("admin", "operator")
+def delete_schedule(sid):
+    rec = dbm.get_record(_db_path(), "deploy_schedules", sid)
+    if not rec:
+        return jsonify({"error": "计划不存在"}), 404
+    dbm.delete_record(_db_path(), "deploy_schedules", sid)
+    audit("delete_schedule", "deploy_schedule", sid, {"name": rec["name"]})
+    return jsonify({"ok": True})
+
+
+@deploy_enhance_bp.route("/deploy/schedules/<int:sid>/toggle", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def toggle_schedule(sid):
+    rec = dbm.get_record(_db_path(), "deploy_schedules", sid)
+    if not rec:
+        return jsonify({"error": "计划不存在"}), 404
+    new_enabled = 0 if rec["enabled"] else 1
+    dbm.update_record(_db_path(), "deploy_schedules", sid, {"enabled": new_enabled})
+    audit("toggle_schedule", "deploy_schedule", sid, {"enabled": new_enabled})
+    return jsonify({"enabled": bool(new_enabled)})
+
+
+@deploy_enhance_bp.route("/deploy/schedules/<int:sid>/run", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def run_schedule(sid):
+    rec = dbm.get_record(_db_path(), "deploy_schedules", sid)
+    if not rec:
+        return jsonify({"error": "计划不存在"}), 404
+    # 窗口检查
+    window = check_release_window(_db_path(), rec["project_id"])
+    if window and window["block_level"] == "block":
+        return jsonify({"error": f"当前处于封网窗口 '{window['name']}'，禁止发布"}), 403
+    # 创建任务
+    extra = rec.get("extra", [])
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except (ValueError, TypeError):
+            extra = []
+    if window and window["block_level"] == "warn":
+        extra.append("--force-window")
+    task_id = dbm.create_task(
+        _db_path(), rec["project_id"],
+        rec["ref_type"], rec["ref_id"],
+        rec["name"], rec["env"],
+        rec["version"], rec["previous_version"],
+        g.user["id"], extra=extra)
+    from .. import task_manager
+    task = dbm.get_task(_db_path(), task_id)
+    task_manager.submit_task(_db_path(), task, extra)
+    audit("run_schedule", "deploy_schedule", sid, {"task_id": task_id})
+    return jsonify({"task_id": task_id, "status": "pending"}), 201
+
+
+# ========== 发布窗口 ==========
+
+@deploy_enhance_bp.route("/deploy/windows", methods=["GET"])
+@require_auth
+def list_windows():
+    rows = dbm.list_records(_db_path(), "release_windows", "", (), "id DESC")
+    return jsonify(rows)
+
+
+@deploy_enhance_bp.route("/deploy/windows", methods=["POST"])
+@require_auth
+@require_role("admin")
+def create_window():
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    project_id = body.get("project_id", 0)
+    name = body.get("name", "")
+    start_at = body.get("start_at", 0)
+    end_at = body.get("end_at", 0)
+    block_level = body.get("block_level", "warn")
+    repeat_yearly = 1 if body.get("repeat_yearly") else 0
+    if not isinstance(name, str) or not name.strip():
+        return jsonify({"error": "name 必填"}), 400
+    if block_level not in ("block", "warn"):
+        return jsonify({"error": "block_level 必须为 block 或 warn"}), 400
+    wid = dbm.create_record(_db_path(), "release_windows", dict(
+        project_id=project_id, name=name.strip(),
+        start_at=int(start_at), end_at=int(end_at),
+        block_level=block_level, repeat_yearly=repeat_yearly,
+        created_by=g.user["id"], created_at=int(time.time())))
+    audit("create_window", "release_window", wid, {"name": name})
+    return jsonify({"id": wid}), 201
+
+
+@deploy_enhance_bp.route("/deploy/windows/<int:wid>", methods=["PUT"])
+@require_auth
+@require_role("admin")
+def update_window(wid):
+    rec = dbm.get_record(_db_path(), "release_windows", wid)
+    if not rec:
+        return jsonify({"error": "窗口不存在"}), 404
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    fields = {}
+    for k in ("name", "block_level"):
+        if k in body:
+            fields[k] = body[k]
+    for k in ("start_at", "end_at"):
+        if k in body:
+            fields[k] = int(body[k])
+    if "repeat_yearly" in body:
+        fields["repeat_yearly"] = 1 if body["repeat_yearly"] else 0
+    if fields:
+        dbm.update_record(_db_path(), "release_windows", wid, fields)
+    audit("update_window", "release_window", wid, fields)
+    return jsonify({"ok": True})
+
+
+@deploy_enhance_bp.route("/deploy/windows/<int:wid>", methods=["DELETE"])
+@require_auth
+@require_role("admin")
+def delete_window(wid):
+    rec = dbm.get_record(_db_path(), "release_windows", wid)
+    if not rec:
+        return jsonify({"error": "窗口不存在"}), 404
+    dbm.delete_record(_db_path(), "release_windows", wid)
+    audit("delete_window", "release_window", wid, {"name": rec["name"]})
+    return jsonify({"ok": True})
+
+
+@deploy_enhance_bp.route("/deploy/windows/check", methods=["GET"])
+@require_auth
+def check_window():
+    raw_pid = request.args.get("project_id", "0")
+    try:
+        project_id = int(raw_pid)
+    except (TypeError, ValueError):
+        return jsonify({"error": "project_id 必须为整数"}), 400
+    result = check_release_window(_db_path(), project_id)
+    return jsonify(result)
+
+
+# ========== 灰度策略 ==========
+
+@deploy_enhance_bp.route("/deploy/canary-configs", methods=["GET"])
+@require_auth
+def list_canary_configs():
+    raw_pid = request.args.get("project_id")
+    if raw_pid is not None:
+        try:
+            project_id = int(raw_pid)
+        except (TypeError, ValueError):
+            return jsonify({"error": "project_id 必须为整数"}), 400
+        rows = dbm.list_records(_db_path(), "canary_configs",
+                                "project_id=?", (project_id,), "id")
+    else:
+        rows = dbm.list_records(_db_path(), "canary_configs", "", (), "id")
+    return jsonify(rows)
+
+
+@deploy_enhance_bp.route("/deploy/canary-configs", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def create_canary_config():
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    project_id = body.get("project_id")
+    name = body.get("name", "")
+    steps = body.get("steps", [])
+    is_default = 1 if body.get("is_default") else 0
+    if not isinstance(project_id, int) or isinstance(project_id, bool):
+        return jsonify({"error": "project_id 必须为整数"}), 400
+    if not isinstance(name, str) or not name.strip():
+        return jsonify({"error": "name 必填"}), 400
+    if not isinstance(steps, list):
+        return jsonify({"error": "steps 必须为数组"}), 400
+    cid = dbm.create_record(_db_path(), "canary_configs", dict(
+        project_id=project_id, name=name.strip(),
+        steps=json.dumps(steps, ensure_ascii=False),
+        is_default=is_default, created_at=int(time.time())))
+    audit("create_canary_config", "canary_config", cid, {"name": name})
+    return jsonify({"id": cid}), 201
+
+
+@deploy_enhance_bp.route("/deploy/canary-configs/<int:cid>", methods=["PUT"])
+@require_auth
+@require_role("admin", "operator")
+def update_canary_config(cid):
+    rec = dbm.get_record(_db_path(), "canary_configs", cid)
+    if not rec:
+        return jsonify({"error": "配置不存在"}), 404
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    fields = {}
+    if "name" in body:
+        fields["name"] = body["name"]
+    if "steps" in body:
+        steps = body["steps"]
+        if not isinstance(steps, list):
+            return jsonify({"error": "steps 必须为数组"}), 400
+        fields["steps"] = json.dumps(steps, ensure_ascii=False)
+    if "is_default" in body:
+        fields["is_default"] = 1 if body["is_default"] else 0
+    if fields:
+        dbm.update_record(_db_path(), "canary_configs", cid, fields)
+    audit("update_canary_config", "canary_config", cid, fields)
+    return jsonify({"ok": True})
+
+
+@deploy_enhance_bp.route("/deploy/canary-configs/<int:cid>", methods=["DELETE"])
+@require_auth
+@require_role("admin", "operator")
+def delete_canary_config(cid):
+    rec = dbm.get_record(_db_path(), "canary_configs", cid)
+    if not rec:
+        return jsonify({"error": "配置不存在"}), 404
+    dbm.delete_record(_db_path(), "canary_configs", cid)
+    audit("delete_canary_config", "canary_config", cid, {"name": rec["name"]})
+    return jsonify({"ok": True})
+
+
+# ========== 依赖拓扑 & 影响分析 ==========
+
+@deploy_enhance_bp.route("/deploy/topology/<int:project_id>", methods=["GET"])
+@require_auth
+def get_topology(project_id):
+    """获取项目服务依赖拓扑：手动依赖 + dubbo 自动检测"""
+    services = dbm.list_services(_db_path(), project_id)
+    svc_names = {s["name"] for s in services}
+    # 手动依赖
+    manual_deps = dbm.list_records(_db_path(), "service_dependencies",
+                                   "project_id=?", (project_id,), "id")
+    edges = []
+    edge_set = set()
+    for d in manual_deps:
+        key = (d["source_service"], d["target_service"])
+        if key not in edge_set:
+            edges.append({"source": d["source_service"], "target": d["target_service"],
+                          "type": d["dep_type"]})
+            edge_set.add(key)
+    # 自动检测 dubbo 依赖
+    for svc in services:
+        dubbo = svc.get("dubbo_services", [])
+        if isinstance(dubbo, str):
+            try:
+                dubbo = json.loads(dubbo)
+            except (ValueError, TypeError):
+                dubbo = []
+        if isinstance(dubbo, list):
+            for d in dubbo:
+                target = d if isinstance(d, str) else d.get("service", "")
+                if target and target in svc_names:
+                    key = (svc["name"], target)
+                    if key not in edge_set:
+                        edges.append({"source": svc["name"], "target": target,
+                                      "type": "dubbo"})
+                        edge_set.add(key)
+    nodes = [{"name": s["name"], "service_name": s.get("service_name", "")}
+             for s in services]
+    return jsonify({"nodes": nodes, "edges": edges})
+
+
+@deploy_enhance_bp.route("/deploy/topology", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def add_dependency():
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    project_id = body.get("project_id")
+    source = body.get("source_service", "")
+    target = body.get("target_service", "")
+    dep_type = body.get("dep_type", "manual")
+    if not isinstance(project_id, int) or isinstance(project_id, bool):
+        return jsonify({"error": "project_id 必须为整数"}), 400
+    if not source or not target:
+        return jsonify({"error": "source_service 和 target_service 必填"}), 400
+    if source == target:
+        return jsonify({"error": "不能依赖自己"}), 400
+    # 环检测：BFS 从 target 出发，看是否能到达 source
+    if _has_path(_db_path(), project_id, target, source):
+        return jsonify({"error": "添加此依赖会形成循环依赖"}), 400
+    try:
+        did = dbm.create_record(_db_path(), "service_dependencies", dict(
+            project_id=project_id, source_service=source,
+            target_service=target, dep_type=dep_type,
+            created_at=int(time.time())))
+    except Exception as e:
+        if "UNIQUE" in str(e):
+            return jsonify({"error": "依赖关系已存在"}), 400
+        raise
+    audit("add_dependency", "service_dependency", did,
+          {"source": source, "target": target})
+    return jsonify({"id": did}), 201
+
+
+def _has_path(db_path, project_id, from_svc, to_svc):
+    """BFS 检测从 from_svc 是否能到达 to_svc（沿依赖边 source→target）"""
+    deps = dbm.list_records(db_path, "service_dependencies",
+                            "project_id=?", (project_id,), "id")
+    # 构建邻接表：source -> [target, ...]
+    adj = {}
+    for d in deps:
+        adj.setdefault(d["source_service"], []).append(d["target_service"])
+    # BFS
+    visited = set()
+    queue = [from_svc]
+    while queue:
+        curr = queue.pop(0)
+        if curr == to_svc:
+            return True
+        if curr in visited:
+            continue
+        visited.add(curr)
+        for nxt in adj.get(curr, []):
+            if nxt not in visited:
+                queue.append(nxt)
+    return False
+
+
+@deploy_enhance_bp.route("/deploy/topology/<int:dep_id>", methods=["DELETE"])
+@require_auth
+@require_role("admin", "operator")
+def delete_dependency(dep_id):
+    rec = dbm.get_record(_db_path(), "service_dependencies", dep_id)
+    if not rec:
+        return jsonify({"error": "依赖不存在"}), 404
+    dbm.delete_record(_db_path(), "service_dependencies", dep_id)
+    audit("delete_dependency", "service_dependency", dep_id,
+          {"source": rec["source_service"], "target": rec["target_service"]})
+    return jsonify({"ok": True})
+
+
+@deploy_enhance_bp.route("/deploy/impact/<int:project_id>", methods=["GET"])
+@require_auth
+def impact_analysis(project_id):
+    """影响分析：同服务器服务 + 上下游依赖"""
+    env_name = request.args.get("env", "")
+    service_name = request.args.get("service", "")
+    if not env_name or not service_name:
+        return jsonify({"error": "env 和 service 参数必填"}), 400
+    # 找环境
+    env = dbm.get_env_by_name(_db_path(), project_id, env_name)
+    if not env:
+        return jsonify({"error": "环境不存在"}), 404
+    # 同服务器上的其他服务（colocated）
+    servers = dbm.list_env_servers(_db_path(), env["id"])
+    all_services = dbm.list_services(_db_path(), project_id)
+    colocated = [s["name"] for s in all_services if s["name"] != service_name]
+    # 上游：依赖此服务的（source_service = service_name）
+    deps = dbm.list_records(_db_path(), "service_dependencies",
+                            "project_id=?", (project_id,), "id")
+    upstream = list({d["source_service"] for d in deps
+                     if d["target_service"] == service_name})
+    # 下游：此服务依赖的（target_service = service_name）
+    downstream = list({d["target_service"] for d in deps
+                       if d["source_service"] == service_name})
+    return jsonify({"colocated": colocated, "upstream": upstream,
+                    "downstream": downstream})
+
+
+# ========== 发布快照 & 对比 ==========
+
+@deploy_enhance_bp.route("/deploy/snapshots/<int:project_id>", methods=["GET"])
+@require_auth
+def list_snapshots(project_id):
+    env = request.args.get("env", "")
+    if env:
+        rows = dbm.list_records(_db_path(), "deployment_snapshots",
+                                "project_id=? AND env=?",
+                                (project_id, env), "deployed_at DESC")
+    else:
+        rows = dbm.list_records(_db_path(), "deployment_snapshots",
+                                "project_id=?", (project_id,),
+                                "deployed_at DESC")
+    return jsonify(rows)
+
+
+@deploy_enhance_bp.route("/deploy/compare", methods=["GET"])
+@require_auth
+def compare_snapshots():
+    project_id = request.args.get("project_id", type=int)
+    env = request.args.get("env", "")
+    if not project_id or not env:
+        return jsonify({"error": "project_id 和 env 参数必填"}), 400
+    rows = dbm.list_records(_db_path(), "deployment_snapshots",
+                            "project_id=? AND env=?",
+                            (project_id, env), "deployed_at DESC")
+    if len(rows) < 2:
+        return jsonify({"error": "至少需要 2 个快照才能对比"}), 400
+    old = rows[1]
+    new = rows[0]
+    old_versions = old.get("image_versions", {})
+    new_versions = new.get("image_versions", {})
+    if isinstance(old_versions, str):
+        try:
+            old_versions = json.loads(old_versions)
+        except (ValueError, TypeError):
+            old_versions = {}
+    if isinstance(new_versions, str):
+        try:
+            new_versions = json.loads(new_versions)
+        except (ValueError, TypeError):
+            new_versions = {}
+    # 计算变更
+    changes = []
+    all_keys = set(old_versions.keys()) | set(new_versions.keys())
+    for k in sorted(all_keys):
+        old_v = old_versions.get(k, "")
+        new_v = new_versions.get(k, "")
+        if old_v != new_v:
+            changes.append({"service": k, "old": old_v, "new": new_v})
+    return jsonify({"old": {"version": old["version"],
+                            "deployed_at": old["deployed_at"],
+                            "image_versions": old_versions},
+                    "new": {"version": new["version"],
+                            "deployed_at": new["deployed_at"],
+                            "image_versions": new_versions},
+                    "changes": changes})
+
+
+# ========== Webhook ==========
+
+@deploy_enhance_bp.route("/deploy/webhook", methods=["POST"])
+def webhook():
+    """外部 CI/CD 触发发布（token 认证）"""
+    token = request.headers.get("X-Webhook-Token", "")
+    if not token:
+        token = request.args.get("token", "")
+    expected = _get_webhook_token()
+    if not expected or token != expected:
+        return jsonify({"error": "token 无效"}), 403
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    project_id = body.get("project_id")
+    service_name = body.get("service", "")
+    version = body.get("version", "")
+    env = body.get("env", "")
+    if not isinstance(project_id, int) or isinstance(project_id, bool):
+        return jsonify({"error": "project_id 必须为整数"}), 400
+    if not service_name or not version:
+        return jsonify({"error": "service 和 version 必填"}), 400
+    svc = dbm.get_service_by_name(_db_path(), project_id, service_name)
+    if not svc:
+        return jsonify({"error": "服务不存在"}), 404
+    task_id = dbm.create_task(
+        _db_path(), project_id, "project", svc["id"],
+        service_name, env, version, "", 0, action="deploy")
+    from .. import task_manager
+    task = dbm.get_task(_db_path(), task_id)
+    task_manager.submit_task(_db_path(), task, [])
+    return jsonify({"task_id": task_id, "status": "pending"}), 201
+
+
+def _get_webhook_token() -> str:
+    """从 config/deploy.yaml 读取 webhook_token"""
+    config_file = CONFIG_DIR / "deploy.yaml"
+    if not config_file.exists():
+        return ""
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return str(cfg.get("deploy", {}).get("webhook_token", ""))
+    except Exception:
+        return ""

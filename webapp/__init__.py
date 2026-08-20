@@ -93,12 +93,14 @@ def create_app():
     from .routes.dash_routes import dash_bp
     from .routes.alert_routes import alert_bp
     from .routes.log_routes import log_bp
+    from .routes.deploy_enhance_routes import deploy_enhance_bp
     app.register_blueprint(auth_bp, url_prefix="/api")
     app.register_blueprint(config_bp, url_prefix="/api")
     app.register_blueprint(deploy_bp, url_prefix="/api")
     app.register_blueprint(dash_bp, url_prefix="/api")
     app.register_blueprint(alert_bp, url_prefix="/api")
     app.register_blueprint(log_bp, url_prefix="/api")
+    app.register_blueprint(deploy_enhance_bp, url_prefix="/api")
 
     from flask import render_template
 
