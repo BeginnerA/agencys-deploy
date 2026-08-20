@@ -118,9 +118,10 @@ class TestLogCollector(unittest.TestCase):
 
     # ---- 关键词扫描 ----
 
-    def _make_kw_rule(self, metric="ERROR", enabled=1):
+    def _make_kw_rule(self, metric="ERROR", enabled=1, exclude_keyword=""):
         return dbm.create_record(self.db, "alert_rules", dict(
             name="kw test", metric_type="log_keyword", metric=metric,
+            exclude_keyword=exclude_keyword,
             compare=">", threshold=0, duration_seconds=0,
             scope={"type": "all", "ids": []}, severity="P3",
             channels=["wecom"], escalation_interval=30, enabled=enabled,
@@ -240,6 +241,48 @@ class TestLogCollector(unittest.TestCase):
         call_kwargs = mock_engine.trigger_log_alert.call_args[1]
         self.assertEqual(call_kwargs["entry_id"], rowids[1])
         self.assertEqual(call_kwargs["hit_ts"], 1787049046)
+
+    def test_scan_keywords_exclude_suppresses_alert(self):
+        """关键词命中但排除关键词也命中 → 不触发告警"""
+        self._make_kw_rule("ERROR", exclude_keyword="heartbeat")
+        entries = [
+            (1787049045, "prod", "api", "ERROR heartbeat check", "/tmp/f", 0, 1),
+        ]
+        from unittest.mock import MagicMock, patch
+        mock_engine = MagicMock()
+        with patch("webapp.log_collector.get_engine", return_value=mock_engine):
+            self.collector._current_kw_rules = self.collector._load_log_keyword_rules()
+            self.collector._scan_keywords_in_entries(entries, "prod", 1)
+        mock_engine.trigger_log_alert.assert_not_called()
+
+    def test_scan_keywords_exclude_no_match_still_triggers(self):
+        """关键词命中且排除关键词未命中 → 正常触发告警"""
+        self._make_kw_rule("ERROR", exclude_keyword="heartbeat")
+        entries = [
+            (1787049045, "prod", "api", "ERROR something broke", "/tmp/f", 0, 1),
+        ]
+        from unittest.mock import MagicMock, patch
+        mock_engine = MagicMock()
+        with patch("webapp.log_collector.get_engine", return_value=mock_engine):
+            self.collector._current_kw_rules = self.collector._load_log_keyword_rules()
+            self.collector._scan_keywords_in_entries(entries, "prod", 1)
+        mock_engine.trigger_log_alert.assert_called_once()
+
+    def test_scan_keywords_exclude_continues_to_next_line(self):
+        """第一行被排除后，继续扫描后续行，命中则触发"""
+        self._make_kw_rule("ERROR", exclude_keyword="heartbeat")
+        entries = [
+            (1787049045, "prod", "api", "ERROR heartbeat check", "/tmp/f", 0, 1),
+            (1787049046, "prod", "api", "ERROR real failure", "/tmp/f", 10, 1),
+        ]
+        from unittest.mock import MagicMock, patch
+        mock_engine = MagicMock()
+        with patch("webapp.log_collector.get_engine", return_value=mock_engine):
+            self.collector._current_kw_rules = self.collector._load_log_keyword_rules()
+            self.collector._scan_keywords_in_entries(entries, "prod", 1)
+        mock_engine.trigger_log_alert.assert_called_once()
+        call_kwargs = mock_engine.trigger_log_alert.call_args[1]
+        self.assertEqual(call_kwargs["matched_keyword"], "ERROR")
 
 
 if __name__ == "__main__":

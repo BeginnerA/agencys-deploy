@@ -78,6 +78,21 @@
   font-size:var(--fs-13);
 }
 .field input:focus,.field select:focus,.field textarea:focus{border-color:var(--primary);box-shadow:var(--shadow-glow)}
+/* datetime-local / date / time 弹窗跟随深色主题 */
+.field input[type="datetime-local"],.field input[type="date"],.field input[type="time"]{
+  color-scheme:dark;
+}
+.field input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+.field input[type="date"]::-webkit-calendar-picker-indicator,
+.field input[type="time"]::-webkit-calendar-picker-indicator{
+  filter:invert(.7) sepia(1) hue-rotate(175deg);opacity:.7;cursor:pointer;transition:var(--t-fast);
+}
+.field input[type="datetime-local"]::-webkit-calendar-picker-indicator:hover,
+.field input[type="date"]::-webkit-calendar-picker-indicator:hover,
+.field input[type="time"]::-webkit-calendar-picker-indicator:hover{opacity:1}
+/* date + time 拆分并排布局 */
+.dt-split{display:flex;gap:8px}
+.dt-split input{flex:1;min-width:0}
 .field textarea{min-height:72px;resize:vertical;font-family:var(--font-num)}
 .field .hint{font-size:var(--fs-11);color:var(--text-3);margin-top:2px}
 .field.check{display:flex;align-items:center;gap:8px}

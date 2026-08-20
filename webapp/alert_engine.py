@@ -263,13 +263,20 @@ class AlertEngine:
 
     def _fire(self, rule: dict, target: str, subject: str,
               description: str, target_info: dict) -> int:
-        """创建或更新告警（收敛）；新告警首次触发时通知（静默窗口内不通知）"""
+        """创建或更新告警（收敛）；新告警首次触发时通知（静默窗口内不通知）
+
+        收敛策略：
+        - 同指纹活跃告警（firing/acked）→ 仅刷新 last_seen_at / 位置
+        - 同指纹已解决告警（resolved）→ 重新激活（避免 partial unique index 冲突）
+        - 无同指纹告警 → 新建
+        """
         fp = f"{rule['id']}:{target}"
-        rows = dbm.list_records(self._db_path, "alerts",
-                                "fingerprint=? AND status != 'resolved'", (fp,))
+        # 先查活跃告警（收敛），再查已解决告警（重新激活）
+        active = dbm.list_records(self._db_path, "alerts",
+                                  "fingerprint=? AND status != 'resolved'", (fp,))
         now = int(time.time())
-        if rows:
-            a = rows[0]
+        if active:
+            a = active[0]
             updates = {"last_seen_at": now}
             # 位置刷新：收敛时若新命中携带 entry_id 且与既有不同，仅更新位置字段
             # （entry_id/hit_ts），保留 context 等既有字段；非日志告警/旧调用
@@ -291,6 +298,40 @@ class AlertEngine:
                 updates["notify_count"] = 1
             dbm.update_record(self._db_path, "alerts", a["id"], updates)
             return a["id"]
+        # 无活跃告警：检查是否有已解决的告警可重新激活
+        resolved = dbm.list_records(self._db_path, "alerts",
+                                    "fingerprint=?", (fp,), order="id DESC")
+        if resolved and resolved[0].get("status") == "resolved":
+            a = resolved[0]
+            updates = {
+                "status": "firing",
+                "subject": subject,
+                "description": description,
+                "severity": rule.get("severity", "P2"),
+                "target_info": target_info,
+                "first_seen_at": now,
+                "last_seen_at": now,
+                "notify_count": 0,
+                "escalation_level": 0,
+                "resolved_by": "",
+                "resolved_at": None,
+                "resolved_type": "",
+                "ack_by": "",
+                "ack_at": None,
+                "escalation_at": now + int(rule.get("escalation_interval", 30)) * 60,
+            }
+            dbm.update_record(self._db_path, "alerts", a["id"], updates)
+            alert = dbm.get_record(self._db_path, "alerts", a["id"])
+            if self._silenced(rule, target_info):
+                dbm.create_record(self._db_path, "alert_events", dict(
+                    alert_id=a["id"], channel="silenced", target="", payload="",
+                    ok=1, detail="静默窗口内，未发送通知", created_at=now))
+            else:
+                send_alert(self._db_path, alert, rule.get("channels") or [])
+                dbm.update_record(self._db_path, "alerts", a["id"],
+                                  {"notify_count": 1})
+            return a["id"]
+        # 无任何同指纹告警 → 新建
         alert_id = dbm.create_record(self._db_path, "alerts", dict(
             rule_id=rule["id"], fingerprint=fp, status="firing",
             severity=rule.get("severity", "P2"), subject=subject,

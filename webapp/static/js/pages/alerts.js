@@ -733,6 +733,8 @@
           else if (r.metric_type === 'log_keyword') {
             const kws = (r.metric || '').split(',').map(k => k.trim()).filter(Boolean);
             cond = kws.length ? kws.map(k => `<span class="rule-kw-tag">${esc(k)}</span>`).join('') : '-';
+            const exKws = (r.exclude_keyword || '').split(',').map(k => k.trim()).filter(Boolean);
+            if (exKws.length) cond += `<div class="rule-sub">排除: ${exKws.map(k => `<span class="rule-kw-tag rule-kw-exclude">${esc(k)}</span>`).join('')}</div>`;
           }
           return `<tr>
             <td><b>${esc(r.name)}</b>${r.remark ? `<div class="rule-remark">${esc(r.remark)}</div>` : ''}</td>
@@ -821,6 +823,9 @@
         <div class="field full" id="rfLogKwWrap" style="display:none"><label>日志关键词</label>
           <input id="rfLogKw" value="${esc(r.metric_type==='log_keyword' ? (r.metric||'') : '')}" placeholder="多个关键词用逗号分隔，如 ERROR,FATAL,Exception">
           <div class="field-hint">采集器每轮扫描日志，命中任一关键词即触发告警；同一规则+服务由指纹去重不会重复告警</div></div>
+        <div class="field full" id="rfExKwWrap" style="display:none"><label>排除关键词</label>
+          <input id="rfExKw" value="${esc(r.metric_type==='log_keyword' ? (r.exclude_keyword||'') : '')}" placeholder="多个关键词用逗号分隔，如 DEBUG,heartbeat">
+          <div class="field-hint">命中包含关键词后，若同一行也命中任一排除关键词，则不触发告警</div></div>
         <div class="field full"><label>备注</label>
           <textarea id="rfRemark" rows="2">${esc(r.remark||'')}</textarea></div>
         <div class="full" style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
@@ -847,6 +852,7 @@
       document.getElementById('rfThresholdWrap').style.display = isMetric ? '' : 'none';
       document.getElementById('rfMetricWrap').style.display = isLog ? 'none' : '';
       document.getElementById('rfLogKwWrap').style.display = isLog ? '' : 'none';
+      document.getElementById('rfExKwWrap').style.display = isLog ? '' : 'none';
     }
     // ---- 作用域选择（标签点选 + 服务器/服务级联） ----
     const selScope = document.getElementById('rfScopeType');
@@ -982,6 +988,7 @@
     // 回填 metric（编辑时）
     if (r.metric && (r.metric_type !== 'log_keyword')) selMetric.value = r.metric;
     updateScopeTypeOpts();
+    updateFieldVis();
     updateScopeVis();
     loadScopeEnvs();  // 统一预加载环境列表，供项目/环境/服务器/服务共用
     // 按钮
@@ -1004,6 +1011,9 @@
       const metric = metricType === 'log_keyword'
         ? document.getElementById('rfLogKw').value.trim()
         : document.getElementById('rfMetric').value;
+      const excludeKeyword = metricType === 'log_keyword'
+        ? document.getElementById('rfExKw').value.trim()
+        : '';
       const compare = document.getElementById('rfCompare').value;
       const threshold = parseFloat(document.getElementById('rfThreshold').value) || 0;
       const duration = parseInt(document.getElementById('rfDuration').value) || 300;
@@ -1033,13 +1043,12 @@
         toastError(`请至少选择一个${label}`); return;
       }
       const channels = [...document.querySelectorAll('#rfChannels input:checked')].map(c => c.value);
-      if (!channels.length) { toastError('至少选择一个通知渠道'); return; }
       const escalationInterval = parseInt(document.getElementById('rfEscInt').value) || 30;
       const enabled = document.getElementById('rfEnabled').checked;
       const remark = document.getElementById('rfRemark').value.trim();
       const payload = {name, metric_type: metricType, metric, compare, threshold,
         duration_seconds: duration, scope, severity, channels, escalation_interval: escalationInterval,
-        enabled, remark};
+        exclude_keyword: excludeKeyword, enabled, remark};
       if (editingRuleId) {
         await api(`/api/alerts/rules/${editingRuleId}`, {method:'PUT', body: JSON.stringify(payload)});
         toastSuccess('规则已更新');

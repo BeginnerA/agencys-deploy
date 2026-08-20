@@ -270,6 +270,8 @@ class LogCollector:
 
         rowids: _index_log_entries 返回的 rowid 列表，与 entries 一一对应；
         传入后命中行携带 entry_id/hit_ts，供告警详情展示日志上下文。
+
+        排除关键词：命中包含关键词后，若同一行也命中任一排除关键词，则跳过不告警。
         """
         rules = getattr(self, '_current_kw_rules', None)
         if not rules:
@@ -285,22 +287,33 @@ class LogCollector:
             keywords = [kw.strip() for kw in metric_raw.split(",") if kw.strip()]
             if not keywords:
                 continue
+            # 解析排除关键词
+            exclude_raw = (rule.get("exclude_keyword") or "").strip()
+            exclude_kws = [k.strip() for k in exclude_raw.split(",") if k.strip()] if exclude_raw else []
             # 扫描每条日志，找到第一个命中即触发（同规则同服务由指纹去重）
             for i, (ts, env, svc, content, file_path, offset, count) in enumerate(entries):
                 if not content:
                     continue
+                matched_kw = None
+                excluded = False
                 for kw in keywords:
                     if kw in content:
-                        ctx = [content]
-                        engine.trigger_log_alert(
-                            rule, svc, env_name, content, ctx, env_id,
-                            matched_keyword=kw,
-                            entry_id=rowids[i] if rowids and i < len(rowids) else None,
-                            hit_ts=ts if rowids else None)
-                        break  # 本条日志只触发一次（取首个命中关键词）
-                else:
-                    continue
-                break  # 本规则已触发，不再扫描后续日志行（指纹去重，同规则同服务只告警一次）
+                        # 检查排除关键词：同一行命中任一排除词则跳过
+                        if exclude_kws and any(ekw in content for ekw in exclude_kws):
+                            excluded = True
+                            break
+                        matched_kw = kw
+                        break
+                if excluded:
+                    continue  # 被排除，继续扫描下一行日志
+                if matched_kw:
+                    ctx = [content]
+                    engine.trigger_log_alert(
+                        rule, svc, env_name, content, ctx, env_id,
+                        matched_keyword=matched_kw,
+                        entry_id=rowids[i] if rowids and i < len(rowids) else None,
+                        hit_ts=ts if rowids else None)
+                    break  # 本规则已触发，不再扫描后续日志行（指纹去重）
 
     def _update_scan_state(self, env: str, server: str, container: str,
                            service: str, last_ts: str, last_line: int):

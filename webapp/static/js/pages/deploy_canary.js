@@ -45,19 +45,19 @@
 
   function openCreateForm(){
     openDrawer({ title: '新建灰度策略', wide: true, body: `
-      <div style="display:flex;flex-direction:column;gap:12px">
-        <div><label class="dg-label">策略名称</label><input id="canaryName" class="inp" placeholder="如：标准三批"></div>
-        <div><label class="dg-label">所属项目</label>
-          <select id="canaryProj" class="inp">${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
-        <div><label class="dg-label">批次配置 (JSON)</label>
-          <textarea id="canarySteps" class="inp" rows="6" style="font-family:monospace">[
+      <div class="form-grid">
+        <div class="field"><label>策略名称</label><input id="canaryName" placeholder="如：标准三批"></div>
+        <div class="field"><label>所属项目</label>
+          <select id="canaryProj">${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
+        <div class="field full"><label>批次配置 (JSON)</label>
+          <textarea id="canarySteps" rows="6" style="font-family:var(--font-num)">[
   {"batch":1, "servers":1, "observe_minutes":5, "auto_advance":true},
   {"batch":2, "servers":2, "observe_minutes":10, "auto_advance":true},
   {"batch":3, "servers":"all", "observe_minutes":0, "auto_advance":false}
 ]</textarea></div>
-        <label><input type="checkbox" id="canaryDefault"> 设为默认策略</label>
-        <button class="btn primary" id="canarySave">保存</button>
-      </div>`});
+        <div class="field full check"><label><input type="checkbox" id="canaryDefault"> 设为默认策略</label></div>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:20px"><button class="btn primary flex-1" id="canarySave">保存</button></div>`});
     document.getElementById('canarySave').onclick = async () => {
       let steps;
       try { steps = JSON.parse(document.getElementById('canarySteps').value); }

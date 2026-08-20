@@ -239,6 +239,37 @@ class TestAlertRoutes(unittest.TestCase):
             "type": "server", "ids": [1, 2], "env_ids": [1]})
         self.assertEqual(r.status_code, 200)
 
+    def test_create_log_keyword_rule_with_exclude(self):
+        """日志关键词规则支持排除关键词"""
+        r = self._create_rule(
+            metric_type="log_keyword", metric="ERROR",
+            exclude_keyword="heartbeat,DEBUG")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        rid = r.get_json()["id"]
+        rules = self.c.get("/api/alerts/rules", headers=self._h(self.token)).get_json()
+        rule = next(x for x in rules if x["id"] == rid)
+        self.assertEqual(rule["exclude_keyword"], "heartbeat,DEBUG")
+
+    def test_update_rule_exclude_keyword(self):
+        """更新规则时设置排除关键词"""
+        r = self._create_rule(metric_type="log_keyword", metric="ERROR")
+        rid = r.get_json()["id"]
+        r = self.c.put(f"/api/alerts/rules/{rid}",
+                       json={"exclude_keyword": "heartbeat"},
+                       headers=self._h(self.token))
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        rules = self.c.get("/api/alerts/rules", headers=self._h(self.token)).get_json()
+        rule = next(x for x in rules if x["id"] == rid)
+        self.assertEqual(rule["exclude_keyword"], "heartbeat")
+
+    def test_create_rule_exclude_keyword_too_long(self):
+        """单个排除关键词超过 100 字符拒绝"""
+        r = self._create_rule(
+            metric_type="log_keyword", metric="ERROR",
+            exclude_keyword="a" * 101)
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("排除关键词", r.get_json()["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

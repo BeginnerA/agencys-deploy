@@ -458,6 +458,12 @@ def _validate_rule(body, partial=False) -> str:
                 return "日志关键词不能为空"
             if any(len(k) > 100 for k in keywords):
                 return "单个关键词长度不能超过 100"
+    if has("exclude_keyword"):
+        ex_raw = (body.get("exclude_keyword") or "").strip()
+        if ex_raw:
+            ex_keywords = [k.strip() for k in ex_raw.split(",") if k.strip()]
+            if any(len(k) > 100 for k in ex_keywords):
+                return "单个排除关键词长度不能超过 100"
     if has("severity") and body.get("severity") not in SEVERITIES:
         return "severity 非法"
     if has("compare") and body.get("compare") not in ("<", "<=", ">", ">="):
@@ -497,9 +503,7 @@ def _validate_rule(body, partial=False) -> str:
             return "状态/日志规则不能选择服务器作用域"
     if has("channels"):
         channels = body.get("channels") or []
-        if not channels:
-            return "至少选择一个通知渠道"
-        if not set(channels) <= set(CHANNELS):
+        if channels and not set(channels) <= set(CHANNELS):
             return "channels 包含非法渠道"
     return ""
 
@@ -521,6 +525,7 @@ def create_rule():
         scope=body.get("scope") or {"type": "all", "ids": []},
         severity=body["severity"], channels=body.get("channels") or [],
         escalation_interval=int(body.get("escalation_interval", 30)),
+        exclude_keyword=(body.get("exclude_keyword") or "").strip(),
         enabled=1 if body.get("enabled", True) else 0,
         remark=body.get("remark", ""), created_at=now, updated_at=now))
     audit("create_alert_rule", "alert_rule", rid, {"name": body["name"]})
@@ -560,6 +565,7 @@ def update_rule(rule_id):
         channels=body.get("channels", old["channels"]),
         escalation_interval=int(body.get("escalation_interval",
                                          old["escalation_interval"])),
+        exclude_keyword=body.get("exclude_keyword", old.get("exclude_keyword", "")).strip() if "exclude_keyword" in body else old.get("exclude_keyword", ""),
         enabled=1 if body.get("enabled", old["enabled"]) else 0,
         remark=body.get("remark", old["remark"]),
         updated_at=int(time.time())))

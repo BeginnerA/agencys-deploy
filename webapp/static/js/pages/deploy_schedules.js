@@ -56,24 +56,20 @@
 
   function openCreateForm(){
     openDrawer({ title: '新建定时计划', body: `
-      <div style="display:flex;flex-direction:column;gap:12px">
-        <div><label class="dg-label">名称</label><input id="schedName" class="inp" placeholder="如：每日凌晨发布"></div>
-        <div><label class="dg-label">类型</label>
-          <select id="schedType" class="inp"><option value="once">一次性</option><option value="cron">周期性</option></select></div>
-        <div><label class="dg-label">项目</label>
-          <select id="schedProj" class="inp">${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
-        <div><label class="dg-label">环境</label><input id="schedEnv" class="inp" placeholder="prod"></div>
-        <div><label class="dg-label">版本</label><input id="schedVer" class="inp" placeholder="1.0.0"></div>
-        <div id="schedTimeWrap">
-          <label class="dg-label">执行时间</label>
-          <input id="schedAt" type="datetime-local" class="inp">
-        </div>
-        <div id="schedCronWrap" style="display:none">
-          <label class="dg-label">CRON 表达式</label>
-          <input id="schedCron" class="inp" placeholder="0 2 * * *（每天凌晨2点）">
-        </div>
-        <button class="btn primary" id="schedSave">保存</button>
-      </div>`});
+      <div class="form-grid">
+        <div class="field full"><label>名称</label><input id="schedName" placeholder="如：每日凌晨发布"></div>
+        <div class="field"><label>类型</label>
+          <select id="schedType">${[['once','一次性'],['cron','周期性']].map(o=>`<option value="${o[0]}">${o[1]}</option>`).join('')}</select></div>
+        <div class="field"><label>项目</label>
+          <select id="schedProj">${projects.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
+        <div class="field"><label>环境</label><input id="schedEnv" placeholder="prod"></div>
+        <div class="field"><label>版本</label><input id="schedVer" placeholder="1.0.0"></div>
+        <div class="field full" id="schedTimeWrap"><label>执行时间</label>
+          <input id="schedAt" type="datetime-local"></div>
+        <div class="field full" id="schedCronWrap" style="display:none"><label>CRON 表达式</label>
+          <input id="schedCron" placeholder="0 2 * * *（每天凌晨2点）"></div>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:20px"><button class="btn primary flex-1" id="schedSave">保存</button></div>`});
     document.getElementById('schedType').onchange = (e) => {
       document.getElementById('schedTimeWrap').style.display = e.target.value === 'once' ? '' : 'none';
       document.getElementById('schedCronWrap').style.display = e.target.value === 'cron' ? '' : 'none';

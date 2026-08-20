@@ -74,6 +74,9 @@
 /* 日志关键词标签（规则列表内） */
 .rule-kw-tag{display:inline-block;padding:1px 7px;border-radius:var(--r-full);font-size:var(--fs-11);
   background:rgba(254,176,25,.10);color:var(--warning);border:1px solid rgba(254,176,25,.30);margin:1px 2px}
+/* 排除关键词标签（灰色调区分） */
+.rule-kw-tag.rule-kw-exclude{background:rgba(90,114,150,.10);color:var(--text-3);
+  border-color:rgba(90,114,150,.30);text-decoration:line-through}
 
 /* 表单字段提示 */
 .field-hint{font-size:var(--fs-11);color:var(--text-3);margin-top:4px;line-height:1.5}

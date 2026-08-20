@@ -465,29 +465,75 @@ def delete_dependency(dep_id):
 @deploy_enhance_bp.route("/deploy/impact/<int:project_id>", methods=["GET"])
 @require_auth
 def impact_analysis(project_id):
-    """影响分析：同服务器服务 + 上下游依赖"""
-    env_name = request.args.get("env", "")
+    """影响分析：上下游依赖 + 依赖类型"""
     service_name = request.args.get("service", "")
-    if not env_name or not service_name:
-        return jsonify({"error": "env 和 service 参数必填"}), 400
-    # 找环境
-    env = dbm.get_env_by_name(_db_path(), project_id, env_name)
-    if not env:
-        return jsonify({"error": "环境不存在"}), 404
-    # 同服务器上的其他服务（colocated）
-    servers = dbm.list_env_servers(_db_path(), env["id"])
-    all_services = dbm.list_services(_db_path(), project_id)
-    colocated = [s["name"] for s in all_services if s["name"] != service_name]
-    # 上游：依赖此服务的（source_service = service_name）
+    if not service_name:
+        return jsonify({"error": "service 参数必填"}), 400
     deps = dbm.list_records(_db_path(), "service_dependencies",
                             "project_id=?", (project_id,), "id")
-    upstream = list({d["source_service"] for d in deps
-                     if d["target_service"] == service_name})
-    # 下游：此服务依赖的（target_service = service_name）
-    downstream = list({d["target_service"] for d in deps
-                       if d["source_service"] == service_name})
-    return jsonify({"colocated": colocated, "upstream": upstream,
-                    "downstream": downstream})
+    # 上游：谁依赖我（source → me）
+    upstream = [{"name": d["source_service"], "type": d.get("dep_type", "manual")}
+                for d in deps if d["target_service"] == service_name]
+    # 下游：我依赖谁（me → target）
+    downstream = [{"name": d["target_service"], "type": d.get("dep_type", "manual")}
+                  for d in deps if d["source_service"] == service_name]
+    # 间接上游（BFS 两层）
+    adj_up = {}
+    for d in deps:
+        adj_up.setdefault(d["target_service"], []).append(d["source_service"])
+    indirect_up = set()
+    for u in upstream:
+        for uu in adj_up.get(u["name"], []):
+            if uu != service_name:
+                indirect_up.add(uu)
+    # 间接下游（BFS 两层）
+    adj_down = {}
+    for d in deps:
+        adj_down.setdefault(d["source_service"], []).append(d["target_service"])
+    indirect_down = set()
+    for d in downstream:
+        for dd in adj_down.get(d["name"], []):
+            if dd != service_name:
+                indirect_down.add(dd)
+    return jsonify({"service": service_name, "upstream": upstream,
+                    "downstream": downstream,
+                    "indirect_upstream": sorted(indirect_up),
+                    "indirect_downstream": sorted(indirect_down)})
+
+
+# ========== 发布顺序建议 ==========
+
+@deploy_enhance_bp.route("/deploy/publish-order/<int:project_id>", methods=["GET"])
+@require_auth
+def publish_order(project_id):
+    """拓扑排序：返回建议的发布顺序（先发布被依赖的）"""
+    services = dbm.list_services(_db_path(), project_id)
+    svc_names = [s["name"] for s in services]
+    deps = dbm.list_records(_db_path(), "service_dependencies",
+                            "project_id=?", (project_id,), "id")
+    # Kahn 算法拓扑排序
+    in_degree = {n: 0 for n in svc_names}
+    adj = {n: [] for n in svc_names}
+    for d in deps:
+        src, tgt = d["source_service"], d["target_service"]
+        if src in in_degree and tgt in in_degree:
+            adj[tgt].append(src)  # 被依赖的先发布
+            in_degree[src] += 1
+    queue = [n for n in svc_names if in_degree[n] == 0]
+    queue.sort()  # 同层级按名称排序，保证稳定
+    order = []
+    while queue:
+        node = queue.pop(0)
+        order.append(node)
+        for nxt in sorted(adj.get(node, [])):
+            in_degree[nxt] -= 1
+            if in_degree[nxt] == 0:
+                queue.append(nxt)
+    # 剩余未排序的（有环）
+    remaining = [n for n in svc_names if n not in order]
+    if remaining:
+        order.extend(sorted(remaining))
+    return jsonify({"order": order, "has_cycle": bool(remaining)})
 
 
 # ========== 发布快照 & 对比 ==========

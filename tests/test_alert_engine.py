@@ -117,6 +117,35 @@ class TestAlertEngine(unittest.TestCase):
                                resolved_at=int(time.time()), resolved_type="manual"))
         self.assertEqual(dbm.get_record(self.db, "alerts", alert["id"])["status"], "resolved")
 
+    def test_resolved_alert_refires(self):
+        """已解决告警再次触发时应重新激活（状态回到 firing），而非创建新记录"""
+        self._metric_rule(metric="cpu", threshold=80, duration=0)
+        e = self._engine(interval=30, overviews={
+            (self.proj_id, "test"): {"host_metrics": {"h1": {"cpu": 95}}, "services": {}}
+        })
+        # 第 1 轮：触发
+        e._push_history((self.env_id, "h1", "cpu"), 95.0)
+        e._evaluate_metric_rules()
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 1)
+        aid = alerts[0]["id"]
+        self.assertEqual(alerts[0]["status"], "firing")
+        # 手动解决
+        dbm.update_record(self.db, "alerts", aid,
+                          dict(status="resolved", resolved_by="admin",
+                               resolved_at=int(time.time()), resolved_type="manual"))
+        self.assertEqual(dbm.get_record(self.db, "alerts", aid)["status"], "resolved")
+        # 第 2 轮：条件仍然满足 → 应重新激活同一条告警
+        e._push_history((self.env_id, "h1", "cpu"), 96.0)
+        e._evaluate_metric_rules()
+        all_alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(all_alerts), 1, "不应创建新告警，应重新激活已有告警")
+        reactivated = dbm.get_record(self.db, "alerts", aid)
+        self.assertEqual(reactivated["status"], "firing")
+        self.assertEqual(reactivated["resolved_by"], "")
+        self.assertIsNone(reactivated["resolved_at"])
+        self.assertEqual(reactivated["notify_count"], 1)  # 重新通知
+
     # ---- 自动恢复 ----
     def test_auto_resolve_on_recovery(self):
         self._metric_rule(metric="cpu", threshold=80, duration=0)

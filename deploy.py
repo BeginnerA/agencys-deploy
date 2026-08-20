@@ -581,41 +581,44 @@ class Deployer:
                                 success_all = False
                                 break
             else:
-            try:
-                for idx, srv in enumerate(servers):
-                    host = srv["ip"]
-                    is_canary = (idx == 0)
-                    ok = self.deploy_server(host, srv, is_canary=is_canary)
-                    if not ok:
-                        success_all = False
-                        log("首台或中间服务器失败，停止继续滚动，请人工排查。")
-                        break
-                    # 金丝雀模式：首台成功后暂停，等待人工确认
-                    if self.canary and is_canary and idx < len(servers) - 1:
-                        decision = self._canary_prompt(host)
-                        if decision == "rollback":
-                            log(f">>> 回滚首台 {host} 到 {self.previous_version}")
-                            rollback_server = RemoteServer(host, merge_server_ssh(self.ssh_cfg, srv))
-                            try:
-                                nacos_ip = self._nacos_ip(srv)
-                                self.nacos_offline(nacos_ip)
-                                self.rollback_container(rollback_server)
-                                self.nacos_online(nacos_ip, weight=1.0)
-                                log(f"首台 {host} 已回滚")
-                            except Exception as re:
-                                log(f"首台回滚失败: {re}")
-                                try:
-                                    self.nacos_online(nacos_ip, weight=1.0)
-                                except Exception:
-                                    pass
-                            finally:
-                                rollback_server.close()
+                try:
+                    for idx, srv in enumerate(servers):
+                        host = srv["ip"]
+                        is_canary = (idx == 0)
+                        ok = self.deploy_server(host, srv, is_canary=is_canary)
+                        if not ok:
                             success_all = False
+                            log("首台或中间服务器失败，停止继续滚动，请人工排查。")
                             break
-                        elif decision == "stop":
-                            log("已停止发布剩余服务器，首台保持新版本")
-                            break
-                        # continue → 继续发布剩余服务器
+                        # 金丝雀模式：首台成功后暂停，等待人工确认
+                        if self.canary and is_canary and idx < len(servers) - 1:
+                            decision = self._canary_prompt(host)
+                            if decision == "rollback":
+                                log(f">>> 回滚首台 {host} 到 {self.previous_version}")
+                                rollback_server = RemoteServer(host, merge_server_ssh(self.ssh_cfg, srv))
+                                try:
+                                    nacos_ip = self._nacos_ip(srv)
+                                    self.nacos_offline(nacos_ip)
+                                    self.rollback_container(rollback_server)
+                                    self.nacos_online(nacos_ip, weight=1.0)
+                                    log(f"首台 {host} 已回滚")
+                                except Exception as re:
+                                    log(f"首台回滚失败: {re}")
+                                    try:
+                                        self.nacos_online(nacos_ip, weight=1.0)
+                                    except Exception:
+                                        pass
+                                finally:
+                                    rollback_server.close()
+                                success_all = False
+                                break
+                            elif decision == "stop":
+                                log("已停止发布剩余服务器，首台保持新版本")
+                                break
+                            # continue → 继续发布剩余服务器
+                except Exception as e:
+                    log(f"部署异常: {e}")
+                    success_all = False
         finally:
             # 无论发布成功/失败/异常，都必须恢复 SnailJob，避免任务组长期停留在暂停状态
             if group and not skip_snailjob:

@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     name TEXT NOT NULL,
     metric_type TEXT NOT NULL DEFAULT 'metric',
     metric TEXT DEFAULT '',
+    exclude_keyword TEXT DEFAULT '',
     compare TEXT DEFAULT '>',
     threshold REAL DEFAULT 0,
     duration_seconds INTEGER DEFAULT 0,
@@ -345,6 +346,10 @@ def _migrate(conn):
     log_cols = {r["name"] for r in conn.execute("PRAGMA table_info(log_entries)")}
     if "content" not in log_cols:
         conn.execute("ALTER TABLE log_entries ADD COLUMN content TEXT NOT NULL DEFAULT ''")
+    # alert_rules 补 exclude_keyword 列（日志关键词排除规则）
+    ar_cols = {r["name"] for r in conn.execute("PRAGMA table_info(alert_rules)")}
+    if "exclude_keyword" not in ar_cols:
+        conn.execute("ALTER TABLE alert_rules ADD COLUMN exclude_keyword TEXT DEFAULT ''")
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(servers)")}
     if "role" in cols:
         return

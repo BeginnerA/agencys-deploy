@@ -15,14 +15,15 @@
     const today = now.getDate();
     let cells = '';
     ['日','一','二','三','四','五','六'].forEach(d =>
-      cells += `<div style="text-align:center;font-size:11px;color:var(--text-secondary);padding:4px">${d}</div>`);
+      cells += `<div style="text-align:center;font-size:11px;color:var(--text-2);padding:4px">${d}</div>`);
     for (let i = 0; i < firstDay; i++)
       cells += '<div class="cal-cell" style="visibility:hidden"></div>';
     for (let d = 1; d <= daysInMonth; d++) {
       const dayStart = new Date(year, month, d).getTime() / 1000;
       const dayEnd = dayStart + 86400;
       let cls = 'cal-cell' + (d === today ? ' today' : '');
-      let title = '';
+      let titles = [];
+      let hasBlock = false, hasWarn = false;
       for (const w of windows) {
         let ws = w.start_at, we = w.end_at;
         if (w.repeat_yearly) {
@@ -31,12 +32,17 @@
           ws += offset; we += offset;
         }
         if (ws < dayEnd && we > dayStart) {
-          cls += w.block_level === 'block' ? ' cal-block' : ' cal-warn';
-          title = w.name;
-          break;
+          titles.push(w.name);
+          if (w.block_level === 'block') hasBlock = true; else hasWarn = true;
         }
       }
-      cells += `<div class="${cls}" title="${esc(title)}"><span class="cal-day">${d}</span></div>`;
+      if (hasBlock) cls += ' cal-block';
+      else if (hasWarn) cls += ' cal-warn';
+      const titleAttr = titles.join('、');
+      const titleHtml = titles.length
+        ? titles.map(t => `<span class="cal-title">${esc(t)}</span>`).join('')
+        : '';
+      cells += `<div class="${cls}" title="${esc(titleAttr)}"><span class="cal-day">${d}</span><div class="cal-titles">${titleHtml}</div></div>`;
     }
     return cells;
   }
@@ -73,15 +79,15 @@
 
   function openCreateForm(){
     openDrawer({ title: '新建发布窗口', body: `
-      <div style="display:flex;flex-direction:column;gap:12px">
-        <div><label class="dg-label">名称</label><input id="winName" class="inp" placeholder="如：春节封网"></div>
-        <div><label class="dg-label">开始时间</label><input id="winStart" type="datetime-local" class="inp"></div>
-        <div><label class="dg-label">结束时间</label><input id="winEnd" type="datetime-local" class="inp"></div>
-        <div><label class="dg-label">拦截级别</label>
-          <select id="winLevel" class="inp"><option value="block">硬拦截（禁止发布）</option><option value="warn">软警告（确认后放行）</option></select></div>
-        <div><label><input type="checkbox" id="winRepeat"> 每年重复（节假日适用）</label></div>
-        <button class="btn primary" id="winSave">保存</button>
-      </div>`});
+      <div class="form-grid">
+        <div class="field full"><label>名称</label><input id="winName" placeholder="如：春节封网"></div>
+        <div class="field"><label>开始时间</label><input id="winStart" type="datetime-local"></div>
+        <div class="field"><label>结束时间</label><input id="winEnd" type="datetime-local"></div>
+        <div class="field full"><label>拦截级别</label>
+          <select id="winLevel"><option value="block">硬拦截（禁止发布）</option><option value="warn">软警告（确认后放行）</option></select></div>
+        <div class="field full check"><label><input type="checkbox" id="winRepeat"> 每年重复（节假日适用）</label></div>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:20px"><button class="btn primary flex-1" id="winSave">保存</button></div>`});
     document.getElementById('winSave').onclick = async () => {
       const startDt = document.getElementById('winStart').value;
       const endDt = document.getElementById('winEnd').value;
