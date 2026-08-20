@@ -333,6 +333,47 @@ class TestDeployEnhanceAPI(unittest.TestCase):
         self.assertEqual(data["old"]["version"], "1.0.0")
         self.assertEqual(data["new"]["version"], "1.1.0")
 
+    def test_compare_by_snapshot_ids(self):
+        """手动模式：通过 old_id/new_id 对比指定两条快照"""
+        now = int(time.time())
+        sid1 = dbm.create_record(self.db_path, "deployment_snapshots", dict(
+            project_id=self.proj_id, env="prod", task_id=1,
+            version="1.0.0", image_versions='{"auth":"auth:1.0.0"}',
+            nacos_config_hash="aaa", env_vars_hash="eee",
+            deployed_at=now - 200))
+        sid2 = dbm.create_record(self.db_path, "deployment_snapshots", dict(
+            project_id=self.proj_id, env="prod", task_id=2,
+            version="1.1.0", image_versions='{"auth":"auth:1.1.0"}',
+            nacos_config_hash="bbb", env_vars_hash="eee",
+            deployed_at=now - 100))
+        sid3 = dbm.create_record(self.db_path, "deployment_snapshots", dict(
+            project_id=self.proj_id, env="test", task_id=3,
+            version="1.2.0", image_versions='{"auth":"auth:1.2.0"}',
+            nacos_config_hash="ccc", env_vars_hash="fff",
+            deployed_at=now))
+        # 跨环境对比：old=prod(sid1), new=test(sid3)
+        resp = self.client.get(
+            f"/api/deploy/compare?old_id={sid1}&new_id={sid3}",
+            headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["old"]["version"], "1.0.0")
+        self.assertEqual(data["new"]["version"], "1.2.0")
+
+    def test_compare_manual_mode_missing_ids(self):
+        """手动模式：只传一个 ID 应返回 400"""
+        resp = self.client.get(
+            "/api/deploy/compare?old_id=1",
+            headers=self.headers)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_compare_default_mode_missing_env(self):
+        """默认模式：不传 env 应返回 400"""
+        resp = self.client.get(
+            "/api/deploy/compare?project_id=1",
+            headers=self.headers)
+        self.assertEqual(resp.status_code, 400)
+
     def test_impact_analysis(self):
         env_id = dbm.create_record(self.db_path, "environments", dict(
             project_id=self.proj_id, name="prod", is_default=1,

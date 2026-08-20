@@ -556,17 +556,31 @@ def list_snapshots(project_id):
 @deploy_enhance_bp.route("/deploy/compare", methods=["GET"])
 @require_auth
 def compare_snapshots():
-    project_id = request.args.get("project_id", type=int)
-    env = request.args.get("env", "")
-    if not project_id or not env:
-        return jsonify({"error": "project_id 和 env 参数必填"}), 400
-    rows = dbm.list_records(_db_path(), "deployment_snapshots",
-                            "project_id=? AND env=?",
-                            (project_id, env), "deployed_at DESC")
-    if len(rows) < 2:
-        return jsonify({"error": "至少需要 2 个快照才能对比"}), 400
-    old = rows[1]
-    new = rows[0]
+    old_id = request.args.get("old_id", type=int)
+    new_id = request.args.get("new_id", type=int)
+
+    # 手动模式：old_id + new_id 都存在
+    if old_id and new_id:
+        old = dbm.get_record(_db_path(), "deployment_snapshots", old_id)
+        new = dbm.get_record(_db_path(), "deployment_snapshots", new_id)
+        if not old or not new:
+            return jsonify({"error": "指定的快照不存在"}), 404
+    else:
+        # 手动模式参数不完整时，走默认模式
+        if old_id or new_id:
+            return jsonify({"error": "手动模式需要同时提供 old_id 和 new_id"}), 400
+        project_id = request.args.get("project_id", type=int)
+        env = request.args.get("env", "")
+        if not project_id or not env:
+            return jsonify({"error": "project_id 和 env 参数必填"}), 400
+        rows = dbm.list_records(_db_path(), "deployment_snapshots",
+                                "project_id=? AND env=?",
+                                (project_id, env), "deployed_at DESC")
+        if len(rows) < 2:
+            return jsonify({"error": "至少需要 2 个快照才能对比"}), 400
+        old = rows[1]
+        new = rows[0]
+
     old_versions = old.get("image_versions", {})
     new_versions = new.get("image_versions", {})
     if isinstance(old_versions, str):
@@ -587,10 +601,12 @@ def compare_snapshots():
         new_v = new_versions.get(k, "")
         if old_v != new_v:
             changes.append({"service": k, "old": old_v, "new": new_v})
-    return jsonify({"old": {"version": old["version"],
+    return jsonify({"old": {"id": old["id"], "version": old["version"],
+                            "env": old.get("env", ""),
                             "deployed_at": old["deployed_at"],
                             "image_versions": old_versions},
-                    "new": {"version": new["version"],
+                    "new": {"id": new["id"], "version": new["version"],
+                            "env": new.get("env", ""),
                             "deployed_at": new["deployed_at"],
                             "image_versions": new_versions},
                     "changes": changes})
