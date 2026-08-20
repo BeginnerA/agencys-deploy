@@ -7,12 +7,14 @@
   let pos = {};          // 节点位置缓存
   let highlightedNode = null;
 
+
   const EDGE_COLORS = {
-    dubbo:  'rgba(0,212,255,.55)',
-    http:   'rgba(0,230,118,.55)',
-    manual: 'rgba(254,176,25,.55)',
+    dubbo:  'rgba(0,212,255,.85)',
+    http:   'rgba(0,230,118,.85)',
+    manual: 'rgba(254,176,25,.85)',
   };
   const EDGE_LABELS = { dubbo: 'Dubbo', http: 'HTTP', manual: '手动' };
+  const NODE_R = 32;
 
   async function loadProjects(){
     projects = await api('/api/projects').catch(() => []);
@@ -24,57 +26,23 @@
     topologyData = await api(`/api/deploy/topology/${selectedProject}`).catch(() => ({ nodes:[], edges:[] }));
   }
 
-  /* ---- 力导向布局 ---- */
+  /* ---- 环形布局 ---- */
   function computeLayout(W, H){
     const nodes = topologyData.nodes || [];
-    const edges = topologyData.edges || [];
     pos = {};
-    const cx = W/2, cy = H/2, radius = Math.min(W,H) * 0.32;
+    const cx = W/2, cy = H/2;
+    const radius = Math.min(W, H) * 0.38;
     nodes.forEach((n, i) => {
       const angle = (2 * Math.PI * i) / Math.max(nodes.length, 1) - Math.PI/2;
       pos[n.name] = { x: cx + Math.cos(angle) * radius, y: cy + Math.sin(angle) * radius };
     });
-    // 弹簧力 + 斥力，50 次迭代
-    for (let iter = 0; iter < 50; iter++){
-      const alpha = 1 - iter / 50;
-      // 斥力（所有节点对）
-      for (let i = 0; i < nodes.length; i++){
-        for (let j = i+1; j < nodes.length; j++){
-          const a = pos[nodes[i].name], b = pos[nodes[j].name];
-          if (!a || !b) continue;
-          let dx = b.x - a.x, dy = b.y - a.y;
-          let dist = Math.sqrt(dx*dx + dy*dy) || 1;
-          let force = 800 * alpha / (dist * dist);
-          a.x -= dx/dist * force; a.y -= dy/dist * force;
-          b.x += dx/dist * force; b.y += dy/dist * force;
-        }
-      }
-      // 弹簧力（边）
-      for (const e of edges){
-        const a = pos[e.source], b = pos[e.target];
-        if (!a || !b) continue;
-        let dx = b.x - a.x, dy = b.y - a.y;
-        let dist = Math.sqrt(dx*dx + dy*dy) || 1;
-        let force = (dist - 140) * 0.08 * alpha;
-        a.x += dx/dist * force; a.y += dy/dist * force;
-        b.x -= dx/dist * force; b.y -= dy/dist * force;
-      }
-      // 中心引力
-      for (const n of nodes){
-        const p = pos[n.name];
-        p.x += (cx - p.x) * 0.01 * alpha;
-        p.y += (cy - p.y) * 0.01 * alpha;
-        p.x = Math.max(50, Math.min(W-50, p.x));
-        p.y = Math.max(50, Math.min(H-50, p.y));
-      }
-    }
   }
 
   /* ---- 渲染 SVG ---- */
   function renderTopology(){
     const svg = document.getElementById('topoSvg');
     if (!svg) return;
-    const W = svg.clientWidth || 700, H = svg.clientHeight || 460;
+    const W = svg.clientWidth || 700, H = svg.clientHeight || 600;
     const nodes = topologyData.nodes || [];
     const edges = topologyData.edges || [];
     if (!nodes.length){
@@ -100,25 +68,32 @@
     const hasHighlight = highlightedNode != null;
 
     let html = '<defs>';
-    // 箭头 marker
-    html += '<marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="rgba(0,212,255,.5)"/></marker>';
-    html += '<marker id="arrow-dim" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="rgba(0,212,255,.15)"/></marker>';
+    // 箭头 marker — 加大尺寸确保可见
+    html += '<marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="10" markerHeight="10" orient="auto"><path d="M0,1 L10,5 L0,9 z" fill="rgba(0,212,255,.7)"/></marker>';
+    html += '<marker id="arrow-dim" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="10" markerHeight="10" orient="auto"><path d="M0,1 L10,5 L0,9 z" fill="rgba(0,212,255,.2)"/></marker>';
     html += '</defs>';
 
-    // 边
+    // 边 — 缩短端点避免被节点圆遮盖
     edges.forEach((e, i) => {
       const a = pos[e.source], b = pos[e.target];
       if (!a || !b) return;
       const dimmed = hasHighlight && !hlEdges.has(i);
       const color = EDGE_COLORS[e.type] || EDGE_COLORS.manual;
-      const sw = hasHighlight && hlEdges.has(i) ? 2.5 : 1.5;
+      const sw = hasHighlight && hlEdges.has(i) ? 4 : 2.5;
       const marker = dimmed ? 'url(#arrow-dim)' : 'url(#arrow)';
       const opacity = dimmed ? 0.15 : 1;
-      html += `<line class="topo-edge" data-idx="${i}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke="${color}" stroke-width="${sw}" marker-end="${marker}" opacity="${opacity}"/>`;
+      // 缩短线段：两端各退让 NODE_R+4 像素，使箭头刚好到圆边
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+      const ux = dx/dist, uy = dy/dist;
+      const gap = NODE_R + 4;
+      const x1 = a.x + ux*gap, y1 = a.y + uy*gap;
+      const x2 = b.x - ux*gap, y2 = b.y - uy*gap;
+      html += `<line class="topo-edge" data-idx="${i}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${sw}" marker-end="${marker}" opacity="${opacity}"/>`;
       // 边类型标签
       if (!dimmed){
         const mx = (a.x+b.x)/2, my = (a.y+b.y)/2;
-        html += `<text x="${mx}" y="${my-6}" font-size="9" fill="${color}" text-anchor="middle" opacity="0.8">${EDGE_LABELS[e.type]||''}</text>`;
+        html += `<text x="${mx}" y="${my-8}" font-size="11" fill="${color}" text-anchor="middle" font-weight="600">${EDGE_LABELS[e.type]||''}</text>`;
       }
     });
 
@@ -128,28 +103,43 @@
       if (!p) return;
       const dimmed = hasHighlight && !hlNodes.has(n.name);
       const isHl = highlightedNode === n.name;
-      const r = isHl ? 24 : 20;
+      const r = isHl ? NODE_R + 4 : NODE_R;
       const opacity = dimmed ? 0.2 : 1;
       const fill = isHl ? 'var(--warning)' : 'var(--primary)';
       html += `<g class="topo-node" data-name="${esc(n.name)}" opacity="${opacity}">`;
-      html += `<circle cx="${p.x}" cy="${p.y}" r="${r}" fill="${fill}" stroke="${isHl ? 'var(--warning)' : 'rgba(0,212,255,.5)'}" stroke-width="${isHl?3:2}" filter="drop-shadow(0 0 4px rgba(0,212,255,.3))"/>`;
+      html += `<circle cx="${p.x}" cy="${p.y}" r="${r}" fill="${fill}" stroke="${isHl ? 'var(--warning)' : 'rgba(0,212,255,.5)'}" stroke-width="${isHl?3:2}" filter="drop-shadow(0 0 6px rgba(0,212,255,.35))"/>`;
       // 节点内文字（缩写）
-      const short = n.name.length > 8 ? n.name.slice(0,7)+'…' : n.name;
-      html += `<text x="${p.x}" y="${p.y+4}" font-size="10" fill="#fff" text-anchor="middle" font-weight="600">${esc(short)}</text>`;
+      const short = n.name.length > 10 ? n.name.slice(0,9)+'…' : n.name;
+      html += `<text x="${p.x}" y="${p.y+5}" font-size="12" fill="#fff" text-anchor="middle" font-weight="600">${esc(short)}</text>`;
       // 节点下标签
-      html += `<text x="${p.x}" y="${p.y+r+14}" font-size="11" fill="var(--text-1)" text-anchor="middle">${esc(n.name)}</text>`;
+      html += `<text x="${p.x}" y="${p.y+r+16}" font-size="13" fill="var(--text-1)" text-anchor="middle">${esc(n.name)}</text>`;
       html += '</g>';
     });
 
     svg.innerHTML = html;
 
-    // 绑定交互
-    svg.querySelectorAll('.topo-node').forEach(g => {
-      g.addEventListener('click', () => onNodeClick(g.dataset.name));
-      g.addEventListener('mouseenter', () => { highlightedNode = g.dataset.name; renderTopology(); });
-      g.addEventListener('mouseleave', () => { if (highlightedNode && highlightedNode !== g.dataset.name) return; });
-    });
-    svg.addEventListener('mouseleave', () => { highlightedNode = null; renderTopology(); });
+    // 绑定交互 — 事件委托到 SVG，避免 innerHTML 重建后重复绑定导致无限循环
+    if (!svg._topoBound){
+      svg._topoBound = true;
+      svg.addEventListener('click', (e) => {
+        const g = e.target.closest('.topo-node');
+        if (g) onNodeClick(g.dataset.name);
+      });
+      svg.addEventListener('mouseover', (e) => {
+        const g = e.target.closest('.topo-node');
+        const name = g ? g.dataset.name : null;
+        if (name !== highlightedNode){
+          highlightedNode = name;
+          renderTopology();
+        }
+      });
+      svg.addEventListener('mouseleave', () => {
+        if (highlightedNode !== null){
+          highlightedNode = null;
+          renderTopology();
+        }
+      });
+    }
   }
 
   /* ---- 点击节点 → 影响分析 ---- */
@@ -252,9 +242,9 @@
     if (!svg) return;
     const W = svg.clientWidth || 700;
     let html = '<div style="display:flex;gap:16px;align-items:center;justify-content:center;padding:8px;font-size:12px;color:var(--text-2)">';
-    html += '<span style="display:flex;align-items:center;gap:4px"><span style="width:20px;height:3px;background:rgba(0,212,255,.55);display:inline-block;border-radius:2px"></span> Dubbo</span>';
-    html += '<span style="display:flex;align-items:center;gap:4px"><span style="width:20px;height:3px;background:rgba(0,230,118,.55);display:inline-block;border-radius:2px"></span> HTTP</span>';
-    html += '<span style="display:flex;align-items:center;gap:4px"><span style="width:20px;height:3px;background:rgba(254,176,25,.55);display:inline-block;border-radius:2px"></span> 手动</span>';
+    html += '<span style="display:flex;align-items:center;gap:4px"><span style="width:20px;height:3px;background:rgba(0,212,255,.85);display:inline-block;border-radius:2px"></span> Dubbo</span>';
+    html += '<span style="display:flex;align-items:center;gap:4px"><span style="width:20px;height:3px;background:rgba(0,230,118,.85);display:inline-block;border-radius:2px"></span> HTTP</span>';
+    html += '<span style="display:flex;align-items:center;gap:4px"><span style="width:20px;height:3px;background:rgba(254,176,25,.85);display:inline-block;border-radius:2px"></span> 手动</span>';
     html += '<span style="margin-left:8px;color:var(--text-2);font-size:11px"> 点击节点查看影响分析 · 悬停高亮关联</span>';
     html += '</div>';
     // 插入到 SVG 后面
@@ -298,8 +288,17 @@
       if (orderBtn) orderBtn.onclick = showPublishOrder;
       renderTopology();
       renderLegend();
-      // 窗口 resize 重绘
-      const ro = new ResizeObserver(() => { renderTopology(); renderLegend(); });
+      // 窗口 resize 重绘（防重入：内容变化引起的尺寸抖动不触发二次渲染）
+      let resizing = false;
+      const ro = new ResizeObserver(() => {
+        if (resizing) return;
+        resizing = true;
+        requestAnimationFrame(() => {
+          renderTopology();
+          renderLegend();
+          resizing = false;
+        });
+      });
       ro.observe(root);
       return [() => ro.disconnect()];
     },

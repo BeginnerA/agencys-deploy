@@ -20,7 +20,7 @@
 .cal-cell.cal-warn { background:rgba(254,176,25,.15); border-color:rgba(254,176,25,.4); }
 
 /* 拓扑图 */
-.topo-svg { width:100%; height:460px; background:var(--bg-panel); border-radius:8px; border:1px solid var(--border); }
+.topo-svg { width:100%; height:600px; background:var(--bg-panel); border-radius:8px; border:1px solid var(--border); }
 .topo-node { cursor:pointer; transition: opacity .2s; }
 .topo-node circle { transition: r .15s, fill .15s; }
 .topo-edge { transition: opacity .2s, stroke-width .15s; }
