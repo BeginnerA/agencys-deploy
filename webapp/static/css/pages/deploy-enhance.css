@@ -1,0 +1,60 @@
+/* deploy-enhance.css — 发布流程增强页面样式 */
+
+/* 子导航 tabs */
+.sub-tabs .chip { cursor:pointer; padding:4px 12px; border-radius:12px; font-size:12px;
+  background:var(--card); color:var(--text-secondary); border:1px solid var(--border);
+  text-decoration:none; transition: all .15s; }
+.sub-tabs .chip:hover { border-color:var(--accent); color:var(--accent); }
+.sub-tabs .chip.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+
+/* 日历视图（发布窗口） */
+.cal-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:2px; }
+.cal-cell { aspect-ratio:1; padding:4px; border-radius:4px; font-size:11px;
+  background:var(--card); border:1px solid var(--border); position:relative; }
+.cal-cell.today { border-color:var(--accent); font-weight:600; }
+.cal-cell .cal-day { position:absolute; top:2px; left:4px; font-size:10px; color:var(--text-secondary); }
+.cal-cell.cal-block { background:rgba(239,68,68,.15); border-color:rgba(239,68,68,.3); }
+.cal-cell.cal-warn { background:rgba(245,158,11,.15); border-color:rgba(245,158,11,.3); }
+
+/* 拓扑图 */
+.topo-svg { width:100%; height:400px; background:var(--card); border-radius:8px; border:1px solid var(--border); }
+.topo-node { cursor:pointer; }
+.topo-node circle { fill:var(--accent); stroke:var(--accent-light); stroke-width:2; }
+.topo-node text { font-size:11px; fill:var(--text); text-anchor:middle; dominant-baseline:central; }
+.topo-edge line { stroke:var(--border); stroke-width:1.5; }
+.topo-node.highlight circle { fill:var(--warn); stroke:var(--warn); }
+
+/* 灰度策略可视化 */
+.canary-steps { display:flex; gap:8px; align-items:flex-end; padding:16px 0; }
+.canary-step { display:flex; flex-direction:column; align-items:center; gap:4px;
+  padding:8px 16px; border-radius:8px; background:var(--card); border:1px solid var(--border);
+  min-width:80px; }
+.canary-step .step-num { font-size:20px; font-weight:700; color:var(--accent); }
+.canary-step .step-label { font-size:11px; color:var(--text-secondary); }
+.canary-arrow { font-size:18px; color:var(--text-secondary); padding:0 4px; }
+
+/* 对比表格 */
+.compare-tbl td.changed { background:rgba(245,158,11,.08); }
+.compare-tbl .tag-upgrade { color:#22c55e; }
+.compare-tbl .tag-downgrade { color:#ef4444; }
+.compare-tbl .tag-unchanged { color:var(--text-secondary); }
+
+/* 定时计划表单 */
+.sched-form { display:flex; flex-direction:column; gap:12px; }
+.sched-form .form-row { display:flex; gap:12px; }
+.sched-form .form-row > * { flex:1; }
+
+/* 发布窗口时间线 */
+.window-timeline { display:flex; flex-direction:column; gap:8px; padding:12px 0; }
+.window-item { display:flex; align-items:center; gap:12px; padding:8px 12px;
+  border-radius:6px; background:var(--card); border:1px solid var(--border); }
+.window-item.block { border-left:3px solid #ef4444; }
+.window-item.warn { border-left:3px solid #f59e0b; }
+
+/* 影响分析 */
+.impact-list { display:flex; flex-direction:column; gap:6px; }
+.impact-item { display:flex; align-items:center; gap:8px; padding:6px 10px;
+  border-radius:6px; background:var(--card); border:1px solid var(--border); }
+.impact-item .impact-icon { font-size:16px; }
+.impact-item .impact-name { font-weight:500; }
+.impact-item .impact-detail { font-size:12px; color:var(--text-secondary); }

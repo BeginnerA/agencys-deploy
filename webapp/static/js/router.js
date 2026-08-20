@@ -3,6 +3,11 @@ const ROUTES = [
   { path:'dashboard', group:'运维监控', icon:'📊', name:'监控中心', page:'dashboard', crumbs:['运维中心','监控中心'] },
   { path:'devices',   group:'运维监控', icon:'🖥️', name:'项目总览', page:'devices',   crumbs:['运维中心','项目总览'] },
   { path:'deploy',    group:'运维操作', icon:'🚀', name:'发布中心', page:'deploy',    crumbs:['运维操作','发布中心'] },
+  { path:'deploy/schedules', group:'运维操作', icon:'📅', name:'定时计划', page:'deploy_schedules', crumbs:['运维操作','发布中心','定时计划'], sub:true, parent:'deploy' },
+  { path:'deploy/windows',   group:'运维操作', icon:'🔒', name:'发布窗口', page:'deploy_windows',   crumbs:['运维操作','发布中心','发布窗口'], sub:true, parent:'deploy' },
+  { path:'deploy/canary',    group:'运维操作', icon:'🐤', name:'灰度策略', page:'deploy_canary',    crumbs:['运维操作','发布中心','灰度策略'], sub:true, parent:'deploy' },
+  { path:'deploy/topology',  group:'运维操作', icon:'🕸️', name:'依赖拓扑', page:'deploy_topology',  crumbs:['运维操作','发布中心','依赖拓扑'], sub:true, parent:'deploy' },
+  { path:'deploy/compare',   group:'运维操作', icon:'📊', name:'发布对比', page:'deploy_compare',   crumbs:['运维操作','发布中心','发布对比'], sub:true, parent:'deploy' },
   { path:'alerts',    group:'运维操作', icon:'🔔', name:'告警中心', page:'alerts',    crumbs:['运维操作','告警中心'] },
   { path:'logs',      group:'运维操作', icon:'📜', name:'日志中心', page:'logs',      crumbs:['运维操作','日志中心'] },
   { path:'config',    group:'系统管理', icon:'⚙️', name:'配置管理', page:'config',    crumbs:['系统管理','配置管理'], adminOnly:true, sub:true },
@@ -15,7 +20,11 @@ let activeTimers = [];
 
 function getRoute(){
   const hash = location.hash.replace(/^#\/?/, '').split('?')[0] || 'dashboard';
-  const base = hash.split('/')[0];   // 支持子路径：#/config/p/1/services → base='config'
+  // 先尝试完整匹配（如 deploy/schedules）
+  const fullMatch = ROUTES.find(r => r.path === hash);
+  if (fullMatch) return fullMatch;
+  // 回退到基础路径匹配
+  const base = hash.split('/')[0];
   return ROUTES.find(r => r.path === base) || ROUTES[0];
 }
 function visibleRoutes(){
@@ -94,7 +103,7 @@ function renderBreadcrumb(){
   const el = document.getElementById('breadcrumb');
   // 子页场景（config 下有 p/:id 等子路由）允许点击上一级返回，避免进入后无法回到工作台
   const base = (location.hash || '').replace(/^#\/?/, '').split('?')[0].split('/')[0];
-  const canGoBack = base === 'config' && (location.hash || '').includes('/');
+  const canGoBack = (base === 'config' || base === 'deploy') && (location.hash || '').includes('/');
   el.innerHTML = currentRoute.crumbs.map((c, i) => {
     const isLast = i === currentRoute.crumbs.length - 1;
     if (isLast) return `<span class="cur">${c}</span>`;

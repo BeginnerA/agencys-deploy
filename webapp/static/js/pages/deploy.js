@@ -222,7 +222,16 @@
       if (timer) clearInterval(timer); // 项目筛选重渲染时先清理旧轮询
       timer = null;
       const statuses = [['all','全部'],['running','运行中'],['pending','等待中'],['success','成功'],['failed','失败']];
-      root.innerHTML = `
+      const subTabs = `
+        <div class="sub-tabs" style="display:flex;gap:4px;margin-bottom:12px">
+          <a class="chip ${location.hash.replace(/^#\\/?/,'').split('?')[0] === 'deploy' ? 'active' : ''}" href="#/deploy">任务列表</a>
+          <a class="chip ${location.hash.startsWith('#/deploy/schedules') ? 'active' : ''}" href="#/deploy/schedules">📅 定时计划</a>
+          <a class="chip ${location.hash.startsWith('#/deploy/windows') ? 'active' : ''}" href="#/deploy/windows">🔒 发布窗口</a>
+          <a class="chip ${location.hash.startsWith('#/deploy/canary') ? 'active' : ''}" href="#/deploy/canary">🐤 灰度策略</a>
+          <a class="chip ${location.hash.startsWith('#/deploy/topology') ? 'active' : ''}" href="#/deploy/topology">🕸️ 依赖拓扑</a>
+          <a class="chip ${location.hash.startsWith('#/deploy/compare') ? 'active' : ''}" href="#/deploy/compare">📊 发布对比</a>
+        </div>`;
+      root.innerHTML = subTabs + `
         <div class="deploy-toolbar">
           <span class="weak" style="font-size:12px">项目</span>
           <select class="filter-sel" id="dpProjSel"></select>
