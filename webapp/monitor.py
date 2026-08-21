@@ -383,13 +383,10 @@ def _build_extended_cmds(services: list, health_hosts: dict) -> list:
     返回 7 条命令的列表，直接传给 _ssh_exec_multi 作为 cmds 参数，
     避免字符串拼接/拆分导致的 shell 语法破坏（for 循环内分号等）。
     """
-    svc_names = "|".join(s["service_name"] for s in services) if services else ""
     # 1. 容器重启次数 + 运行时长（从 docker ps Status 解析）
-    if svc_names:
-        c1 = (f"docker ps -a --format '{{{{.Names}}}}|{{{{.Status}}}}' "
-              f"| grep -E '^({svc_names})\\|' 2>/dev/null || true")
-    else:
-        c1 = "true"
+    # 采集所有容器（含未注册为服务的基础设施容器如 RocketMQ 等），
+    # 避免服务器上有容器但 container_status 为空导致运行时长永远为空。
+    c1 = "docker ps -a --format '{{.Names}}|{{.Status}}'"
     # 2. Swap（/proc/meminfo）
     c2 = "grep -E 'SwapTotal|SwapFree' /proc/meminfo 2>/dev/null || true"
     # 3. 网络流量（两次采样间隔 1s，计算每秒字节数）
@@ -428,15 +425,15 @@ def _build_extended_cmds(services: list, health_hosts: dict) -> list:
 
 def _parse_container_status(out: str, services: list) -> dict:
     """解析容器重启次数和运行时长
-    返回 {service_name: {"restart_count": int, "uptime_hours": float}}"""
+    返回 {container_name: {"restart_count": int, "uptime_hours": float}}
+    包含服务器上所有容器（含未注册为服务的基础设施容器）。"""
     result = {}
-    svc_names = {s["service_name"] for s in services}
     for line in out.splitlines():
         if "|" not in line:
             continue
-        name, status = line.split("|", 1)
-        name = name.strip()
-        if name not in svc_names:
+        name = line.split("|", 1)[0].strip()
+        status = line.split("|", 1)[1]
+        if not name:
             continue
         info = {"restart_count": 0, "uptime_hours": -1}
         # Restart count: "Up X hours (healthy)" → 0; "Exited" → 1+
