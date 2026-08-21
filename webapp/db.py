@@ -301,6 +301,25 @@ CREATE TABLE IF NOT EXISTS monitor_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_ms_env_host_ts
     ON monitor_snapshots(env_id, host, created_at);
+CREATE TABLE IF NOT EXISTS custom_monitors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    target TEXT NOT NULL,
+    port INTEGER DEFAULT 443,
+    expiry_at INTEGER,
+    days_left REAL,
+    warn_days INTEGER DEFAULT 0,
+    severity TEXT DEFAULT '',
+    channels TEXT DEFAULT '[]',
+    enabled INTEGER DEFAULT 1,
+    last_checked INTEGER,
+    detail TEXT DEFAULT '{}',
+    error TEXT DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(type, target, port)
+);
 """
 
 # JSON 字段（读写时自动序列化/反序列化）
@@ -316,6 +335,7 @@ JSON_FIELDS = {
     "deploy_schedules": {"extra"},
     "deployment_snapshots": {"image_versions"},
     "canary_configs": {"steps"},
+    "custom_monitors": {"channels", "detail"},
 }
 
 # 表名白名单（泛型 CRUD 的标识符护栏，防 SQL 注入）
@@ -327,7 +347,8 @@ TABLES = frozenset(("projects", "services", "environments", "servers",
                     "deploy_schedules", "release_windows",
                     "service_dependencies", "deployment_snapshots",
                     "canary_configs",
-                    "response_time_history", "monitor_snapshots"))
+                    "response_time_history", "monitor_snapshots",
+                    "custom_monitors"))
 
 
 def _check_table(table: str):

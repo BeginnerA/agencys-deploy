@@ -1,7 +1,8 @@
-"""DB 扩展测试：告警表 + 日志中心表 + services 加列 + JSON 字段往返 + FTS5 检索"""
+"""DB 扩展测试：告警表 + 日志中心表 + services 加列 + JSON 字段往返 + FTS5 检索 + custom_monitors"""
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 from webapp import db as dbm
@@ -160,6 +161,57 @@ class TestLogTables(unittest.TestCase):
                     ("prod", "10.0.0.1", "api", "api-v2", "", 0, 1000))
         finally:
             conn.close()
+
+
+class TestCustomMonitorsTable(unittest.TestCase):
+    """custom_monitors 表：建表 + CRUD + JSON 字段自动序列化"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "test.db")
+        dbm.init_db(self.db)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_create_and_read(self):
+        now = int(time.time())
+        mid = dbm.create_record(self.db, "custom_monitors", dict(
+            type="ssl", name="测试证书", target="api.example.com", port=443,
+            warn_days=30, severity="P1", channels=["feishu"],
+            enabled=1, detail={"cert_subject": "CN=api.example.com"},
+            error="", created_at=now, updated_at=now))
+        row = dbm.get_record(self.db, "custom_monitors", mid)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["type"], "ssl")
+        self.assertEqual(row["target"], "api.example.com")
+        # JSON 字段自动反序列化
+        self.assertIsInstance(row["channels"], list)
+        self.assertEqual(row["channels"], ["feishu"])
+        self.assertIsInstance(row["detail"], dict)
+        self.assertEqual(row["detail"]["cert_subject"], "CN=api.example.com")
+
+    def test_list_enabled(self):
+        now = int(time.time())
+        dbm.create_record(self.db, "custom_monitors", dict(
+            type="ssl", name="A", target="a.com", port=443,
+            enabled=1, days_left=10, created_at=now, updated_at=now))
+        dbm.create_record(self.db, "custom_monitors", dict(
+            type="ssl", name="B", target="b.com", port=443,
+            enabled=0, days_left=5, created_at=now, updated_at=now))
+        rows = dbm.list_records(self.db, "custom_monitors", "enabled=1")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "A")
+
+    def test_unique_constraint(self):
+        now = int(time.time())
+        dbm.create_record(self.db, "custom_monitors", dict(
+            type="ssl", name="A", target="dup.com", port=443,
+            enabled=1, created_at=now, updated_at=now))
+        with self.assertRaises(Exception):
+            dbm.create_record(self.db, "custom_monitors", dict(
+                type="ssl", name="B", target="dup.com", port=443,
+                enabled=1, created_at=now, updated_at=now))
 
 
 if __name__ == "__main__":
