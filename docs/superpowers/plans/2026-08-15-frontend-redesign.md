@@ -16,9 +16,9 @@
 - **验证方式**：每个任务完成后的验证均以「启动 Flask + 浏览器访问」为基准。启动命令：
   ```powershell
   cd d:\work\IdeaProjects\Reid\agencys\agencys-deploy
-  python webapp/app.py --port 8099
+  python webapp/app.py --port 5678
   ```
-  （后台运行；无需 --monitor-interval 时监控默认 30s。验证时可用浏览器工具访问 http://127.0.0.1:8099/screen 检查 console 无报错。）
+  （后台运行；无需 --monitor-interval 时监控默认 30s。验证时可用浏览器工具访问 http://127.0.0.1:5678/screen 检查 console 无报错。）
 - **commit 步骤**：项目当前不在 git 仓库中（`git rev-parse` 失败）。若执行时已初始化仓库，按步骤执行 `git add`/`git commit`；否则跳过。
 - **删除旧文件**：仅在所有新文件就绪、页面可运行后（Task 12）才删除旧 JS/CSS，避免中途回退困难。
 
@@ -359,10 +359,10 @@ git commit -m "feat(webapp): 设计系统 tokens 与 base 样式"
 
 - [ ] **Step 3: 验证**
 
-启动 Flask，访问 `http://127.0.0.1:8099/screen`：
+启动 Flask，访问 `http://127.0.0.1:5678/screen`：
 ```powershell
 cd d:\work\IdeaProjects\Reid\agencys\agencys-deploy
-python webapp/app.py --port 8099
+python webapp/app.py --port 5678
 ```
 Expected: 页面骨架渲染（侧边栏/顶栏/面包屑/内容区为空但存在），无 404 静态资源（tokens/base/layout/components 及 pages/*.css 均存在；components.css 与各页面 CSS 尚未创建 → 用浏览器确认 `GET /static/css/components.css` 返回 404 属预期，Task 3 补齐）。**注意**：为避免中途 404，可先创建空占位 CSS 文件，或跳过此步直接进入 Task 3 后一并验证。推荐：Task 2 与 Task 3 完成后统一验证。
 
@@ -645,7 +645,7 @@ function esc(s){
 
 - [ ] **Step 3: 验证**
 
-启动 Flask 后访问 `http://127.0.0.1:8099/screen`，浏览器 console 执行：
+启动 Flask 后访问 `http://127.0.0.1:5678/screen`，浏览器 console 执行：
 ```javascript
 // 手工验证组件函数存在且可用
 typeof toast === 'function' && typeof confirmDialog === 'function' && typeof openDrawer === 'function'
@@ -927,7 +927,7 @@ function renderMarquee(latest){
 
 - [ ] **Step 5: 验证**
 
-浏览器访问 `http://127.0.0.1:8099/screen`：
+浏览器访问 `http://127.0.0.1:5678/screen`：
 - Expected: 左侧导航渲染（运维监控/运维操作两组；admin 登录含系统管理）、顶部栏含搜索框与用户 chip、面包屑显示"运维中心 / 监控中心"
 - Expected: 无 token 访问自动跳 `/`
 - console 无 JS 语法错误（页面模块 `dashboard` 未定义导致的报错属预期——Task 6 实现）
@@ -1040,7 +1040,7 @@ git commit -m "feat(webapp): SPA 路由与布局基础设施"
 
 - [ ] **Step 2: 验证**
 
-浏览器访问 `http://127.0.0.1:8099/`：
+浏览器访问 `http://127.0.0.1:5678/`：
 - Expected: 深蓝渐变玻璃拟态登录卡；空提交显示"请输入用户名和密码"；错误密码显示后端 error 文案；正确登录跳 `/screen#/dashboard`
 - 登录后顶部栏用户 chip 显示用户名与角色名
 
@@ -1338,7 +1338,7 @@ git commit -m "feat(webapp): 深蓝科技风登录页重设计"
 
 - [ ] **Step 3: 验证**
 
-浏览器访问 `http://127.0.0.1:8099/screen#/dashboard`：
+浏览器访问 `http://127.0.0.1:5678/screen#/dashboard`：
 - Expected: KPI 条 6 项渲染真实数据；雷达图/趋势图/4 仪表盘渲染；5s 后仪表盘数值轻微扰动；服务器状态表（无数据时显示"实时探测未启用"提示条）
 - Expected: 切到 `#/devices` 再切回 `#/dashboard`，图表重新初始化且 console 无 `There is a chart instance already initialized` 警告（destroy 生效）
 - 浏览器窗口缩放后图表不塌陷（容器高度固定）
@@ -1573,7 +1573,7 @@ git commit -m "feat(webapp): 监控中心大屏（KPI/雷达/机房/趋势/服�
 
 - [ ] **Step 3: 验证**
 
-浏览器访问 `http://127.0.0.1:8099/screen#/devices`：
+浏览器访问 `http://127.0.0.1:5678/screen#/devices`：
 - Expected: 项目 chip 与环境 chip 渲染；切项目/环境后卡片墙与服务器列表刷新；卡片显示状态点/镜像版本/实例数/端口
 - Expected: 点击"发布"弹出抽屉；填环境/版本提交后 toast 提示任务已创建并跳转 `#/deploy`（Task 8 未实现前跳转后显示错误态可接受）
 - Expected: 无服务项目显示"该项目暂无服务"空态
@@ -1750,7 +1750,7 @@ window.openTaskLogDrawer = function(id){
 
 - [ ] **Step 3: 验证**
 
-浏览器访问 `http://127.0.0.1:8099/screen#/deploy`：
+浏览器访问 `http://127.0.0.1:5678/screen#/deploy`：
 - Expected: 任务表格渲染（#/任务名/类型/环境/版本/状态/时间/耗时）；状态 chip 筛选生效
 - Expected: 点击任务名打开宽抽屉；日志增量追尾；运行中任务 2s 自动刷新；结束后显示"任务已结束"尾部标记
 - Expected: 运行中任务显示"终止任务"按钮，确认弹窗后调用 kill API 并刷新列表
@@ -1977,7 +1977,7 @@ const radar = computeHealth(overview, mon);
 
 - [ ] **Step 5: 验证**
 
-浏览器访问 `http://127.0.0.1:8099/screen#/alerts`：
+浏览器访问 `http://127.0.0.1:5678/screen#/alerts`：
 - Expected: 三个统计卡（未处理/已处理/全部）渲染；有失败任务/异常服务时出现告警行（级别徽标正确：回滚失败=严重）
 - Expected: 标记已处理后行变灰划线、统计数更新、左侧导航角标数减少；刷新页面后状态保持（localStorage）
 - Expected: 15s 轮询自动刷新；`#/dashboard` 页雷达仍正常（computeHealth 迁移无回归）
@@ -2146,7 +2146,7 @@ git commit -m "feat(webapp): 告警中心聚合与导航角标"
 
 - [ ] **Step 3: 验证**
 
-浏览器访问 `http://127.0.0.1:8099/screen#/logs`：
+浏览器访问 `http://127.0.0.1:5678/screen#/logs`：
 - Expected: 任务下拉列出最近 200 个任务；选择运行中任务后日志增量追尾（3s），选择已完成任务一次性全量展示
 - Expected: 追尾期间任务结束 → 自动停止并显示终态徽标；「全量刷新」重新拉取全部日志
 - Expected: admin 可见审计日志表（时间/用户/动作中文映射/对象/详情截断，hover 显示完整）；viewer 角色不渲染审计面板
@@ -2630,7 +2630,7 @@ git commit -m "feat(webapp): 日志中心（任务日志追尾+审计日志）"
 
 - [ ] **Step 3: 验证**
 
-浏览器访问 `http://127.0.0.1:8099/screen#/config`（admin 登录）：
+浏览器访问 `http://127.0.0.1:5678/screen#/config`（admin 登录）：
 - Expected: 顶层 4 个 tab 可切换；项目管理左侧项目列表 + 右侧服务/环境/流水线子 tab 联动
 - Expected: 六类各建/改/删一次：项目（名称/编码必填校验）、服务（列表字段 textarea 每行一个转数组）、环境（JSON 子对象 textarea 校验）、流水线（stages JSON 数组校验、引用不存在服务报后端错误）、服务器（密码留空不覆盖）、用户（新建强制改密标记；不能删除自己）
 - Expected: 删除均弹 confirmDialog；被流水线引用的服务删除显示后端 400 文案 toast
@@ -2699,7 +2699,7 @@ webapp/static/css/screen.css
 
 ```powershell
 cd d:\work\IdeaProjects\Reid\agencys\agencys-deploy
-python webapp/app.py --port 8099
+python webapp/app.py --port 5678
 ```
 
 浏览器按序验证（每步检查 console 无报错、Network 无 404）：

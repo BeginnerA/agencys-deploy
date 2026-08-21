@@ -7,12 +7,13 @@
     const st = {
       project, container, onSaved,
       svcs: [],
-      data: svc ? JSON.parse(JSON.stringify(svc)) : {
+      data: svc ? Object.assign(JSON.parse(JSON.stringify(svc)), { enabled: !!svc.enabled }) : {
         name:'', image_name:'', service_name:'', git_repo:'',
         build_order:[], docker_context:'', dockerfile:'',
         nacos_groups:[], dubbo_services:[], snailjob_group:'',
         health_port:'', health_url:'',
         log_error_keywords:['ERROR','Exception','Failed to start'], clear_log_dir:'',
+        enabled: true,
       },
     };
     openDrawer({ title: svc ? '编辑服务：' + svc.name : '新建服务', wide: true,
@@ -34,6 +35,15 @@
       // ① 基本信息
       const basic = `
         <div class="form-grid">
+          <div class="field full" style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+            <label style="margin:0;white-space:nowrap">启用状态</label>
+            <label class="switch" style="position:relative;display:inline-block;width:40px;height:22px;cursor:pointer">
+              <input type="checkbox" id="sEnabled" ${d.enabled ? 'checked' : ''} style="opacity:0;width:0;height:0">
+              <span style="position:absolute;inset:0;background:${d.enabled ? 'var(--c-primary,#4f7cff)' : 'var(--c-muted,#888)'};border-radius:11px;transition:.2s"></span>
+              <span style="position:absolute;left:${d.enabled ? '20px' : '2px'};top:2px;width:18px;height:18px;background:#fff;border-radius:50%;transition:.2s"></span>
+            </label>
+            <span class="weak" style="font-size:12px">${d.enabled ? '启用中 — 参与监控、告警与发布' : '已停用 — 不出现在监控/告警/总览'}</span>
+          </div>
           ${H.field({ label:'服务名', required:true, tip:'发布命令 --project 参数；须与 docker-compose 服务名、镜像名对应；项目内唯一', input:`<input id="sName" value="${esc(d.name)}" placeholder="如 service-biz">`, hint:'被流水线 stages 引用后改名不受影响（引用按 id），但请同步更新发布习惯' })}
           ${H.field({ label:'镜像短名', required:true, tip:'完整镜像名 = {registry}/{namespace}/{image_name}:{version}', input:`<input id="sImage" value="${esc(d.image_name)}" placeholder="如 biz">`, hint:'不要带命名空间前缀，命名空间来自环境配置' })}
           ${H.field({ label:'Git 仓库路径', required:true, tip:'相对 deploy.project_root；发布成功后在仓库打 v{version} tag 并推送远端', input:`<input id="sGit" value="${esc(d.git_repo)}" placeholder="如 service-biz">`, hint:'多服务共用仓库时填仓库目录名' })}
@@ -120,6 +130,7 @@
           build_order: d.build_order, nacos_groups: d.nacos_groups, dubbo_services: d.dubbo_services,
           snailjob_group: d.snailjob_group, health_url: d.health_url,
           health_port: d.health_port, log_error_keywords: d.log_error_keywords, clear_log_dir: d.clear_log_dir,
+          enabled: document.getElementById('sEnabled').checked,
         };
         try{
           if (svc) await api(`/api/projects/${project.id}/services/${svc.id}`, { method: 'PUT', body: JSON.stringify(payload) });
@@ -145,6 +156,7 @@
       d.clear_log_dir = val('sClearLog').trim();
       const hp = val('sHealthPort').trim();
       d.health_port = hp === '' ? 0 : Number(hp);
+      d.enabled = document.getElementById('sEnabled').checked;
       d.build_order = H.rowList({ id:'sBuildOrder', rows:[] }).read();
       d.nacos_groups = H.tagInput({ id:'sNacosGroups', values:[] }).read();
       d.dubbo_services = H.tagInput({ id:'sDubbo', values:[] }).read();

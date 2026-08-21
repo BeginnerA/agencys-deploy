@@ -532,8 +532,12 @@ def delete_record(db_path: str, table: str, record_id: int) -> bool:
 
 # ---------- 域查询 ----------
 
-def list_services(db_path: str, project_id: int) -> list:
-    return list_records(db_path, "services", "project_id=?", (project_id,), "id")
+def list_services(db_path: str, project_id: int, enabled_only: bool = False) -> list:
+    where = "project_id=?"
+    params = [project_id]
+    if enabled_only:
+        where += " AND enabled=1"
+    return list_records(db_path, "services", where, tuple(params), "id")
 
 
 def list_environments(db_path: str, project_id: int) -> list:

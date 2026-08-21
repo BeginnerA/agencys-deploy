@@ -114,20 +114,38 @@
   async function renderServices(sb, project){
     try{
       const svcs = await api(`/api/projects/${project.id}/services`);
+      const enabledCnt = svcs.filter(s => s.enabled).length;
       sb.innerHTML = `<div class="deploy-toolbar">
-          <span class="weak" style="font-size:12px">服务（${svcs.length}）</span><span style="flex:1"></span>
+          <span class="weak" style="font-size:12px">服务（${enabledCnt}/${svcs.length} 启用）</span><span style="flex:1"></span>
           <button class="btn sm primary" id="addSvc">+ 新建服务</button>
         </div>
         <div class="panel" style="padding:0">${svcs.length ? `<div class="tbl-wrap"><table class="tbl"><thead><tr>
           <th>名称</th><th>镜像</th><th>服务名</th><th>端口</th><th>启用</th><th>操作</th></tr></thead><tbody>
-          ${svcs.map(s => `<tr>
+          ${svcs.map(s => `<tr style="${s.enabled ? '' : 'opacity:0.5'}">
             <td>${esc(s.name)}</td><td class="num">${esc(s.image_name)}</td><td class="num">${esc(s.service_name)}</td>
             <td class="num">${s.health_port ?? '-'}</td>
-            <td>${s.enabled ? '<span class="ok">启用</span>' : '<span class="weak">停用</span>'}</td>
+            <td><label class="switch" style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer" title="${s.enabled ? '点击停用' : '点击启用'}">
+              <input type="checkbox" ${s.enabled ? 'checked' : ''} data-toggle="${s.id}" style="opacity:0;width:0;height:0">
+              <span style="position:absolute;inset:0;background:${s.enabled ? 'var(--c-success,#22c55e)' : 'var(--c-muted,#888)'};border-radius:10px;transition:.2s"></span>
+              <span style="position:absolute;left:${s.enabled ? '18px' : '2px'};top:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:.2s"></span>
+            </label></td>
             <td><button class="btn sm ghost" data-edit="${s.id}">编辑</button>
                 <button class="btn sm danger" data-del="${s.id}">删除</button></td>
           </tr>`).join('')}</tbody></table></div>`
         : `<div class="empty-state"><div class="e-ico">🧩</div><div>暂无服务，点右上角新建</div></div>`}</div>`;
+      // 快速切换启用/停用
+      sb.querySelectorAll('[data-toggle]').forEach(async cb => {
+        cb.onchange = async () => {
+          const sid = Number(cb.dataset.toggle);
+          const s = svcs.find(x => x.id === sid);
+          if (!s) return;
+          try{
+            await api(`/api/projects/${project.id}/services/${sid}`, { method: 'PUT', body: JSON.stringify({ enabled: cb.checked }) });
+            toastSuccess(cb.checked ? `已启用「${s.name}」` : `已停用「${s.name}」`);
+            await renderServices(sb, project);
+          }catch(e){ toastError(e.message); cb.checked = !cb.checked; }
+        };
+      });
       document.getElementById('addSvc').onclick = () => cfgServiceForm.open(sb, project, null, () => renderServices(sb, project));
       sb.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => cfgServiceForm.open(sb, project, svcs.find(s => s.id === Number(b.dataset.edit)), () => renderServices(sb, project)));
       sb.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {

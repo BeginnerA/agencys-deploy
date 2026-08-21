@@ -1,7 +1,7 @@
 """验证告警过滤是否生效"""
 import requests
 
-BASE = "http://127.0.0.1:8099"
+BASE = "http://127.0.0.1:5678"
 
 # Login
 resp = requests.post(f"{BASE}/api/auth/login", json={"username": "admin", "password": "admin123"})

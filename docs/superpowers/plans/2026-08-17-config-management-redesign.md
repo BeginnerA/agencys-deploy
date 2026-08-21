@@ -16,9 +16,9 @@
 - **验证方式**：每个任务完成后的验证均以「启动 Flask + 浏览器访问」为基准。启动命令（后台运行）：
   ```powershell
   cd d:\work\IdeaProjects\Reid\agencys\agencys-deploy
-  python webapp/app.py --port 8099
+  python webapp/app.py --port 5678
   ```
-  浏览器访问 `http://127.0.0.1:8099/screen#/config` 检查页面与 console 无报错。若端口被占用（Windows Flask 双实例缺陷），先结束旧进程再启动。
+  浏览器访问 `http://127.0.0.1:5678/screen#/config` 检查页面与 console 无报错。若端口被占用（Windows Flask 双实例缺陷），先结束旧进程再启动。
 - **commit 步骤**：项目当前不在 git 仓库中（已核实无 `.git`）。若执行时已初始化仓库，按步骤执行 `git add`/`git commit`；否则跳过该步。
 - **安全与卫生（沿用既有约定）**：所有插值用户/后端数据处必须 `esc()`；抽屉关闭后 `root.innerHTML = ''` 防密码残留 DOM；密码输入编辑态显示"已遮蔽，留空不修改"。
 - **命名空间**：`window.cfgHelpers / cfgHome / cfgProject / cfgEnvForm / cfgPipelineEditor / cfgServiceForm / cfgServerForm`；入口 `config.js` 导出 `window.config`。
@@ -147,9 +147,9 @@ foreach ($f in @('config-form-helpers.js','config-home.js','config-project.js','
 - [ ] **Step 4: 验证**
 
 启动 Flask（后台）后浏览器访问：
-- `http://127.0.0.1:8099/screen#/config` → 旧版配置页正常渲染（topTab=projects）
-- `http://127.0.0.1:8099/screen#/config/p/1/services` → 仍渲染旧版配置页（子路由此时无内部处理属预期中间态），**关键验证点：不会 fallback 到 dashboard**
-- `http://127.0.0.1:8099/screen#/config/users` → 同上不 fallback
+- `http://127.0.0.1:5678/screen#/config` → 旧版配置页正常渲染（topTab=projects）
+- `http://127.0.0.1:5678/screen#/config/p/1/services` → 仍渲染旧版配置页（子路由此时无内部处理属预期中间态），**关键验证点：不会 fallback 到 dashboard**
+- `http://127.0.0.1:5678/screen#/config/users` → 同上不 fallback
 - console 无 404/报错（除占位文件本身无逻辑）
 
 - [ ] **Step 5: Commit**
@@ -357,7 +357,7 @@ git commit -m "feat(config): 路由支持配置管理子路径并拆分页面模
 
 - [ ] **Step 2: 验证**
 
-浏览器访问 `http://127.0.0.1:8099/screen#/config` → 旧版配置页样式不受影响（新类未使用，纯追加）。console 无报错。
+浏览器访问 `http://127.0.0.1:5678/screen#/config` → 旧版配置页样式不受影响（新类未使用，纯追加）。console 无报错。
 
 - [ ] **Step 3: Commit**
 
@@ -710,7 +710,7 @@ git commit -m "style(config): 配置管理新组件样式（统计卡/模板卡/
 
 - [ ] **Step 2: 验证**
 
-浏览器访问 `http://127.0.0.1:8099/screen#/config` 后，console 执行：
+浏览器访问 `http://127.0.0.1:5678/screen#/config` 后，console 执行：
 
 ```js
 const h = window.cfgHelpers;
@@ -951,7 +951,7 @@ git commit -m "feat(config): 共享表单工具（字段/分区/标签输入器/
 
 - [ ] **Step 2: 验证**
 
-浏览器访问 `http://127.0.0.1:8099/screen#/config`（此时入口未切换，仍显示旧版），console 执行：
+浏览器访问 `http://127.0.0.1:5678/screen#/config`（此时入口未切换，仍显示旧版），console 执行：
 
 ```js
 const root = document.getElementById('pageRoot');

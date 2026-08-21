@@ -705,7 +705,7 @@ class MonitorScheduler:
                     print(f"[monitor] 环境探测异常: {e!r}", file=sys.stderr)
 
     def _probe_env(self, proj: dict, env: dict):
-        services = dbm.list_services(self._db_path, proj["id"])
+        services = dbm.list_services(self._db_path, proj["id"], enabled_only=True)
         servers = dbm.list_env_servers(self._db_path, env["id"])
         ssh_cfg = env.get("ssh") or {}
         result = {"ts": time.time(), "servers": [], "services": {},
@@ -713,9 +713,9 @@ class MonitorScheduler:
         health_hosts = {}  # {svc_name: [host, ...]} 用于健康检查
         per_server_metrics = {}  # {host: {cpu, mem, disk, load}} 按服务器存储主机指标
         per_server_extended = {}  # {host: {swap, net_rx, ...}} 扩展指标
-        # 扩展指标节流：每 5 轮采集一次（@60s 间隔 ≈ 5 分钟一次），
+        # 扩展指标节流：每 3 轮采集一次（@60s 间隔 ≈ 3 分钟一次），
         # 大幅减少 SSH 连接数（跳过时每台服务器每轮仅 1 次连接而非 2 次）
-        skip_extended = (self._round % 5) != 0
+        skip_extended = (self._round % 3) != 0
         # 每台服务器整体一个任务（单连接内串行 ps/stats/主机指标，任务间全并发）：
         # 避免旧实现中 stats/指标在调度线程串行执行，整轮时长随服务器数线性增长
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -759,6 +759,15 @@ class MonitorScheduler:
                             # 记录该服务在此服务器可达，用于后续 HTTP 健康检查
                             health_hosts.setdefault(svc["name"], []).append(s["host"])
         result["host_metrics"] = per_server_metrics
+        # 扩展指标节流时保留上次采集结果：skip_extended 轮次不采集扩展指标，
+        # 如果不从上一轮缓存回填，前端会看到数据"闪现几秒就消失"（缓存被空 dict 覆盖）
+        if not per_server_extended and not skip_extended:
+            pass  # 本轮采集了但全部为空（可能全部失败），正常写入空
+        elif not per_server_extended:
+            # 本轮跳过了采集 → 从上次缓存回填，保证前端持续有数据
+            prev_cache = self._cache.get(env["id"])
+            if prev_cache:
+                per_server_extended = dict(prev_cache.get("extended_metrics") or {})
         result["extended_metrics"] = per_server_extended
         # SSH 全部失败时服务状态标 probe_failed（区分"确实未部署"与"探测不到"，
         # 避免把运行中的服务误报为未部署）

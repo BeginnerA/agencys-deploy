@@ -109,7 +109,7 @@ async function resolveAlert(id) {
 - [ ] **Step 5: 浏览器验证**
 
 启动 app：`python webapp/app.py --monitor-interval 30`（后台）
-打开浏览器：`http://localhost:8099`
+打开浏览器：`http://localhost:5678`
 导航到告警页，验证：
 - 统计卡片显示 firing/acked/resolved 数量
 - 筛选栏工作（级别/状态/关键词）
@@ -423,7 +423,7 @@ async function loadTabContent() {
 - [ ] **Step 2: 端到端联调**
 
 启动 app：`python webapp/app.py --monitor-interval 30`（后台）
-打开浏览器：`http://localhost:8099`
+打开浏览器：`http://localhost:5678`
 导航到告警页，验证：
 - 4 个 Tab 切换工作
 - 告警列表 Tab：统计卡片、筛选、列表、ack/resolve、分页

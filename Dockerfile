@@ -13,10 +13,10 @@ COPY . .
 RUN mkdir -p data/logs data/runtime data/export
 
 # 暴露端口
-EXPOSE 8099
+EXPOSE 5678
 
 # 环境变量
 ENV DASHBOARD_MONITOR_INTERVAL=30
 
 # 启动命令
-CMD ["python", "webapp/app.py", "--host", "0.0.0.0", "--port", "8099"]
+CMD ["python", "webapp/app.py", "--host", "0.0.0.0", "--port", "5678"]

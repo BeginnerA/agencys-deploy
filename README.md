@@ -135,7 +135,7 @@ SnailJob 暂停前会先备份 `sj_job` 记录（SQL 文件 + 任务状态快照
 
 ```powershell
 pip install -r requirements.txt
-python webapp/app.py          # 默认 http://127.0.0.1:8099
+python webapp/app.py          # 默认 http://127.0.0.1:5678
 ```
 
 - 首次启动自动导入 `config/` 旧配置（原 11 个服务 + 4 条流水线 + prod/test 环境），创建默认管理员 `admin/admin`（首次登录强制改密）。

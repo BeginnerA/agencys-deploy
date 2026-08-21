@@ -135,7 +135,7 @@ def list_projects():
     for p in rows:
         out.append({"id": p["id"], "name": p["name"], "code": p["code"],
                     "description": p["description"], "git_org": p["git_org"],
-                    "services": len(dbm.list_services(current_app.config["DB_PATH"], p["id"])),
+                    "services": len(dbm.list_services(current_app.config["DB_PATH"], p["id"], enabled_only=True)),
                     "environments": len(dbm.list_environments(current_app.config["DB_PATH"], p["id"])),
                     "pipelines": len(dbm.list_pipelines(current_app.config["DB_PATH"], p["id"]))})
     return _ok(out)
@@ -370,6 +370,15 @@ def create_environment(pid):
     eid = dbm.create_record(current_app.config["DB_PATH"], "environments", fields)
     audit("create_environment", "environment", eid, {"name": name})
     return _ok({"id": eid}), 201
+
+
+@config_bp.route("/projects/<int:pid>/environments/<int:eid>", methods=["GET"])
+@require_auth
+def get_environment(pid, eid):
+    rec, err = _owned_or_404("environments", eid, pid)
+    if err:
+        return err
+    return _ok(rec)
 
 
 @config_bp.route("/projects/<int:pid>/environments/<int:eid>", methods=["PUT"])

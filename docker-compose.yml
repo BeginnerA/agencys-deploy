@@ -3,7 +3,7 @@ services:
     build: .
     container_name: agencys-platform
     ports:
-      - "8099:8099"
+      - "5678:5678"
     volumes:
       # 持久化数据目录（SQLite 数据库、日志、密钥等）
       - ./data:/app/data

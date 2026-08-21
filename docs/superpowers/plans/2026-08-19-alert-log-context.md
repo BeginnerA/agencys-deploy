@@ -692,9 +692,9 @@ git commit -m "feat: 告警详情日志上下文查询接口 GET /api/alerts/<id
 Run（后台启动）:
 ```bash
 cd d:\work\IdeaProjects\Reid\agencys\agencys-deploy
-.venv\Scripts\python -m webapp.app --port 8099
+.venv\Scripts\python -m webapp.app --port 5678
 ```
-浏览器打开 `http://127.0.0.1:8099` 登录，验证清单：
+浏览器打开 `http://127.0.0.1:5678` 登录，验证清单：
 
 1. **日志告警详情**：打开一个带 entry_id 的日志告警 → "日志上下文"区块出现在元信息与投递历史之间；命中行有黄色左边框 + 背景高亮；关键词在行内有 `<mark>` 高亮；信息条显示"命中行前 N 行 · 命中行 · 后 N 行"；列表超高时滚动
 2. **旧告警**：打开 entry_id 缺失的旧日志告警 → 提示"该告警未记录日志位置，无法展示上下文"

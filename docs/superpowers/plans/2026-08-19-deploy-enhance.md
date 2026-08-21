@@ -2315,12 +2315,12 @@ Expected: 所有测试通过
 - [ ] **Step 3: 启动应用验证**
 
 ```bash
-python webapp/app.py --port 8099
+python webapp/app.py --port 5678
 ```
 
 验证：
 - 应用启动日志显示 `[deploy-sched] 发布调度器已启动`
-- 访问 `http://localhost:8099`，登录后导航到发布中心
+- 访问 `http://localhost:5678`，登录后导航到发布中心
 - 子页面 Tab（定时计划/发布窗口/灰度策略/依赖拓扑/发布对比）可正常切换
 
 - [ ] **Step 4: 最终提交**

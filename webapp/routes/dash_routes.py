@@ -63,7 +63,7 @@ def overview():
     avg_duration = sum(t["finished_at"] - t["started_at"] for t in completed) / len(completed) if completed else 0
     out = {
         "projects": len(projects),
-        "services": sum(len(dbm.list_services(db, p["id"])) for p in projects),
+        "services": sum(len(dbm.list_services(db, p["id"], enabled_only=True)) for p in projects),
         "environments": sum(len(dbm.list_environments(db, p["id"])) for p in projects),
         "servers": len(servers),
         "tasks_total": total, "tasks_success": success,

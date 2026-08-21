@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""智能运维平台入口：python webapp/app.py [--host 127.0.0.1] [--port 8099]"""
+"""智能运维平台入口：python webapp/app.py [--host 127.0.0.1] [--port 5678]"""
 import argparse
 import sys
 from pathlib import Path
@@ -15,7 +15,7 @@ app = create_app()
 def main():
     parser = argparse.ArgumentParser(description="智能运维平台")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8099)
+    parser.add_argument("--port", type=int, default=5678)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--monitor-interval", type=int, default=60,
                         help="实时探测周期（秒），0 关闭监控")

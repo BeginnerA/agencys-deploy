@@ -376,7 +376,7 @@ def delete_canary_config(cid):
 @require_auth
 def get_topology(project_id):
     """获取项目服务依赖拓扑：手动依赖 + dubbo 自动检测"""
-    services = dbm.list_services(_db_path(), project_id)
+    services = dbm.list_services(_db_path(), project_id, enabled_only=True)
     svc_names = {s["name"] for s in services}
     # 手动依赖
     manual_deps = dbm.list_records(_db_path(), "service_dependencies",
@@ -531,7 +531,7 @@ def impact_analysis(project_id):
 @require_auth
 def publish_order(project_id):
     """拓扑排序：返回建议的发布顺序（先发布被依赖的）"""
-    services = dbm.list_services(_db_path(), project_id)
+    services = dbm.list_services(_db_path(), project_id, enabled_only=True)
     svc_names = [s["name"] for s in services]
     deps = dbm.list_records(_db_path(), "service_dependencies",
                             "project_id=?", (project_id,), "id")

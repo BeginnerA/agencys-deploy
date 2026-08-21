@@ -142,7 +142,7 @@ class AlertEngine:
             "projects": dbm.list_records(self._db_path, "projects"),
             "envs": dbm.list_records(self._db_path, "environments"),
             "servers": dbm.list_records(self._db_path, "servers"),
-            "services": dbm.list_records(self._db_path, "services"),
+            "services": dbm.list_records(self._db_path, "services", "enabled=1"),
             "windows": dbm.list_records(self._db_path, "silence_windows"),
         }
 
@@ -397,11 +397,13 @@ class AlertEngine:
                 updates["target_info"] = merged
             # 静默期首次触发的告警：窗口已过期、仍在 firing 且从未通知 → 补发一次
             # （acked/resolved 不再补发：ack 后停止重复通知）
+            channels = rule.get("channels") or []
             if (a["status"] == "firing" and a["notify_count"] == 0
                     and not self._silenced(rule, target_info, windows)):
                 alert = dbm.get_record(self._db_path, "alerts", a["id"])
-                self._notify(alert, rule.get("channels") or [])
-                updates["notify_count"] = 1
+                if channels:
+                    self._notify(alert, channels)
+                    updates["notify_count"] = 1
             dbm.update_record(self._db_path, "alerts", a["id"], updates)
             return a["id"]
         # 无活跃告警：检查是否有已解决的告警可重新激活
@@ -432,8 +434,8 @@ class AlertEngine:
                 dbm.create_record(self._db_path, "alert_events", dict(
                     alert_id=a["id"], channel="silenced", target="", payload="",
                     ok=1, detail="静默窗口内，未发送通知", created_at=now))
-            else:
-                self._notify(alert, rule.get("channels") or [])
+            elif rule.get("channels"):
+                self._notify(alert, rule["channels"])
                 dbm.update_record(self._db_path, "alerts", a["id"],
                                   {"notify_count": 1})
             return a["id"]
@@ -450,8 +452,8 @@ class AlertEngine:
             dbm.create_record(self._db_path, "alert_events", dict(
                 alert_id=alert_id, channel="silenced", target="", payload="",
                 ok=1, detail="静默窗口内，未发送通知", created_at=now))
-        else:
-            self._notify(alert, rule.get("channels") or [])
+        elif rule.get("channels"):
+            self._notify(alert, rule["channels"])
             dbm.update_record(self._db_path, "alerts", alert_id,
                               {"notify_count": 1})
         return alert_id

@@ -460,7 +460,7 @@ def scope_services():
             f"SELECT DISTINCT s.id, s.name FROM services s "
             f"WHERE s.project_id IN ("
             f"  SELECT DISTINCT project_id FROM environments WHERE id IN ({placeholders})"
-            f") ORDER BY s.name",
+            f") AND s.enabled = 1 ORDER BY s.name",
             env_ids
         ).fetchall()
         return jsonify([dict(r) for r in rows])

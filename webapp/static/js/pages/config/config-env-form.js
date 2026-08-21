@@ -128,14 +128,21 @@
         card.onclick = () => {
           const t = H.ENV_TEMPLATES.find(x => x.id === card.dataset.tpl);
           if (t.copy){
-            const box = document.getElementById('copySel');
-            box.style.display = 'block';
-            box.innerHTML = `<div class="field full"><label>选择要复制的源环境</label>
-              <select id="envCopySrc">${st.envs.map(e => `<option value="${e.id}">${esc(e.name)}</option>`).join('') || '<option value="">（暂无可复制环境）</option>'}</select>
-              <div class="f-hint">选中后自动带入该环境的全部 6 大块配置，改名字和差异项即可</div></div>`;
-            const sel = document.getElementById('envCopySrc');
-            if (sel && sel.value) loadCopy(Number(sel.value));
-            sel && (sel.onchange = () => loadCopy(Number(sel.value)));
+            if (st.envs.length === 0){
+              const box = document.getElementById('copySel');
+              box.style.display = 'block';
+              box.innerHTML = '<div class="weak">暂无可复制的环境，请先创建至少一个环境</div>';
+            }else if (st.envs.length === 1){
+              loadCopy(st.envs[0].id);
+            }else{
+              const box = document.getElementById('copySel');
+              box.style.display = 'block';
+              box.innerHTML = `<div class="field full"><label>选择要复制的源环境</label>
+                <select id="envCopySrc">${st.envs.map(e => `<option value="${e.id}">${esc(e.name)}</option>`).join('')}</select>
+                <div class="f-hint">选中后自动带入该环境的全部 6 大块配置，改名字和差异项即可</div></div>`;
+              const sel = document.getElementById('envCopySrc');
+              sel && (sel.onchange = () => loadCopy(Number(sel.value)));
+            }
           }else{
             st.data = JSON.parse(JSON.stringify(t.data));
             st.data.name = '';
