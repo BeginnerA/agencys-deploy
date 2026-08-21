@@ -1695,12 +1695,13 @@
               return `<label class="rule-ch-cb"><input type="checkbox" value="${v}" ${checked?'checked':''}> ${l}</label>`;
             }).join('')}</div></div>
         <div class="field full"><label>备注</label><input id="mfRemark" value="${m ? esc(m.detail && m.detail.remark || '') : ''}" placeholder="可选"></div>
+        <div class="full" style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
+          <button class="btn" id="mfCancel">取消</button>
+          <button class="btn primary" id="mfSave">${monitorSaving ? '保存中...' : '保存'}</button>
+        </div>
       </div>`;
 
-    openDrawer({ title, body: bodyHTML, wide: true,
-      footer: `<button class="btn primary" id="mfSave">${monitorSaving ? '保存中...' : '保存'}</button>
-               <button class="btn ghost" id="mfCancel">取消</button>`
-    });
+    openDrawer({ title, body: bodyHTML, wide: true });
 
     document.getElementById('mfCancel').onclick = () => {
       const c = document.getElementById('dwClose');
@@ -1819,12 +1820,13 @@
         <div class="field"><label>SSL 检测周期（秒）</label>
           <input id="mcInterval" type="number" value="${cfg.ssl_check_interval || 3600}">
         </div>
+        <div class="full" style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
+          <button class="btn" id="mcCancel">取消</button>
+          <button class="btn primary" id="mcSave">保存</button>
+        </div>
       </div>`;
 
-    openDrawer({ title: '到期监控全局配置', body: bodyHTML,
-      footer: `<button class="btn primary" id="mcSave">保存</button>
-               <button class="btn ghost" id="mcCancel">取消</button>`
-    });
+    openDrawer({ title: '到期监控全局配置', body: bodyHTML });
 
     document.getElementById('mcCancel').onclick = () => {
       const c = document.getElementById('dwClose');
