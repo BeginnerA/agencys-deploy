@@ -28,6 +28,9 @@ def main():
         from webapp.alert_engine import init_engine
         init_engine(app)
         print(f"[alert] 告警引擎已启动，评估周期 {args.monitor_interval}s")
+        from webapp.ssl_monitor import init_ssl_monitor
+        init_ssl_monitor(app)
+        print("[ssl-monitor] SSL 证书探测已启动")
         from webapp.log_collector import init_collector
         init_collector(app)
         from webapp.deploy_scheduler import DeployScheduler
