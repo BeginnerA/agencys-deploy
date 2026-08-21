@@ -796,6 +796,11 @@ def get_response_time_history(db_path: str, env_id: int = None,
 def save_monitor_snapshot(db_path: str, env_id: int, host: str, data: dict):
     """保存一轮监控快照（新指标：swap/network/diskio/tcp/restart/docker_df/ssl）"""
     now = int(time.time())
+    # 从嵌套的 container_status 中聚合 restart_count（总和）和 uptime_hours（最小值）
+    cs = data.get("container_status") or {}
+    total_restarts = sum(c.get("restart_count", 0) for c in cs.values())
+    uptimes = [c.get("uptime_hours", -1) for c in cs.values() if c.get("uptime_hours", -1) >= 0]
+    min_uptime = min(uptimes) if uptimes else None
     conn = get_conn(db_path)
     try:
         conn.execute(
@@ -812,7 +817,7 @@ def save_monitor_snapshot(db_path: str, env_id: int, host: str, data: dict):
              data.get("tcp", {}).get("ESTABLISHED"),
              data.get("tcp", {}).get("TIME_WAIT"),
              data.get("tcp", {}).get("CLOSE_WAIT"),
-             data.get("restart_count", 0), data.get("uptime_hours"),
+             total_restarts, min_uptime,
              data.get("docker_df", {}).get("images"),
              data.get("docker_df", {}).get("containers"),
              data.get("docker_df", {}).get("volumes"),

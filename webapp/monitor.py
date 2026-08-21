@@ -795,8 +795,8 @@ class MonitorScheduler:
             with ThreadPoolExecutor(max_workers=min(8, len(online))) as pool:
                 for svc in online:
                     hp = svc.get("health_port") or 0
-                    hu = svc.get("health_url") or ""
-                    if hp > 0 and hu:
+                    hu = svc.get("health_url") or "/"
+                    if hp > 0:
                         for host in health_hosts.get(svc["name"], [])[:2]:  # 最多探测 2 台
                             health_futures[pool.submit(_probe_health_url, host, hp, hu)] = (
                                 svc["name"], host)
@@ -824,6 +824,32 @@ class MonitorScheduler:
         result["security"] = _compute_security(servers)
         with self._lock:
             self._cache[env["id"]] = result
+
+    @staticmethod
+    def _merge_extended(existing: dict, new_data: dict) -> dict:
+        """合并同一服务器跨环境的扩展指标：container_status 取并集（不同环境部署不同服务），
+        其余指标（swap/net/tcp/...）取非空值覆盖。
+
+        解决 bug：同一台服务器属于多个环境时，后处理的环境若未部署匹配容器，
+        空 container_status 会覆盖前面环境已匹配到的容器数据（导致运行时长永远为空）。
+        """
+        if not existing:
+            return dict(new_data)
+        merged = dict(existing)
+        # container_status 按服务名合并（不同环境可能部署不同服务）
+        old_cs = merged.get("container_status") or {}
+        new_cs = (new_data.get("container_status") or {})
+        if new_cs:
+            merged_cs = dict(old_cs)
+            merged_cs.update(new_cs)
+            merged["container_status"] = merged_cs
+        # 其余指标：非空则覆盖
+        for k, v in new_data.items():
+            if k == "container_status":
+                continue
+            if v is not None and v != {} and v != []:
+                merged[k] = v
+        return merged
 
     def _aggregate_all_env(self, project_id: int) -> dict:
         """聚合项目下所有环境的探测缓存，用于"全部"视图
@@ -860,7 +886,9 @@ class MonitorScheduler:
             all_resources.update(data.get("resources", {}))
             all_health.update(data.get("health_checks", {}))
             all_hm.update(data.get("host_metrics", {}))
-            all_ext.update(data.get("extended_metrics", {}))
+            # 扩展指标跨环境合并（container_status 取并集，避免空数据覆盖）
+            for host, ext in (data.get("extended_metrics") or {}).items():
+                all_ext[host] = self._merge_extended(all_ext.get(host), ext)
         return {"services": all_services, "servers": list(all_servers.values()),
                 "ts": latest_ts, "env": "",
                 "resources": all_resources, "health_checks": all_health,
@@ -902,7 +930,9 @@ class MonitorScheduler:
             all_resources.update(data.get("resources", {}))
             all_health.update(data.get("health_checks", {}))
             all_hm.update(data.get("host_metrics", {}))
-            all_ext.update(data.get("extended_metrics", {}))
+            # 扩展指标跨环境合并（container_status 取并集，避免空数据覆盖）
+            for host, ext in (data.get("extended_metrics") or {}).items():
+                all_ext[host] = self._merge_extended(all_ext.get(host), ext)
         return {"services": all_services, "servers": list(all_servers.values()),
                 "ts": latest_ts, "env": "",
                 "resources": all_resources, "health_checks": all_health,
