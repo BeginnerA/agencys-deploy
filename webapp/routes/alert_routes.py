@@ -485,7 +485,7 @@ def _validate_rule(body, partial=False) -> str:
     if has("name") and not (body.get("name") or "").strip():
         return "规则名称必填"
     if has("metric_type") and body.get("metric_type") not in (
-            "metric", "status", "log_keyword"):
+            "metric", "status", "log_keyword", "custom_monitor"):
         return "metric_type 非法"
     if has("metric"):
         if body.get("metric_type") == "metric" and body.get("metric") not in (
@@ -795,3 +795,206 @@ def put_channels():
                                "updated_at": now})
     audit("update_alert_channels", "config", 0, {"channels": list(body.keys())})
     return jsonify({"ok": True})
+
+
+# ---------- 到期监控 CRUD ----------
+
+MONITOR_TYPES = ("ssl", "cloud_renewal", "license", "custom")
+
+
+@alert_bp.route("/alerts/monitors")
+@require_auth
+def list_monitors():
+    """到期监控列表"""
+    db = current_app.config["DB_PATH"]
+    rows = dbm.list_records(db, "custom_monitors", "", (), "id")
+    return jsonify(rows)
+
+
+@alert_bp.route("/alerts/monitors", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def create_monitor():
+    """添加监控项"""
+    db = current_app.config["DB_PATH"]
+    body = request.get_json(silent=True) or {}
+    err = _validate_monitor(body)
+    if err:
+        return jsonify({"error": err}), 400
+    now = int(time.time())
+    mid = dbm.create_record(db, "custom_monitors", dict(
+        type=body["type"], name=body["name"].strip(),
+        target=body["target"].strip(),
+        port=body.get("port", 443),
+        expiry_at=body.get("expiry_at"),
+        days_left=body.get("days_left"),
+        warn_days=body.get("warn_days", 0),
+        severity=body.get("severity", ""),
+        channels=body.get("channels", []),
+        enabled=1,
+        detail=body.get("detail", {}),
+        error="",
+        created_at=now, updated_at=now))
+    audit("create_monitor", "custom_monitor", mid, {"name": body["name"]})
+    return jsonify({"id": mid})
+
+
+@alert_bp.route("/alerts/monitors/<int:monitor_id>", methods=["PUT"])
+@require_auth
+@require_role("admin", "operator")
+def update_monitor(monitor_id):
+    """编辑监控项"""
+    db = current_app.config["DB_PATH"]
+    old = dbm.get_record(db, "custom_monitors", monitor_id)
+    if not old:
+        return jsonify({"error": "监控项不存在"}), 404
+    body = request.get_json(silent=True) or {}
+    err = _validate_monitor(body, partial=True)
+    if err:
+        return jsonify({"error": err}), 400
+    dbm.update_record(db, "custom_monitors", monitor_id, dict(
+        type=body.get("type", old["type"]),
+        name=(body.get("name") or old["name"]).strip(),
+        target=(body.get("target") or old["target"]).strip(),
+        port=body.get("port", old["port"]),
+        expiry_at=body.get("expiry_at", old["expiry_at"]),
+        days_left=body.get("days_left", old["days_left"]),
+        warn_days=body.get("warn_days", old["warn_days"]),
+        severity=body.get("severity", old.get("severity", "")),
+        channels=body.get("channels", old.get("channels", [])),
+        detail=body.get("detail", old.get("detail", {})),
+        updated_at=int(time.time())))
+    audit("update_monitor", "custom_monitor", monitor_id,
+          {"name": body.get("name", old["name"])})
+    return jsonify({"ok": True})
+
+
+@alert_bp.route("/alerts/monitors/<int:monitor_id>", methods=["DELETE"])
+@require_auth
+@require_role("admin", "operator")
+def delete_monitor(monitor_id):
+    """删除监控项"""
+    db = current_app.config["DB_PATH"]
+    if not dbm.get_record(db, "custom_monitors", monitor_id):
+        return jsonify({"error": "监控项不存在"}), 404
+    dbm.delete_record(db, "custom_monitors", monitor_id)
+    audit("delete_monitor", "custom_monitor", monitor_id)
+    return jsonify({"ok": True})
+
+
+@alert_bp.route("/alerts/monitors/<int:monitor_id>/toggle", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def toggle_monitor(monitor_id):
+    """启用/禁用监控项"""
+    db = current_app.config["DB_PATH"]
+    m = dbm.get_record(db, "custom_monitors", monitor_id)
+    if not m:
+        return jsonify({"error": "监控项不存在"}), 404
+    new_enabled = 0 if m["enabled"] else 1
+    dbm.update_record(db, "custom_monitors", monitor_id,
+                      {"enabled": new_enabled})
+    audit("toggle_monitor", "custom_monitor", monitor_id,
+          {"enabled": new_enabled})
+    return jsonify({"ok": True, "enabled": new_enabled})
+
+
+@alert_bp.route("/alerts/monitors/<int:monitor_id>/check", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def check_monitor(monitor_id):
+    """手动触发 SSL 探测"""
+    from ..ssl_monitor import get_ssl_monitor
+    mon = get_ssl_monitor()
+    if not mon:
+        return jsonify({"error": "SSL 监控未启动"}), 503
+    result = mon.probe_one_now(monitor_id)
+    if "error" in result and len(result) == 1:
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@alert_bp.route("/alerts/monitors/config")
+@require_auth
+def get_monitor_config():
+    """获取全局到期监控配置"""
+    db = current_app.config["DB_PATH"]
+    rows = dbm.list_records(db, "platform_settings",
+                            "key=?", ("custom_monitor_config",))
+    if rows and rows[0]["value"]:
+        try:
+            return jsonify(json.loads(rows[0]["value"]))
+        except ValueError:
+            pass
+    return jsonify({"default_warn_days": 30, "default_severity": "P1",
+                    "default_channels": ["feishu"], "ssl_check_interval": 3600})
+
+
+@alert_bp.route("/alerts/monitors/config", methods=["PUT"])
+@require_auth
+@require_role("admin")
+def put_monitor_config():
+    """更新全局到期监控配置"""
+    db = current_app.config["DB_PATH"]
+    body = request.get_json(silent=True) or {}
+    cfg = {
+        "default_warn_days": int(body.get("default_warn_days", 30)),
+        "default_severity": body.get("default_severity", "P1"),
+        "default_channels": body.get("default_channels", ["feishu"]),
+        "ssl_check_interval": int(body.get("ssl_check_interval", 3600)),
+    }
+    if cfg["default_severity"] not in SEVERITIES:
+        return jsonify({"error": "severity 非法"}), 400
+    now = int(time.time())
+    value = json.dumps(cfg, ensure_ascii=False)
+    rows = dbm.list_records(db, "platform_settings",
+                            "key=?", ("custom_monitor_config",))
+    if rows:
+        dbm.update_record(db, "platform_settings", rows[0]["id"],
+                          {"value": value, "updated_at": now})
+    else:
+        dbm.create_record(db, "platform_settings",
+                          {"key": "custom_monitor_config", "value": value,
+                           "updated_at": now})
+    audit("update_monitor_config", "config", 0, {"config": cfg})
+    return jsonify({"ok": True})
+
+
+def _validate_monitor(body, partial=False) -> str:
+    """监控项校验；返回错误信息，空串=通过"""
+    if not partial:
+        if body.get("type") not in MONITOR_TYPES:
+            return "type 非法"
+        if not (body.get("name") or "").strip():
+            return "名称必填"
+        if not (body.get("target") or "").strip():
+            return "目标必填"
+    if "type" in body and body["type"] not in MONITOR_TYPES:
+        return "type 非法"
+    if "port" in body:
+        try:
+            p = int(body["port"])
+            if p < 1 or p > 65535:
+                return "port 需在 1-65535 之间"
+        except (TypeError, ValueError):
+            return "port 必须为数字"
+    if "warn_days" in body:
+        try:
+            wd = int(body["warn_days"])
+            if wd < 0:
+                return "warn_days 需为非负整数"
+        except (TypeError, ValueError):
+            return "warn_days 必须为数字"
+    if "severity" in body and body["severity"] and body["severity"] not in SEVERITIES:
+        return "severity 非法"
+    if "channels" in body:
+        ch = body.get("channels") or []
+        if not isinstance(ch, list):
+            return "channels 需为列表"
+        if ch and not set(ch) <= set(CHANNELS):
+            return "channels 包含非法渠道"
+    # 非 SSL 类型需要到期时间
+    if not partial and body.get("type") != "ssl":
+        if not body.get("expiry_at") and body.get("days_left") is None:
+            return "非 SSL 类型需提供 expiry_at 或 days_left"
+    return ""
