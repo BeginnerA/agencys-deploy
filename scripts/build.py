@@ -8,6 +8,67 @@ from pathlib import Path
 from common import load_config, get_project_config, get_registry_auth, get_registry_mode, log, fail
 
 
+def git_prepare(proj: dict, project_root: Path) -> None:
+    """构建前 Git 准备：切换分支 + 拉取最新代码
+
+    行为由 projects.yaml（或 DB services 表）的两个字段控制：
+      git_branch            - 构建前 checkout 的分支/tag，留空则不切换
+      git_pull_before_build - 为 true 时在 checkout 后执行 git pull
+
+    Git 操作失败仅告警，不阻断构建流程（与 git_tag 保持一致）。
+    """
+    repo = (proj.get("git_repo") or "").strip()
+    if not repo:
+        return
+    repo_path = project_root / repo
+    if not (repo_path / ".git").exists():
+        log(f"警告: {repo_path} 不是 Git 仓库，跳过构建前 Git 操作")
+        return
+
+    branch = (proj.get("git_branch") or "").strip()
+    pull = bool(proj.get("git_pull_before_build"))
+
+    if not branch and not pull:
+        return  # 两个都没配置，直接跳过
+
+    log(f"构建前 Git 准备: {repo}（branch={branch or '当前'}, pull={pull}）")
+
+    # 1. 切换分支/tag
+    if branch:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_path), "checkout", branch],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                log(f"警告: git checkout {branch} 失败（不阻断构建）: {result.stderr.strip()}")
+                return  # checkout 失败就不继续 pull 了
+            log(f"git checkout {branch} 完成")
+        except subprocess.TimeoutExpired:
+            log(f"警告: git checkout {branch} 超时，跳过")
+            return
+        except FileNotFoundError:
+            log("警告: git 命令不存在，跳过构建前 Git 操作")
+            return
+
+    # 2. 拉取最新代码
+    if pull:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_path), "pull", "--ff-only"],
+                capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                log(f"警告: git pull 失败（不阻断构建）: {result.stderr.strip()}")
+            else:
+                summary = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "Already up to date."
+                log(f"git pull 完成: {summary}")
+        except subprocess.TimeoutExpired:
+            log("警告: git pull 超时，跳过")
+        except FileNotFoundError:
+            log("警告: git 命令不存在，跳过 git pull")
+
+
 def find_mvn(config: dict = None) -> str:
     """跨平台定位 mvn 可执行文件（绝对路径）
 
@@ -152,6 +213,9 @@ def build_project(project_name: str, version: str, env: str = None):
     if not project_root.exists():
         log(f"警告: 项目根目录不存在: {project_root}（Docker 部署时请勾选「跳过构建」，或在宿主机上确认路径存在）")
         return
+
+    # 构建前 Git 准备：切换分支 + 拉取最新代码（配置了才执行，失败不阻断）
+    git_prepare(proj, project_root)
 
     if mode == "push":
         docker_login(registry)

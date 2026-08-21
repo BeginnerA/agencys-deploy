@@ -124,26 +124,32 @@
           ${svcs.map(s => `<tr style="${s.enabled ? '' : 'opacity:0.5'}">
             <td>${esc(s.name)}</td><td class="num">${esc(s.image_name)}</td><td class="num">${esc(s.service_name)}</td>
             <td class="num">${s.health_port ?? '-'}</td>
-            <td><label class="switch" style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer" title="${s.enabled ? '点击停用' : '点击启用'}">
-              <input type="checkbox" ${s.enabled ? 'checked' : ''} data-toggle="${s.id}" style="opacity:0;width:0;height:0">
+            <td><div data-toggle-div="${s.id}" style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer;border-radius:10px" title="${s.enabled ? '点击停用' : '点击启用'}">
+              <input type="checkbox" ${s.enabled ? 'checked' : ''} data-toggle="${s.id}" style="display:none">
               <span style="position:absolute;inset:0;background:${s.enabled ? 'var(--c-success,#22c55e)' : 'var(--c-muted,#888)'};border-radius:10px;transition:.2s"></span>
               <span style="position:absolute;left:${s.enabled ? '18px' : '2px'};top:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:.2s"></span>
-            </label></td>
+            </div></td>
             <td><button class="btn sm ghost" data-edit="${s.id}">编辑</button>
                 <button class="btn sm danger" data-del="${s.id}">删除</button></td>
           </tr>`).join('')}</tbody></table></div>`
         : `<div class="empty-state"><div class="e-ico">🧩</div><div>暂无服务，点右上角新建</div></div>`}</div>`;
       // 快速切换启用/停用
-      sb.querySelectorAll('[data-toggle]').forEach(async cb => {
-        cb.onchange = async () => {
-          const sid = Number(cb.dataset.toggle);
+      sb.querySelectorAll('[data-toggle-div]').forEach(async div => {
+        div.onclick = async () => {
+          const sid = Number(div.dataset.toggleDiv);
           const s = svcs.find(x => x.id === sid);
           if (!s) return;
+          const cb = div.querySelector('input[type=checkbox]');
+          cb.checked = !cb.checked;
+          // 更新视觉
+          const spans = div.querySelectorAll('span');
+          spans[0].style.background = cb.checked ? 'var(--c-success,#22c55e)' : 'var(--c-muted,#888)';
+          spans[1].style.left = cb.checked ? '18px' : '2px';
           try{
             await api(`/api/projects/${project.id}/services/${sid}`, { method: 'PUT', body: JSON.stringify({ enabled: cb.checked }) });
             toastSuccess(cb.checked ? `已启用「${s.name}」` : `已停用「${s.name}」`);
             await renderServices(sb, project);
-          }catch(e){ toastError(e.message); cb.checked = !cb.checked; }
+          }catch(e){ toastError(e.message); cb.checked = !cb.checked; await renderServices(sb, project); }
         };
       });
       document.getElementById('addSvc').onclick = () => cfgServiceForm.open(sb, project, null, () => renderServices(sb, project));

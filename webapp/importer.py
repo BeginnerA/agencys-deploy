@@ -58,6 +58,8 @@ def _import_projects(db_path: str, path: Path) -> tuple:
             log_error_keywords=cfg.get("log_error_keywords", []) or [],
             clear_log_dir=cfg.get("clear_log_dir", ""),
             git_repo=cfg.get("git_repo", ""),
+            git_branch=cfg.get("git_branch", ""),
+            git_pull_before_build=1 if cfg.get("git_pull_before_build") else 0,
             enabled=1))
         n += 1
     return True, f"项目 code={code}，导入服务 {n} 个"

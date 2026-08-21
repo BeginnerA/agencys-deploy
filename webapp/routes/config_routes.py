@@ -252,6 +252,8 @@ def create_service(pid):
                   log_error_keywords=lists["log_error_keywords"],
                   clear_log_dir=body.get("clear_log_dir", ""),
                   git_repo=body.get("git_repo", ""),
+                  git_branch=body.get("git_branch", ""),
+                  git_pull_before_build=1 if _bool_field(body, "git_pull_before_build", False) else 0,
                   enabled=1 if enabled else 0)
     sid = dbm.create_record(current_app.config["DB_PATH"], "services", fields)
     audit("create_service", "service", sid, {"name": name, "pid": pid})
@@ -276,7 +278,7 @@ def update_service(pid, sid):
         return _err("name 不能为空")
     allowed = ("name", "image_name", "service_name", "docker_context",
                "dockerfile", "snailjob_group", "health_url",
-               "clear_log_dir", "git_repo")
+               "clear_log_dir", "git_repo", "git_branch")
     fields = {k: v for k, v in body.items() if k in allowed}
     for k in _LIST_FIELDS_SERVICE:
         if k in body:
@@ -293,6 +295,11 @@ def update_service(pid, sid):
         if enabled is None:
             return _err("enabled 必须为布尔值")
         fields["enabled"] = 1 if enabled else 0
+    if "git_pull_before_build" in body:
+        gpb = _bool_field(body, "git_pull_before_build")
+        if gpb is None:
+            return _err("git_pull_before_build 必须为布尔值")
+        fields["git_pull_before_build"] = 1 if gpb else 0
     if fields:
         dbm.update_record(current_app.config["DB_PATH"], "services", sid, fields)
     audit("update_service", "service", sid, {"name": rec["name"]})

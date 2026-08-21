@@ -176,14 +176,30 @@
         return;
       }
       // 基本信息区
-      const basic = `<div class="form-grid">
-        <div class="field"><label>环境名称 *（字母数字 _ -，保存后不可改）</label><input id="envName" value="${esc(st.data.name)}" ${env ? 'disabled' : ''} placeholder="如 prod / test / dev"></div>
-        <div class="field"><label>Maven Profile</label><select id="envProfile">
+      const basic = `<div class="form-grid" style="grid-template-areas:'name profile' 'def profile' 'mon profile';grid-template-columns:1fr 1fr">
+        <div class="field" style="grid-area:name"><label>环境名称 *（字母数字 _ -，保存后不可改）</label><input id="envName" value="${esc(st.data.name)}" ${env ? 'disabled' : ''} placeholder="如 prod / test / dev"></div>
+        <div class="field" style="grid-area:def;display:flex;align-items:center;gap:10px">
+          <label style="margin:0;white-space:nowrap">默认环境</label>
+          <input type="checkbox" id="envDef" ${st.data.is_default ? 'checked' : ''} style="display:none">
+          <div id="swDefEnv" style="position:relative;display:inline-block;width:40px;height:22px;cursor:pointer;border-radius:11px">
+            <span id="swDefEnvBg" style="position:absolute;inset:0;background:${st.data.is_default ? 'var(--c-primary,#4f7cff)' : 'var(--c-muted,#888)'};border-radius:11px;transition:.2s"></span>
+            <span id="swDefEnvDot" style="position:absolute;left:${st.data.is_default ? '20px' : '2px'};top:2px;width:18px;height:18px;background:#fff;border-radius:50%;transition:.2s"></span>
+          </div>
+          <span id="swDefEnvTxt" class="weak" style="font-size:12px">${st.data.is_default ? '是 — 作为项目默认发布环境' : '否 — 非默认环境'}</span>
+        </div>
+        <div class="field" style="grid-area:mon;display:flex;align-items:center;gap:10px">
+          <label style="margin:0;white-space:nowrap">启用监控</label>
+          <input type="checkbox" id="envMon" ${st.data.monitor_enabled ? 'checked' : ''} style="display:none">
+          <div id="swMonEnv" style="position:relative;display:inline-block;width:40px;height:22px;cursor:pointer;border-radius:11px">
+            <span id="swMonEnvBg" style="position:absolute;inset:0;background:${st.data.monitor_enabled ? 'var(--c-primary,#4f7cff)' : 'var(--c-muted,#888)'};border-radius:11px;transition:.2s"></span>
+            <span id="swMonEnvDot" style="position:absolute;left:${st.data.monitor_enabled ? '20px' : '2px'};top:2px;width:18px;height:18px;background:#fff;border-radius:50%;transition:.2s"></span>
+          </div>
+          <span id="swMonEnvTxt" class="weak" style="font-size:12px">${st.data.monitor_enabled ? '已启用 — 采集指标与告警' : '未启用 — 不采集监控数据'}</span>
+        </div>
+        <div class="field" style="grid-area:profile"><label>Maven Profile</label><select id="envProfile">
           <option value="">留空自动推导</option>
           ${['prod','test','dev','custom'].map(p => `<option value="${p}" ${st.data.maven_profile === p ? 'selected' : ''}>${p}</option>`).join('')}
         </select>
-        <div class="field check" style="align-self:end"><label><input type="checkbox" id="envDef" ${st.data.is_default ? 'checked' : ''}> 默认环境</label></div>
-        <div class="field check" style="align-self:end"><label><input type="checkbox" id="envMon" ${st.data.monitor_enabled ? 'checked' : ''}> 启用监控</label></div>
       </div>`;
       const sections = [
         H.section({ id:'registry', icon:'📦', title:'镜像分发（registry）', desc:'direct=直传无需仓库 / push=推送到仓库', open: !!Object.keys(st.data.registry || {}).length, body: blockForm('registry') }),
@@ -198,6 +214,22 @@
         ${sections.map(s => s.html).join('')}
         <div class="f-hint">带 * 为必填；? 图标悬停查看字段用途；分区折叠不影响已填内容。</div>`;
       sections.forEach(s => s.bind());
+      // 开关绑定：点击 div 切换 checkbox + 更新视觉
+      function bindEnvToggle(divId, cbId, bgId, dotId, txtId, onText, offText) {
+        const div = document.getElementById(divId);
+        if (!div) return;
+        div.onclick = () => {
+          const cb = document.getElementById(cbId);
+          cb.checked = !cb.checked;
+          document.getElementById(bgId).style.background = cb.checked ? 'var(--c-primary,#4f7cff)' : 'var(--c-muted,#888)';
+          document.getElementById(dotId).style.left = cb.checked ? '20px' : '2px';
+          document.getElementById(txtId).textContent = cb.checked ? onText : offText;
+        };
+      }
+      bindEnvToggle('swDefEnv', 'envDef', 'swDefEnvBg', 'swDefEnvDot', 'swDefEnvTxt',
+        '是 — 作为项目默认发布环境', '否 — 非默认环境');
+      bindEnvToggle('swMonEnv', 'envMon', 'swMonEnvBg', 'swMonEnvDot', 'swMonEnvTxt',
+        '已启用 — 采集指标与告警', '未启用 — 不采集监控数据');
       refreshBadges();
     }
     function blockForm(block){

@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS services (
     log_error_keywords TEXT DEFAULT '[]',
     clear_log_dir TEXT DEFAULT '',
     git_repo TEXT DEFAULT '',
+    git_branch TEXT DEFAULT '',
+    git_pull_before_build INTEGER DEFAULT 0,
     enabled INTEGER DEFAULT 1,
     UNIQUE(project_id, name)
 );
@@ -387,9 +389,15 @@ def _migrate(conn):
     ar_cols = {r["name"] for r in conn.execute("PRAGMA table_info(alert_rules)")}
     if "exclude_keyword" not in ar_cols:
         conn.execute("ALTER TABLE alert_rules ADD COLUMN exclude_keyword TEXT DEFAULT ''")
+    # services 表新增 git_branch / git_pull_before_build 列（构建前 Git 操作）
+    srv_cols_now = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
+    if "git_branch" not in srv_cols_now:
+        conn.execute("ALTER TABLE services ADD COLUMN git_branch TEXT DEFAULT ''")
+    if "git_pull_before_build" not in srv_cols_now:
+        conn.execute("ALTER TABLE services ADD COLUMN git_pull_before_build INTEGER DEFAULT 0")
     # servers 表 role 列已废弃（发布顺序由 env_servers.order_no 决定），存量库删除该列
-    srv_cols_now = {r["name"] for r in conn.execute("PRAGMA table_info(servers)")}
-    if "role" in srv_cols_now:
+    srv_cols_now2 = {r["name"] for r in conn.execute("PRAGMA table_info(servers)")}
+    if "role" in srv_cols_now2:
         conn.execute("ALTER TABLE servers DROP COLUMN role")
 
 

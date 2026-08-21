@@ -9,6 +9,7 @@
       svcs: [],
       data: svc ? Object.assign(JSON.parse(JSON.stringify(svc)), { enabled: !!svc.enabled }) : {
         name:'', image_name:'', service_name:'', git_repo:'',
+        git_branch:'', git_pull_before_build:false,
         build_order:[], docker_context:'', dockerfile:'',
         nacos_groups:[], dubbo_services:[], snailjob_group:'',
         health_port:'', health_url:'',
@@ -37,16 +38,26 @@
         <div class="form-grid">
           <div class="field full" style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
             <label style="margin:0;white-space:nowrap">启用状态</label>
-            <label class="switch" style="position:relative;display:inline-block;width:40px;height:22px;cursor:pointer">
-              <input type="checkbox" id="sEnabled" ${d.enabled ? 'checked' : ''} style="opacity:0;width:0;height:0">
-              <span style="position:absolute;inset:0;background:${d.enabled ? 'var(--c-primary,#4f7cff)' : 'var(--c-muted,#888)'};border-radius:11px;transition:.2s"></span>
-              <span style="position:absolute;left:${d.enabled ? '20px' : '2px'};top:2px;width:18px;height:18px;background:#fff;border-radius:50%;transition:.2s"></span>
-            </label>
-            <span class="weak" style="font-size:12px">${d.enabled ? '启用中 — 参与监控、告警与发布' : '已停用 — 不出现在监控/告警/总览'}</span>
+            <input type="checkbox" id="sEnabled" ${d.enabled ? 'checked' : ''} style="display:none">
+            <div id="swEnabled" style="position:relative;display:inline-block;width:40px;height:22px;cursor:pointer;border-radius:11px">
+              <span id="swEnabledBg" style="position:absolute;inset:0;background:${d.enabled ? 'var(--c-primary,#4f7cff)' : 'var(--c-muted,#888)'};border-radius:11px;transition:.2s"></span>
+              <span id="swEnabledDot" style="position:absolute;left:${d.enabled ? '20px' : '2px'};top:2px;width:18px;height:18px;background:#fff;border-radius:50%;transition:.2s"></span>
+            </div>
+            <span id="swEnabledTxt" class="weak" style="font-size:12px">${d.enabled ? '启用中 — 参与监控、告警与发布' : '已停用 — 不出现在监控/告警/总览'}</span>
           </div>
           ${H.field({ label:'服务名', required:true, tip:'发布命令 --project 参数；须与 docker-compose 服务名、镜像名对应；项目内唯一', input:`<input id="sName" value="${esc(d.name)}" placeholder="如 service-biz">`, hint:'被流水线 stages 引用后改名不受影响（引用按 id），但请同步更新发布习惯' })}
           ${H.field({ label:'镜像短名', required:true, tip:'完整镜像名 = {registry}/{namespace}/{image_name}:{version}', input:`<input id="sImage" value="${esc(d.image_name)}" placeholder="如 biz">`, hint:'不要带命名空间前缀，命名空间来自环境配置' })}
           ${H.field({ label:'Git 仓库路径', required:true, tip:'相对 deploy.project_root；发布成功后在仓库打 v{version} tag 并推送远端', input:`<input id="sGit" value="${esc(d.git_repo)}" placeholder="如 service-biz">`, hint:'多服务共用仓库时填仓库目录名' })}
+          ${H.field({ label:'构建分支', tip:'构建前 checkout 的分支或 tag；留空则不切换，使用当前分支', input:`<input id="sGitBranch" value="${esc(d.git_branch || '')}" placeholder="如 master / v1.0.0">` })}
+          <div class="field full" style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+            <label style="margin:0;white-space:nowrap">构建前拉取代码</label>
+            <input type="checkbox" id="sGitPull" ${d.git_pull_before_build ? 'checked' : ''} style="display:none">
+            <div id="swGitPull" style="position:relative;display:inline-block;width:40px;height:22px;cursor:pointer;border-radius:11px">
+              <span id="swGitPullBg" style="position:absolute;inset:0;background:${d.git_pull_before_build ? 'var(--c-primary,#4f7cff)' : 'var(--c-muted,#888)'};border-radius:11px;transition:.2s"></span>
+              <span id="swGitPullDot" style="position:absolute;left:${d.git_pull_before_build ? '20px' : '2px'};top:2px;width:18px;height:18px;background:#fff;border-radius:50%;transition:.2s"></span>
+            </div>
+            <span id="swGitPullTxt" class="weak" style="font-size:12px">${d.git_pull_before_build ? '开启 — 构建前执行 git pull 拉取最新代码' : '关闭 — 使用本地现有代码构建'}</span>
+          </div>
           ${H.field({ label:'docker-compose 服务名', required:true, tip:'docker-compose.yml 里的服务名', input:`<input id="sCompose" value="${esc(d.service_name)}" placeholder="留空自动填服务名">` })}
         </div>`;
       // ② 构建配置
@@ -111,6 +122,23 @@
       H.tagInput({ id:'sDubbo', values: d.dubbo_services }).bind();
       H.tagInput({ id:'sLogKw', values: d.log_error_keywords }).bind();
 
+      // 开关绑定：点击 div 切换 checkbox + 更新视觉
+      function bindToggle(divId, cbId, bgId, dotId, txtId, onText, offText, w, h) {
+        const div = document.getElementById(divId);
+        if (!div) return;
+        div.onclick = () => {
+          const cb = document.getElementById(cbId);
+          cb.checked = !cb.checked;
+          document.getElementById(bgId).style.background = cb.checked ? 'var(--c-primary,#4f7cff)' : 'var(--c-muted,#888)';
+          document.getElementById(dotId).style.left = cb.checked ? (w - 20) + 'px' : '2px';
+          document.getElementById(txtId).textContent = cb.checked ? onText : offText;
+        };
+      }
+      bindToggle('swEnabled', 'sEnabled', 'swEnabledBg', 'swEnabledDot', 'swEnabledTxt',
+        '启用中 — 参与监控、告警与发布', '已停用 — 不出现在监控/告警/总览', 40, 22);
+      bindToggle('swGitPull', 'sGitPull', 'swGitPullBg', 'swGitPullDot', 'swGitPullTxt',
+        '开启 — 构建前执行 git pull 拉取最新代码', '关闭 — 使用本地现有代码构建', 40, 22);
+
       const copySel = document.getElementById('svcCopy');
       if (copySel) copySel.onchange = e => {
         const src = st.svcs.find(x => x.id === Number(e.target.value));
@@ -126,7 +154,8 @@
         const d = st.data;
         const payload = {
           name: d.name, image_name: d.image_name, service_name: d.service_name || d.name,
-          git_repo: d.git_repo, docker_context: d.docker_context, dockerfile: d.dockerfile,
+          git_repo: d.git_repo, git_branch: d.git_branch, git_pull_before_build: d.git_pull_before_build,
+          docker_context: d.docker_context, dockerfile: d.dockerfile,
           build_order: d.build_order, nacos_groups: d.nacos_groups, dubbo_services: d.dubbo_services,
           snailjob_group: d.snailjob_group, health_url: d.health_url,
           health_port: d.health_port, log_error_keywords: d.log_error_keywords, clear_log_dir: d.clear_log_dir,
@@ -148,6 +177,8 @@
       d.name = val('sName').trim();
       d.image_name = val('sImage').trim();
       d.git_repo = val('sGit').trim();
+      d.git_branch = val('sGitBranch').trim();
+      d.git_pull_before_build = document.getElementById('sGitPull').checked;
       d.service_name = val('sCompose').trim();
       d.docker_context = val('sDockerCtx').trim();
       d.dockerfile = val('sDockerfile').trim();

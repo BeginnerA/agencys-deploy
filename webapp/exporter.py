@@ -46,6 +46,10 @@ def export_projects_yaml(db_path: str, project_id: int) -> str:
             "dubbo_services": s["dubbo_services"] or [],
             "snailjob_group": s["snailjob_group"],
         }
+        if s.get("git_branch"):
+            cfg["git_branch"] = s["git_branch"]
+        if s.get("git_pull_before_build"):
+            cfg["git_pull_before_build"] = True
         if s["health_url"]:
             cfg["health_url"] = s["health_url"]
         if s["health_port"]:
