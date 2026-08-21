@@ -1695,18 +1695,11 @@
               return `<label class="rule-ch-cb"><input type="checkbox" value="${v}" ${checked?'checked':''}> ${l}</label>`;
             }).join('')}</div></div>
         <div class="field full"><label>备注</label><input id="mfRemark" value="${m ? esc(m.detail && m.detail.remark || '') : ''}" placeholder="可选"></div>
-        <div class="full" style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
-          <button class="btn" id="mfCancel">取消</button>
-          <button class="btn primary" id="mfSave">${monitorSaving ? '保存中...' : '保存'}</button>
-        </div>
-      </div>`;
+      </div>
+      <div style="display:flex;gap:10px;margin-top:20px"><button class="btn primary flex-1" id="mfSave">${monitorSaving ? '保存中...' : '保存'}</button></div>`;
 
     openDrawer({ title, body: bodyHTML, wide: true });
 
-    document.getElementById('mfCancel').onclick = () => {
-      const c = document.getElementById('dwClose');
-      if (c) c.click();
-    };
     document.getElementById('mfSave').onclick = saveMonitorForm;
 
     // SSL 类型时隐藏到期时间和剩余天数（自动检测）
@@ -1820,18 +1813,11 @@
         <div class="field"><label>SSL 检测周期（秒）</label>
           <input id="mcInterval" type="number" value="${cfg.ssl_check_interval || 3600}">
         </div>
-        <div class="full" style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
-          <button class="btn" id="mcCancel">取消</button>
-          <button class="btn primary" id="mcSave">保存</button>
-        </div>
-      </div>`;
+      </div>
+      <div style="display:flex;gap:10px;margin-top:20px"><button class="btn primary flex-1" id="mcSave">保存</button></div>`;
 
     openDrawer({ title: '到期监控全局配置', body: bodyHTML });
 
-    document.getElementById('mcCancel').onclick = () => {
-      const c = document.getElementById('dwClose');
-      if (c) c.click();
-    };
     document.getElementById('mcSave').onclick = async () => {
       try {
         const channels = [...document.querySelectorAll('#mcChannelsWrap input:checked')].map(c => c.value);
