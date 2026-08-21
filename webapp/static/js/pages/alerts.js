@@ -1,9 +1,9 @@
-// pages/alerts.js — 告警中心（告警列表 Tab + 规则管理 Tab + 静默窗口 Tab + 历史统计 Tab，消费后端 /api/alerts API）
+// pages/alerts.js — 告警中心（告警列表 Tab + 规则管理 Tab + 静默窗口 Tab + 历史统计 Tab + 到期监控 Tab，消费后端 /api/alerts API）
 (function(){
   let timer = null;
   let destroyed = false;
   let searchTimer = null;
-  let currentTab = 'alerts';  // Tab 切换：alerts | rules | silences | stats
+  let currentTab = 'alerts';  // Tab 切换：alerts | rules | silences | stats | monitors
 
   // 告警列表状态
   let alerts = [];
@@ -144,6 +144,7 @@
         <button class="tab-btn ${currentTab==='rules'?'active':''}" data-tab="rules">📏 规则管理</button>
         <button class="tab-btn ${currentTab==='silences'?'active':''}" data-tab="silences">🔕 静默窗口</button>
         <button class="tab-btn ${currentTab==='stats'?'active':''}" data-tab="stats">📊 历史统计</button>
+        <button class="tab-btn ${currentTab==='monitors'?'active':''}" data-tab="monitors">📜 到期监控</button>
       </div>
       <div id="tabContent"></div>`;
     root.querySelectorAll('.tab-btn[data-tab]').forEach(btn => {
@@ -153,6 +154,7 @@
     else if (currentTab === 'rules') renderRulesTab();
     else if (currentTab === 'silences') renderSilencesTab();
     else if (currentTab === 'stats') renderStatsTab();
+    else if (currentTab === 'monitors') renderMonitorsTab();
   }
 
   function switchTab(tab){
@@ -163,6 +165,7 @@
     else if (tab === 'rules') { loadRules(); }
     else if (tab === 'silences') { loadSilences(); }
     else if (tab === 'stats') { loadStats(); }
+    else if (tab === 'monitors') { loadMonitors(); }
   }
 
   // ==================== 告警列表 Tab ====================
@@ -1577,6 +1580,283 @@
     }
   }
 
+  // ==================== 到期监控 Tab ====================
+
+  let monitors = [];
+  let editingMonitorId = null;
+  let monitorSaving = false;
+  let monitorConfig = {};
+
+  const MONITOR_TYPES = [['ssl','SSL 证书'],['cloud_renewal','云产品续费'],['license','License 授权'],['custom','自定义']];
+  const MT_LABELS = Object.fromEntries(MONITOR_TYPES);
+
+  async function loadMonitors(){
+    try {
+      const [list, cfg] = await Promise.all([
+        api('/api/alerts/monitors'),
+        api('/api/alerts/monitors/config')
+      ]);
+      if (destroyed) return;
+      monitors = list || [];
+      monitorConfig = cfg || {};
+      renderMonitorsTab();
+    } catch(e) {
+      console.warn('loadMonitors failed', e);
+    }
+  }
+
+  function renderMonitorsTab(){
+    const tc = document.getElementById('tabContent');
+    if (!tc) return;
+    const canManage = ['admin','operator'].includes(currentUser().role);
+    tc.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h3 style="margin:0">到期监控</h3>
+        <div style="display:flex;gap:8px">
+          ${canManage ? '<button class="btn sm primary" id="monAddBtn">+ 添加监控</button>' : ''}
+          <button class="btn sm ghost" id="monConfigBtn">⚙ 全局配置</button>
+        </div>
+      </div>
+      <div class="mon-summary">
+        <span class="mon-summary-item">总计 <b>${monitors.length}</b> 项</span>
+        <span class="mon-summary-item warn">即将到期 <b>${monitors.filter(m => m.days_left != null && m.days_left <= 30).length}</b> 项</span>
+        <span class="mon-summary-item danger">已到期 <b>${monitors.filter(m => m.days_left != null && m.days_left <= 0).length}</b> 项</span>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr>
+            <th>类型</th><th>名称</th><th>目标</th><th>剩余天数</th>
+            <th>通知阈值</th><th>状态</th><th>最近检测</th><th>操作</th>
+          </tr></thead>
+          <tbody>
+            ${monitors.length === 0 ? '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">暂无监控项，点击「添加监控」开始</td></tr>' :
+              monitors.map(m => {
+                const daysCls = m.days_left == null ? 'muted' : m.days_left <= 0 ? 'danger' : m.days_left <= 7 ? 'danger' : m.days_left <= 30 ? 'warn' : '';
+                const daysText = m.days_left == null ? '<span class="muted">未检测</span>' : `${m.days_left} 天`;
+                const threshold = m.warn_days > 0 ? `${m.warn_days} 天` : '全局默认';
+                const checkedText = m.last_checked ? fmtTime(m.last_checked) : '<span class="muted">未检测</span>';
+                const detail = m.detail || {};
+                const certInfo = m.type === 'ssl' && detail.cert_issuer ? `<div class="muted" style="font-size:12px">${esc(detail.cert_issuer)}</div>` : '';
+                return `<tr>
+                  <td><span class="badge" style="font-size:11px">${esc(MT_LABELS[m.type] || m.type)}</span></td>
+                  <td>${esc(m.name)}${certInfo}</td>
+                  <td>${esc(m.target)}${m.port && m.port !== 443 ? ':' + m.port : ''}</td>
+                  <td class="${daysCls}" style="font-weight:600">${daysText}</td>
+                  <td>${threshold}</td>
+                  <td>${m.enabled ? '<span class="badge success">启用</span>' : '<span class="badge">禁用</span>'}</td>
+                  <td>${checkedText}</td>
+                  <td>
+                    ${m.type === 'ssl' && m.enabled ? `<button class="btn xs ghost mon-check-btn" data-id="${m.id}">检测</button>` : ''}
+                    ${canManage ? `
+                      <button class="btn xs ghost mon-edit-btn" data-id="${m.id}">编辑</button>
+                      <button class="btn xs ghost mon-toggle-btn" data-id="${m.id}">${m.enabled ? '禁用' : '启用'}</button>
+                      <button class="btn xs ghost mon-del-btn" data-id="${m.id}">删除</button>
+                    ` : ''}
+                  </td>
+                </tr>`;
+              }).join('')}
+          </tbody>
+        </table>
+      </div>`;
+
+    // Bind events
+    const addBtn = document.getElementById('monAddBtn');
+    if (addBtn) addBtn.onclick = () => openMonitorForm();
+    const cfgBtn = document.getElementById('monConfigBtn');
+    if (cfgBtn) cfgBtn.onclick = () => openMonitorConfig();
+    tc.querySelectorAll('.mon-check-btn').forEach(b => b.onclick = () => checkMonitor(Number(b.dataset.id)));
+    tc.querySelectorAll('.mon-edit-btn').forEach(b => b.onclick = () => openMonitorForm(Number(b.dataset.id)));
+    tc.querySelectorAll('.mon-toggle-btn').forEach(b => b.onclick = () => toggleMonitor(Number(b.dataset.id)));
+    tc.querySelectorAll('.mon-del-btn').forEach(b => b.onclick = () => deleteMonitor(Number(b.dataset.id)));
+  }
+
+  function openMonitorForm(id){
+    const m = id ? monitors.find(x => x.id === id) : null;
+    editingMonitorId = id || null;
+    const title = m ? `编辑监控: ${m.name}` : '添加监控';
+    const type = m ? m.type : 'ssl';
+    const bodyHTML = `
+      <div class="form-grid">
+        <label>类型
+          <select id="mfTypes">
+            ${MONITOR_TYPES.map(([v,l]) => `<option value="${v}" ${type===v?'selected':''}>${l}</option>`).join('')}
+          </select>
+        </label>
+        <label>名称 <input id="mfName" value="${m ? esc(m.name) : ''}" placeholder="如：API 网关证书"></label>
+        <label>目标 <input id="mfTarget" value="${m ? esc(m.target) : ''}" placeholder="SSL: 域名，其他: 产品标识等"></label>
+        <label>端口 <input id="mfPort" type="number" value="${m ? m.port || 443 : 443}" placeholder="443（仅 SSL 有效）"></label>
+        <label>到期时间 <input id="mfExpiry" type="datetime-local" value="${m && m.expiry_at ? new Date(m.expiry_at * 1000).toISOString().slice(0,16) : ''}"></label>
+        <label>剩余天数 <input id="mfDaysLeft" type="number" value="${m && m.days_left != null ? m.days_left : ''}" placeholder="SSL 类型自动检测"></label>
+        <label>提前通知天数 <input id="mfWarnDays" type="number" value="${m ? m.warn_days || 0 : 0}" placeholder="0 = 跟随全局"></label>
+        <label>告警级别
+          <select id="mfSeverity">
+            <option value="">跟随全局</option>
+            ${SEVERITIES.map(([v,l]) => `<option value="${v}" ${m && m.severity===v?'selected':''}>${l}</option>`).join('')}
+          </select>
+        </label>
+        <label>通知渠道（空=跟随全局）
+          <div id="mfChannelsWrap" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">
+            ${CHANNELS.map(([v,l]) => {
+              const checked = m && m.channels && m.channels.length ? m.channels.includes(v) : false;
+              return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" value="${v}" ${checked?'checked':''}>${l}</label>`;
+            }).join('')}
+          </div>
+        </label>
+        <label>备注 <input id="mfRemark" value="${m ? esc(m.detail && m.detail.remark || '') : ''}" placeholder="可选"></label>
+      </div>`;
+
+    openDrawer({ title, body: bodyHTML, wide: true,
+      footer: `<button class="btn primary" id="mfSave">${monitorSaving ? '保存中...' : '保存'}</button>
+               <button class="btn ghost" id="mfCancel">取消</button>`
+    });
+
+    document.getElementById('mfCancel').onclick = () => {
+      const c = document.getElementById('dwClose');
+      if (c) c.click();
+    };
+    document.getElementById('mfSave').onclick = saveMonitorForm;
+
+    // SSL 类型时隐藏到期时间和剩余天数（自动检测）
+    const typeSelect = document.getElementById('mfTypes');
+    const expiryLabel = document.getElementById('mfExpiry').closest('label');
+    const daysLabel = document.getElementById('mfDaysLeft').closest('label');
+    function toggleSslFields(){
+      const isSsl = document.getElementById('mfTypes').value === 'ssl';
+      expiryLabel.style.display = isSsl ? 'none' : '';
+      daysLabel.style.display = isSsl ? 'none' : '';
+    }
+    typeSelect.onchange = toggleSslFields;
+    toggleSslFields();
+  }
+
+  async function saveMonitorForm(){
+    if (monitorSaving) return;
+    monitorSaving = true;
+    const saveBtn = document.getElementById('mfSave');
+    if (saveBtn) saveBtn.textContent = '保存中...';
+    try {
+      const type = document.getElementById('mfTypes').value;
+      const name = document.getElementById('mfName').value.trim();
+      const target = document.getElementById('mfTarget').value.trim();
+      if (!name) { toastError('名称必填'); return; }
+      if (!target) { toastError('目标必填'); return; }
+
+      const channels = [...document.querySelectorAll('#mfChannelsWrap input:checked')].map(c => c.value);
+      const expiryRaw = document.getElementById('mfExpiry').value;
+      const daysRaw = document.getElementById('mfDaysLeft').value;
+
+      const payload = {
+        type,
+        name,
+        target,
+        port: type === 'ssl' ? (parseInt(document.getElementById('mfPort').value) || 443) : 0,
+        warn_days: parseInt(document.getElementById('mfWarnDays').value) || 0,
+        severity: document.getElementById('mfSeverity').value || '',
+        channels,
+      };
+
+      // 非 SSL 类型提供到期信息
+      if (type !== 'ssl') {
+        if (expiryRaw) payload.expiry_at = Math.floor(new Date(expiryRaw).getTime() / 1000);
+        if (daysRaw) payload.days_left = Number(daysRaw);
+        else if (!expiryRaw) { toastError('非 SSL 类型需提供到期时间或剩余天数'); return; }
+      }
+
+      if (editingMonitorId) {
+        await api(`/api/alerts/monitors/${editingMonitorId}`, {method:'PUT', body: JSON.stringify(payload)});
+        toastSuccess('监控项已更新');
+      } else {
+        await api('/api/alerts/monitors', {method:'POST', body: JSON.stringify(payload)});
+        toastSuccess('监控项已创建');
+      }
+      const c = document.getElementById('dwClose');
+      if (c) c.click();
+      loadMonitors();
+    } catch(e) {
+      toastError(e.message || '保存失败');
+    } finally {
+      monitorSaving = false;
+      if (saveBtn) saveBtn.textContent = '保存';
+    }
+  }
+
+  async function toggleMonitor(id){
+    try {
+      const r = await api(`/api/alerts/monitors/${id}/toggle`, {method:'POST'});
+      toastSuccess(r.enabled ? '已启用' : '已禁用');
+      loadMonitors();
+    } catch(e) { toastError(e.message || '操作失败'); }
+  }
+
+  async function deleteMonitor(id){
+    if (!await confirmDialog('确认删除此监控项？')) return;
+    try {
+      await api(`/api/alerts/monitors/${id}`, {method:'DELETE'});
+      toastSuccess('已删除');
+      loadMonitors();
+    } catch(e) { toastError(e.message || '删除失败'); }
+  }
+
+  async function checkMonitor(id){
+    try {
+      toastSuccess('正在检测...');
+      await api(`/api/alerts/monitors/${id}/check`, {method:'POST'});
+      toastSuccess('检测完成');
+      loadMonitors();
+    } catch(e) { toastError(e.message || '检测失败'); }
+  }
+
+  function openMonitorConfig(){
+    const cfg = monitorConfig || {};
+    const bodyHTML = `
+      <div class="form-grid">
+        <label>默认提前通知天数
+          <input id="mcWarnDays" type="number" value="${cfg.default_warn_days || 30}">
+        </label>
+        <label>默认告警级别
+          <select id="mcSeverity">
+            ${SEVERITIES.map(([v,l]) => `<option value="${v}" ${(cfg.default_severity||'P1')===v?'selected':''}>${l}</option>`).join('')}
+          </select>
+        </label>
+        <label>默认通知渠道
+          <div id="mcChannelsWrap" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">
+            ${CHANNELS.map(([v,l]) => {
+              const checked = (cfg.default_channels || ['feishu']).includes(v);
+              return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" value="${v}" ${checked?'checked':''}>${l}</label>`;
+            }).join('')}
+          </div>
+        </label>
+        <label>SSL 检测周期（秒）
+          <input id="mcInterval" type="number" value="${cfg.ssl_check_interval || 3600}">
+        </label>
+      </div>`;
+
+    openDrawer({ title: '到期监控全局配置', body: bodyHTML,
+      footer: `<button class="btn primary" id="mcSave">保存</button>
+               <button class="btn ghost" id="mcCancel">取消</button>`
+    });
+
+    document.getElementById('mcCancel').onclick = () => {
+      const c = document.getElementById('dwClose');
+      if (c) c.click();
+    };
+    document.getElementById('mcSave').onclick = async () => {
+      try {
+        const channels = [...document.querySelectorAll('#mcChannelsWrap input:checked')].map(c => c.value);
+        await api('/api/alerts/monitors/config', {method:'PUT', body: JSON.stringify({
+          default_warn_days: parseInt(document.getElementById('mcWarnDays').value) || 30,
+          default_severity: document.getElementById('mcSeverity').value || 'P1',
+          default_channels: channels,
+          ssl_check_interval: parseInt(document.getElementById('mcInterval').value) || 3600,
+        })});
+        toastSuccess('配置已保存');
+        const c = document.getElementById('dwClose');
+        if (c) c.click();
+        loadMonitors();
+      } catch(e) { toastError(e.message || '保存失败'); }
+    };
+  }
+
   // ---- 模块导出 ----
   window.alerts = {
     render: async function(root){
@@ -1593,6 +1873,8 @@
         loadSilences();
       } else if (currentTab === 'stats') {
         loadStats();
+      } else if (currentTab === 'monitors') {
+        loadMonitors();
       }
       return [timer];
     },
