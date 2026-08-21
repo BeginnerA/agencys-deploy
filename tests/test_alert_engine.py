@@ -588,5 +588,82 @@ class TestAlertEngine(unittest.TestCase):
         self.assertIn("OOM", alerts[0]["description"])
 
 
+class TestCustomMonitorAlerts(unittest.TestCase):
+    """到期监控告警：全局默认 + 域名级覆盖 + 自动恢复"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "test.db")
+        dbm.init_db(self.db)
+
+    def _engine(self, interval=30):
+        return AlertEngine(self.db, interval=interval, monitor=None)
+
+    def _add_monitor(self, days_left=5, warn_days=0, severity="",
+                     channels="[]", mtype="ssl"):
+        now = int(time.time())
+        return dbm.create_record(self.db, "custom_monitors", dict(
+            type=mtype, name=f"test-{days_left}d", target="test.com",
+            port=443, days_left=days_left, warn_days=warn_days,
+            severity=severity, channels=channels,
+            enabled=1, created_at=now, updated_at=now))
+
+    def _set_global_config(self, warn_days=30, severity="P1",
+                           channels=None):
+        import json
+        cfg = {"default_warn_days": warn_days, "default_severity": severity,
+               "default_channels": channels or ["feishu"],
+               "ssl_check_interval": 3600}
+        now = int(time.time())
+        dbm.create_record(self.db, "platform_settings", dict(
+            key="custom_monitor_config", value=json.dumps(cfg), updated_at=now))
+
+    def test_fires_with_global_default(self):
+        """全局默认 30 天，监控项 days_left=5 → 触发告警"""
+        self._set_global_config(warn_days=30, severity="P1")
+        mid = self._add_monitor(days_left=5)
+        e = self._engine()
+        e._seed_rules()
+        snap = e._load_snapshot()
+        e._evaluate_custom_monitors(snap)
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("test.com", alerts[0]["subject"])
+
+    def test_domain_override_threshold(self):
+        """域名级 warn_days=3 覆盖全局 30 天，days_left=5 → 不触发"""
+        self._set_global_config(warn_days=30)
+        self._add_monitor(days_left=5, warn_days=3)
+        e = self._engine()
+        e._seed_rules()
+        snap = e._load_snapshot()
+        e._evaluate_custom_monitors(snap)
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 0)
+
+    def test_no_alert_when_days_left_null(self):
+        """days_left 为 NULL（从未成功探测）→ 不触发告警"""
+        self._set_global_config(warn_days=30)
+        now = int(time.time())
+        dbm.create_record(self.db, "custom_monitors", dict(
+            type="ssl", name="never-checked", target="new.com",
+            port=443, days_left=None, warn_days=0, severity="",
+            channels="[]", enabled=1, created_at=now, updated_at=now))
+        e = self._engine()
+        e._seed_rules()
+        snap = e._load_snapshot()
+        e._evaluate_custom_monitors(snap)
+        alerts = dbm.list_records(self.db, "alerts")
+        self.assertEqual(len(alerts), 0)
+
+    def test_seed_rule_exists(self):
+        """种子规则包含「自定义监控到期」"""
+        e = self._engine()
+        e._seed_rules()
+        rules = dbm.list_records(self.db, "alert_rules")
+        names = {r["name"] for r in rules}
+        self.assertIn("自定义监控到期", names)
+
+
 if __name__ == "__main__":
     unittest.main()

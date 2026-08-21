@@ -60,6 +60,11 @@ DEFAULT_RULES = [
          compare=">", threshold=0, duration_seconds=0,
          scope={"type": "all", "ids": []}, severity="P3",
          channels=["feishu"], escalation_interval=30, remark="内置默认规则（日志联动）"),
+    dict(name="自定义监控到期", metric_type="custom_monitor", metric="expiry",
+         compare="<", threshold=30, duration_seconds=0,
+         scope={"type": "all", "ids": []}, severity="P1",
+         channels=["feishu"], escalation_interval=30,
+         remark="内置默认规则（到期监控）"),
 ]
 
 # 自动恢复判定轮数（连续 N 轮正常才 resolved，避免单轮抖动误恢复）
@@ -119,6 +124,7 @@ class AlertEngine:
         snap = self._load_snapshot()
         self._evaluate_metric_rules(snap)
         self._evaluate_status_rules(snap)
+        self._evaluate_custom_monitors(snap)
         self._check_tasks(snap)
         self._auto_resolve(snap)
         self._escalate(snap)
@@ -144,6 +150,10 @@ class AlertEngine:
             "servers": dbm.list_records(self._db_path, "servers"),
             "services": dbm.list_records(self._db_path, "services", "enabled=1"),
             "windows": dbm.list_records(self._db_path, "silence_windows"),
+            "custom_monitors": dbm.list_records(
+                self._db_path, "custom_monitors",
+                "enabled=1 AND days_left IS NOT NULL"),
+            "custom_monitor_config": self._load_custom_monitor_config(),
         }
 
     # ---------- 种子规则 ----------
@@ -330,6 +340,63 @@ class AlertEngine:
                                    description=f"服务 {name} 在环境 {env['name']} 未部署或已停止",
                                    target_info={"project": pcode_map.get(env["project_id"], ""), "env": env["name"], "service": name},
                                    windows=snap["windows"])
+
+    def _load_custom_monitor_config(self) -> dict:
+        """加载全局到期监控配置"""
+        import json
+        rows = dbm.list_records(self._db_path, "platform_settings",
+                                "key=?", ("custom_monitor_config",))
+        if rows and rows[0].get("value"):
+            try:
+                return json.loads(rows[0]["value"])
+            except (ValueError, TypeError):
+                pass
+        return {"default_warn_days": 30, "default_severity": "P1",
+                "default_channels": ["feishu"], "ssl_check_interval": 3600}
+
+    def _evaluate_custom_monitors(self, snap=None):
+        """评估到期监控项：days_left <= 阈值 → 触发告警"""
+        if snap is None:
+            snap = self._load_snapshot()
+        monitors = snap.get("custom_monitors") or []
+        if not monitors:
+            return
+        cfg = snap.get("custom_monitor_config") or {}
+        default_warn = cfg.get("default_warn_days", 30)
+        default_sev = cfg.get("default_severity", "P1")
+        default_channels = cfg.get("default_channels", ["feishu"])
+        # 查找 custom_monitor 类型的种子规则
+        cm_rule = None
+        for r in snap.get("rules", []):
+            if r.get("metric_type") == "custom_monitor" and r.get("enabled"):
+                cm_rule = r
+                break
+        if not cm_rule:
+            return
+        for m in monitors:
+            days_left = m.get("days_left")
+            if days_left is None:
+                continue
+            # 计算有效配置：域名级覆盖 > 全局默认
+            warn_days = m.get("warn_days") or 0
+            threshold = warn_days if warn_days > 0 else default_warn
+            severity = m.get("severity") or default_sev
+            channels_raw = m.get("channels") or []
+            channels = channels_raw if channels_raw else default_channels
+            # 判断是否触发
+            if days_left <= threshold:
+                subject = f"到期监控: {m['name']} ({m['target']})"
+                desc = f"剩余 {days_left} 天，阈值 {threshold} 天"
+                target_info = {"monitor_id": m["id"], "type": m["type"],
+                               "target": m["target"], "name": m["name"]}
+                # 构造一个临时 rule 用于 _fire 调用
+                fire_rule = dict(cm_rule)
+                fire_rule["severity"] = severity
+                fire_rule["channels"] = channels
+                self._fire(fire_rule, f"custom_monitor:{m['id']}",
+                           subject=subject, description=desc,
+                           target_info=target_info,
+                           windows=snap.get("windows"))
 
     def _check_tasks(self, snap=None):
         """扫描最近失败任务（增量：finished_at > 上次扫描点）触发任务失败告警"""
@@ -574,7 +641,8 @@ class AlertEngine:
 
     def _auto_resolve(self, snap=None):
         """指标类告警：连续 RECOVER_ROUNDS 轮恢复 → resolved(auto)；
-        服务下线告警：服务重新在线 → resolved(auto)；任务失败不自动恢复"""
+        服务下线告警：服务重新在线 → resolved(auto)；任务失败不自动恢复；
+        SSL 到期监控：证书续期后 days_left > threshold → resolved(auto)"""
         if snap is None:
             snap = self._load_snapshot()
         rules_by_id = {r["id"]: r for r in snap["rules"]}
@@ -586,6 +654,9 @@ class AlertEngine:
                     self._resolve(a, "auto")
             elif rule.get("metric") == "service_down":
                 if self._service_back(rule, a):
+                    self._resolve(a, "auto")
+            elif rule.get("metric_type") == "custom_monitor":
+                if self._custom_monitor_recovered(a):
                     self._resolve(a, "auto")
 
     def _metric_recovered(self, rule: dict, alert: dict) -> bool:
@@ -634,6 +705,37 @@ class AlertEngine:
         data = self._monitor.get_overview(env["project_id"], env["name"]) or {}
         st = (data.get("services") or {}).get(name) or {}
         return st.get("status") == "online"
+
+    def _custom_monitor_recovered(self, alert: dict) -> bool:
+        """SSL 类型到期监控自动恢复：days_left > threshold 连续 RECOVER_ROUNDS 轮"""
+        # 仅 SSL 类型适用自动恢复（非 SSL 类型 days_left 手动填写，不会自动变化）
+        ti = alert.get("target_info") or {}
+        if ti.get("type") != "ssl":
+            return False
+        monitor_id = ti.get("monitor_id")
+        if not monitor_id:
+            return False
+        m = dbm.get_record(self._db_path, "custom_monitors", monitor_id)
+        if not m or m.get("days_left") is None:
+            return False
+        # 使用滑动窗口判定
+        key = (0, f"cm:{monitor_id}", "custom_monitor")
+        self._push_history(key, m["days_left"])
+        dq = self._history.get(key)
+        if not dq:
+            return False
+        # 取该监控项的有效阈值
+        cfg = self._load_custom_monitor_config()
+        warn = m.get("warn_days") or 0
+        threshold = warn if warn > 0 else cfg.get("default_warn_days", 30)
+        n = 0
+        for ts, value in reversed(dq):
+            if value <= threshold:
+                return False  # 仍超阈值
+            n += 1
+            if n >= RECOVER_ROUNDS:
+                return True
+        return False
 
     def _resolve(self, alert: dict, rtype: str, by: str = ""):
         dbm.update_record(self._db_path, "alerts", alert["id"], dict(
