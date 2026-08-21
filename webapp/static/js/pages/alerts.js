@@ -1610,54 +1610,51 @@
     if (!tc) return;
     const canManage = ['admin','operator'].includes(currentUser().role);
     tc.innerHTML = `
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-        <h3 style="margin:0">到期监控</h3>
-        <div style="display:flex;gap:8px">
-          ${canManage ? '<button class="btn sm primary" id="monAddBtn">+ 添加监控</button>' : ''}
-          <button class="btn sm ghost" id="monConfigBtn">⚙ 全局配置</button>
-        </div>
+      <div class="alert-toolbar">
+        <span class="weak" style="font-size:12px">到期监控</span>
+        <span style="flex:1"></span>
+        ${canManage ? '<button class="btn primary sm" id="monAddBtn">+ 添加监控</button>' : ''}
+        <button class="btn sm ghost" id="monConfigBtn">⚙ 全局配置</button>
       </div>
       <div class="mon-summary">
-        <span class="mon-summary-item">总计 <b>${monitors.length}</b> 项</span>
-        <span class="mon-summary-item warn">即将到期 <b>${monitors.filter(m => m.days_left != null && m.days_left <= 30).length}</b> 项</span>
-        <span class="mon-summary-item danger">已到期 <b>${monitors.filter(m => m.days_left != null && m.days_left <= 0).length}</b> 项</span>
+        <div class="mon-summary-item"><div class="ms-num">${monitors.length}</div><div class="ms-label">总计监控</div></div>
+        <div class="mon-summary-item warn"><div class="ms-num">${monitors.filter(m => m.days_left != null && m.days_left <= 30).length}</div><div class="ms-label">即将到期</div></div>
+        <div class="mon-summary-item danger"><div class="ms-num">${monitors.filter(m => m.days_left != null && m.days_left <= 0).length}</div><div class="ms-label">已到期</div></div>
       </div>
-      <div class="table-wrap">
-        <table class="table">
+      <div class="panel" style="padding:0"><div class="tbl-wrap"><table class="tbl mon-tbl">
           <thead><tr>
             <th>类型</th><th>名称</th><th>目标</th><th>剩余天数</th>
             <th>通知阈值</th><th>状态</th><th>最近检测</th><th>操作</th>
           </tr></thead>
           <tbody>
-            ${monitors.length === 0 ? '<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">暂无监控项，点击「添加监控」开始</td></tr>' :
+            ${monitors.length === 0 ? '<tr class="empty-row"><td colspan="8">暂无监控项，点击「添加监控」开始</td></tr>' :
               monitors.map(m => {
                 const daysCls = m.days_left == null ? 'muted' : m.days_left <= 0 ? 'danger' : m.days_left <= 7 ? 'danger' : m.days_left <= 30 ? 'warn' : '';
-                const daysText = m.days_left == null ? '<span class="muted">未检测</span>' : `${m.days_left} 天`;
+                const daysText = m.days_left == null ? '未检测' : `${m.days_left} 天`;
                 const threshold = m.warn_days > 0 ? `${m.warn_days} 天` : '全局默认';
                 const checkedText = m.last_checked ? fmtTime(m.last_checked) : '<span class="muted">未检测</span>';
                 const detail = m.detail || {};
-                const certInfo = m.type === 'ssl' && detail.cert_issuer ? `<div class="muted" style="font-size:12px">${esc(detail.cert_issuer)}</div>` : '';
+                const certInfo = m.type === 'ssl' && detail.cert_issuer ? `<div class="mon-cert-info">${esc(detail.cert_issuer)}</div>` : '';
                 return `<tr>
                   <td><span class="badge" style="font-size:11px">${esc(MT_LABELS[m.type] || m.type)}</span></td>
                   <td>${esc(m.name)}${certInfo}</td>
                   <td>${esc(m.target)}${m.port && m.port !== 443 ? ':' + m.port : ''}</td>
-                  <td class="${daysCls}" style="font-weight:600">${daysText}</td>
+                  <td class="mon-days ${daysCls}">${daysText}</td>
                   <td>${threshold}</td>
                   <td>${m.enabled ? '<span class="badge success">启用</span>' : '<span class="badge">禁用</span>'}</td>
                   <td>${checkedText}</td>
-                  <td>
-                    ${m.type === 'ssl' && m.enabled ? `<button class="btn xs ghost mon-check-btn" data-id="${m.id}">检测</button>` : ''}
+                  <td class="mon-actions">
+                    ${m.type === 'ssl' && m.enabled ? `<button class="btn sm ghost mon-check-btn" data-id="${m.id}">检测</button>` : ''}
                     ${canManage ? `
-                      <button class="btn xs ghost mon-edit-btn" data-id="${m.id}">编辑</button>
-                      <button class="btn xs ghost mon-toggle-btn" data-id="${m.id}">${m.enabled ? '禁用' : '启用'}</button>
-                      <button class="btn xs ghost mon-del-btn" data-id="${m.id}">删除</button>
+                      <button class="btn sm ghost mon-edit-btn" data-id="${m.id}">编辑</button>
+                      <button class="btn sm ghost mon-toggle-btn" data-id="${m.id}">${m.enabled ? '禁用' : '启用'}</button>
+                      <button class="btn sm ghost mon-del-btn" data-id="${m.id}">删除</button>
                     ` : ''}
                   </td>
                 </tr>`;
               }).join('')}
           </tbody>
-        </table>
-      </div>`;
+        </table></div></div>`;
 
     // Bind events
     const addBtn = document.getElementById('monAddBtn');
