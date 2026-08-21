@@ -1682,7 +1682,6 @@
         <div class="field"><label>目标</label><input id="mfTarget" value="${m ? esc(m.target) : ''}" placeholder="SSL: 域名，其他: 产品标识等"></div>
         <div class="field"><label>端口</label><input id="mfPort" type="number" value="${m ? m.port || 443 : 443}" placeholder="443（仅 SSL 有效）"></div>
         <div class="field" id="mfExpiryWrap"><label>到期时间</label><input id="mfExpiry" type="datetime-local" value="${m && m.expiry_at ? new Date(m.expiry_at * 1000).toISOString().slice(0,16) : ''}"></div>
-        <div class="field" id="mfDaysLeftWrap"><label>剩余天数</label><input id="mfDaysLeft" type="number" value="${m && m.days_left != null ? m.days_left : ''}" placeholder="SSL 类型自动检测"></div>
         <div class="field"><label>提前通知天数</label><input id="mfWarnDays" type="number" value="${m ? m.warn_days || 0 : 0}" placeholder="0 = 跟随全局"></div>
         <div class="field"><label>告警级别</label>
           <select id="mfSeverity">
@@ -1702,14 +1701,12 @@
 
     document.getElementById('mfSave').onclick = saveMonitorForm;
 
-    // SSL 类型时隐藏到期时间和剩余天数（自动检测）
+    // SSL 类型时隐藏到期时间（自动检测）
     const typeSelect = document.getElementById('mfTypes');
     const expiryWrap = document.getElementById('mfExpiryWrap');
-    const daysWrap = document.getElementById('mfDaysLeftWrap');
     function toggleSslFields(){
       const isSsl = document.getElementById('mfTypes').value === 'ssl';
       expiryWrap.style.display = isSsl ? 'none' : '';
-      daysWrap.style.display = isSsl ? 'none' : '';
     }
     typeSelect.onchange = toggleSslFields;
     toggleSslFields();
@@ -1729,7 +1726,6 @@
 
       const channels = [...document.querySelectorAll('#mfChannelsWrap input:checked')].map(c => c.value);
       const expiryRaw = document.getElementById('mfExpiry').value;
-      const daysRaw = document.getElementById('mfDaysLeft').value;
 
       const payload = {
         type,
@@ -1741,11 +1737,10 @@
         channels,
       };
 
-      // 非 SSL 类型提供到期信息
+      // 非 SSL 类型提供到期时间（剩余天数后端自动计算）
       if (type !== 'ssl') {
         if (expiryRaw) payload.expiry_at = Math.floor(new Date(expiryRaw).getTime() / 1000);
-        if (daysRaw) payload.days_left = Number(daysRaw);
-        else if (!expiryRaw) { toastError('非 SSL 类型需提供到期时间或剩余天数'); return; }
+        else { toastError('非 SSL 类型需提供到期时间'); return; }
       }
 
       if (editingMonitorId) {

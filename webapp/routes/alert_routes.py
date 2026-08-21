@@ -822,12 +822,16 @@ def create_monitor():
     if err:
         return jsonify({"error": err}), 400
     now = int(time.time())
+    expiry_at = body.get("expiry_at")
+    days_left = None
+    if expiry_at:
+        days_left = max(0, (int(expiry_at) - now) // 86400)
     mid = dbm.create_record(db, "custom_monitors", dict(
         type=body["type"], name=body["name"].strip(),
         target=body["target"].strip(),
         port=body.get("port", 443),
-        expiry_at=body.get("expiry_at"),
-        days_left=body.get("days_left"),
+        expiry_at=expiry_at,
+        days_left=days_left,
         warn_days=body.get("warn_days", 0),
         severity=body.get("severity", ""),
         channels=body.get("channels", []),
@@ -858,7 +862,7 @@ def update_monitor(monitor_id):
         target=(body.get("target") or old["target"]).strip(),
         port=body.get("port", old["port"]),
         expiry_at=body.get("expiry_at", old["expiry_at"]),
-        days_left=body.get("days_left", old["days_left"]),
+        days_left=_calc_days_left(body.get("expiry_at", old["expiry_at"])),
         warn_days=body.get("warn_days", old["warn_days"]),
         severity=body.get("severity", old.get("severity", "")),
         channels=body.get("channels", old.get("channels", [])),
@@ -965,6 +969,13 @@ def put_monitor_config():
     return jsonify({"ok": True})
 
 
+def _calc_days_left(expiry_at):
+    """根据 expiry_at (epoch 秒) 自动计算剩余天数"""
+    if not expiry_at:
+        return None
+    return max(0, (int(expiry_at) - int(time.time())) // 86400)
+
+
 def _validate_monitor(body, partial=False) -> str:
     """监控项校验；返回错误信息，空串=通过"""
     if not partial:
@@ -1000,6 +1011,6 @@ def _validate_monitor(body, partial=False) -> str:
             return "channels 包含非法渠道"
     # 非 SSL 类型需要到期时间
     if not partial and body.get("type") != "ssl":
-        if not body.get("expiry_at") and body.get("days_left") is None:
-            return "非 SSL 类型需提供 expiry_at 或 days_left"
+        if not body.get("expiry_at"):
+            return "非 SSL 类型需提供 expiry_at"
     return ""

@@ -59,7 +59,6 @@ class TestCustomMonitorRoutes(unittest.TestCase):
             "type": "cloud_renewal", "name": "阿里云 ECS",
             "target": "ecs-bp1xxx",
             "expiry_at": int(time.time()) + 86400 * 90,
-            "days_left": 90,
             "detail": {"provider": "阿里云", "product": "ECS"}
         })
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
