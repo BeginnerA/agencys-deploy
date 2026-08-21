@@ -1674,32 +1674,29 @@
     const type = m ? m.type : 'ssl';
     const bodyHTML = `
       <div class="form-grid">
-        <label>类型
+        <div class="field"><label>类型</label>
           <select id="mfTypes">
             ${MONITOR_TYPES.map(([v,l]) => `<option value="${v}" ${type===v?'selected':''}>${l}</option>`).join('')}
-          </select>
-        </label>
-        <label>名称 <input id="mfName" value="${m ? esc(m.name) : ''}" placeholder="如：API 网关证书"></label>
-        <label>目标 <input id="mfTarget" value="${m ? esc(m.target) : ''}" placeholder="SSL: 域名，其他: 产品标识等"></label>
-        <label>端口 <input id="mfPort" type="number" value="${m ? m.port || 443 : 443}" placeholder="443（仅 SSL 有效）"></label>
-        <label>到期时间 <input id="mfExpiry" type="datetime-local" value="${m && m.expiry_at ? new Date(m.expiry_at * 1000).toISOString().slice(0,16) : ''}"></label>
-        <label>剩余天数 <input id="mfDaysLeft" type="number" value="${m && m.days_left != null ? m.days_left : ''}" placeholder="SSL 类型自动检测"></label>
-        <label>提前通知天数 <input id="mfWarnDays" type="number" value="${m ? m.warn_days || 0 : 0}" placeholder="0 = 跟随全局"></label>
-        <label>告警级别
+          </select></div>
+        <div class="field"><label>名称</label><input id="mfName" value="${m ? esc(m.name) : ''}" placeholder="如：API 网关证书"></div>
+        <div class="field"><label>目标</label><input id="mfTarget" value="${m ? esc(m.target) : ''}" placeholder="SSL: 域名，其他: 产品标识等"></div>
+        <div class="field"><label>端口</label><input id="mfPort" type="number" value="${m ? m.port || 443 : 443}" placeholder="443（仅 SSL 有效）"></div>
+        <div class="field" id="mfExpiryWrap"><label>到期时间</label><input id="mfExpiry" type="datetime-local" value="${m && m.expiry_at ? new Date(m.expiry_at * 1000).toISOString().slice(0,16) : ''}"></div>
+        <div class="field" id="mfDaysLeftWrap"><label>剩余天数</label><input id="mfDaysLeft" type="number" value="${m && m.days_left != null ? m.days_left : ''}" placeholder="SSL 类型自动检测"></div>
+        <div class="field"><label>提前通知天数</label><input id="mfWarnDays" type="number" value="${m ? m.warn_days || 0 : 0}" placeholder="0 = 跟随全局"></div>
+        <div class="field"><label>告警级别</label>
           <select id="mfSeverity">
             <option value="">跟随全局</option>
             ${SEVERITIES.map(([v,l]) => `<option value="${v}" ${m && m.severity===v?'selected':''}>${l}</option>`).join('')}
-          </select>
-        </label>
-        <label>通知渠道（空=跟随全局）
+          </select></div>
+        <div class="field full"><label>通知渠道（空=跟随全局）</label>
           <div id="mfChannelsWrap" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">
             ${CHANNELS.map(([v,l]) => {
               const checked = m && m.channels && m.channels.length ? m.channels.includes(v) : false;
-              return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" value="${v}" ${checked?'checked':''}>${l}</label>`;
+              return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:var(--fs-13);color:var(--text-1)"><input type="checkbox" value="${v}" ${checked?'checked':''}>${l}</label>`;
             }).join('')}
-          </div>
-        </label>
-        <label>备注 <input id="mfRemark" value="${m ? esc(m.detail && m.detail.remark || '') : ''}" placeholder="可选"></label>
+          </div></div>
+        <div class="field full"><label>备注</label><input id="mfRemark" value="${m ? esc(m.detail && m.detail.remark || '') : ''}" placeholder="可选"></div>
       </div>`;
 
     openDrawer({ title, body: bodyHTML, wide: true,
@@ -1715,12 +1712,12 @@
 
     // SSL 类型时隐藏到期时间和剩余天数（自动检测）
     const typeSelect = document.getElementById('mfTypes');
-    const expiryLabel = document.getElementById('mfExpiry').closest('label');
-    const daysLabel = document.getElementById('mfDaysLeft').closest('label');
+    const expiryWrap = document.getElementById('mfExpiryWrap');
+    const daysWrap = document.getElementById('mfDaysLeftWrap');
     function toggleSslFields(){
       const isSsl = document.getElementById('mfTypes').value === 'ssl';
-      expiryLabel.style.display = isSsl ? 'none' : '';
-      daysLabel.style.display = isSsl ? 'none' : '';
+      expiryWrap.style.display = isSsl ? 'none' : '';
+      daysWrap.style.display = isSsl ? 'none' : '';
     }
     typeSelect.onchange = toggleSslFields;
     toggleSslFields();
@@ -1807,25 +1804,25 @@
     const cfg = monitorConfig || {};
     const bodyHTML = `
       <div class="form-grid">
-        <label>默认提前通知天数
+        <div class="field"><label>默认提前通知天数</label>
           <input id="mcWarnDays" type="number" value="${cfg.default_warn_days || 30}">
-        </label>
-        <label>默认告警级别
+        </div>
+        <div class="field"><label>默认告警级别</label>
           <select id="mcSeverity">
             ${SEVERITIES.map(([v,l]) => `<option value="${v}" ${(cfg.default_severity||'P1')===v?'selected':''}>${l}</option>`).join('')}
           </select>
-        </label>
-        <label>默认通知渠道
+        </div>
+        <div class="field full"><label>默认通知渠道</label>
           <div id="mcChannelsWrap" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">
             ${CHANNELS.map(([v,l]) => {
               const checked = (cfg.default_channels || ['feishu']).includes(v);
-              return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px"><input type="checkbox" value="${v}" ${checked?'checked':''}>${l}</label>`;
+              return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:var(--fs-13);color:var(--text-1)"><input type="checkbox" value="${v}" ${checked?'checked':''}>${l}</label>`;
             }).join('')}
           </div>
-        </label>
-        <label>SSL 检测周期（秒）
+        </div>
+        <div class="field"><label>SSL 检测周期（秒）</label>
           <input id="mcInterval" type="number" value="${cfg.ssl_check_interval || 3600}">
-        </label>
+        </div>
       </div>`;
 
     openDrawer({ title: '到期监控全局配置', body: bodyHTML,
