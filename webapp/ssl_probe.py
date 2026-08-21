@@ -21,7 +21,8 @@ def probe_ssl(domain: str, port: int = 443, timeout: int = 10) -> dict:
             # 解析到期时间: "Jun 15 12:00:00 2026 GMT"
             not_after = cert.get("notAfter", "")
             expiry_dt = datetime.datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-            days_left = (expiry_dt - datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)).days
+            expiry_dt = expiry_dt.replace(tzinfo=datetime.timezone.utc)
+            days_left = (expiry_dt - datetime.datetime.now(datetime.timezone.utc)).days
             # 提取 CN
             subject = _extract_cn(cert.get("subject", ()))
             issuer = _extract_cn(cert.get("issuer", ()))

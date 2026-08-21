@@ -937,11 +937,16 @@ def put_monitor_config():
     """更新全局到期监控配置"""
     db = current_app.config["DB_PATH"]
     body = request.get_json(silent=True) or {}
+    try:
+        warn_days = int(body.get("default_warn_days", 30))
+        ssl_interval = int(body.get("ssl_check_interval", 3600))
+    except (TypeError, ValueError):
+        return jsonify({"error": "default_warn_days 和 ssl_check_interval 必须为数字"}), 400
     cfg = {
-        "default_warn_days": int(body.get("default_warn_days", 30)),
+        "default_warn_days": warn_days,
         "default_severity": body.get("default_severity", "P1"),
         "default_channels": body.get("default_channels", ["feishu"]),
-        "ssl_check_interval": int(body.get("ssl_check_interval", 3600)),
+        "ssl_check_interval": ssl_interval,
     }
     if cfg["default_severity"] not in SEVERITIES:
         return jsonify({"error": "severity 非法"}), 400
