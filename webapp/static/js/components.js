@@ -47,6 +47,7 @@ function openDrawer(opts){
         <div class="dh-right"><button class="btn sm ghost" id="dwClose">关闭</button></div>
       </div>
       <div class="drawer-body" id="dwBody">${opts.body}</div>
+      ${opts.footer ? `<div class="drawer-foot" id="dwFoot">${opts.footer}</div>` : ''}
     </div>`;
   const close = async () => {
     if (opts.onClose) { await opts.onClose(); }
