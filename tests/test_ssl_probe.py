@@ -14,7 +14,7 @@ class TestProbeSsl(unittest.TestCase):
     def test_successful_probe(self, mock_sock_cls, mock_ctx_fn):
         """成功探测：返回证书信息和剩余天数"""
         # 模拟证书 notAfter: "Sep 15 12:00:00 2026 GMT"
-        future = datetime.datetime.utcnow() + datetime.timedelta(days=60)
+        future = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None) + datetime.timedelta(days=60)
         not_after = future.strftime("%b %d %H:%M:%S %Y GMT")
         # 构造 mock 证书
         mock_cert = {
