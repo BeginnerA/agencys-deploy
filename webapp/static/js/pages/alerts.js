@@ -1674,11 +1674,11 @@
     const type = m ? m.type : 'ssl';
     const bodyHTML = `
       <div class="form-grid">
+        <div class="field"><label>名称</label><input id="mfName" value="${m ? esc(m.name) : ''}" placeholder="如：API 网关证书"></div>
         <div class="field"><label>类型</label>
           <select id="mfTypes">
             ${MONITOR_TYPES.map(([v,l]) => `<option value="${v}" ${type===v?'selected':''}>${l}</option>`).join('')}
           </select></div>
-        <div class="field"><label>名称</label><input id="mfName" value="${m ? esc(m.name) : ''}" placeholder="如：API 网关证书"></div>
         <div class="field"><label>目标</label><input id="mfTarget" value="${m ? esc(m.target) : ''}" placeholder="SSL: 域名，其他: 产品标识等"></div>
         <div class="field"><label>端口</label><input id="mfPort" type="number" value="${m ? m.port || 443 : 443}" placeholder="443（仅 SSL 有效）"></div>
         <div class="field" id="mfExpiryWrap"><label>到期时间</label><input id="mfExpiry" type="datetime-local" value="${m && m.expiry_at ? new Date(m.expiry_at * 1000).toISOString().slice(0,16) : ''}"></div>
@@ -1690,12 +1690,10 @@
             ${SEVERITIES.map(([v,l]) => `<option value="${v}" ${m && m.severity===v?'selected':''}>${l}</option>`).join('')}
           </select></div>
         <div class="field full"><label>通知渠道（空=跟随全局）</label>
-          <div id="mfChannelsWrap" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">
-            ${CHANNELS.map(([v,l]) => {
+          <div class="rule-ch-box" id="mfChannelsWrap">${CHANNELS.map(([v,l]) => {
               const checked = m && m.channels && m.channels.length ? m.channels.includes(v) : false;
-              return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:var(--fs-13);color:var(--text-1)"><input type="checkbox" value="${v}" ${checked?'checked':''}>${l}</label>`;
-            }).join('')}
-          </div></div>
+              return `<label class="rule-ch-cb"><input type="checkbox" value="${v}" ${checked?'checked':''}> ${l}</label>`;
+            }).join('')}</div></div>
         <div class="field full"><label>备注</label><input id="mfRemark" value="${m ? esc(m.detail && m.detail.remark || '') : ''}" placeholder="可选"></div>
       </div>`;
 
@@ -1813,12 +1811,10 @@
           </select>
         </div>
         <div class="field full"><label>默认通知渠道</label>
-          <div id="mcChannelsWrap" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">
-            ${CHANNELS.map(([v,l]) => {
+          <div class="rule-ch-box" id="mcChannelsWrap">${CHANNELS.map(([v,l]) => {
               const checked = (cfg.default_channels || ['feishu']).includes(v);
-              return `<label style="display:inline-flex;align-items:center;gap:4px;font-size:var(--fs-13);color:var(--text-1)"><input type="checkbox" value="${v}" ${checked?'checked':''}>${l}</label>`;
-            }).join('')}
-          </div>
+              return `<label class="rule-ch-cb"><input type="checkbox" value="${v}" ${checked?'checked':''}> ${l}</label>`;
+            }).join('')}</div>
         </div>
         <div class="field"><label>SSL 检测周期（秒）</label>
           <input id="mcInterval" type="number" value="${cfg.ssl_check_interval || 3600}">
