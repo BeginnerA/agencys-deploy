@@ -30,10 +30,15 @@ def export_projects_yaml(db_path: str, project_id: int) -> str:
         for b in s["build_order"] or []:
             if not isinstance(b, dict):
                 continue
-            entry = {"name": b.get("name", ""), "path": b.get("path", ""),
-                     "goal": b.get("goal", "package")}
-            if b.get("extra_profile"):
-                entry["extra_profile"] = b["extra_profile"]
+            if "commands" in b:
+                # 前端构建步骤：保留 commands 数组
+                entry = {"name": b.get("name", ""), "path": b.get("path", ""),
+                         "commands": b["commands"]}
+            else:
+                entry = {"name": b.get("name", ""), "path": b.get("path", ""),
+                         "goal": b.get("goal", "package")}
+                if b.get("extra_profile"):
+                    entry["extra_profile"] = b["extra_profile"]
             build_order.append(entry)
         cfg = {
             "build_order": build_order,
@@ -46,6 +51,9 @@ def export_projects_yaml(db_path: str, project_id: int) -> str:
             "dubbo_services": s["dubbo_services"] or [],
             "snailjob_group": s["snailjob_group"],
         }
+        # build_type 仅非默认值时输出（保持向后兼容）
+        if s.get("build_type") and s["build_type"] != "maven":
+            cfg["build_type"] = s["build_type"]
         if s.get("git_branch"):
             cfg["git_branch"] = s["git_branch"]
         if s.get("git_pull_before_build"):

@@ -13,6 +13,11 @@
       others: [],
       testing: false, testOk: null, testMsg: null,
     };
+    // 表单值快照：切换开关/连接方式时 render() 会重建 DOM，须从快照回填而非原始 srv，否则用户已输入的内容丢失
+    const fv = { host: srv ? srv.host || '' : '', nacos_ip: srv ? srv.nacos_ip || '' : '', remark: srv ? srv.remark || '' : '',
+      ssh_user: srv ? srv.ssh_user || '' : '', ssh_port: srv && srv.ssh_port ? String(srv.ssh_port) : '',
+      ssh_key_file: srv ? srv.ssh_key_file || '' : '' };
+    function saveForm(){ const h = document.getElementById('sHost'); if (!h) return; fv.host = val('sHost') || ''; fv.nacos_ip = val('sNacosIp') || ''; fv.remark = val('sRemark') || ''; fv.ssh_user = val('sUser') || ''; fv.ssh_port = val('sPort') || ''; fv.ssh_key_file = val('sKey') || ''; }
     openDrawer({ title: srv ? '编辑服务器：' + srv.host : '添加服务器', wide: true,
       body: '<div class="cfg-home">' + skeletonHTML(3) + '</div>', onClose: null });
     const bodyEl = document.getElementById('dwBody');
@@ -24,6 +29,7 @@
     })();
 
     function render(){
+      saveForm();   // 重建前快照当前表单值，防止 IP / 备注等用户输入丢失
       const pwdMasked = srv && srv.ssh_password === '***';
       const hasCovered = srv && (srv.ssh_user || srv.ssh_key_file ||
         (srv.ssh_password ?? null) !== null || (srv.ssh_port ?? null) !== null);
@@ -32,19 +38,19 @@
             ${hasCovered ? '<div style="color:var(--warning);margin-top:6px">⚠ 本台存在端口/密码覆盖配置，保存后将被清空（如需保留请取消继承）</div>' : ''}
           </div>`
         : `<div class="form-grid">
-            ${H.field({ label:'登录用户', input:`<input id="sUser" value="${esc(srv ? srv.ssh_user || '' : '')}" placeholder="如 root">`, hint:'留空 = 使用环境级用户' })}
-            ${H.field({ label:'SSH 端口', input:`<input id="sPort" type="number" value="${esc(srv && srv.ssh_port ? srv.ssh_port : '')}" placeholder="22">`, hint:'留空 = 使用环境级端口' })}
+            ${H.field({ label:'登录用户', input:`<input id="sUser" value="${esc(fv.ssh_user)}" placeholder="如 root">`, hint:'留空 = 使用环境级用户' })}
+            ${H.field({ label:'SSH 端口', input:`<input id="sPort" type="number" value="${esc(fv.ssh_port)}" placeholder="22">`, hint:'留空 = 使用环境级端口' })}
             <div class="field full"><label>连接方式</label>
               <select id="sAuth"><option value="key" ${st.authMode === 'key' ? 'selected' : ''}>密钥（推荐）</option><option value="pwd" ${st.authMode === 'pwd' ? 'selected' : ''}>密码</option></select>
             </div>
             ${st.authMode === 'key'
-              ? H.field({ label:'私钥路径', tip:'未配置密码时使用', input:`<input id="sKey" value="${esc(srv ? srv.ssh_key_file || '' : '')}" placeholder="如 ~/.ssh/id_rsa_deploy">`, hint:'留空 = 使用环境级密钥' })
+              ? H.field({ label:'私钥路径', tip:'未配置密码时使用', input:`<input id="sKey" value="${esc(fv.ssh_key_file)}" placeholder="如 ~/.ssh/id_rsa_deploy">`, hint:'留空 = 使用环境级密钥' })
               : H.field({ label:'密码', tip:'密码优先、失败自动回退密钥', input:`<input id="sPwd" type="password" value="" placeholder="${pwdMasked ? '已遮蔽，留空不修改' : '敏感密码建议环境变量 SSH_PASSWORD'}">`, hint: pwdMasked ? '原密码已遮蔽：留空不修改，保存后保留原密码' : '留空 = 不配置密码（仅用密钥）；敏感密码建议环境变量 SSH_PASSWORD' })}
           </div>`;
       bodyEl.innerHTML = `
         <div class="form-grid">
-          ${H.field({ label:'服务器 IP', required:true, tip:'SSH 连接用地址，全平台唯一', input:`<input id="sHost" value="${esc(srv ? srv.host : '')}" placeholder="如 10.0.0.11">` })}
-          ${H.field({ label:'Nacos 注册 IP（nacos_ip）', tip:'NAT 环境下与外网 IP 不同才填', input:`<input id="sNacosIp" value="${esc(srv ? srv.nacos_ip || '' : '')}" placeholder="留空 = 使用服务器 IP">`, hint:'NAT 环境下服务在 Nacos 中注册的内网 IP，与上方 IP 相同则留空' })}
+          ${H.field({ label:'服务器 IP', required:true, tip:'SSH 连接用地址，全平台唯一', input:`<input id="sHost" value="${esc(fv.host)}" placeholder="如 10.0.0.11">` })}
+          ${H.field({ label:'Nacos 注册 IP（nacos_ip）', tip:'NAT 环境下与外网 IP 不同才填', input:`<input id="sNacosIp" value="${esc(fv.nacos_ip)}" placeholder="留空 = 使用服务器 IP">`, hint:'NAT 环境下服务在 Nacos 中注册的内网 IP，与上方 IP 相同则留空' })}
         </div>
         <div class="cfg-section"><div class="cs-head"><span class="cs-ico">🔑</span><span class="cs-title">SSH 连接凭据</span><span class="cs-desc">大部分服务器共用环境级凭据</span></div>
           <div class="cs-body">
@@ -52,7 +58,7 @@
             ${sshBody}
           </div>
         </div>
-        <div class="field full"><label>备注</label><textarea id="sRemark" rows="2" placeholder="仅用于识别服务器用途，不影响发布逻辑">${esc(srv ? srv.remark || '' : '')}</textarea></div>
+        <div class="field full"><label>备注</label><textarea id="sRemark" rows="2" placeholder="仅用于识别服务器用途，不影响发布逻辑">${esc(fv.remark)}</textarea></div>
         <div id="testPanel"></div>
         <div style="display:flex;gap:10px;margin-top:16px">
           <button class="btn primary flex-1" id="srvSave">保存并测试连接</button>
@@ -63,6 +69,9 @@
       document.getElementById('sInherit').onchange = e => { st.inherit = e.target.checked; render(); };
       const auth = document.getElementById('sAuth');
       if (auth) auth.onchange = e => { st.authMode = e.target.value; render(); };
+      // 实时同步快照：用户在输入框键入时即时写入 fv，切换开关后回填不丢
+      const fvMap = { sHost:'host', sNacosIp:'nacos_ip', sRemark:'remark', sUser:'ssh_user', sPort:'ssh_port', sKey:'ssh_key_file' };
+      Object.keys(fvMap).forEach(id => { const el = document.getElementById(id); if (el) el.oninput = () => { fv[fvMap[id]] = el.value; }; });
       document.getElementById('srvSave').onclick = async () => {
         if (!validate()) return;
         const btn = document.getElementById('srvSave');

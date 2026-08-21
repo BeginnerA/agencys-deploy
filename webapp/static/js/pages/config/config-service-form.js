@@ -10,6 +10,7 @@
       data: svc ? Object.assign(JSON.parse(JSON.stringify(svc)), { enabled: !!svc.enabled }) : {
         name:'', image_name:'', service_name:'', git_repo:'',
         git_branch:'', git_pull_before_build:false,
+        build_type:'maven',
         build_order:[], docker_context:'', dockerfile:'',
         nacos_groups:[], dubbo_services:[], snailjob_group:'',
         health_port:'', health_url:'',
@@ -61,12 +62,26 @@
           ${H.field({ label:'docker-compose 服务名', required:true, tip:'docker-compose.yml 里的服务名', input:`<input id="sCompose" value="${esc(d.service_name)}" placeholder="留空自动填服务名">` })}
         </div>`;
       // ② 构建配置
+      const isFrontend = d.build_type === 'frontend';
       const build = `
         <div class="form-grid">
+          <div class="field full">
+            <label>构建类型</label>
+            <select id="sBuildType">
+              <option value="maven" ${!isFrontend ? 'selected' : ''}>☕ Java (Maven)</option>
+              <option value="frontend" ${isFrontend ? 'selected' : ''}>🌐 Web 前端 (npm/pnpm/yarn)</option>
+            </select>
+            <div class="f-hint">Java 项目使用 Maven 构建；Web 前端项目使用 npm/pnpm/yarn 等命令构建</div>
+          </div>
+          ${isFrontend ? `
+          <div class="field full"><label>构建步骤（commands）</label>
+            ${H.cmdList({ id:'sBuildOrder', rows: d.build_order }).html}
+            <div class="f-hint">每个步骤填写工作目录和命令列表（每行一条命令）；支持 \${VERSION} 变量替换；自动探测 npm/pnpm/yarn 可执行路径。</div>
+          </div>` : `
           <div class="field full"><label>构建顺序（build_order）</label>
             ${H.rowList({ id:'sBuildOrder', rows: d.build_order }).html}
             <div class="f-hint">按顺序对每个模块执行 mvn clean {goal} -P{profile}；common-build / api 等被依赖模块一般 install，最终服务模块 package；extra_profile 用于同一仓库按 profile 产出不同 jar 的项目。</div>
-          </div>
+          </div>`}
           ${H.field({ label:'Docker 上下文目录', tip:'docker build 的上下文', input:`<input id="sDockerCtx" value="${esc(d.docker_context)}" placeholder="如 .">` })}
           ${H.field({ label:'Dockerfile 路径', tip:'相对 docker_context', input:`<input id="sDockerfile" value="${esc(d.dockerfile)}" placeholder="如 Dockerfile">` })}
         </div>`;
@@ -117,7 +132,19 @@
         <div style="display:flex;gap:10px;margin-top:18px"><button class="btn primary flex-1" id="svcSave">✓ 保存服务</button></div>`;
 
       groups.forEach(g => g.bind());
-      H.rowList({ id:'sBuildOrder', rows: d.build_order }).bind();
+      if (isFrontend) {
+        H.cmdList({ id:'sBuildOrder', rows: d.build_order }).bind();
+      } else {
+        H.rowList({ id:'sBuildOrder', rows: d.build_order }).bind();
+      }
+      // 构建类型切换：重新渲染表单
+      const btSel = document.getElementById('sBuildType');
+      if (btSel) btSel.onchange = e => {
+        d.build_type = e.target.value;
+        // 切换构建类型时清空构建步骤（避免 Maven 步骤与前端步骤混用）
+        d.build_order = [];
+        render();
+      };
       H.tagInput({ id:'sNacosGroups', values: d.nacos_groups }).bind();
       H.tagInput({ id:'sDubbo', values: d.dubbo_services }).bind();
       H.tagInput({ id:'sLogKw', values: d.log_error_keywords }).bind();
@@ -155,6 +182,7 @@
         const payload = {
           name: d.name, image_name: d.image_name, service_name: d.service_name || d.name,
           git_repo: d.git_repo, git_branch: d.git_branch, git_pull_before_build: d.git_pull_before_build,
+          build_type: d.build_type || 'maven',
           docker_context: d.docker_context, dockerfile: d.dockerfile,
           build_order: d.build_order, nacos_groups: d.nacos_groups, dubbo_services: d.dubbo_services,
           snailjob_group: d.snailjob_group, health_url: d.health_url,
@@ -179,6 +207,7 @@
       d.git_repo = val('sGit').trim();
       d.git_branch = val('sGitBranch').trim();
       d.git_pull_before_build = document.getElementById('sGitPull').checked;
+      d.build_type = val('sBuildType') || 'maven';
       d.service_name = val('sCompose').trim();
       d.docker_context = val('sDockerCtx').trim();
       d.dockerfile = val('sDockerfile').trim();
@@ -188,7 +217,9 @@
       const hp = val('sHealthPort').trim();
       d.health_port = hp === '' ? 0 : Number(hp);
       d.enabled = document.getElementById('sEnabled').checked;
-      d.build_order = H.rowList({ id:'sBuildOrder', rows:[] }).read();
+      d.build_order = (d.build_type === 'frontend'
+        ? H.cmdList({ id:'sBuildOrder', rows:[] }).read()
+        : H.rowList({ id:'sBuildOrder', rows:[] }).read());
       d.nacos_groups = H.tagInput({ id:'sNacosGroups', values:[] }).read();
       d.dubbo_services = H.tagInput({ id:'sDubbo', values:[] }).read();
       d.log_error_keywords = H.tagInput({ id:'sLogKw', values:[] }).read();

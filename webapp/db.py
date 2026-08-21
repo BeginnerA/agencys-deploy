@@ -399,6 +399,10 @@ def _migrate(conn):
     srv_cols_now2 = {r["name"] for r in conn.execute("PRAGMA table_info(servers)")}
     if "role" in srv_cols_now2:
         conn.execute("ALTER TABLE servers DROP COLUMN role")
+    # services 表新增 build_type 列（构建类型：maven / frontend）
+    srv_cols_now3 = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
+    if "build_type" not in srv_cols_now3:
+        conn.execute("ALTER TABLE services ADD COLUMN build_type TEXT DEFAULT 'maven'")
 
 
 def _serialize(table: str, fields: dict) -> dict:

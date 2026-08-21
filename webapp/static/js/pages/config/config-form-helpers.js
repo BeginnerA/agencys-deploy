@@ -109,6 +109,72 @@
   }
 
   // ---- 行编辑器（build_order：模块名/相对路径/goal/额外 profile） ----
+  // ---- 前端构建步骤编辑器（name/path/commands 多行文本） ----
+  function cmdList({id, rows}){
+    const buildRow = (r, i) => {
+      const cmds = (r.commands || []).join('\n');
+      return `<div class="row-item" data-i="${i}">
+        <input class="ri-name" placeholder="步骤名（仅展示）" value="${esc(r.name || '')}">
+        <input class="ri-path" placeholder="工作目录（相对 project_root）" value="${esc(r.path || '')}">
+        <textarea class="ri-cmds" rows="3" placeholder="每行一条命令，如&#10;npm install&#10;npm run build">${esc(cmds)}</textarea>
+        <span class="ri-btns">
+          <button data-act="up" title="上移">↑</button>
+          <button data-act="down" title="下移">↓</button>
+          <button class="del" data-act="del" title="删除">✕</button>
+        </span>
+      </div>`;
+    };
+    const getBox = () => document.getElementById(id);
+    const readRow = el => {
+      const cmds = el.querySelector('.ri-cmds').value.split('\n').map(s => s.trim()).filter(Boolean);
+      return {
+        name: el.querySelector('.ri-name').value.trim(),
+        path: el.querySelector('.ri-path').value.trim(),
+        commands: cmds,
+      };
+    };
+    return {
+      html: `<div class="row-list" id="${id}">
+        ${(rows || []).map((r, i) => buildRow(r, i)).join('')}
+        <div class="row-add"><button class="btn sm" data-act="add">＋ 添加构建步骤</button></div>
+      </div>`,
+      bind(){
+        const box = getBox();
+        if (!box) return;
+        const rawRead = () => [...box.querySelectorAll('.row-item')].map(readRow);
+        const read = () => rawRead().filter(r => r.path || r.name || r.commands.length);
+        const bindActions = () => {
+          box.querySelectorAll('.row-item').forEach((row, i) => {
+            row.querySelectorAll('button[data-act]').forEach(btn => {
+              btn.onclick = () => {
+                const act = btn.dataset.act;
+                const arr = rawRead();
+                if (act === 'up' && i > 0){ const t = arr[i-1]; arr[i-1] = arr[i]; arr[i] = t; }
+                else if (act === 'down' && i < arr.length - 1){ const t = arr[i+1]; arr[i+1] = arr[i]; arr[i] = t; }
+                else if (act === 'del') arr.splice(i, 1);
+                box.querySelectorAll('.row-item').forEach(el => el.remove());
+                arr.forEach((r, j) => box.insertAdjacentHTML('beforeend', buildRow(r, j)));
+                bindActions();
+              };
+            });
+          });
+        };
+        box.querySelector('.row-add button').onclick = () => {
+          box.insertAdjacentHTML('beforeend', buildRow({name:'', path:'', commands:[]}, read().length));
+          bindActions();
+        };
+        bindActions();
+      },
+      read(){
+        const box = getBox();
+        if (!box) return [];
+        return [...box.querySelectorAll('.row-item')].map(readRow)
+          .filter(r => r.path || r.name || r.commands.length);
+      },
+    };
+  }
+
+  // ---- 行编辑器（build_order：模块名/相对路径/goal/额外 profile） ----
   function rowList({id, rows}){
     const buildRow = (r, i) => `
       <div class="row-item" data-i="${i}">
@@ -327,7 +393,7 @@
   // ---- 模块导出 ----
   window.cfgHelpers = {
     field, fieldErr, section, stepper, templateCard,
-    tagInput, rowList,
+    tagInput, rowList, cmdList,
     yamlToObj, objToYaml,
     ipValid, safeName,
     touchRecent, getRecent,

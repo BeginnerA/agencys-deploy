@@ -244,6 +244,7 @@ def create_service(pid):
                   docker_context=body.get("docker_context", ""),
                   dockerfile=body.get("dockerfile", ""),
                   build_order=lists["build_order"],
+                  build_type=body.get("build_type", "maven"),
                   nacos_groups=lists["nacos_groups"],
                   dubbo_services=lists["dubbo_services"],
                   snailjob_group=body.get("snailjob_group", ""),
@@ -278,7 +279,7 @@ def update_service(pid, sid):
         return _err("name 不能为空")
     allowed = ("name", "image_name", "service_name", "docker_context",
                "dockerfile", "snailjob_group", "health_url",
-               "clear_log_dir", "git_repo", "git_branch")
+               "clear_log_dir", "git_repo", "git_branch", "build_type")
     fields = {k: v for k, v in body.items() if k in allowed}
     for k in _LIST_FIELDS_SERVICE:
         if k in body:

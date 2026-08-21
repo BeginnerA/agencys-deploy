@@ -5,12 +5,29 @@
 # 可配置参数说明：
 #
 # projects.<服务名>       - 服务键名，须与 docker-compose 服务名、镜像名对应
+# build_type             - （可选）构建类型：maven（默认）或 frontend
+#                         maven    = Java 微服务，走 Maven 多模块构建
+#                         frontend = Web 前端项目，走自定义命令（npm/pnpm/yarn 等）
+#
+# 【Maven 模式】build_order 配置：
 # build_order            - Maven 构建顺序，按顺序对每个模块执行 mvn clean {goal} -P{profile}
 #   build_order[].name      - 模块名（仅用于日志展示）
 #   build_order[].path      - 模块相对路径（相对 deploy.project_root）
 #   build_order[].goal      - Maven goal：install / package 等
 #   build_order[].extra_profile - （可选）额外 Maven profile，与环境 profile 组合为 -P{env},{extra}；
 #                           用于同一仓库按 profile 产出不同 jar 的项目（如 basketball 的 web/job/cli）
+#
+# 【前端模式】build_order 配置（build_type: frontend 时）：
+#   build_order[].name      - 步骤名（仅用于日志展示）
+#   build_order[].path      - 工作目录（相对 deploy.project_root）
+#   build_order[].commands  - 命令列表，按顺序执行；支持 shell 语法；${VERSION} 会被替换为版本号
+#   示例：
+#     build_order:
+#       - name: "前端构建"
+#         path: "mall-web"
+#         commands:
+#           - "npm install"
+#           - "npm run build"
 # docker_context         - Dockerfile 所在目录（docker build 上下文）
 # dockerfile             - Dockerfile 相对路径
 # image_name             - 镜像短名，完整镜像名为 {registry}/{namespace}/{image_name}:{version}

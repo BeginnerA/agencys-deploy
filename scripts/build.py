@@ -1,4 +1,9 @@
-"""Maven 多模块构建 + Docker 镜像构建推送"""
+"""Maven 多模块构建 / 前端构建 + Docker 镜像构建推送
+
+支持两种构建类型（由 projects.yaml 的 build_type 字段决定）：
+  maven    - Java 微服务：Maven 多模块构建 → Docker 镜像（默认）
+  frontend - Web 前端项目：自定义命令（npm install / npm run build 等）→ Docker 镜像
+"""
 import os
 import sys
 import shutil
@@ -141,6 +146,48 @@ def find_java_home(config: dict = None) -> str:
     fail("未找到 JDK：请在 config/deploy*.yaml 的 build.java_home 配置，或设置 JAVA_HOME 环境变量，或安装 JDK 并加入 PATH")
 
 
+def find_node():
+    """定位 node/npm/npx 可执行文件（仅 Windows 绝对路径兜底）
+
+    前端构建需要 node 与包管理器在 PATH 中可用；
+    Windows 上 subprocess 无法直接执行裸命令，须返回绝对路径。
+    """
+    node = shutil.which("node")
+    if node:
+        return node
+    if os.name == "nt":
+        for cand in [
+            Path(r"C:\Program Files\nodejs\node.exe"),
+            Path(r"C:\Program Files (x86)\nodejs\node.exe"),
+            *Path(r"C:\Program Files\nodejs").glob("node.exe"),
+        ]:
+            if cand.exists():
+                return str(cand)
+    fail("未找到 node：请安装 Node.js 并加入 PATH")
+
+
+def find_pm(project_root: Path, step_path: Path) -> str:
+    """探测前端包管理器：项目目录下有 pnpm-lock → pnpm，有 yarn.lock → yarn，否则 npm
+
+    返回绝对路径（Windows 兼容）。
+    """
+    for pm_name, lock_file in [("pnpm", "pnpm-lock.yaml"), ("yarn", "yarn.lock")]:
+        if (step_path / lock_file).exists():
+            pm = shutil.which(pm_name)
+            if pm:
+                return pm
+            fail(f"项目使用 {pm_name}（检测到 {lock_file}），但未找到 {pm_name} 命令，请安装后加入 PATH")
+    # 默认 npm
+    npm = shutil.which("npm")
+    if npm:
+        return npm
+    if os.name == "nt":
+        npm_cmd = Path(r"C:\Program Files\nodejs\npm.cmd")
+        if npm_cmd.exists():
+            return str(npm_cmd)
+    fail("未找到 npm：请安装 Node.js 并加入 PATH")
+
+
 def run(cmd: list, cwd: Path, env: dict = None, timeout: int = None):
     log(f"执行: {' '.join(cmd)}")
     try:
@@ -159,6 +206,28 @@ def run(cmd: list, cwd: Path, env: dict = None, timeout: int = None):
         fail(f"命令超时 ({timeout}s): {' '.join(cmd)}")
     except FileNotFoundError:
         fail(f"命令不存在: {cmd[0]}")
+
+
+def run_shell(cmd: str, cwd: Path, env: dict = None, timeout: int = None):
+    """通过 shell 执行自定义命令（前端构建步骤的 commands 列表）
+
+    支持 shell 语法（管道、重定向等）；Windows 使用 cmd /c，Unix 使用 /bin/sh -c。
+    """
+    log(f"执行: {cmd}")
+    shell_cmd = cmd if os.name != "nt" else f'cmd /c "{cmd}"'
+    try:
+        result = subprocess.run(
+            shell_cmd, cwd=cwd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, shell=True, timeout=timeout,
+        )
+        if result.stdout:
+            for line in result.stdout.rstrip().splitlines():
+                print(f"  | {line}", flush=True)
+        if result.returncode != 0:
+            fail(f"命令执行失败 (rc={result.returncode}): {cmd}")
+    except subprocess.TimeoutExpired:
+        fail(f"命令超时 ({timeout}s): {cmd}")
 
 
 def docker_login(registry: dict):
@@ -201,14 +270,80 @@ def get_maven_profile(config: dict, env: str = None) -> str:
     )
 
 
+def _run_build_steps(proj: dict, project_root: Path, version: str,
+                     profile: str, env_vars: dict, config: dict = None):
+    """根据 build_type 执行 Maven 或前端构建步骤"""
+    build_type = proj.get("build_type", "maven")
+    if build_type == "frontend":
+        _run_frontend_steps(proj, project_root, version, env_vars)
+    else:
+        _run_maven_steps(proj, project_root, version, profile, env_vars, config)
+
+
+def _run_maven_steps(proj: dict, project_root: Path, version: str,
+                     profile: str, env_vars: dict, config: dict = None):
+    """Maven 多模块构建（原有逻辑）"""
+    mvn = find_mvn(config)
+    java_home = find_java_home(config)
+    if java_home:
+        env_vars["JAVA_HOME"] = java_home
+        env_vars["PATH"] = str(Path(java_home) / "bin") + os.pathsep + env_vars.get("PATH", "")
+    log(f"使用 Maven: {mvn}" + (f"，JAVA_HOME: {java_home}" if java_home else ""))
+    log(f"Maven profile: {profile}（jar 将固化该环境配置）")
+
+    for step in proj["build_order"]:
+        module_path = project_root / step["path"]
+        pom = module_path / "pom.xml"
+        if not pom.exists():
+            fail(f"未找到 pom.xml: {pom}")
+        extra = step.get("extra_profile")
+        maven_profiles = f"{profile},{extra}" if extra else profile
+        cmd = [
+            mvn, "-f", str(pom), "clean", step["goal"],
+            f"-P{maven_profiles}", f"-Drevision={version}", "-DskipTests",
+        ]
+        run(cmd, project_root, env=env_vars, timeout=600)
+
+
+def _run_frontend_steps(proj: dict, project_root: Path, version: str,
+                        env_vars: dict):
+    """前端构建：按 build_order 中每个步骤的 commands 列表顺序执行
+
+    commands 中的命令支持 shell 语法（管道、重定向等）。
+    特殊变量替换：${VERSION} → 当前版本号。
+    """
+    node = find_node()
+    log(f"使用 Node: {node}")
+    log(f"构建类型: frontend（Web 前端项目）")
+
+    for step in proj.get("build_order", []):
+        step_name = step.get("name", "未命名步骤")
+        step_path = project_root / step.get("path", ".")
+        commands = step.get("commands", [])
+        if not commands:
+            log(f"警告: 步骤 [{step_name}] 无 commands，跳过")
+            continue
+        log(f">>> 前端步骤: {step_name}（{step_path}）")
+        for cmd_template in commands:
+            # 支持 ${VERSION} 变量替换
+            cmd = cmd_template.replace("${VERSION}", version)
+            # 如果命令以 npm/pnpm/yarn 开头，尝试定位绝对路径
+            parts = cmd.split(None, 1)
+            if parts and parts[0] in ("npm", "pnpm", "yarn"):
+                pm = shutil.which(parts[0])
+                if pm:
+                    cmd = pm + (" " + parts[1] if len(parts) > 1 else "")
+            run_shell(cmd, step_path, env=env_vars, timeout=600)
+
+
 def build_project(project_name: str, version: str, env: str = None):
     config = load_config(env=env)
     proj = get_project_config(project_name)
     registry = get_registry_auth(config)
     mode = get_registry_mode(config)
-    # Maven profile 决定 jar 内固化的环境配置（spring.profiles.active / Nacos 命名空间）
-    # 注意必须在下方 env = os.environ.copy() 覆盖参数前计算
-    profile = get_maven_profile(config, env)
+    build_type = proj.get("build_type", "maven")
+    # Maven profile 仅对 maven 类型项目有意义
+    profile = get_maven_profile(config, env) if build_type != "frontend" else ""
     project_root = Path(config["deploy"]["project_root"]).expanduser()
     if not project_root.exists():
         log(f"警告: 项目根目录不存在: {project_root}（Docker 部署时请勾选「跳过构建」，或在宿主机上确认路径存在）")
@@ -222,34 +357,12 @@ def build_project(project_name: str, version: str, env: str = None):
     else:
         log(f"直传模式（{mode}）: 跳过 docker login / docker push")
 
-    # 定位 Maven 与 JDK（优先级：配置文件 build.* → 环境变量/PATH → 常见位置）
-    mvn = find_mvn(config)
-    java_home = find_java_home(config)
-    env = os.environ.copy()
-    if java_home:
-        env["JAVA_HOME"] = java_home
-        env["PATH"] = str(Path(java_home) / "bin") + os.pathsep + env.get("PATH", "")
-    log(f"使用 Maven: {mvn}" + (f"，JAVA_HOME: {java_home}" if java_home else ""))
-    log(f"Maven profile: {profile}（--env: {env or '默认/生产'}），jar 将固化该环境配置")
+    env_vars = os.environ.copy()
 
-    # Maven 顺序构建（单步超时 10 分钟）
-    for step in proj["build_order"]:
-        module_path = project_root / step["path"]
-        pom = module_path / "pom.xml"
-        if not pom.exists():
-            fail(f"未找到 pom.xml: {pom}")
-        # 支持 extra_profile：与环境 profile 组合为 -P{env},{extra}
-        # 用于同一仓库按 Maven profile 产出不同 jar 的项目（如 basketball 的 web/job/cli）
-        extra = step.get("extra_profile")
-        maven_profiles = f"{profile},{extra}" if extra else profile
-        cmd = [
-            mvn, "-f", str(pom), "clean", step["goal"],
-            f"-P{maven_profiles}", f"-Drevision={version}", "-DskipTests",
-        ]
-        run(cmd, project_root, env=env, timeout=600)
+    # 按 build_type 执行对应的构建步骤
+    _run_build_steps(proj, project_root, version, profile, env_vars, config)
 
     # Docker 构建（超时 10 分钟，--progress=plain 便于排查）
-    # 直传模式使用 {namespace}/{image_name} 短名（与 IDEA 直推一致），便于服务器 docker load 后直接引用
     if mode == "push":
         image = f"{registry['host']}/{registry['namespace']}/{proj['image_name']}:{version}"
     else:
@@ -267,7 +380,6 @@ def build_project(project_name: str, version: str, env: str = None):
     run(cmd, project_root, timeout=600)
 
     if mode == "push":
-        # 推送镜像（超时 10 分钟，取决于上行带宽）
         cmd = ["docker", "push", image]
         run(cmd, project_root, timeout=600)
         log(f"镜像已推送: {image}")

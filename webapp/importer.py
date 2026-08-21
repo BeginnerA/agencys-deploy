@@ -40,16 +40,26 @@ def _import_projects(db_path: str, path: Path) -> tuple:
         if dbm.get_service_by_name(db_path, pid, name):
             continue
         build_order = cfg.get("build_order", []) or []
+        # 前端项目的 build_order 元素含 commands 数组（无 goal 字段），原样保留
+        normalised_build_order = []
+        for b in build_order:
+            if "commands" in b:
+                normalised_build_order.append({"name": b.get("name", ""),
+                                               "path": b.get("path", ""),
+                                               "commands": b["commands"]})
+            else:
+                normalised_build_order.append({"name": b.get("name", ""),
+                                               "path": b.get("path", ""),
+                                               "goal": b.get("goal", "package"),
+                                               "extra_profile": b.get("extra_profile", "")})
         dbm.create_record(db_path, "services", dict(
             project_id=pid, name=name,
             image_name=cfg.get("image_name", name),
             service_name=cfg.get("service_name", name),
             docker_context=cfg.get("docker_context", ""),
             dockerfile=cfg.get("dockerfile", ""),
-            build_order=[{"name": b.get("name", ""), "path": b.get("path", ""),
-                          "goal": b.get("goal", "package"),
-                          "extra_profile": b.get("extra_profile", "")}
-                         for b in build_order],
+            build_order=normalised_build_order,
+            build_type=cfg.get("build_type", "maven"),
             nacos_groups=cfg.get("nacos_groups", []) or [],
             dubbo_services=cfg.get("dubbo_services", []) or [],
             snailjob_group=cfg.get("snailjob_group", ""),
