@@ -236,6 +236,7 @@ CREATE TABLE IF NOT EXISTS release_windows (
     start_at INTEGER NOT NULL,
     end_at INTEGER NOT NULL,
     block_level TEXT NOT NULL DEFAULT 'warn',
+    scope TEXT DEFAULT '{"type":"all","ids":[]}',
     repeat_yearly INTEGER DEFAULT 0,
     created_by INTEGER DEFAULT 0,
     created_at INTEGER NOT NULL
@@ -336,6 +337,7 @@ JSON_FIELDS = {
     "deployment_snapshots": {"image_versions"},
     "canary_configs": {"steps"},
     "custom_monitors": {"channels", "detail"},
+    "release_windows": {"scope"},
 }
 
 # 表名白名单（泛型 CRUD 的标识符护栏，防 SQL 注入）
@@ -424,6 +426,17 @@ def _migrate(conn):
     srv_cols_now3 = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
     if "build_type" not in srv_cols_now3:
         conn.execute("ALTER TABLE services ADD COLUMN build_type TEXT DEFAULT 'maven'")
+    # release_windows 补 scope 列（作用域配置，与 alert_rules.scope 同构）
+    rw_cols = {r["name"] for r in conn.execute("PRAGMA table_info(release_windows)")}
+    if "scope" not in rw_cols:
+        conn.execute("ALTER TABLE release_windows ADD COLUMN scope TEXT DEFAULT '{\"type\":\"all\",\"ids\":[]}'")
+        # 存量数据迁移：project_id > 0 的记录转为 project 作用域
+        for row in conn.execute("SELECT id, project_id FROM release_windows").fetchall():
+            if row["project_id"] > 0:
+                s = json.dumps({"type": "project", "ids": [row["project_id"]]})
+            else:
+                s = json.dumps({"type": "all", "ids": []})
+            conn.execute("UPDATE release_windows SET scope=? WHERE id=?", (s, row["id"]))
 
 
 def _serialize(table: str, fields: dict) -> dict:

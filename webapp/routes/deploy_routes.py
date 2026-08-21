@@ -4,6 +4,7 @@ from flask import Blueprint, request, jsonify, current_app, g
 from .. import db as dbm
 from ..auth import require_auth, require_role, audit
 from ..task_manager import submit_task, tail_log, kill_task
+from ..deploy_scheduler import check_release_window
 
 deploy_bp = Blueprint("deploy", __name__)
 
@@ -77,6 +78,12 @@ def create_task():
         extra.append("--skip-build")
     if rollback:
         extra.append("--rollback")
+    # 发布窗口检查
+    window = check_release_window(current_app.config["DB_PATH"], project_id)
+    if window and window["block_level"] == "block":
+        return jsonify({"error": f"当前处于封网窗口 '{window['name']}'，禁止发布"}), 403
+    if window and window["block_level"] == "warn":
+        extra.append("--force-window")
     task_id = dbm.create_task(current_app.config["DB_PATH"], project_id, type_,
                               ref_id, rec["name"], env, version,
                               previous_version, g.user["id"], extra=extra,

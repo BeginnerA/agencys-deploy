@@ -38,19 +38,30 @@ def compute_canary_batches(steps: list, total_servers: int) -> list:
     return batches
 
 
-def check_release_window(db_path: str, project_id: int) -> dict | None:
+def check_release_window(db_path: str, project_id: int,
+                         env_id: int = None,
+                         server_id: int = None,
+                         service: str = None) -> dict | None:
     """检查当前是否命中发布窗口。
 
     返回 None 表示未命中任何窗口；
     返回 {"id", "name", "block_level"} 表示命中。
     repeat_yearly=1 的窗口将年份偏移到当前年份后比较。
-    优先匹配项目级窗口（project_id 匹配），其次全局窗口（project_id=0）。
+
+    作用域匹配逻辑（与 alert_rules.scope 同构）：
+      - type=all → 匹配所有部署
+      - type=project → project_id 在 scope.ids 中
+      - type=env → env_id 在 scope.ids 中
+      - type=server → server_id 在 scope.ids 中
+      - type=service → service 名在 scope.ids 中
+    旧版无 scope 列的窗口回退到 project_id 匹配。
     """
     now = int(time.time())
     windows = []
-    # 项目级 + 全局窗口
-    for w in _list_windows(db_path, project_id):
-        if _window_matches(w, now):
+    for w in _list_windows(db_path):
+        if not _window_matches(w, now):
+            continue
+        if _scope_matches(w, project_id, env_id, server_id, service):
             windows.append(w)
     if not windows:
         return None
@@ -59,12 +70,35 @@ def check_release_window(db_path: str, project_id: int) -> dict | None:
     return blocks[0] if blocks else windows[0]
 
 
-def _list_windows(db_path: str, project_id: int) -> list:
-    """查询项目级 + 全局窗口"""
+def _list_windows(db_path: str) -> list:
+    """查询所有窗口"""
     from . import db as dbm
-    return dbm.list_records(
-        db_path, "release_windows",
-        "project_id=? OR project_id=0", (project_id,))
+    return dbm.list_records(db_path, "release_windows", "", (), "id DESC")
+
+
+def _scope_matches(w: dict, project_id: int,
+                   env_id: int = None,
+                   server_id: int = None,
+                   service: str = None) -> bool:
+    """判断窗口的作用域是否匹配当前部署目标"""
+    scope = w.get("scope")
+    # 兼容旧数据：无 scope 字段时回退到 project_id 匹配
+    if not scope or not isinstance(scope, dict):
+        wp = w.get("project_id", 0)
+        return wp == 0 or wp == project_id
+    st = scope.get("type", "all")
+    ids = scope.get("ids", [])
+    if st == "all":
+        return True
+    if st == "project":
+        return project_id in ids
+    if st == "env":
+        return env_id is not None and env_id in ids
+    if st == "server":
+        return server_id is not None and server_id in ids
+    if st == "service":
+        return service is not None and service in ids
+    return False
 
 
 def _window_matches(w: dict, now: int) -> bool:

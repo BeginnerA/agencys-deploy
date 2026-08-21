@@ -207,6 +207,22 @@ def run_schedule(sid):
 
 # ========== 发布窗口 ==========
 
+_VALID_SCOPE_TYPES = ("all", "project", "env", "server", "service")
+
+
+def _validate_scope(scope) -> str:
+    """校验 scope 结构，返回错误信息或空字符串"""
+    if not isinstance(scope, dict):
+        return "scope 格式错误"
+    if scope.get("type") not in _VALID_SCOPE_TYPES:
+        return "scope type 非法"
+    if not isinstance(scope.get("ids"), list):
+        return "scope.ids 需为列表"
+    if "env_ids" in scope and not isinstance(scope["env_ids"], list):
+        return "scope.env_ids 需为列表"
+    return ""
+
+
 @deploy_enhance_bp.route("/deploy/windows", methods=["GET"])
 @require_auth
 def list_windows():
@@ -227,14 +243,19 @@ def create_window():
     end_at = body.get("end_at", 0)
     block_level = body.get("block_level", "warn")
     repeat_yearly = 1 if body.get("repeat_yearly") else 0
+    scope = body.get("scope") or {"type": "all", "ids": []}
     if not isinstance(name, str) or not name.strip():
         return jsonify({"error": "name 必填"}), 400
     if block_level not in ("block", "warn"):
         return jsonify({"error": "block_level 必须为 block 或 warn"}), 400
+    err = _validate_scope(scope)
+    if err:
+        return jsonify({"error": err}), 400
     wid = dbm.create_record(_db_path(), "release_windows", dict(
         project_id=project_id, name=name.strip(),
         start_at=int(start_at), end_at=int(end_at),
-        block_level=block_level, repeat_yearly=repeat_yearly,
+        block_level=block_level, scope=scope,
+        repeat_yearly=repeat_yearly,
         created_by=g.user["id"], created_at=int(time.time())))
     audit("create_window", "release_window", wid, {"name": name})
     return jsonify({"id": wid}), 201
@@ -259,6 +280,12 @@ def update_window(wid):
             fields[k] = int(body[k])
     if "repeat_yearly" in body:
         fields["repeat_yearly"] = 1 if body["repeat_yearly"] else 0
+    if "scope" in body:
+        scope = body["scope"] or {}
+        err = _validate_scope(scope)
+        if err:
+            return jsonify({"error": err}), 400
+        fields["scope"] = scope
     if fields:
         dbm.update_record(_db_path(), "release_windows", wid, fields)
     audit("update_window", "release_window", wid, fields)
