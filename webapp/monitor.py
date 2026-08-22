@@ -466,7 +466,7 @@ def _parse_container_status(out: str, services: list) -> dict:
                     days * 24 + hours + mins / 60, 1)
         else:
             info["restart_count"] = 1  # 容器不在运行状态
-            info["uptime_hours"] = 0
+            info["uptime_hours"] = -1  # 已停止容器不参与运行时长计算（-1 被前端过滤）
         result[name] = info
     return result
 
@@ -753,6 +753,11 @@ class MonitorScheduler:
                             m = re.search(r":(\d+\.\d+\.\d+)$", image)
                             st["version"] = m.group(1) if m else image.rsplit("/", 1)[-1]
                             st["status"] = "online"
+                            # 服务运行时长（从容器状态中按 service_name 匹配）
+                            ext_cs = (per_server_extended.get(s["host"]) or {}).get("container_status") or {}
+                            c_info = ext_cs.get(svc["service_name"])
+                            if c_info and c_info.get("uptime_hours", -1) >= 0:
+                                st["uptime_hours"] = c_info["uptime_hours"]
                             # 记录该服务在此服务器可达，用于后续 HTTP 健康检查
                             health_hosts.setdefault(svc["name"], []).append(s["host"])
         result["host_metrics"] = per_server_metrics

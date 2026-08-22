@@ -56,6 +56,14 @@ def overview():
     success = sum(1 for t in tasks if t["status"] == "success")
     failed = sum(1 for t in tasks if t["status"] == "failed")
     running = sum(1 for t in tasks if t["status"] == "running")
+    # 活跃告警数（firing 状态）
+    conn = dbm.get_conn(db)
+    try:
+        alerts_active = conn.execute(
+            "SELECT COUNT(*) FROM alerts WHERE status='firing'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
     servers = dbm.list_records(db, "servers")
     # 计算任务平均耗时（用于性能评分）
     completed = [t for t in tasks if t["status"] in ("success", "failed")
@@ -68,6 +76,7 @@ def overview():
         "servers": len(servers),
         "tasks_total": total, "tasks_success": success,
         "tasks_failed": failed, "tasks_running": running,
+        "alerts_active": alerts_active,
         "tasks_avg_duration": avg_duration,
         "trend7": _trend(tasks, 7),
         "trend30": _trend(tasks, 30),

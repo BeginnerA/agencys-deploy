@@ -12,7 +12,7 @@
   function kpiRow(o){
     const items = [
       ['🗂️', o.projects, '项目'], ['🧩', o.services, '服务'], ['🌐', o.environments, '环境'],
-      ['🖥️', o.servers, '服务器'], ['📋', o.tasks_total, '任务总数'],
+      ['🖥️', o.servers, '服务器'], ['🔔', o.alerts_active || 0, '告警活跃数'],
       ['📈', o.success_rate === null ? '—' : o.success_rate + '%', '发布成功率'],
       ['🚀', o.tasks_total || 0, '部署频次'],
       ['⏱️', o.tasks_avg_duration ? Math.round(o.tasks_avg_duration) + 's' : '—', '平均耗时'],
@@ -157,10 +157,8 @@
     const hasExt = extEntries.length > 0;
     // 扩展指标汇总
     const extAvg = hasExt ? {
-      swap: (() => { const vals = extEntries.map(([,v]) => v.swap).filter(x => x != null); return vals.length ? +(vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(1) : null; })(),
-      restarts: extEntries.reduce((s, [,v]) => s + ((v.container_status && Object.values(v.container_status).reduce((a, c) => a + (c.restart_count||0), 0)) || 0), 0),
+      restarts: extEntries.reduce((s, [,v]) => s + ((v.container_status && Object.values(v.container_status).filter(c => (c.uptime_hours ?? -1) < 0).length) || 0), 0),
       tcpCW: extEntries.reduce((s, [,v]) => s + ((v.tcp && v.tcp.CLOSE_WAIT) || 0), 0),
-      sslMin: (() => { const vals = extEntries.map(([,v]) => v.ssl_days).filter(x => x != null); return vals.length ? Math.min(...vals) : null; })(),
     } : null;
     // 合并服务器状态 + 资源明细为统一列表
     const allServers = (mon && mon.servers) || [];
@@ -189,7 +187,7 @@
           <span class="muted" style="font-weight:400;font-size:12px">（${mergedServers.length} 台）</span>
           ${hmWarn > 0 ? `<span class="hm-warn-tag">${hmWarn} 台超阈值</span>` : ''}
           ${extAvg && extAvg.tcpCW > 50 ? `<span class="hm-warn-tag">CLOSE_WAIT ${extAvg.tcpCW}</span>` : ''}
-          ${extAvg && extAvg.sslMin != null && extAvg.sslMin < 14 ? `<span class="hm-warn-tag">SSL ≤${Math.round(extAvg.sslMin)}天</span>` : ''}
+
         </div>
         ${hasHM ? `
         <div class="hm-summary-row">
@@ -198,20 +196,18 @@
             .map(([id,name,val,color]) => `<div class="hm-gauge-box"><div id="${id}" style="height:140px"></div></div>`).join('')}
         </div>` : ''}
         <div class="tbl-wrap"><table class="tbl hm-tbl"><thead><tr>
-          <th style="width:180px">主机</th><th>SSH</th><th>容器</th><th>CPU</th><th>内存</th><th>磁盘</th><th>负载</th><th>Swap</th><th>重启</th><th>运行时长</th><th>网络</th><th>TCP</th><th>磁盘IO</th><th>Docker存储</th><th>SSL到期</th><th>健康检查</th><th>最后探测</th></tr></thead><tbody>
+          <th style="width:180px">主机</th><th>SSH</th><th>容器</th><th>CPU</th><th>内存</th><th>磁盘</th><th>负载</th><th>服务异常/总</th><th>网络</th><th>TCP</th><th>磁盘IO</th><th>Docker存储</th><th>健康检查</th><th>最后探测</th></tr></thead><tbody>
           ${mergedServers.length ? mergedServers.map(sv => {
             const m = sv.hm;
             const ext = sv.ext || {};
-            // 重启次数（取所有容器总和）
+            // 异常容器数 / 总容器数
             const csObj = ext.container_status || {};
-            const restarts = Object.values(csObj).reduce((a, c) => a + (c.restart_count||0), 0);
+            const totalContainers = Object.keys(csObj).length;
+            const unhealthyCnt = Object.values(csObj).filter(c => (c.uptime_hours ?? -1) < 0).length;
             // TCP
             const tcp = ext.tcp || {};
             const tcpCW = tcp.CLOSE_WAIT || 0;
             const tcpEST = tcp.ESTABLISHED || 0;
-            // 运行时长
-            const uptimes = Object.values(csObj).map(c => c.uptime_hours).filter(h => h >= 0);
-            const minUp = uptimes.length ? Math.min(...uptimes) : -1;
             // Docker 磁盘
             const ddf = ext.docker_df || {};
             const dockerTotal = (ddf.images||0) + (ddf.containers||0) + (ddf.volumes||0);
@@ -233,19 +229,36 @@
                 return `<td><div class="hm-bar-wrap"><div class="hm-bar ${cls}" style="width:${Math.min(100,val)}%"></div>
                   <span class="hm-bar-val">${val.toFixed(1)}%</span></div></td>`;
               }).join('') : '<td colspan="4" class="muted" style="text-align:center">—</td>'}
-              <td class="num">${ext.swap != null ? `<span class="${ext.swap>80?'hm-high':ext.swap>50?'hm-mid':'hm-low'}">${ext.swap.toFixed(1)}%</span>` : '<span class="muted">—</span>'}</td>
-              <td class="num">${restarts > 0 ? `<span class="${restarts>3?'hm-high':'hm-low'}">${restarts}</span>` : '<span class="muted">0</span>'}</td>
-              <td class="num" style="font-size:11px">${minUp >= 0 ? (minUp >= 24 ? Math.floor(minUp/24) + '天' + Math.floor(minUp%24) + '时' : Math.floor(minUp) + '时') : '<span class="muted">—</span>'}</td>
+              <td class="num">${totalContainers > 0 ? (unhealthyCnt > 0 ? `<span class="hm-high">${unhealthyCnt}/${totalContainers}</span>` : `<span class="hm-low">${totalContainers}</span>`) : '<span class="muted">—</span>'}</td>
               <td class="num" style="font-size:11px">${ext.net_rx != null ? `↓${fmtRate(ext.net_rx)}` : '<span class="muted">—</span>'}${ext.net_tx != null ? `<br>↑${fmtRate(ext.net_tx)}` : ''}</td>
               <td class="num" style="font-size:11px">${tcpEST > 0 ? `E:${tcpEST}` : ''}${tcpCW > 0 ? ` <span class="${tcpCW>50?'hm-high':'hm-mid'}">CW:${tcpCW}</span>` : ''}${tcpEST === 0 && tcpCW === 0 ? '<span class="muted">—</span>' : ''}</td>
               <td class="num" style="font-size:11px">${ext.disk_read != null ? `R:${fmtRate(ext.disk_read*512)}` : ''}${ext.disk_write != null ? `<br>W:${fmtRate(ext.disk_write*512)}` : ''}${ext.disk_read == null && ext.disk_write == null ? '<span class="muted">—</span>' : ''}</td>
               <td class="num" style="font-size:11px">${dockerTotal > 0 ? fmtBytes(dockerTotal) : '<span class="muted">—</span>'}</td>
-              <td class="num">${ext.ssl_days != null ? `<span class="${ext.ssl_days<7?'hm-high':ext.ssl_days<30?'hm-mid':'hm-low'}">${Math.round(ext.ssl_days)}天</span>` : '<span class="muted">—</span>'}</td>
               <td class="num">${hcMs != null && hcMs > 0 ? `<span class="${hcMs>1000?'hm-high':hcMs>500?'hm-mid':'hm-low'}">${hcMs}ms</span>` : '<span class="muted">—</span>'}</td>
               <td class="muted">${sv.error ? esc(sv.error) : (sv.ts ? fmtTime(sv.ts) : '—')}</td></tr>`;
-          }).join('') : `<tr><td colspan="17" class="muted" style="text-align:center;padding:20px">暂无服务器数据</td></tr>`}
+          }).join('') : `<tr><td colspan="14" class="muted" style="text-align:center;padding:20px">暂无服务器数据</td></tr>`}
         </tbody></table></div>
       </div>
+      ${(() => {
+        const svcs = mon && mon.services || {};
+        const svcEntries = Object.entries(svcs);
+        if (!svcEntries.length) return '';
+        function fmtUp(h){ if(h==null||h<0) return '—'; if(h>=24) return Math.floor(h/24)+'天'+Math.floor(h%24)+'时'; return Math.floor(h)+'时'; }
+        const rows = svcEntries.map(([name, info]) => {
+          const dotCls = info.status === 'online' ? 'ok' : info.status === 'probe_failed' ? 'warn' : 'bad';
+          const statusTxt = info.status === 'online' ? '运行中' : info.status === 'probe_failed' ? '探测失败' : '未部署';
+          const upTxt = info.uptime_hours != null && info.uptime_hours >= 0 ? fmtUp(info.uptime_hours) : '';
+          return `<div class="list-item">
+            <div class="li-main ellipsis"><span class="dot ${dotCls}"></span>${esc(name)}
+              ${info.version ? ' <span class="weak">v'+esc(info.version)+'</span>' : ''}
+              ${upTxt ? ' <span class="weak" style="margin-left:4px">⏱'+upTxt+'</span>' : ''}</div>
+            <span class="${info.status==='online'?'ok':'err'}">${statusTxt}</span>
+          </div>`;
+        }).join('');
+        return `<div class="panel"><div class="panel-title">服务状态
+          <span class="muted" style="font-weight:400;font-size:12px">（${svcEntries.length} 个）</span></div>
+          <div class="rlist">${rows}</div></div>`;
+      })()}
       <div class="panel"><div class="panel-title">响应时间趋势</div>
         <div id="chartRespTime" style="height:220px"></div></div>
     `;
