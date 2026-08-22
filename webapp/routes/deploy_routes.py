@@ -59,8 +59,9 @@ def create_task():
     rollback = _bool_field(body, "rollback", False)
     auto_version = _bool_field(body, "auto_version", False)
     skip_build = _bool_field(body, "skip_build", False)
-    if rollback is None or auto_version is None or skip_build is None:
-        return jsonify({"error": "rollback/auto_version/skip_build 必须为布尔值"}), 400
+    force_window = _bool_field(body, "force_window", False)
+    if rollback is None or auto_version is None or skip_build is None or force_window is None:
+        return jsonify({"error": "rollback/auto_version/skip_build/force_window 必须为布尔值"}), 400
     if auto_version and (version or previous_version):
         return jsonify({"error": "auto_version 与显式 version/previous_version 互斥"}), 400
     if rollback:
@@ -83,6 +84,9 @@ def create_task():
     if window and window["block_level"] == "block":
         return jsonify({"error": f"当前处于封网窗口 '{window['name']}'，禁止发布"}), 403
     if window and window["block_level"] == "warn":
+        if not force_window:
+            return jsonify({"error": "window_warn",
+                            "window": {"name": window["name"], "id": window["id"]}}), 409
         extra.append("--force-window")
     task_id = dbm.create_task(current_app.config["DB_PATH"], project_id, type_,
                               ref_id, rec["name"], env, version,

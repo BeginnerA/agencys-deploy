@@ -7,16 +7,18 @@ async function api(path, opts={}){
   const resp = await fetch(path, opts);
   if(resp.status===401){ localStorage.removeItem('token'); localStorage.removeItem('user'); location.href='/'; throw new Error('未登录'); }
   const data = await resp.json().catch(()=>({}));
-  if(!resp.ok) throw new Error(data.error || ('HTTP '+resp.status));
+  if(!resp.ok){ const err = new Error(data.error || ('HTTP '+resp.status)); err.data = data; throw err; }
   return data;
 }
 function logout(){ localStorage.removeItem('token'); localStorage.removeItem('user'); location.href='/'; }
 
 // 追加：轮询封装（错误静默，避免轮询失败刷屏 toast）
 async function poll(fn, intervalMs){
-  const tick = async () => { try{ await fn(); }catch(e){ /* 轮询失败静默 */ } };
+  let id = null;
+  const tick = async () => { try{ if (await fn() === false && id){ clearInterval(id); id=null; } }catch(e){ /* 轮询失败静默 */ } };
   await tick();
-  return setInterval(tick, intervalMs);
+  id = setInterval(tick, intervalMs);
+  return id;
 }
 // 追加：当前用户（含 role 快捷判断）
 function isAdmin(){ return currentUser().role === 'admin'; }

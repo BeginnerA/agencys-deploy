@@ -1641,13 +1641,12 @@
                   <td>${esc(m.target)}${m.port && m.port !== 443 ? ':' + m.port : ''}</td>
                   <td class="mon-days ${daysCls}">${daysText}</td>
                   <td>${threshold}</td>
-                  <td>${m.enabled ? '<span class="badge success">启用</span>' : '<span class="badge">禁用</span>'}</td>
+                  <td><label class="mon-switch"><input type="checkbox" data-id="${m.id}" ${m.enabled ? 'checked' : ''} ${!canManage ? 'disabled' : ''}><span class="slider"></span></label></td>
                   <td>${checkedText}</td>
                   <td class="mon-actions">
                     ${m.type === 'ssl' && m.enabled ? `<button class="btn sm ghost mon-check-btn" data-id="${m.id}">检测</button>` : ''}
                     ${canManage ? `
                       <button class="btn sm ghost mon-edit-btn" data-id="${m.id}">编辑</button>
-                      <button class="btn sm ghost mon-toggle-btn" data-id="${m.id}">${m.enabled ? '禁用' : '启用'}</button>
                       <button class="btn sm ghost mon-del-btn" data-id="${m.id}">删除</button>
                     ` : ''}
                   </td>
@@ -1663,7 +1662,7 @@
     if (cfgBtn) cfgBtn.onclick = () => openMonitorConfig();
     tc.querySelectorAll('.mon-check-btn').forEach(b => b.onclick = () => checkMonitor(Number(b.dataset.id)));
     tc.querySelectorAll('.mon-edit-btn').forEach(b => b.onclick = () => openMonitorForm(Number(b.dataset.id)));
-    tc.querySelectorAll('.mon-toggle-btn').forEach(b => b.onclick = () => toggleMonitor(Number(b.dataset.id)));
+    tc.querySelectorAll('.mon-switch input').forEach(el => el.onchange = () => toggleMonitor(Number(el.dataset.id)));
     tc.querySelectorAll('.mon-del-btn').forEach(b => b.onclick = () => deleteMonitor(Number(b.dataset.id)));
   }
 

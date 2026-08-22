@@ -164,18 +164,31 @@
       </div>` });
     if (rollback){
       // 回滚提交：固定 type=project/ref_id=sid，version 留空由后端兜底为目标版本
-      document.getElementById('dpSubmit').onclick = async () => {
+      const doRollback = async (forceWindow) => {
         const env = document.getElementById('dpEnv').value;
         const previous_version = document.getElementById('dpPrevVersion').value.trim();
+        if (!previous_version) throw new Error('请填写回滚目标版本');
+        return await api('/api/tasks', {method:'POST', body: JSON.stringify({
+          project_id: pid, type: 'project', ref_id: sid, env, version: '', previous_version,
+          rollback: true, auto_version: false, skip_build: false, force_window: forceWindow})});
+      };
+      document.getElementById('dpSubmit').onclick = async () => {
         try{
-          if (!previous_version) throw new Error('请填写回滚目标版本');
-          const resp = await api('/api/tasks', {method:'POST', body: JSON.stringify({
-            project_id: pid, type: 'project', ref_id: sid, env, version: '', previous_version,
-            rollback: true, auto_version: false, skip_build: false})});
+          const resp = await doRollback(false);
           toastSuccess(`任务 #${resp.id} 已创建`);
           document.getElementById('drawerRoot').classList.add('hidden');
           location.hash = '#/deploy';
-        }catch(e){ toastError(e.message); }
+        }catch(e){
+          if (e.message === 'window_warn' && e.data && e.data.window){
+            if (!await confirmDialog(`当前处于发布窗口「${e.data.window.name}」（软警告），确认仍要继续回滚？`)) return;
+            try{
+              const resp2 = await doRollback(true);
+              toastSuccess(`任务 #${resp2.id} 已创建（已忽略窗口警告）`);
+              document.getElementById('drawerRoot').classList.add('hidden');
+              location.hash = '#/deploy';
+            }catch(e2){ toastError(e2.message); }
+          } else { toastError(e.message); }
+        }
       };
       return;
     }
@@ -189,7 +202,7 @@
     const refSel = document.getElementById('dpRef');
     refSel.innerHTML = refOpts();
     document.getElementById('dpType').onchange = () => { refSel.innerHTML = refOpts(); };
-    document.getElementById('dpSubmit').onclick = async () => {
+    const doDeploy = async (forceWindow) => {
       const typeSel = document.getElementById('dpType').value;
       const ref = document.getElementById('dpRef').value;
       const env = document.getElementById('dpEnv').value;
@@ -197,16 +210,29 @@
       const previous_version = document.getElementById('dpPrevVersion').value.trim();
       const auto_version = document.getElementById('dpAuto').checked;
       const skip_build = document.getElementById('dpSkip').checked;
+      if (auto_version && (version || previous_version)) throw new Error('自动版本与显式版本互斥');
+      const [t, rid] = ref.split(':');
+      return await api('/api/tasks', {method:'POST', body: JSON.stringify({
+        project_id: pid, type: t, ref_id: Number(rid), env, version, previous_version,
+        rollback, auto_version, skip_build, force_window: forceWindow})});
+    };
+    document.getElementById('dpSubmit').onclick = async () => {
       try{
-        if (auto_version && (version || previous_version)) throw new Error('自动版本与显式版本互斥');
-        const [t, rid] = ref.split(':');
-        const resp = await api('/api/tasks', {method:'POST', body: JSON.stringify({
-          project_id: pid, type: t, ref_id: Number(rid), env, version, previous_version,
-          rollback, auto_version, skip_build})});
+        const resp = await doDeploy(false);
         toastSuccess(`任务 #${resp.id} 已创建`);
         document.getElementById('drawerRoot').classList.add('hidden');
         location.hash = '#/deploy';
-      }catch(e){ toastError(e.message); }
+      }catch(e){
+        if (e.message === 'window_warn' && e.data && e.data.window){
+          if (!await confirmDialog(`当前处于发布窗口「${e.data.window.name}」（软警告），确认仍要继续发布？`)) return;
+          try{
+            const resp2 = await doDeploy(true);
+            toastSuccess(`任务 #${resp2.id} 已创建（已忽略窗口警告）`);
+            document.getElementById('drawerRoot').classList.add('hidden');
+            location.hash = '#/deploy';
+          }catch(e2){ toastError(e2.message); }
+        } else { toastError(e.message); }
+      }
     };
   }
 

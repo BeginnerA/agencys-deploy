@@ -173,6 +173,8 @@ def run_schedule(sid):
     rec = dbm.get_record(_db_path(), "deploy_schedules", sid)
     if not rec:
         return jsonify({"error": "计划不存在"}), 404
+    body = request.get_json(silent=True)
+    force_window = isinstance(body, dict) and body.get("force_window") is True
     # 窗口检查
     window = check_release_window(_db_path(), rec["project_id"])
     if window and window["block_level"] == "block":
@@ -185,6 +187,9 @@ def run_schedule(sid):
         except (ValueError, TypeError):
             extra = []
     if window and window["block_level"] == "warn":
+        if not force_window:
+            return jsonify({"error": "window_warn",
+                            "window": {"name": window["name"], "id": window["id"]}}), 409
         extra.append("--force-window")
     # ref_type=service 时，解析服务名作为任务名
     task_name = rec["name"]

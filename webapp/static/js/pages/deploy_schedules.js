@@ -67,10 +67,24 @@
     });
     box.querySelectorAll('[data-run]').forEach(btn => btn.onclick = async () => {
       if (!await confirmDialog('确认立即执行此计划？')) return;
+      const sid = btn.dataset.run;
+      const doRun = async (forceWindow) => {
+        const opts = {method:'POST'};
+        if (forceWindow) opts.body = JSON.stringify({force_window: true});
+        return await api(`/api/deploy/schedules/${sid}/run`, opts);
+      };
       try {
-        const r = await api(`/api/deploy/schedules/${btn.dataset.run}/run`, {method:'POST'});
-        toastSuccess(`任务 #${r.id} 已创建`);
-      } catch(e) { toastError(e.message); }
+        const r = await doRun(false);
+        toastSuccess(`任务 #${r.task_id} 已创建`);
+      } catch(e) {
+        if (e.message === 'window_warn' && e.data && e.data.window){
+          if (!await confirmDialog(`当前处于发布窗口「${e.data.window.name}」（软警告），确认仍要继续执行？`)) return;
+          try{
+            const r2 = await doRun(true);
+            toastSuccess(`任务 #${r2.task_id} 已创建（已忽略窗口警告）`);
+          }catch(e2){ toastError(e2.message); }
+        } else { toastError(e.message); }
+      }
     });
     box.querySelectorAll('[data-del]').forEach(btn => btn.onclick = async () => {
       if (!await confirmDialog('确认删除此计划？')) return;

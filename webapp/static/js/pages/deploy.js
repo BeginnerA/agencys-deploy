@@ -181,11 +181,9 @@
   // ---- 重新运行：用原任务参数创建新任务 ----
   async function rerunTask(task){
     if (!await confirmDialog(`确认使用相同参数重新运行任务 #${task.id}（${task.name}）？`)) return;
-    try{
-      // 执行参数持久化于 task.extra（--skip-build/--rollback/--auto-version）；
-      // 旧任务无 extra 记录时回退到版本字段推断 auto_version
-      const extra = Array.isArray(task.extra) ? task.extra : [];
-      const resp = await api('/api/tasks', {method:'POST', body: JSON.stringify({
+    const extra = Array.isArray(task.extra) ? task.extra : [];
+    const doRerun = async (forceWindow) => {
+      return await api('/api/tasks', {method:'POST', body: JSON.stringify({
         project_id: task.project_id,
         type: task.type,
         ref_id: task.ref_id,
@@ -195,11 +193,25 @@
         rollback: extra.includes('--rollback'),
         auto_version: extra.includes('--auto-version') || (!task.version && !task.previous_version),
         skip_build: extra.includes('--skip-build'),
+        force_window: forceWindow,
       })});
+    };
+    try{
+      const resp = await doRerun(false);
       toastSuccess(`任务 #${resp.id} 已创建，开始重新运行`);
       await loadTasks();
       openTaskDetail(resp.id, true);
-    }catch(e){ toastError('重新运行失败：' + e.message); }
+    }catch(e){
+      if (e.message === 'window_warn' && e.data && e.data.window){
+        if (!await confirmDialog(`当前处于发布窗口「${e.data.window.name}」（软警告），确认仍要继续重新运行？`)) return;
+        try{
+          const resp2 = await doRerun(true);
+          toastSuccess(`任务 #${resp2.id} 已创建，开始重新运行（已忽略窗口警告）`);
+          await loadTasks();
+          openTaskDetail(resp2.id, true);
+        }catch(e2){ toastError('重新运行失败：' + e2.message); }
+      } else { toastError('重新运行失败：' + e.message); }
+    }
   }
 
   // ---- 删除任务 ----
@@ -225,6 +237,7 @@
   window.deploy = {
     render: async function(root){
       destroyed = false;
+      lastSig = null; // 重置签名：确保重渲染后首次 loadTasks 必定执行 renderTable
       if (timer) clearInterval(timer); // 项目筛选重渲染时先清理旧轮询
       timer = null;
       const statuses = [['all','全部'],['running','运行中'],['pending','等待中'],['success','成功'],['failed','失败']];
@@ -288,7 +301,7 @@
       timer = setInterval(loadTasks, 5000);
       return [timer];
     },
-    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; if (logTimer){ logTimer(); logTimer = null; } },
+    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; lastSig = null; if (logTimer){ logTimer(); logTimer = null; } },
   };
   // 跨页复用：dashboard 最近发布 / layout 全局搜索 → 任务日志抽屉（无路由依赖）
   window.deployPage = { openTaskDetailSafe: function(id){ return openTaskDetail(id, true); } };

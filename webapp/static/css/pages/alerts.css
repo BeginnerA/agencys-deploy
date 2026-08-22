@@ -185,3 +185,14 @@
 .mon-tbl .mon-days.warn{color:var(--warning)}
 .mon-tbl .mon-cert-info{font-size:var(--fs-11);color:var(--text-3);margin-top:2px}
 .mon-tbl .mon-actions{white-space:nowrap;display:flex;gap:4px}
+
+/* 到期监控开关 */
+.mon-switch{position:relative;display:inline-block;width:36px;height:20px;cursor:pointer;flex-shrink:0}
+.mon-switch input{opacity:0;width:0;height:0;position:absolute}
+.mon-switch .slider{position:absolute;inset:0;background:rgba(90,114,150,.35);border-radius:var(--r-full);
+  border:1px solid rgba(90,114,150,.4);transition:var(--t-fast)}
+.mon-switch .slider::before{content:'';position:absolute;width:14px;height:14px;left:2px;top:50%;
+  transform:translateY(-50%);background:var(--text-3);border-radius:50%;transition:var(--t-fast)}
+.mon-switch input:checked+.slider{background:rgba(0,227,150,.25);border-color:rgba(0,227,150,.5)}
+.mon-switch input:checked+.slider::before{left:18px;background:var(--success)}
+.mon-switch:hover .slider{border-color:var(--primary)}

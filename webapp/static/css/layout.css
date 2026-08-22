@@ -122,3 +122,4 @@
 #marqueeBar .mq-text{flex:1;overflow:hidden;text-overflow:ellipsis}
 #marqueeBar .mq-close{cursor:pointer;color:var(--text-3);flex-shrink:0;border:none;background:none;font-size:14px}
 #marqueeBar .mq-close:hover{color:var(--danger)}
+
