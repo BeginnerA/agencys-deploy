@@ -355,7 +355,11 @@ class AlertEngine:
                 "default_channels": ["feishu"], "ssl_check_interval": 3600}
 
     def _evaluate_custom_monitors(self, snap=None):
-        """评估到期监控项：days_left <= 阈值 → 触发告警"""
+        """评估到期监控项：days_left <= 阈值 → 触发告警
+
+        支持阶梯式告警：监控项可配置 tiered_thresholds 如 {"30":"P3","14":"P2","7":"P1","0":"P0"}
+        每个阶梯独立触发告警，形成递进式催促。
+        """
         if snap is None:
             snap = self._load_snapshot()
         monitors = snap.get("custom_monitors") or []
@@ -377,26 +381,117 @@ class AlertEngine:
             days_left = m.get("days_left")
             if days_left is None:
                 continue
-            # 计算有效配置：域名级覆盖 > 全局默认
-            warn_days = m.get("warn_days") or 0
-            threshold = warn_days if warn_days > 0 else default_warn
-            severity = m.get("severity") or default_sev
-            channels_raw = m.get("channels") or []
-            channels = channels_raw if channels_raw else default_channels
-            # 判断是否触发
-            if days_left <= threshold:
-                subject = f"到期监控: {m['name']} ({m['target']})"
-                desc = f"剩余 {days_left} 天，阈值 {threshold} 天"
-                target_info = {"monitor_id": m["id"], "type": m["type"],
-                               "target": m["target"], "name": m["name"]}
-                # 构造一个临时 rule 用于 _fire 调用
-                fire_rule = dict(cm_rule)
-                fire_rule["severity"] = severity
-                fire_rule["channels"] = channels
-                self._fire(fire_rule, f"custom_monitor:{m['id']}",
-                           subject=subject, description=desc,
-                           target_info=target_info,
-                           windows=snap.get("windows"))
+            # 解析阶梯阈值
+            tiered = self._parse_tiered(m.get("tiered_thresholds"))
+            if tiered:
+                # 阶梯式告警：找到当前命中的最高阶梯
+                matched_tier = None
+                for threshold_days, severity in tiered:
+                    if days_left <= threshold_days:
+                        matched_tier = (threshold_days, severity)
+                if matched_tier:
+                    threshold, severity = matched_tier
+                    channels_raw = m.get("channels") or []
+                    channels = channels_raw if channels_raw else default_channels
+                    subject = f"到期监控: {m['name']} ({m['target']})"
+                    desc = f"剩余 {days_left} 天，阶梯阈值 {threshold} 天 / {severity}"
+                    target_info = {"monitor_id": m["id"], "type": m["type"],
+                                   "target": m["target"], "name": m["name"],
+                                   "tier": threshold, "owner": m.get("owner", "")}
+                    fire_rule = dict(cm_rule)
+                    fire_rule["severity"] = severity
+                    fire_rule["channels"] = channels
+                    self._fire(fire_rule, f"custom_monitor:{m['id']}",
+                               subject=subject, description=desc,
+                               target_info=target_info,
+                               windows=snap.get("windows"))
+            else:
+                # 传统单阈值告警
+                warn_days = m.get("warn_days") or 0
+                threshold = warn_days if warn_days > 0 else default_warn
+                severity = m.get("severity") or default_sev
+                channels_raw = m.get("channels") or []
+                channels = channels_raw if channels_raw else default_channels
+                if days_left <= threshold:
+                    subject = f"到期监控: {m['name']} ({m['target']})"
+                    desc = f"剩余 {days_left} 天，阈值 {threshold} 天"
+                    target_info = {"monitor_id": m["id"], "type": m["type"],
+                                   "target": m["target"], "name": m["name"],
+                                   "owner": m.get("owner", "")}
+                    fire_rule = dict(cm_rule)
+                    fire_rule["severity"] = severity
+                    fire_rule["channels"] = channels
+                    self._fire(fire_rule, f"custom_monitor:{m['id']}",
+                               subject=subject, description=desc,
+                               target_info=target_info,
+                               windows=snap.get("windows"))
+        # 探测失败告警
+        self._evaluate_probe_failures(snap, cm_rule, default_channels)
+
+    @staticmethod
+    def _parse_tiered(raw) -> list:
+        """解析阶梯阈值配置，返回 [(days, severity), ...] 按 days 降序排列
+
+        支持格式:
+        - JSON 字符串: '{"30":"P3","14":"P2","7":"P1","0":"P0"}'
+        - 空串/None: 返回空列表（使用传统单阈值）
+        """
+        if not raw:
+            return []
+        import json as _json
+        try:
+            if isinstance(raw, str):
+                data = _json.loads(raw)
+            elif isinstance(raw, dict):
+                data = raw
+            else:
+                return []
+            tiers = []
+            for k, v in data.items():
+                try:
+                    days = int(k)
+                    if v in SEVERITY_ORDER:
+                        tiers.append((days, v))
+                except (ValueError, TypeError):
+                    continue
+            tiers.sort(key=lambda x: x[0], reverse=True)
+            return tiers
+        except (ValueError, TypeError):
+            return []
+
+    def _evaluate_probe_failures(self, snap, cm_rule, default_channels):
+        """评估 SSL 探测失败告警：连续失败 >= PROBE_FAIL_THRESHOLD 次触发告警"""
+        from .ssl_monitor import get_ssl_monitor, PROBE_FAIL_THRESHOLD
+        mon = get_ssl_monitor()
+        if not mon:
+            return
+        try:
+            failures = mon.get_probe_failures()
+        except Exception:
+            return
+        if not failures:
+            return
+        # 查找或构造探测失败规则
+        fail_rule = None
+        for r in snap.get("rules", []):
+            if r.get("metric_type") == "custom_monitor" and r.get("enabled"):
+                fail_rule = dict(r)
+                fail_rule["severity"] = "P2"
+                fail_rule["channels"] = r.get("channels") or default_channels
+                break
+        if not fail_rule:
+            return
+        for m in failures:
+            fail_count = m.get("probe_fail_count", 0)
+            subject = f"SSL 探测连续失败: {m['name']} ({m['target']})"
+            desc = f"已连续失败 {fail_count} 次，最近错误: {m.get('error', '')[:200]}"
+            target_info = {"monitor_id": m["id"], "type": "ssl",
+                           "target": m["target"], "name": m["name"],
+                           "probe_fail_count": fail_count}
+            self._fire(fail_rule, f"custom_monitor_probe_fail:{m['id']}",
+                       subject=subject, description=desc,
+                       target_info=target_info,
+                       windows=snap.get("windows"))
 
     def _check_tasks(self, snap=None):
         """扫描最近失败任务（增量：finished_at > 上次扫描点）触发任务失败告警"""

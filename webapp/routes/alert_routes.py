@@ -799,7 +799,7 @@ def put_channels():
 
 # ---------- 到期监控 CRUD ----------
 
-MONITOR_TYPES = ("ssl", "cloud_renewal", "license", "custom")
+MONITOR_TYPES = ("ssl", "cloud_renewal", "license", "custom", "domain")
 
 
 @alert_bp.route("/alerts/monitors")
@@ -826,6 +826,12 @@ def create_monitor():
     days_left = None
     if expiry_at:
         days_left = max(0, (int(expiry_at) - now) // 86400)
+    # domain 类型自动 WHOIS 查询
+    if body.get("type") == "domain" and not expiry_at:
+        whois_result = _whois_lookup(body["target"].strip())
+        if whois_result.get("expiry_at"):
+            expiry_at = whois_result["expiry_at"]
+            days_left = max(0, (expiry_at - now) // 86400)
     mid = dbm.create_record(db, "custom_monitors", dict(
         type=body["type"], name=body["name"].strip(),
         target=body["target"].strip(),
@@ -836,6 +842,9 @@ def create_monitor():
         severity=body.get("severity", ""),
         channels=body.get("channels", []),
         enabled=1,
+        owner=body.get("owner", ""),
+        renewal_status="",
+        tiered_thresholds=body.get("tiered_thresholds", ""),
         detail=body.get("detail", {}),
         error="",
         created_at=now, updated_at=now))
@@ -866,6 +875,9 @@ def update_monitor(monitor_id):
         warn_days=body.get("warn_days", old["warn_days"]),
         severity=body.get("severity", old.get("severity", "")),
         channels=body.get("channels", old.get("channels", [])),
+        owner=body.get("owner", old.get("owner", "")),
+        renewal_status=body.get("renewal_status", old.get("renewal_status", "")),
+        tiered_thresholds=body.get("tiered_thresholds", old.get("tiered_thresholds", "")),
         detail=body.get("detail", old.get("detail", {})),
         updated_at=int(time.time())))
     audit("update_monitor", "custom_monitor", monitor_id,
@@ -976,6 +988,330 @@ def _calc_days_left(expiry_at):
     return max(0, (int(expiry_at) - int(time.time())) // 86400)
 
 
+# ---------- 批量操作 ----------
+
+@alert_bp.route("/alerts/monitors/batch", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def monitor_batch():
+    """批量操作监控项：enable/disable/delete/update"""
+    body = request.get_json(silent=True) or {}
+    action = body.get("action")  # enable / disable / delete / update
+    ids = body.get("ids") or []
+    if action not in ("enable", "disable", "delete", "update"):
+        return jsonify({"error": "action 需为 enable/disable/delete/update"}), 400
+    if not ids or not isinstance(ids, list):
+        return jsonify({"error": "ids 不能为空"}), 400
+    if len(ids) > 200:
+        return jsonify({"error": "单次最多操作 200 条"}), 400
+    db = current_app.config["DB_PATH"]
+    int_ids = [int(i) for i in ids]
+    if action == "enable":
+        count = dbm.batch_update_monitors(db, int_ids, {"enabled": 1})
+    elif action == "disable":
+        count = dbm.batch_update_monitors(db, int_ids, {"enabled": 0})
+    elif action == "delete":
+        count = 0
+        for mid in int_ids:
+            if dbm.delete_record(db, "custom_monitors", mid):
+                count += 1
+    elif action == "update":
+        fields = body.get("fields") or {}
+        count = dbm.batch_update_monitors(db, int_ids, fields)
+    audit(f"batch_{action}_monitors", "custom_monitor", 0,
+          {"ids": ids, "count": count})
+    return jsonify({"ok": True, "count": count})
+
+
+# ---------- 导入导出 ----------
+
+@alert_bp.route("/alerts/monitors/export")
+@require_auth
+def export_monitors():
+    """导出监控项为 JSON"""
+    db = current_app.config["DB_PATH"]
+    fmt = request.args.get("format", "json")
+    rows = dbm.list_records(db, "custom_monitors", "", (), "id")
+    if fmt == "csv":
+        import csv
+        import io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["id", "type", "name", "target", "port", "expiry_at",
+                         "days_left", "warn_days", "severity", "owner",
+                         "renewal_status", "enabled", "error"])
+        for r in rows:
+            writer.writerow([r.get("id"), r.get("type"), r.get("name"),
+                             r.get("target"), r.get("port"), r.get("expiry_at"),
+                             r.get("days_left"), r.get("warn_days"),
+                             r.get("severity"), r.get("owner", ""),
+                             r.get("renewal_status", ""), r.get("enabled"),
+                             r.get("error", "")])
+        from flask import Response
+        return Response(output.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": "attachment;filename=monitors.csv"})
+    return jsonify(rows)
+
+
+@alert_bp.route("/alerts/monitors/import", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def import_monitors():
+    """批量导入监控项 (JSON 数组)"""
+    db = current_app.config["DB_PATH"]
+    body = request.get_json(silent=True)
+    if not isinstance(body, list):
+        return jsonify({"error": "需为 JSON 数组"}), 400
+    if len(body) > 500:
+        return jsonify({"error": "单次最多导入 500 条"}), 400
+    now = int(time.time())
+    created = 0
+    errors = []
+    for idx, item in enumerate(body):
+        err = _validate_monitor(item)
+        if err:
+            errors.append(f"第 {idx+1} 条: {err}")
+            continue
+        expiry_at = item.get("expiry_at")
+        days_left = _calc_days_left(expiry_at)
+        try:
+            dbm.create_record(db, "custom_monitors", dict(
+                type=item["type"], name=item["name"].strip(),
+                target=item["target"].strip(),
+                port=item.get("port", 443),
+                expiry_at=expiry_at, days_left=days_left,
+                warn_days=item.get("warn_days", 0),
+                severity=item.get("severity", ""),
+                channels=item.get("channels", []),
+                enabled=1 if item.get("enabled", 1) else 0,
+                owner=item.get("owner", ""),
+                renewal_status="",
+                tiered_thresholds=item.get("tiered_thresholds", ""),
+                detail=item.get("detail", {}),
+                error="",
+                created_at=now, updated_at=now))
+            created += 1
+        except Exception as e:
+            errors.append(f"第 {idx+1} 条: {e}")
+    audit("import_monitors", "custom_monitor", 0,
+          {"created": created, "errors": len(errors)})
+    return jsonify({"ok": True, "created": created,
+                    "errors": errors[:10]})
+
+
+# ---------- 监控模板 ----------
+
+MONITOR_TEMPLATES = [
+    {"type": "ssl", "name": "SSL 证书监控", "target": "example.com",
+     "port": 443, "warn_days": 30, "remark": "自动探测 SSL 证书到期"},
+    {"type": "cloud_renewal", "name": "阿里云 ECS 续费", "target": "阿里云 ECS",
+     "port": 0, "warn_days": 15, "remark": "云产品续费提醒"},
+    {"type": "cloud_renewal", "name": "腾讯云 COS 续费", "target": "腾讯云 COS",
+     "port": 0, "warn_days": 15, "remark": "云产品续费提醒"},
+    {"type": "license", "name": "软件 License 授权", "target": "License 标识",
+     "port": 0, "warn_days": 30, "remark": "License 到期提醒"},
+    {"type": "domain", "name": "域名到期监控", "target": "example.com",
+     "port": 0, "warn_days": 30, "remark": "WHOIS 查询域名到期"},
+    {"type": "custom", "name": "自定义到期监控", "target": "自定义目标",
+     "port": 0, "warn_days": 7, "remark": "自定义到期提醒"},
+]
+
+
+@alert_bp.route("/alerts/monitors/templates")
+@require_auth
+def list_monitor_templates():
+    """获取监控项模板列表"""
+    return jsonify(MONITOR_TEMPLATES)
+
+
+# ---------- 续期状态跟踪 ----------
+
+@alert_bp.route("/alerts/monitors/<int:monitor_id>/renewal", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def update_renewal_status(monitor_id):
+    """更新续期状态并记录日志"""
+    db = current_app.config["DB_PATH"]
+    m = dbm.get_record(db, "custom_monitors", monitor_id)
+    if not m:
+        return jsonify({"error": "监控项不存在"}), 404
+    body = request.get_json(silent=True) or {}
+    new_status = body.get("status")  # pending / in_progress / completed / failed
+    valid_statuses = ("pending", "in_progress", "completed", "failed", "")
+    if new_status not in valid_statuses:
+        return jsonify({"error": f"status 需为 {valid_statuses}"}), 400
+    remark = body.get("remark", "")
+    dbm.update_record(db, "custom_monitors", monitor_id, dict(
+        renewal_status=new_status, updated_at=int(time.time())))
+    # 记录续期日志
+    dbm.create_renewal_log(db, monitor_id, action=new_status or "reset",
+                           operator=g.user.get("username", ""),
+                           detail={"remark": remark})
+    audit("update_renewal_status", "custom_monitor", monitor_id,
+          {"status": new_status})
+    return jsonify({"ok": True})
+
+
+@alert_bp.route("/alerts/monitors/<int:monitor_id>/renewal-logs")
+@require_auth
+def get_renewal_logs(monitor_id):
+    """获取监控项的续期操作日志"""
+    db = current_app.config["DB_PATH"]
+    logs = dbm.list_renewal_logs(db, monitor_id)
+    return jsonify(logs)
+
+
+# ---------- WHOIS 域名到期探测 ----------
+
+def _whois_lookup(domain: str) -> dict:
+    """WHOIS 查询域名到期时间（简化版，支持主流后缀）"""
+    import socket
+    import re
+    try:
+        # 提取顶级域名对应的 WHOIS 服务器
+        parts = domain.split(".")
+        if len(parts) < 2:
+            return {"error": "域名格式不正确"}
+        tld = parts[-1].lower()
+        whois_servers = {
+            "com": "whois.verisign-grs.com",
+            "net": "whois.verisign-grs.com",
+            "org": "whois.pir.org",
+            "cn": "whois.cnnic.cn",
+            "io": "whois.nic.io",
+            "cc": "ccwhois.verisign-grs.com",
+            "info": "whois.afilias.net",
+        }
+        whois_server = whois_servers.get(tld)
+        if not whois_server:
+            return {"error": f"不支持的顶级域名: {tld}"}
+        # 连接 WHOIS 服务器
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(10)
+        s.connect((whois_server, 43))
+        s.send((domain + "\r\n").encode())
+        response = b""
+        while True:
+            data = s.recv(4096)
+            if not data:
+                break
+            response += data
+        s.close()
+        text = response.decode("utf-8", errors="ignore")
+        # 解析到期时间
+        patterns = [
+            r"Registry Expiry Date:\s*(\d{4}-\d{2}-\d{2})",
+            r"Expiration Date:\s*(\d{4}-\d{2}-\d{2})",
+            r"Expiry Date:\s*(\d{4}-\d{2}-\d{2})",
+            r"Expiration Time:\s*(\d{4}-\d{2}-\d{2})",
+        ]
+        for pat in patterns:
+            match = re.search(pat, text, re.IGNORECASE)
+            if match:
+                date_str = match.group(1)
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                dt = dt.replace(tzinfo=__import__("datetime").timezone.utc)
+                expiry_at = int(dt.timestamp())
+                days_left = max(0, (expiry_at - int(time.time())) // 86400)
+                return {"expiry_at": expiry_at, "days_left": days_left, "error": None}
+        return {"error": "未找到到期时间"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@alert_bp.route("/alerts/monitors/whois", methods=["POST"])
+@require_auth
+def whois_check():
+    """手动 WHOIS 查询域名到期"""
+    body = request.get_json(silent=True) or {}
+    domain = (body.get("domain") or "").strip()
+    if not domain:
+        return jsonify({"error": "域名不能为空"}), 400
+    result = _whois_lookup(domain)
+    if result.get("error"):
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@alert_bp.route("/alerts/monitors/<int:monitor_id>/whois", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def whois_check_monitor(monitor_id):
+    """手动触发域名 WHOIS 查询并更新监控项"""
+    db = current_app.config["DB_PATH"]
+    m = dbm.get_record(db, "custom_monitors", monitor_id)
+    if not m or m.get("type") != "domain":
+        return jsonify({"error": "监控项不存在或非域名类型"}), 404
+    result = _whois_lookup(m["target"])
+    now = int(time.time())
+    if result.get("error"):
+        dbm.update_record(db, "custom_monitors", monitor_id, dict(
+            last_checked=now, error=result["error"], updated_at=now))
+        return jsonify(result), 400
+    dbm.update_record(db, "custom_monitors", monitor_id, dict(
+        last_checked=now,
+        expiry_at=result["expiry_at"],
+        days_left=result["days_left"],
+        error="",
+        updated_at=now))
+    return jsonify(result)
+
+
+# ---------- 到期监控统计 ----------
+
+@alert_bp.route("/alerts/monitors/stats")
+@require_auth
+def monitor_stats():
+    """到期监控统计：按类型/状态分组"""
+    db = current_app.config["DB_PATH"]
+    rows = dbm.list_records(db, "custom_monitors", "", (), "id")
+    by_type = {}
+    by_status = {"total": len(rows), "expiring": 0, "expired": 0, "healthy": 0}
+    for m in rows:
+        t = m.get("type", "unknown")
+        by_type.setdefault(t, {"total": 0, "expiring": 0, "expired": 0})
+        by_type[t]["total"] += 1
+        dl = m.get("days_left")
+        if dl is not None:
+            if dl <= 0:
+                by_status["expired"] += 1
+                by_type[t]["expired"] += 1
+            elif dl <= 30:
+                by_status["expiring"] += 1
+                by_type[t]["expiring"] += 1
+            else:
+                by_status["healthy"] += 1
+    # 按类型统计
+    type_stats = [{"type": t, **v} for t, v in by_type.items()]
+    return jsonify({"summary": by_status, "by_type": type_stats})
+
+
+# ---------- 时间线视图 ----------
+
+@alert_bp.route("/alerts/monitors/timeline")
+@require_auth
+def monitor_timeline():
+    """到期监控时间线：按到期时间排序，返回未来 N 天到期的监控项"""
+    db = current_app.config["DB_PATH"]
+    days = min(365, max(1, request.args.get("days", 90, type=int)))
+    now = int(time.time())
+    cutoff = now + days * 86400
+    rows = dbm.list_records(db, "custom_monitors",
+                            "enabled=1 AND expiry_at IS NOT NULL AND expiry_at <= ?",
+                            (cutoff,), "expiry_at")
+    items = []
+    for m in rows:
+        expiry_at = m.get("expiry_at") or 0
+        days_left = max(0, (expiry_at - now) // 86400)
+        items.append({
+            "id": m["id"], "name": m["name"], "type": m["type"],
+            "target": m["target"], "expiry_at": expiry_at,
+            "days_left": days_left, "owner": m.get("owner", ""),
+            "renewal_status": m.get("renewal_status", ""),
+        })
+    return jsonify(items)
+
+
 def _validate_monitor(body, partial=False) -> str:
     """监控项校验；返回错误信息，空串=通过"""
     if not partial:
@@ -1009,8 +1345,8 @@ def _validate_monitor(body, partial=False) -> str:
             return "channels 需为列表"
         if ch and not set(ch) <= set(CHANNELS):
             return "channels 包含非法渠道"
-    # 非 SSL 类型需要到期时间
-    if not partial and body.get("type") != "ssl":
+    # 非 SSL 类型需要到期时间（domain 类型可自动 WHOIS 查询）
+    if not partial and body.get("type") not in ("ssl", "domain"):
         if not body.get("expiry_at"):
             return "非 SSL 类型需提供 expiry_at"
     return ""

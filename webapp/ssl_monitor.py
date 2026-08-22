@@ -7,6 +7,9 @@ import time
 from . import db as dbm
 from .ssl_probe import probe_ssl
 
+# 连续探测失败次数阈值，超过后触发告警
+PROBE_FAIL_THRESHOLD = 3
+
 
 class SSLMonitor:
     """SSL 证书自动探测守护线程
@@ -57,23 +60,39 @@ class SSLMonitor:
         result = probe_ssl(domain, port, timeout=10)
         now = int(time.time())
         if result["error"]:
-            # 探测失败：保留旧 days_left，记录 error
+            # 探测失败：累加失败计数，保留旧 days_left
+            fail_count = (row.get("probe_fail_count") or 0) + 1
             dbm.update_record(self._db_path, "custom_monitors", row["id"], dict(
                 last_checked=now,
                 error=result["error"],
+                probe_fail_count=fail_count,
                 updated_at=now))
         else:
-            # 探测成功：更新所有字段
+            # 探测成功：更新所有字段（含增强信息）
             detail = json.dumps({
                 "cert_subject": result["cert_subject"],
                 "cert_issuer": result["cert_issuer"],
+                "key_type": result.get("key_type", ""),
+                "key_bits": result.get("key_bits", 0),
+                "tls_version": result.get("tls_version", ""),
             }, ensure_ascii=False)
+            san_domains = result.get("san_domains") or []
+            fingerprint = result.get("fingerprint_sha256") or ""
+            # 检测证书变更（指纹变化）
+            old_fp = row.get("cert_fingerprint") or ""
+            if old_fp and fingerprint and old_fp != fingerprint:
+                print(f"[ssl-monitor] 证书已更换: {domain} "
+                      f"(旧指纹: {old_fp[:17]}... → 新指纹: {fingerprint[:17]}...)",
+                      file=sys.stderr)
             dbm.update_record(self._db_path, "custom_monitors", row["id"], dict(
                 last_checked=now,
                 expiry_at=result["cert_expiry"],
                 days_left=result["days_left"],
                 detail=detail,
                 error="",
+                probe_fail_count=0,
+                cert_fingerprint=fingerprint,
+                san_domains=san_domains,
                 updated_at=now))
 
     def probe_one_now(self, monitor_id: int) -> dict:
@@ -83,6 +102,12 @@ class SSLMonitor:
             return {"error": "监控项不存在或非 SSL 类型"}
         self._probe_one(row)
         return dbm.get_record(self._db_path, "custom_monitors", monitor_id)
+
+    def get_probe_failures(self) -> list:
+        """返回连续探测失败超过阈值的监控项列表（供告警引擎调用）"""
+        rows = dbm.list_records(self._db_path, "custom_monitors",
+                                f"type='ssl' AND enabled=1 AND probe_fail_count >= {PROBE_FAIL_THRESHOLD}")
+        return rows
 
 
 _ssl_monitor = None

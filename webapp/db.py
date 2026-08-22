@@ -319,8 +319,24 @@ CREATE TABLE IF NOT EXISTS custom_monitors (
     error TEXT DEFAULT '',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    owner TEXT DEFAULT '',
+    renewal_status TEXT DEFAULT '',
+    tiered_thresholds TEXT DEFAULT '',
+    probe_fail_count INTEGER DEFAULT 0,
+    cert_fingerprint TEXT DEFAULT '',
+    san_domains TEXT DEFAULT '[]',
     UNIQUE(type, target, port)
 );
+CREATE TABLE IF NOT EXISTS renewal_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    monitor_id INTEGER NOT NULL,
+    action TEXT NOT NULL DEFAULT '',
+    operator TEXT DEFAULT '',
+    detail TEXT DEFAULT '{}',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_renewal_logs_monitor
+    ON renewal_logs(monitor_id, created_at);
 """
 
 # JSON 字段（读写时自动序列化/反序列化）
@@ -336,8 +352,9 @@ JSON_FIELDS = {
     "deploy_schedules": {"extra"},
     "deployment_snapshots": {"image_versions"},
     "canary_configs": {"steps"},
-    "custom_monitors": {"channels", "detail"},
+    "custom_monitors": {"channels", "detail", "san_domains"},
     "release_windows": {"scope"},
+    "renewal_logs": {"detail"},
 }
 
 # 表名白名单（泛型 CRUD 的标识符护栏，防 SQL 注入）
@@ -350,7 +367,7 @@ TABLES = frozenset(("projects", "services", "environments", "servers",
                     "service_dependencies", "deployment_snapshots",
                     "canary_configs",
                     "response_time_history", "monitor_snapshots",
-                    "custom_monitors"))
+                    "custom_monitors", "renewal_logs"))
 
 
 def _check_table(table: str):
@@ -437,6 +454,34 @@ def _migrate(conn):
             else:
                 s = json.dumps({"type": "all", "ids": []})
             conn.execute("UPDATE release_windows SET scope=? WHERE id=?", (s, row["id"]))
+    # custom_monitors 补列（owner / renewal_status / tiered_thresholds / probe_fail_count / cert_fingerprint / san_domains）
+    cm_cols = {r["name"] for r in conn.execute("PRAGMA table_info(custom_monitors)")}
+    if "owner" not in cm_cols:
+        conn.execute("ALTER TABLE custom_monitors ADD COLUMN owner TEXT DEFAULT ''")
+    if "renewal_status" not in cm_cols:
+        conn.execute("ALTER TABLE custom_monitors ADD COLUMN renewal_status TEXT DEFAULT ''")
+    if "tiered_thresholds" not in cm_cols:
+        conn.execute("ALTER TABLE custom_monitors ADD COLUMN tiered_thresholds TEXT DEFAULT ''")
+    if "probe_fail_count" not in cm_cols:
+        conn.execute("ALTER TABLE custom_monitors ADD COLUMN probe_fail_count INTEGER DEFAULT 0")
+    if "cert_fingerprint" not in cm_cols:
+        conn.execute("ALTER TABLE custom_monitors ADD COLUMN cert_fingerprint TEXT DEFAULT ''")
+    if "san_domains" not in cm_cols:
+        conn.execute("ALTER TABLE custom_monitors ADD COLUMN san_domains TEXT DEFAULT '[]'")
+    # renewal_logs 表（新建库已在 SCHEMA 创建，存量库需补建）
+    tbl_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='renewal_logs'"
+    ).fetchone()
+    if not tbl_exists:
+        conn.execute("""CREATE TABLE renewal_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            monitor_id INTEGER NOT NULL,
+            action TEXT NOT NULL DEFAULT '',
+            operator TEXT DEFAULT '',
+            detail TEXT DEFAULT '{}',
+            created_at INTEGER NOT NULL
+        )""")
+        conn.execute("CREATE INDEX idx_renewal_logs_monitor ON renewal_logs(monitor_id, created_at)")
 
 
 def _serialize(table: str, fields: dict) -> dict:
@@ -902,5 +947,52 @@ def get_monitor_latest(db_path: str, env_id: int = None,
                 ") t ON m.host = t.host AND m.created_at = t.max_ts"
                 " ORDER BY m.host", (since,)).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ---------- 续期日志 ----------
+
+def create_renewal_log(db_path: str, monitor_id: int, action: str,
+                       operator: str = "", detail: dict = None) -> int:
+    return create_record(db_path, "renewal_logs", dict(
+        monitor_id=monitor_id, action=action, operator=operator,
+        detail=json.dumps(detail or {}, ensure_ascii=False),
+        created_at=int(time.time())))
+
+
+def list_renewal_logs(db_path: str, monitor_id: int = None,
+                      limit: int = 50) -> list:
+    where = ""
+    params = ()
+    if monitor_id:
+        where = "monitor_id=?"
+        params = (monitor_id,)
+    return list_records(db_path, "renewal_logs", where, params, "id DESC")[:limit]
+
+
+# ---------- 批量操作 ----------
+
+def batch_update_monitors(db_path: str, ids: list, fields: dict) -> int:
+    """批量更新监控项字段，返回受影响行数"""
+    if not ids or not fields:
+        return 0
+    fields = {k: v for k, v in fields.items()
+              if k in ("enabled", "warn_days", "severity", "owner",
+                       "renewal_status")}
+    if not fields:
+        return 0
+    fields["updated_at"] = int(time.time())
+    fields = _serialize("custom_monitors", fields)
+    sets = ", ".join(f"{k}=?" for k in fields)
+    vals = tuple(fields.values())
+    conn = get_conn(db_path)
+    try:
+        placeholders = ",".join("?" * len(ids))
+        cur = conn.execute(
+            f"UPDATE custom_monitors SET {sets} WHERE id IN ({placeholders})",
+            vals + tuple(ids))
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()

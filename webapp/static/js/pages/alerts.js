@@ -766,10 +766,9 @@
             <td><span class="rule-scope-summary" title="${esc(scopeStr)}">${esc(scopeStr)}</span></td>
             <td><span class="badge ${esc(r.severity||'P2').toLowerCase()}">${esc(r.severity||'P2')}</span></td>
             <td><div class="rule-ch-list">${chList.map(c => `<span class="rule-ch-tag">${esc(c)}</span>`).join('')}</div></td>
-            <td><span class="badge ${r.enabled ? 'success' : 'pending'}">${r.enabled ? '启用' : '停用'}</span></td>
+            <td><label class="mon-switch"><input type="checkbox" data-rid="${r.id}" ${r.enabled ? 'checked' : ''}><span class="slider"></span></label></td>
             <td class="rule-actions">
               <button class="btn sm" data-ra="edit" data-rid="${r.id}">编辑</button>
-              <button class="btn sm" data-ra="toggle" data-rid="${r.id}">${r.enabled ? '停用' : '启用'}</button>
               <button class="btn sm danger" data-ra="del" data-rid="${r.id}">删除</button>
             </td>
           </tr>`;
@@ -778,11 +777,14 @@
     // 事件委托
     box.onclick = async (e) => {
       const btn = e.target.closest('[data-ra]');
-      if (!btn) return;
-      const id = Number(btn.dataset.rid);
-      if (btn.dataset.ra === 'edit') { const r = rules.find(x => x.id === id); if (r) openRuleDrawer(r); }
-      else if (btn.dataset.ra === 'toggle') await toggleRule(id);
-      else if (btn.dataset.ra === 'del') await deleteRule(id);
+      if (btn) {
+        const id = Number(btn.dataset.rid);
+        if (btn.dataset.ra === 'edit') { const r = rules.find(x => x.id === id); if (r) openRuleDrawer(r); }
+        else if (btn.dataset.ra === 'del') await deleteRule(id);
+        return;
+      }
+      const sw = e.target.closest('.mon-switch input');
+      if (sw) { await toggleRule(Number(sw.dataset.rid)); }
     };
   }
 
@@ -1586,9 +1588,16 @@
   let editingMonitorId = null;
   let monitorSaving = false;
   let monitorConfig = {};
+  let monitorTypeFilter = 'all';
+  let monitorSelectedIds = new Set();
+  let monitorViewMode = 'table'; // table | timeline
+  let monitorTimeline = [];
 
-  const MONITOR_TYPES = [['ssl','SSL 证书'],['cloud_renewal','云产品续费'],['license','License 授权'],['custom','自定义']];
+  const MONITOR_TYPES = [['ssl','SSL 证书'],['cloud_renewal','云产品续费'],['license','License 授权'],['domain','域名到期'],['custom','自定义']];
   const MT_LABELS = Object.fromEntries(MONITOR_TYPES);
+  const RENEWAL_STATUSES = [['','未处理'],['pending','待处理'],['in_progress','处理中'],['completed','已完成'],['failed','失败']];
+  const RS_LABELS = Object.fromEntries(RENEWAL_STATUSES);
+  const RS_COLORS = {'':'secondary', pending:'warn', in_progress:'primary', completed:'success', failed:'danger'};
 
   async function loadMonitors(){
     try {
@@ -1599,53 +1608,131 @@
       if (destroyed) return;
       monitors = list || [];
       monitorConfig = cfg || {};
+      if (monitorViewMode === 'timeline') {
+        try { monitorTimeline = await api('/api/alerts/monitors/timeline?days=90') || []; } catch(e) {}
+      }
       renderMonitorsTab();
     } catch(e) {
       console.warn('loadMonitors failed', e);
     }
   }
 
+  function _filteredMonitors(){
+    if (monitorTypeFilter === 'all') return monitors;
+    return monitors.filter(m => m.type === monitorTypeFilter);
+  }
+
   function renderMonitorsTab(){
     const tc = document.getElementById('tabContent');
     if (!tc) return;
     const canManage = ['admin','operator'].includes(currentUser().role);
+    const filtered = _filteredMonitors();
+    const selCount = monitorSelectedIds.size;
     tc.innerHTML = `
       <div class="alert-toolbar">
         <span class="weak" style="font-size:12px">到期监控</span>
+        <select id="monTypeFilter" class="alert-search" style="width:130px">
+          <option value="all" ${monitorTypeFilter==='all'?'selected':''}>全部类型</option>
+          ${MONITOR_TYPES.map(([v,l]) => `<option value="${v}" ${monitorTypeFilter===v?'selected':''}>${l}</option>`).join('')}
+        </select>
+        <div style="display:flex;gap:4px">
+          <button class="btn sm ${monitorViewMode==='table'?'primary':'ghost'}" id="monViewTable">列表</button>
+          <button class="btn sm ${monitorViewMode==='timeline'?'primary':'ghost'}" id="monViewTimeline">时间线</button>
+        </div>
         <span style="flex:1"></span>
-        ${canManage ? '<button class="btn primary sm" id="monAddBtn">+ 添加监控</button>' : ''}
+        ${canManage ? `
+          <button class="btn sm ghost" id="monTemplateBtn">模板</button>
+          <button class="btn sm ghost" id="monImportBtn">导入</button>
+          <button class="btn sm ghost" id="monExportBtn">导出</button>
+          <button class="btn primary sm" id="monAddBtn">+ 添加监控</button>
+        ` : ''}
         <button class="btn sm ghost" id="monConfigBtn">⚙ 全局配置</button>
       </div>
+      ${selCount > 0 && canManage ? `
+      <div class="alert-batch-bar">
+        <span style="font-size:13px">已选 <b>${selCount}</b> 项</span>
+        <button class="btn sm ghost mon-batch-btn" data-act="enable">批量启用</button>
+        <button class="btn sm ghost mon-batch-btn" data-act="disable">批量禁用</button>
+        <button class="btn sm ghost mon-batch-btn" data-act="delete">批量删除</button>
+        <button class="btn sm ghost" id="monBatchClear">取消选择</button>
+      </div>` : ''}
       <div class="mon-summary">
-        <div class="mon-summary-item"><div class="ms-num">${monitors.length}</div><div class="ms-label">总计监控</div></div>
-        <div class="mon-summary-item warn"><div class="ms-num">${monitors.filter(m => m.days_left != null && m.days_left <= 30).length}</div><div class="ms-label">即将到期</div></div>
-        <div class="mon-summary-item danger"><div class="ms-num">${monitors.filter(m => m.days_left != null && m.days_left <= 0).length}</div><div class="ms-label">已到期</div></div>
+        <div class="mon-summary-item"><div class="ms-num">${filtered.length}</div><div class="ms-label">总计监控</div></div>
+        <div class="mon-summary-item warn"><div class="ms-num">${filtered.filter(m => m.days_left != null && m.days_left <= 30 && m.days_left > 0).length}</div><div class="ms-label">即将到期</div></div>
+        <div class="mon-summary-item danger"><div class="ms-num">${filtered.filter(m => m.days_left != null && m.days_left <= 0).length}</div><div class="ms-label">已到期</div></div>
       </div>
+      <div id="monContentArea"></div>`;
+
+    // Bind toolbar events
+    const typeFilter = document.getElementById('monTypeFilter');
+    if (typeFilter) typeFilter.onchange = () => { monitorTypeFilter = typeFilter.value; monitorSelectedIds.clear(); renderMonitorsTab(); };
+    const addBtn = document.getElementById('monAddBtn');
+    if (addBtn) addBtn.onclick = () => openMonitorForm();
+    const cfgBtn = document.getElementById('monConfigBtn');
+    if (cfgBtn) cfgBtn.onclick = () => openMonitorConfig();
+    const tplBtn = document.getElementById('monTemplateBtn');
+    if (tplBtn) tplBtn.onclick = () => openTemplatePicker();
+    const impBtn = document.getElementById('monImportBtn');
+    if (impBtn) impBtn.onclick = () => openImportDialog();
+    const expBtn = document.getElementById('monExportBtn');
+    if (expBtn) expBtn.onclick = () => exportMonitors();
+    const viewTable = document.getElementById('monViewTable');
+    if (viewTable) viewTable.onclick = () => { monitorViewMode = 'table'; renderMonitorsTab(); };
+    const viewTimeline = document.getElementById('monViewTimeline');
+    if (viewTimeline) viewTimeline.onclick = () => { monitorViewMode = 'timeline'; loadMonitors(); };
+    const batchClear = document.getElementById('monBatchClear');
+    if (batchClear) batchClear.onclick = () => { monitorSelectedIds.clear(); renderMonitorsTab(); };
+    tc.querySelectorAll('.mon-batch-btn').forEach(b => b.onclick = () => batchMonitorAction(b.dataset.act));
+
+    // Render content area
+    if (monitorViewMode === 'timeline') {
+      renderTimelineView();
+    } else {
+      renderMonitorTable(filtered, canManage);
+    }
+  }
+
+  function renderMonitorTable(filtered, canManage){
+    const area = document.getElementById('monContentArea');
+    if (!area) return;
+    area.innerHTML = `
       <div class="panel" style="padding:0"><div class="tbl-wrap"><table class="tbl mon-tbl">
           <thead><tr>
+            ${canManage ? '<th style="width:30px"><input type="checkbox" id="monCheckAll"></th>' : ''}
             <th>类型</th><th>名称</th><th>目标</th><th>剩余天数</th>
-            <th>通知阈值</th><th>状态</th><th>最近检测</th><th>操作</th>
+            <th>通知阈值</th><th>责任人</th><th>续期状态</th><th>状态</th><th>最近检测</th><th>操作</th>
           </tr></thead>
           <tbody>
-            ${monitors.length === 0 ? '<tr class="empty-row"><td colspan="8">暂无监控项，点击「添加监控」开始</td></tr>' :
-              monitors.map(m => {
+            ${filtered.length === 0 ? '<tr class="empty-row"><td colspan="11">暂无监控项，点击「添加监控」开始</td></tr>' :
+              filtered.map(m => {
                 const daysCls = m.days_left == null ? 'muted' : m.days_left <= 0 ? 'danger' : m.days_left <= 7 ? 'danger' : m.days_left <= 30 ? 'warn' : '';
                 const daysText = m.days_left == null ? '未检测' : `${m.days_left} 天`;
-                const threshold = m.warn_days > 0 ? `${m.warn_days} 天` : '全局默认';
+                const tiered = m.tiered_thresholds ? _parseTiered(m.tiered_thresholds) : null;
+                const threshold = tiered ? tiered.map(([d,s]) => `${d}天/${s}`).join(' → ') : (m.warn_days > 0 ? `${m.warn_days} 天` : '全局默认');
                 const checkedText = m.last_checked ? fmtTime(m.last_checked) : '<span class="muted">未检测</span>';
                 const detail = m.detail || {};
-                const certInfo = m.type === 'ssl' && detail.cert_issuer ? `<div class="mon-cert-info">${esc(detail.cert_issuer)}</div>` : '';
+                const certInfo = m.type === 'ssl' && detail.cert_issuer ? `<div class="mon-cert-info">${esc(detail.cert_issuer)}${detail.tls_version ? ' | '+esc(detail.tls_version) : ''}</div>` : '';
+                const sanInfo = m.san_domains && m.san_domains.length > 1 ? `<div class="mon-cert-info">SAN: ${esc(m.san_domains.slice(0,3).join(', '))}${m.san_domains.length > 3 ? '...' : ''}</div>` : '';
+                const failBadge = m.probe_fail_count > 0 ? `<span class="badge p2" style="font-size:10px;margin-left:4px" title="探测失败 ${m.probe_fail_count} 次">✕${m.probe_fail_count}</span>` : '';
+                const probeBtn = m.type === 'ssl' && m.enabled ? `<button class="btn sm ghost mon-check-btn" data-id="${m.id}" style="padding:1px 6px;font-size:10px;margin-left:4px" title="立即检测">⟳</button>` : '';
+                const whoisBtn = m.type === 'domain' && m.enabled ? `<button class="btn sm ghost mon-whois-btn" data-id="${m.id}" style="padding:1px 6px;font-size:10px;margin-left:4px" title="WHOIS查询">W</button>` : '';
+                const rs = m.renewal_status || '';
+                const rsColor = RS_COLORS[rs] || 'secondary';
+                const checked = monitorSelectedIds.has(m.id) ? 'checked' : '';
                 return `<tr>
+                  ${canManage ? `<td><input type="checkbox" class="mon-row-check" data-id="${m.id}" ${checked}></td>` : ''}
                   <td><span class="badge" style="font-size:11px">${esc(MT_LABELS[m.type] || m.type)}</span></td>
-                  <td>${esc(m.name)}${certInfo}</td>
-                  <td>${esc(m.target)}${m.port && m.port !== 443 ? ':' + m.port : ''}</td>
+                  <td>${esc(m.name)}${certInfo}${sanInfo}</td>
+                  <td>${esc(m.target)}${m.port && m.port !== 443 ? ':' + m.port : ''}${failBadge}${probeBtn}${whoisBtn}</td>
                   <td class="mon-days ${daysCls}">${daysText}</td>
-                  <td>${threshold}</td>
+                  <td style="font-size:12px">${threshold}</td>
+                  <td style="font-size:12px">${m.owner ? esc(m.owner) : '<span class="muted">-</span>'}</td>
+                  <td><span class="badge ${rsColor}" style="font-size:11px">${esc(RS_LABELS[rs] || '未处理')}</span></td>
                   <td><label class="mon-switch"><input type="checkbox" data-id="${m.id}" ${m.enabled ? 'checked' : ''} ${!canManage ? 'disabled' : ''}><span class="slider"></span></label></td>
                   <td>${checkedText}</td>
                   <td class="mon-actions">
-                    ${m.type === 'ssl' && m.enabled ? `<button class="btn sm ghost mon-check-btn" data-id="${m.id}">检测</button>` : ''}
                     ${canManage ? `
+                      <button class="btn sm ghost mon-renewal-btn" data-id="${m.id}" title="续期状态">续期</button>
                       <button class="btn sm ghost mon-edit-btn" data-id="${m.id}">编辑</button>
                       <button class="btn sm ghost mon-del-btn" data-id="${m.id}">删除</button>
                     ` : ''}
@@ -1656,14 +1743,66 @@
         </table></div></div>`;
 
     // Bind events
-    const addBtn = document.getElementById('monAddBtn');
-    if (addBtn) addBtn.onclick = () => openMonitorForm();
-    const cfgBtn = document.getElementById('monConfigBtn');
-    if (cfgBtn) cfgBtn.onclick = () => openMonitorConfig();
-    tc.querySelectorAll('.mon-check-btn').forEach(b => b.onclick = () => checkMonitor(Number(b.dataset.id)));
-    tc.querySelectorAll('.mon-edit-btn').forEach(b => b.onclick = () => openMonitorForm(Number(b.dataset.id)));
-    tc.querySelectorAll('.mon-switch input').forEach(el => el.onchange = () => toggleMonitor(Number(el.dataset.id)));
-    tc.querySelectorAll('.mon-del-btn').forEach(b => b.onclick = () => deleteMonitor(Number(b.dataset.id)));
+    const checkAll = document.getElementById('monCheckAll');
+    if (checkAll) checkAll.onchange = () => {
+      if (checkAll.checked) filtered.forEach(m => monitorSelectedIds.add(m.id));
+      else monitorSelectedIds.clear();
+      renderMonitorsTab();
+    };
+    area.querySelectorAll('.mon-row-check').forEach(el => el.onchange = () => {
+      const id = Number(el.dataset.id);
+      if (el.checked) monitorSelectedIds.add(id); else monitorSelectedIds.delete(id);
+      renderMonitorsTab();
+    });
+    area.querySelectorAll('.mon-check-btn').forEach(b => b.onclick = () => checkMonitor(Number(b.dataset.id)));
+    area.querySelectorAll('.mon-whois-btn').forEach(b => b.onclick = () => whoisMonitor(Number(b.dataset.id)));
+    area.querySelectorAll('.mon-renewal-btn').forEach(b => b.onclick = () => openRenewalDialog(Number(b.dataset.id)));
+    area.querySelectorAll('.mon-edit-btn').forEach(b => b.onclick = () => openMonitorForm(Number(b.dataset.id)));
+    area.querySelectorAll('.mon-switch input').forEach(el => el.onchange = () => toggleMonitor(Number(el.dataset.id)));
+    area.querySelectorAll('.mon-del-btn').forEach(b => b.onclick = () => deleteMonitor(Number(b.dataset.id)));
+  }
+
+  function renderTimelineView(){
+    const area = document.getElementById('monContentArea');
+    if (!area) return;
+    if (!monitorTimeline.length) {
+      area.innerHTML = '<div class="panel" style="text-align:center;padding:40px"><span class="muted">未来 90 天内无到期项</span></div>';
+      return;
+    }
+    // Group by week
+    const weeks = {};
+    monitorTimeline.forEach(m => {
+      const weekKey = m.days_left <= 0 ? '已到期' : `≤${Math.ceil(m.days_left / 7) * 7}天`;
+      (weeks[weekKey] = weeks[weekKey] || []).push(m);
+    });
+    area.innerHTML = `
+      <div class="mon-timeline">
+        ${Object.entries(weeks).map(([label, items]) => `
+          <div class="mon-tl-group">
+            <div class="mon-tl-label">${esc(label)}</div>
+            <div class="mon-tl-items">
+              ${items.map(m => {
+                const cls = m.days_left <= 0 ? 'danger' : m.days_left <= 7 ? 'danger' : m.days_left <= 30 ? 'warn' : '';
+                return `<div class="mon-tl-item">
+                  <span class="badge" style="font-size:10px">${esc(MT_LABELS[m.type] || m.type)}</span>
+                  <span>${esc(m.name)}</span>
+                  <span class="mon-days ${cls}">${m.days_left}天</span>
+                  ${m.owner ? `<span class="muted" style="font-size:11px">${esc(m.owner)}</span>` : ''}
+                </div>`;
+              }).join('')}
+            </div>
+          </div>
+        `).join('')}
+      </div>`;
+  }
+
+  function _parseTiered(raw){
+    if (!raw) return null;
+    try {
+      const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (typeof obj !== 'object' || !obj) return null;
+      return Object.entries(obj).map(([k,v]) => [parseInt(k), v]).filter(([k,v]) => !isNaN(k)).sort((a,b) => a[0]-b[0]);
+    } catch(e) { return null; }
   }
 
   function openMonitorForm(id){
@@ -1671,6 +1810,7 @@
     editingMonitorId = id || null;
     const title = m ? `编辑监控: ${m.name}` : '添加监控';
     const type = m ? m.type : 'ssl';
+    const tieredRaw = m && m.tiered_thresholds ? (typeof m.tiered_thresholds === 'string' ? m.tiered_thresholds : JSON.stringify(m.tiered_thresholds)) : '';
     const bodyHTML = `
       <div class="form-grid">
         <div class="field"><label>名称</label><input id="mfName" value="${m ? esc(m.name) : ''}" placeholder="如：API 网关证书"></div>
@@ -1681,12 +1821,16 @@
         <div class="field"><label>目标</label><input id="mfTarget" value="${m ? esc(m.target) : ''}" placeholder="SSL: 域名，其他: 产品标识等"></div>
         <div class="field"><label>端口</label><input id="mfPort" type="number" value="${m ? m.port || 443 : 443}" placeholder="443（仅 SSL 有效）"></div>
         <div class="field" id="mfExpiryWrap"><label>到期时间</label><input id="mfExpiry" type="datetime-local" value="${m && m.expiry_at ? new Date(m.expiry_at * 1000).toISOString().slice(0,16) : ''}"></div>
+        <div class="field"><label>责任人</label><input id="mfOwner" value="${m ? esc(m.owner || '') : ''}" placeholder="可选"></div>
         <div class="field"><label>提前通知天数</label><input id="mfWarnDays" type="number" value="${m ? m.warn_days || 0 : 0}" placeholder="0 = 跟随全局"></div>
         <div class="field"><label>告警级别</label>
           <select id="mfSeverity">
             <option value="">跟随全局</option>
             ${SEVERITIES.map(([v,l]) => `<option value="${v}" ${m && m.severity===v?'selected':''}>${l}</option>`).join('')}
           </select></div>
+        <div class="field full"><label>阶梯告警阈值（JSON，如 {"30":"P3","14":"P2","7":"P1","0":"P0"}）</label>
+          <input id="mfTiered" value="${esc(tieredRaw)}" placeholder="留空=使用单阈值，填写后按阶梯触发">
+        </div>
         <div class="field full"><label>通知渠道（空=跟随全局）</label>
           <div class="rule-ch-box" id="mfChannelsWrap">${CHANNELS.map(([v,l]) => {
               const checked = m && m.channels && m.channels.length ? m.channels.includes(v) : false;
@@ -1705,7 +1849,8 @@
     const expiryWrap = document.getElementById('mfExpiryWrap');
     function toggleSslFields(){
       const isSsl = document.getElementById('mfTypes').value === 'ssl';
-      expiryWrap.style.display = isSsl ? 'none' : '';
+      const isDomain = document.getElementById('mfTypes').value === 'domain';
+      expiryWrap.style.display = (isSsl || isDomain) ? 'none' : '';
     }
     typeSelect.onchange = toggleSslFields;
     toggleSslFields();
@@ -1725,6 +1870,7 @@
 
       const channels = [...document.querySelectorAll('#mfChannelsWrap input:checked')].map(c => c.value);
       const expiryRaw = document.getElementById('mfExpiry').value;
+      const tieredRaw = (document.getElementById('mfTiered').value || '').trim();
 
       const payload = {
         type,
@@ -1733,11 +1879,18 @@
         port: type === 'ssl' ? (parseInt(document.getElementById('mfPort').value) || 443) : 0,
         warn_days: parseInt(document.getElementById('mfWarnDays').value) || 0,
         severity: document.getElementById('mfSeverity').value || '',
+        owner: (document.getElementById('mfOwner').value || '').trim(),
         channels,
       };
 
-      // 非 SSL 类型提供到期时间（剩余天数后端自动计算）
-      if (type !== 'ssl') {
+      // 阶梯告警阈值
+      if (tieredRaw) {
+        try { JSON.parse(tieredRaw); payload.tiered_thresholds = tieredRaw; }
+        catch(e) { toastError('阶梯阈值 JSON 格式错误'); return; }
+      }
+
+      // 非 SSL/domain 类型提供到期时间（剩余天数后端自动计算）
+      if (type !== 'ssl' && type !== 'domain') {
         if (expiryRaw) payload.expiry_at = Math.floor(new Date(expiryRaw).getTime() / 1000);
         else { toastError('非 SSL 类型需提供到期时间'); return; }
       }
@@ -1784,6 +1937,155 @@
       toastSuccess('检测完成');
       loadMonitors();
     } catch(e) { toastError(e.message || '检测失败'); }
+  }
+
+  async function whoisMonitor(id){
+    try {
+      toastSuccess('正在 WHOIS 查询...');
+      await api(`/api/alerts/monitors/${id}/whois`, {method:'POST'});
+      toastSuccess('WHOIS 查询完成');
+      loadMonitors();
+    } catch(e) { toastError(e.message || 'WHOIS 查询失败'); }
+  }
+
+  async function batchMonitorAction(action){
+    const ids = [...monitorSelectedIds];
+    if (!ids.length) return;
+    if (action === 'delete' && !await confirmDialog(`确认删除 ${ids.length} 个监控项？`)) return;
+    try {
+      const r = await api('/api/alerts/monitors/batch', {method:'POST', body: JSON.stringify({action, ids})});
+      toastSuccess(`批量操作完成，影响 ${r.count} 项`);
+      monitorSelectedIds.clear();
+      loadMonitors();
+    } catch(e) { toastError(e.message || '操作失败'); }
+  }
+
+  async function exportMonitors(){
+    try {
+      const fmt = 'json';
+      const data = await api('/api/alerts/monitors/export?format=' + fmt);
+      const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'monitors_export.json'; a.click();
+      URL.revokeObjectURL(url);
+      toastSuccess('导出成功');
+    } catch(e) { toastError(e.message || '导出失败'); }
+  }
+
+  function openImportDialog(){
+    const bodyHTML = `
+      <div class="field full">
+        <label>粘贴 JSON 数组或上传文件</label>
+        <textarea id="monImportData" rows="10" style="width:100%;font-family:monospace;font-size:12px" placeholder='[{"type":"ssl","name":"...","target":"example.com"}]'></textarea>
+      </div>
+      <div class="field full">
+        <input type="file" id="monImportFile" accept=".json,.csv" style="font-size:12px">
+      </div>
+      <div style="display:flex;gap:10px;margin-top:20px"><button class="btn primary flex-1" id="monImportSave">导入</button></div>`;
+    openDrawer({ title: '导入监控项', body: bodyHTML, wide: true });
+    document.getElementById('monImportFile').onchange = function(e){
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(ev){ document.getElementById('monImportData').value = ev.target.result; };
+      reader.readAsText(file);
+    };
+    document.getElementById('monImportSave').onclick = async () => {
+      try {
+        const raw = document.getElementById('monImportData').value.trim();
+        if (!raw) { toastError('请粘贴或上传数据'); return; }
+        const data = JSON.parse(raw);
+        if (!Array.isArray(data)) { toastError('需为 JSON 数组'); return; }
+        const r = await api('/api/alerts/monitors/import', {method:'POST', body: JSON.stringify(data)});
+        toastSuccess(`导入成功 ${r.created} 条${r.errors && r.errors.length ? '，失败 ' + r.errors.length + ' 条' : ''}`);
+        const c = document.getElementById('dwClose');
+        if (c) c.click();
+        loadMonitors();
+      } catch(e) { toastError(e.message || '导入失败'); }
+    };
+  }
+
+  async function openTemplatePicker(){
+    try {
+      const templates = await api('/api/alerts/monitors/templates');
+      const bodyHTML = `
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          ${templates.map((t, i) => `
+            <div class="panel" style="padding:12px;cursor:pointer" class="tpl-card" data-idx="${i}">
+              <div style="font-weight:600;font-size:13px">${esc(t.name)}</div>
+              <div style="font-size:11px;color:var(--text-2);margin-top:4px">${esc(t.remark || '')}</div>
+              <div style="margin-top:6px"><span class="badge" style="font-size:10px">${esc(MT_LABELS[t.type] || t.type)}</span></div>
+            </div>
+          `).join('')}
+        </div>`;
+      openDrawer({ title: '从模板快速添加', body: bodyHTML, wide: true });
+      document.querySelectorAll('.tpl-card, [data-idx]').forEach(el => {
+        el.onclick = () => {
+          const idx = Number(el.dataset.idx);
+          const t = templates[idx];
+          if (t) {
+            const c = document.getElementById('dwClose');
+            if (c) c.click();
+            openMonitorForm();
+            setTimeout(() => {
+              const sel = document.getElementById('mfTypes');
+              if (sel) { sel.value = t.type; sel.dispatchEvent(new Event('change')); }
+              const nameEl = document.getElementById('mfName');
+              if (nameEl) nameEl.value = t.name;
+              const targetEl = document.getElementById('mfTarget');
+              if (targetEl) targetEl.value = t.target;
+              const warnEl = document.getElementById('mfWarnDays');
+              if (warnEl) warnEl.value = t.warn_days || 0;
+            }, 100);
+          }
+        };
+      });
+    } catch(e) { toastError(e.message || '加载模板失败'); }
+  }
+
+  function openRenewalDialog(id){
+    const m = monitors.find(x => x.id === id);
+    if (!m) return;
+    const bodyHTML = `
+      <div class="form-grid">
+        <div class="field"><label>监控项</label><input value="${esc(m.name)}" disabled></div>
+        <div class="field"><label>续期状态</label>
+          <select id="renewStatus">
+            ${RENEWAL_STATUSES.map(([v,l]) => `<option value="${v}" ${(m.renewal_status||'')===v?'selected':''}>${l}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field full"><label>备注</label><input id="renewRemark" placeholder="可选，如：已联系 CA、续费订单已提交"></div>
+      </div>
+      <div id="renewLogsWrap" style="margin-top:16px"></div>
+      <div style="display:flex;gap:10px;margin-top:20px"><button class="btn primary flex-1" id="renewSave">保存</button></div>`;
+    openDrawer({ title: '续期状态跟踪', body: bodyHTML });
+    // Load logs
+    api(`/api/alerts/monitors/${id}/renewal-logs`).then(logs => {
+      const wrap = document.getElementById('renewLogsWrap');
+      if (!wrap) return;
+      if (!logs || !logs.length) {
+        wrap.innerHTML = '<div class="muted" style="font-size:12px">暂无续期记录</div>';
+        return;
+      }
+      wrap.innerHTML = `<div style="font-size:12px;font-weight:600;margin-bottom:6px">续期历史</div>
+        ${logs.map(l => `<div style="font-size:11px;padding:4px 0;border-bottom:1px solid var(--border)">
+          <span class="muted">${fmtTime(l.created_at)}</span> | ${esc(l.action)} | ${esc(l.operator || '-')}
+          ${l.detail && l.detail.remark ? ' | ' + esc(l.detail.remark) : ''}
+        </div>`).join('')}`;
+    }).catch(() => {});
+    document.getElementById('renewSave').onclick = async () => {
+      try {
+        await api(`/api/alerts/monitors/${id}/renewal`, {method:'POST', body: JSON.stringify({
+          status: document.getElementById('renewStatus').value,
+          remark: (document.getElementById('renewRemark').value || '').trim()
+        })});
+        toastSuccess('续期状态已更新');
+        const c = document.getElementById('dwClose');
+        if (c) c.click();
+        loadMonitors();
+      } catch(e) { toastError(e.message || '保存失败'); }
+    };
   }
 
   function openMonitorConfig(){

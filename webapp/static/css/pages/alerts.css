@@ -60,7 +60,7 @@
 .rules-tbl td{font-size:var(--fs-13)}
 .rules-tbl .num{text-align:right;font-family:var(--font-num)}
 .rules-tbl .rule-remark{font-size:var(--fs-11);color:var(--text-3);margin-top:2px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rules-tbl .rule-actions{white-space:nowrap;display:flex;gap:4px}
+.rules-tbl .rule-actions{white-space:nowrap}
 
 /* 规则类型徽标 */
 .rule-mt-badge{display:inline-block;padding:2px 8px;border-radius:var(--r-full);font-size:var(--fs-11);font-weight:500}
@@ -95,7 +95,7 @@
 /* 静默表格 */
 .silence-tbl td{font-size:var(--fs-13)}
 .silence-tbl .silence-time{font-family:var(--font-num);font-size:var(--fs-12);white-space:nowrap}
-.silence-tbl .silence-actions{white-space:nowrap;display:flex;gap:4px}
+.silence-tbl .silence-actions{white-space:nowrap}
 .silence-tbl .silence-remark{font-size:var(--fs-11);color:var(--text-3);margin-top:2px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* 静默类型徽标 */
@@ -179,12 +179,15 @@
 .mon-summary-item .ms-label{font-size:var(--fs-12);color:var(--text-2)}
 .mon-summary-item.warn .ms-num{color:var(--warning)}
 .mon-summary-item.danger .ms-num{color:var(--danger)}
+.mon-tbl{table-layout:auto}
+.mon-tbl th,.mon-tbl td{padding:7px 8px}
 .mon-tbl td{font-size:var(--fs-13)}
 .mon-tbl .mon-days{font-weight:600;font-family:var(--font-num)}
 .mon-tbl .mon-days.danger{color:var(--danger)}
 .mon-tbl .mon-days.warn{color:var(--warning)}
 .mon-tbl .mon-cert-info{font-size:var(--fs-11);color:var(--text-3);margin-top:2px}
-.mon-tbl .mon-actions{white-space:nowrap;display:flex;gap:4px}
+.mon-tbl .mon-actions{white-space:nowrap}
+.mon-tbl .mon-actions .btn{padding:2px 6px;font-size:11px}
 
 /* 到期监控开关 */
 .mon-switch{position:relative;display:inline-block;width:36px;height:20px;cursor:pointer;flex-shrink:0}
@@ -196,3 +199,18 @@
 .mon-switch input:checked+.slider{background:rgba(0,227,150,.25);border-color:rgba(0,227,150,.5)}
 .mon-switch input:checked+.slider::before{left:18px;background:var(--success)}
 .mon-switch:hover .slider{border-color:var(--primary)}
+
+/* 到期监控时间线视图 */
+.mon-timeline{display:flex;flex-direction:column;gap:16px}
+.mon-tl-group{display:flex;gap:12px;align-items:flex-start}
+.mon-tl-label{min-width:80px;font-size:13px;font-weight:600;color:var(--text-1);
+  padding:6px 10px;background:rgba(0,212,255,.06);border:1px solid var(--border);
+  border-radius:var(--r-ctl);text-align:center;white-space:nowrap}
+.mon-tl-items{display:flex;flex-wrap:wrap;gap:8px;flex:1}
+.mon-tl-item{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;
+  border:1px solid var(--border);border-radius:var(--r-ctl);font-size:12px;
+  background:linear-gradient(180deg,rgba(17,34,65,.4),rgba(13,27,51,.7));transition:var(--t-fast)}
+.mon-tl-item:hover{border-color:var(--border-strong)}
+.mon-tl-item .mon-days{font-weight:600;font-family:var(--font-num)}
+.mon-tl-item .mon-days.danger{color:var(--danger)}
+.mon-tl-item .mon-days.warn{color:var(--warning)}
