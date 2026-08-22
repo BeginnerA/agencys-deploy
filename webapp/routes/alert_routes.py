@@ -1326,7 +1326,10 @@ def _validate_monitor(body, partial=False) -> str:
     if "port" in body:
         try:
             p = int(body["port"])
-            if p < 1 or p > 65535:
+            # 非 SSL 类型允许 port=0
+            if body.get("type") != "ssl" and p == 0:
+                pass
+            elif p < 1 or p > 65535:
                 return "port 需在 1-65535 之间"
         except (TypeError, ValueError):
             return "port 必须为数字"
