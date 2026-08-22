@@ -811,6 +811,7 @@ def main():
     parser.add_argument("--rollback", action="store_true", help="全量回滚模式：将所有服务器从当前版本回滚到 --previous-version，跳过构建")
     parser.add_argument("--build-only", action="store_true", help="仅本地构建（Maven + Docker），不推送镜像到服务器、不发布")
     parser.add_argument("--push-only", action="store_true", help="构建并推送镜像到服务器，但不发布（不 Nacos 下线、不更新容器）")
+    parser.add_argument("--force-window", action="store_true", help="强制跳过发布窗口检查（由 Web 端窗口确认后自动传入，deploy.py 本身不做窗口校验）")
     args = parser.parse_args()
 
     source = _resolve_config_source(args)
