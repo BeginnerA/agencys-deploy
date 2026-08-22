@@ -198,6 +198,69 @@ def log_services():
         conn.close()
 
 
+# ---------- 服务日志尾部（大屏实时日志抽屉用）----------
+
+@log_bp.route("/logs/tail")
+@require_auth
+def tail_service_logs():
+    """获取指定服务的最近 N 条日志（供大屏服务卡片日志抽屉轮询）
+
+    参数：
+      service — 服务显示名（services.name），自动映射到 service_name（容器名）
+      env     — 环境名（可选，缩小范围）
+      lines   — 返回条数（默认 200，上限 500）
+      after   — 仅返回 id > after 的条目（增量轮询）
+    """
+    service = request.args.get("service", "")
+    env = request.args.get("env", "")
+    lines = min(500, max(1, request.args.get("lines", 200, type=int)))
+    after = request.args.get("after", 0, type=int)
+
+    if not service:
+        return jsonify({"rows": [], "total": 0})
+
+    db_path = current_app.config["DB_PATH"]
+    conn = dbm.get_conn(db_path)
+    try:
+        # 将服务显示名映射到 service_name（Docker 容器名）
+        # log_entries.service 存储的是容器名
+        row = conn.execute(
+            "SELECT service_name FROM services WHERE name = ? LIMIT 1",
+            (service,)
+        ).fetchone()
+        svc_key = row["service_name"] if row else service
+
+        # 查询最近的日志条目
+        if after:
+            sql = ("SELECT id, ts, env, service, content FROM log_entries "
+                   "WHERE service = ? AND id > ?")
+            params = [svc_key, after]
+        else:
+            sql = ("SELECT id, ts, env, service, content FROM log_entries "
+                   "WHERE service = ?")
+            params = [svc_key]
+
+        if env:
+            sql += " AND env = ?"
+            params.append(env)
+
+        if after:
+            sql += " ORDER BY id ASC LIMIT ?"
+        else:
+            # 取最近 N 条，然后反转为时间正序
+            sql += " ORDER BY id DESC LIMIT ?"
+        params.append(lines)
+
+        rows = conn.execute(sql, params).fetchall()
+        result = [dict(r) for r in rows]
+        if not after:
+            result.reverse()
+
+        return jsonify({"rows": result, "total": len(result)})
+    finally:
+        conn.close()
+
+
 # ---------- 日志保留/归档设置 ----------
 
 _LOG_SETTING_KEYS = {

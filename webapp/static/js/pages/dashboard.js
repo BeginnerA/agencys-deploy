@@ -239,26 +239,6 @@
           }).join('') : `<tr><td colspan="14" class="muted" style="text-align:center;padding:20px">暂无服务器数据</td></tr>`}
         </tbody></table></div>
       </div>
-      ${(() => {
-        const svcs = mon && mon.services || {};
-        const svcEntries = Object.entries(svcs);
-        if (!svcEntries.length) return '';
-        function fmtUp(h){ if(h==null||h<0) return '—'; if(h>=24) return Math.floor(h/24)+'天'+Math.floor(h%24)+'时'; return Math.floor(h)+'时'; }
-        const rows = svcEntries.map(([name, info]) => {
-          const dotCls = info.status === 'online' ? 'ok' : info.status === 'probe_failed' ? 'warn' : 'bad';
-          const statusTxt = info.status === 'online' ? '运行中' : info.status === 'probe_failed' ? '探测失败' : '未部署';
-          const upTxt = info.uptime_hours != null && info.uptime_hours >= 0 ? fmtUp(info.uptime_hours) : '';
-          return `<div class="list-item">
-            <div class="li-main ellipsis"><span class="dot ${dotCls}"></span>${esc(name)}
-              ${info.version ? ' <span class="weak">v'+esc(info.version)+'</span>' : ''}
-              ${upTxt ? ' <span class="weak" style="margin-left:4px">⏱'+upTxt+'</span>' : ''}</div>
-            <span class="${info.status==='online'?'ok':'err'}">${statusTxt}</span>
-          </div>`;
-        }).join('');
-        return `<div class="panel"><div class="panel-title">服务状态
-          <span class="muted" style="font-weight:400;font-size:12px">（${svcEntries.length} 个）</span></div>
-          <div class="rlist">${rows}</div></div>`;
-      })()}
       <div class="panel"><div class="panel-title">响应时间趋势</div>
         <div id="chartRespTime" style="height:220px"></div></div>
     `;

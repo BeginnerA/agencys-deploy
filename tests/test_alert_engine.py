@@ -5,7 +5,7 @@ import time
 import unittest
 
 from webapp import db as dbm
-from webapp.alert_engine import AlertEngine, DEFAULT_RULES
+from webapp.alert_engine import AlertEngine, DEFAULT_RULES, RECOVER_ROUNDS
 
 
 class FakeMonitor:
@@ -316,8 +316,16 @@ class TestAlertEngine(unittest.TestCase):
         alerts = dbm.list_records(self.db, "alerts")
         self.assertEqual(len(alerts), 1)
         self.assertIn("svc-a", alerts[0]["subject"])
-        # 服务恢复在线 → 自动 resolved
+        # 服务恢复在线 → 需要连续 RECOVER_ROUNDS 轮才自动 resolved
         e._monitor._data[(self.proj_id, "test")]["services"]["svc-a"]["status"] = "online"
+        # 第 1 轮：记录恢复起始时间，尚不 resolved
+        e._auto_resolve()
+        self.assertEqual(dbm.get_record(self.db, "alerts", alerts[0]["id"])["status"],
+                         "firing")
+        # 模拟时间流逝（超过 RECOVER_ROUNDS × interval = 60s）
+        key = (self.env_id, "svc-a")
+        e._service_recover_since[key] = time.time() - RECOVER_ROUNDS * e._interval
+        # 第 2 轮：持续在线超过恢复窗口 → resolved
         e._auto_resolve()
         self.assertEqual(dbm.get_record(self.db, "alerts", alerts[0]["id"])["status"],
                          "resolved")

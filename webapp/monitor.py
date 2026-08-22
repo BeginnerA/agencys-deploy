@@ -710,6 +710,11 @@ class MonitorScheduler:
         health_hosts = {}  # {svc_name: [host, ...]} 用于健康检查
         per_server_metrics = {}  # {host: {cpu, mem, disk, load}} 按服务器存储主机指标
         per_server_extended = {}  # {host: {swap, net_rx, ...}} 扩展指标
+        # 扩展指标节流时先从缓存回填（供后续服务循环读取 container_status/uptime_hours）
+        # 非 skip 轮次会被本轮新鲜数据覆盖；skip 轮次保证前端持续有运行时长数据
+        prev_ext_cache = self._cache.get(env["id"])
+        if prev_ext_cache:
+            per_server_extended = dict(prev_ext_cache.get("extended_metrics") or {})
         # 扩展指标节流：每 3 轮采集一次（@60s 间隔 ≈ 3 分钟一次），
         # 大幅减少 SSH 连接数（跳过时每台服务器每轮仅 1 次连接而非 2 次）
         skip_extended = (self._round % 3) != 0

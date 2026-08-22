@@ -7,6 +7,14 @@
   let reqSeq = 0; // 丢弃过期响应（快速切换项目/环境时防乱序覆盖）
   let lastSig = null; // 3s 轮询数据签名：无变化时跳过卡片墙/服务器表全量重建
   let destroyed = false; // 路由切换后丢弃 in-flight 响应，防覆盖新页面/泄漏轮询
+  // 服务日志抽屉轮询状态
+  let svcLogTimer = null;
+  let svcLogLastId = 0;
+  let svcLogFilter = 'all';   // all / error / warn / info
+  let svcLogLines = 100;
+  let svcLogShowTs = true;
+  let svcLogAutoScroll = true;
+  let _svcLogRows = [];
 
   // 服务卡片：状态灯优先级 发布中 > 探测结果（沿用旧 dotClass 语义）
   function dotClass(svc, runningTask){
@@ -78,9 +86,13 @@
       const inst = st.instances !== undefined && st.instances !== -1 ? st.instances : '—';
       const ts = st.ts ? fmtTime(st.ts) : '';
       const dotCls = dotClass(st, run);
+      const upTxt = st.uptime_hours != null && st.uptime_hours >= 0
+        ? (st.uptime_hours >= 24 ? Math.floor(st.uptime_hours/24)+'天'+Math.floor(st.uptime_hours%24)+'时' : Math.floor(st.uptime_hours)+'时')
+        : '';
       return `<div class="svc-card ${run ? 'publishing' : ''}" data-id="${s.id}">
         <div class="svc-head"><span class="dot ${dotCls}"></span><b class="ellipsis">${esc(s.name)}</b>
-          ${s.enabled ? '' : '<span class="weak" style="font-size:11px">(停用)</span>'}</div>
+          ${s.enabled ? '' : '<span class="weak" style="font-size:11px">(停用)</span>'}
+          ${upTxt ? '<span class="weak" style="margin-left:auto;font-size:11px">⏱'+upTxt+'</span>' : ''}</div>
         <div class="svc-meta">
           <div><span class="weak">镜像</span> <span class="num">${esc(ver)}</span></div>
           <div><span class="weak">实例</span> <span class="num">${inst}</span>
@@ -91,11 +103,15 @@
         <div class="svc-foot">
           ${canDeploy() ? `<button class="btn sm primary" data-pub="${s.id}">发布</button>
           <button class="btn sm ghost" data-roll="${s.id}">回滚</button>` : '<span class="weak" style="font-size:11px">只读账号</span>'}
+          <button class="svc-log-btn" data-svc="${esc(s.name)}" title="查看实时日志">📋 日志</button>
         </div>
       </div>`;
     }).join('') || emptyState('📭', '该项目暂无服务');
     wall.querySelectorAll('[data-pub]').forEach(b => b.onclick = () => openDeployDrawer(Number(b.dataset.pub), false));
     wall.querySelectorAll('[data-roll]').forEach(b => b.onclick = () => openDeployDrawer(Number(b.dataset.roll), true));
+    wall.querySelectorAll('.svc-log-btn').forEach(btn => {
+      btn.onclick = (e) => { e.stopPropagation(); openServiceLogDrawer(btn.dataset.svc); };
+    });
   }
   function renderServers(){
     const root = document.getElementById('pageRoot');
@@ -236,6 +252,89 @@
     };
   }
 
+  // ---- 服务日志抽屉（1Panel 风格，轮询 /api/logs/tail，5s 增量追加）----
+  function stopSvcLogPolling(){
+    if (svcLogTimer){ clearInterval(svcLogTimer); svcLogTimer = null; }
+  }
+  function openServiceLogDrawer(svcName){
+    stopSvcLogPolling();
+    svcLogLastId = 0;
+    _svcLogRows = [];
+    openDrawer({ title: '服务日志 · ' + svcName, wide: true, onClose: stopSvcLogPolling, body: `
+      <div class="svc-log-toolbar">
+        <select id="svcLogFilterSel" title="日志级别过滤">
+          <option value="all">过滤 所有</option>
+          <option value="error">过滤 ERROR</option>
+          <option value="warn">过滤 WARN</option>
+          <option value="info">过滤 INFO</option>
+        </select>
+        <select id="svcLogLinesSel" title="显示条数">
+          ${[50,100,200,500].map(n => `<option value="${n}" ${n===svcLogLines?'selected':''}>条数 ${n}</option>`).join('')}
+        </select>
+        <label><input type="checkbox" id="svcLogAutoScrollCb" ${svcLogAutoScroll?'checked':''}> 追踪</label>
+        <label><input type="checkbox" id="svcLogShowTsCb" ${svcLogShowTs?'checked':''}> 时间</label>
+        <span style="flex:1"></span>
+        <button class="btn sm ghost" id="svcLogClear">清空</button>
+      </div>
+      <div class="svc-log-console" id="svcLogBox">加载中...</div>
+    `});
+    const box = document.getElementById('svcLogBox');
+    document.getElementById('svcLogFilterSel').onchange = (e) => { svcLogFilter = e.target.value; renderLogLines(svcName); };
+    document.getElementById('svcLogLinesSel').onchange = (e) => { svcLogLines = Number(e.target.value); renderLogLines(svcName); };
+    document.getElementById('svcLogAutoScrollCb').onchange = (e) => { svcLogAutoScroll = e.target.checked; };
+    document.getElementById('svcLogShowTsCb').onchange = (e) => { svcLogShowTs = e.target.checked; renderLogLines(svcName); };
+    document.getElementById('svcLogClear').onclick = () => { if (box) { box.innerHTML = '<span style="color:#8b949e">（已清空）</span>'; svcLogLastId = 0; } };
+    pollServiceLogs(svcName);
+    svcLogTimer = setInterval(() => pollServiceLogs(svcName), 5000);
+  }
+  async function pollServiceLogs(svcName){
+    try {
+      const params = new URLSearchParams({service: svcName, lines: '500'});
+      if (svcLogLastId > 0) params.set('after', String(svcLogLastId));
+      const data = await api('/api/logs/tail?' + params);
+      const box = document.getElementById('svcLogBox');
+      if (!box) { stopSvcLogPolling(); return; }
+      if (!data.rows || data.rows.length === 0) {
+        if (svcLogLastId === 0) box.innerHTML = '<span style="color:#8b949e">（暂无日志，等待采集...）</span>';
+        return;
+      }
+      if (svcLogLastId === 0) { _svcLogRows = data.rows; }
+      else { _svcLogRows = _svcLogRows.concat(data.rows); }
+      svcLogLastId = data.rows[data.rows.length - 1].id;
+      renderLogLines(svcName);
+    } catch(e) {
+      const box = document.getElementById('svcLogBox');
+      if (box && svcLogLastId === 0) box.innerHTML = '<span style="color:#f85149">日志加载失败：' + esc(e.message || e) + '</span>';
+    }
+  }
+  function renderLogLines(svcName){
+    const box = document.getElementById('svcLogBox');
+    if (!box) return;
+    let rows = _svcLogRows;
+    if (svcLogFilter !== 'all') {
+      const kw = svcLogFilter.toUpperCase();
+      rows = rows.filter(r => (r.content || '').toUpperCase().includes(kw));
+    }
+    if (rows.length > svcLogLines) rows = rows.slice(-svcLogLines);
+    const html = rows.map(r => formatLogLineHtml(r)).join('');
+    box.innerHTML = html || '<span style="color:#8b949e">（无匹配日志）</span>';
+    if (svcLogAutoScroll) box.scrollTop = box.scrollHeight;
+  }
+  function formatLogLineHtml(r){
+    const content = r.content || '';
+    const contentEsc = esc(content);
+    const upper = content.toUpperCase();
+    let cls = '';
+    if (upper.includes('ERROR') || upper.includes('EXCEPTION') || upper.includes('FATAL')) cls = 'log-err';
+    else if (upper.includes('WARN')) cls = 'log-warn';
+    else if (upper.includes('INFO')) cls = 'log-info';
+    const contentSpan = cls ? `<span class="${cls}">${contentEsc}</span>` : contentEsc;
+    let prefix = '';
+    if (svcLogShowTs && r.ts) prefix += `<span class="log-ts">${fmtTime(r.ts)}</span> `;
+    if (r.env) prefix += `<span class="log-env">[${esc(r.env)}]</span> `;
+    return prefix + contentSpan + '\n';
+  }
+
   // ---- 模块导出 ----
   window.devices = {
     render: async function(root){
@@ -246,7 +345,7 @@
       if (destroyed) return [];
       return timer ? [timer] : [];
     },
-    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; lastSig = null; },
+    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; lastSig = null; stopSvcLogPolling(); },
   };
 
   async function render(){

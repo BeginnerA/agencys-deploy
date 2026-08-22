@@ -49,7 +49,7 @@ DEFAULT_RULES = [
          scope={"type": "all", "ids": []}, severity="P1",
          channels=["feishu"], escalation_interval=30, remark="内置默认规则"),
     dict(name="服务下线", metric_type="status", metric="service_down",
-         compare=">", threshold=0, duration_seconds=0,
+         compare=">", threshold=0, duration_seconds=300,
          scope={"type": "all", "ids": []}, severity="P1",
          channels=["feishu"], escalation_interval=30, remark="内置默认规则"),
     dict(name="任务失败", metric_type="status", metric="task_failed",
@@ -96,6 +96,12 @@ class AlertEngine:
         # 异步通知 futures 登记表：评估线程不被渠道网络超时阻塞；
         # 列表仅保留未完成项（_notify 提交时顺带清理），供 flush_notifications 等待
         self._pending_notifies = []
+        # 服务下线持续确认：{(env_id, svc_name): first_down_ts}
+        # 首次检测到下线记录时间戳，持续超过 duration 才真正触发告警（避免瞬态重启误报）
+        self._service_down_since = {}
+        # 服务恢复持续确认：{(env_id, svc_name): first_recover_ts}
+        # 连续 RECOVER_ROUNDS 轮在线才自动恢复（避免抖动导致告警风暴）
+        self._service_recover_since = {}
         self._seed_rules()
 
     # ---------- 调度 ----------
@@ -128,6 +134,14 @@ class AlertEngine:
         self._check_tasks(snap)
         self._auto_resolve(snap)
         self._escalate(snap)
+        # 清理过期跟踪条目（服务已删除或超过 1 小时未更新），防止内存泄漏
+        stale_threshold = time.time() - 3600
+        for key in [k for k, v in self._service_down_since.items()
+                    if v < stale_threshold]:
+            del self._service_down_since[key]
+        for key in [k for k, v in self._service_recover_since.items()
+                    if v < stale_threshold]:
+            del self._service_recover_since[key]
 
     def _load_snapshot(self) -> dict:
         """一轮评估的配置快照：规则/项目/环境/服务器/服务/静默窗口各加载一次
@@ -161,6 +175,8 @@ class AlertEngine:
     def _seed_rules(self):
         """首次启动导入内置默认规则（幂等：表非空即跳过）"""
         if dbm.list_records(self._db_path, "alert_rules"):
+            # 迁移：旧版“服务下线”规则 duration_seconds=0（瞬态误报根因）→ 升级为 300s
+            self._migrate_service_down_duration()
             return
         now = int(time.time())
         for r in DEFAULT_RULES:
@@ -171,6 +187,20 @@ class AlertEngine:
                 scope=r["scope"], severity=r["severity"], channels=r["channels"],
                 escalation_interval=r["escalation_interval"], enabled=1,
                 remark=r["remark"], created_at=now, updated_at=now))
+
+    def _migrate_service_down_duration(self):
+        """将旧版“服务下线”种子规则的 duration_seconds 从 0 迁移到 300
+
+        仅匹配内置规则名称“服务下线” + metric=service_down，避免影响
+        用户自建或测试创建的 service_down 规则。
+        """
+        rows = dbm.list_records(self._db_path, "alert_rules",
+                                "name=? AND metric=? AND metric_type=?",
+                                ("服务下线", "service_down", "status"))
+        for r in rows:
+            if r.get("duration_seconds", -1) == 0:
+                dbm.update_record(self._db_path, "alert_rules", r["id"],
+                                  {"duration_seconds": 300})
 
     # ---------- 滑动窗口 ----------
 
@@ -323,6 +353,8 @@ class AlertEngine:
         name_to_sid = {(s["project_id"], s["name"]): s["id"] for s in snap["services"]}
         enabled_env_ids = self._enabled_env_ids(snap)
         pcode_map = self._project_code_map(snap)
+        # 本轮仍在线的 (env_id, svc_name) 集合 → 用于清理不再下线的跟踪条目
+        active_online = set()
         for env in snap["envs"]:
             if env["id"] not in enabled_env_ids:
                 continue
@@ -330,16 +362,37 @@ class AlertEngine:
             for name, st in (data.get("services") or {}).items():
                 for rule in rules:
                     metric = rule.get("metric", "service_down")
-                    if metric == "service_down" and st.get("status") == "not_deployed":
-                        service_id = name_to_sid.get((env["project_id"], name))
-                        if not self._in_scope(rule, env, service=name,
-                                              service_id=service_id):
-                            continue
-                        self._fire(rule, f"service:{env['id']}:{name}",
-                                   subject=f"服务下线: {name}",
-                                   description=f"服务 {name} 在环境 {env['name']} 未部署或已停止",
-                                   target_info={"project": pcode_map.get(env["project_id"], ""), "env": env["name"], "service": name},
-                                   windows=snap["windows"])
+                    if metric != "service_down":
+                        continue
+                    track_key = (env["id"], name)
+                    if st.get("status") != "not_deployed":
+                        # 服务当前在线（或 probe_failed）→ 清除下线跟踪
+                        self._service_down_since.pop(track_key, None)
+                        if st.get("status") == "online":
+                            active_online.add(track_key)
+                        continue
+                    # 服务状态 = not_deployed → 持续确认后才触发
+                    now = time.time()
+                    if track_key not in self._service_down_since:
+                        self._service_down_since[track_key] = now
+                    down_duration = now - self._service_down_since[track_key]
+                    required = max(0, int(rule.get("duration_seconds", 0) or 0))
+                    if down_duration < required:
+                        continue  # 尚未达到持续时长，暂不触发
+                    service_id = name_to_sid.get((env["project_id"], name))
+                    if not self._in_scope(rule, env, service=name,
+                                          service_id=service_id):
+                        continue
+                    self._fire(rule, f"service:{env['id']}:{name}",
+                               subject=f"服务下线: {name}",
+                               description=f"服务 {name} 在环境 {env['name']} 持续未运行超过 {int(down_duration)} 秒",
+                               target_info={"project": pcode_map.get(env["project_id"], ""), "env": env["name"], "service": name},
+                               windows=snap["windows"])
+        # 恢复跟踪：服务重新在线 → 记录恢复起始时间；离线 → 清除恢复跟踪
+        for key in list(self._service_recover_since):
+            if key in active_online:
+                continue  # 仍在线，保留恢复跟踪
+            self._service_recover_since.pop(key, None)
 
     def _load_custom_monitor_config(self) -> dict:
         """加载全局到期监控配置"""
@@ -781,7 +834,17 @@ class AlertEngine:
         env = envs[0]
         data = self._monitor.get_overview(env["project_id"], env["name"]) or {}
         st = (data.get("services") or {}).get(name) or {}
-        return st.get("status") == "online"
+        if st.get("status") != "online":
+            # 服务仍不在线 → 重置恢复跟踪
+            self._service_recover_since.pop((env_id, name), None)
+            return False
+        # 服务在线 → 连续 RECOVER_ROUNDS 轮才确认恢复（避免抖动误恢复）
+        key = (env_id, name)
+        if key not in self._service_recover_since:
+            self._service_recover_since[key] = time.time()
+            return False
+        elapsed = time.time() - self._service_recover_since[key]
+        return elapsed >= RECOVER_ROUNDS * self._interval
 
     def _custom_monitor_recovered(self, alert: dict) -> bool:
         """SSL 类型到期监控自动恢复：days_left > threshold 连续 RECOVER_ROUNDS 轮"""
