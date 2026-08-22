@@ -226,6 +226,31 @@ def send_alert_async(db_path: str, alert: dict, channels: list) -> Future:
     return _notify_executor.submit(send_alert, db_path, alert, channels)
 
 
+def test_channel(db_path: str, channel: str) -> tuple:
+    """测试单个渠道连通性：用测试消息验证配置是否正确。
+
+    返回 (ok, detail)；不抛异常。
+    """
+    func_name = _CHANNEL_FUNCS.get(channel)
+    if not func_name:
+        return False, f"未知渠道: {channel}"
+    try:
+        cfg = get_channel_config(db_path, channel)
+        missing = [k for k in _REQUIRED.get(channel, ()) if not cfg.get(k)]
+        if missing:
+            return False, "渠道未配置: " + ",".join(missing)
+        test_alert = {
+            "id": 0, "severity": "P3", "subject": "🔔 测试通知",
+            "description": "渠道连通性验证，如收到此消息说明配置正确",
+            "target_info": {}, "first_seen_at": int(time.time()),
+        }
+        text = format_alert_text(test_alert)
+        getattr(sys.modules[__name__], func_name)(cfg, text, test_alert)
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)[:200]
+
+
 def send_alert(db_path: str, alert: dict, channels: list) -> list:
     """按渠道发送告警通知（失败重试 2 次指数退避），结果写 alert_events。
 

@@ -282,6 +282,7 @@
             <span class="ch-ico">${meta.ico}</span>
             <div><div class="ch-name">${meta.name}</div><div class="ch-desc">${meta.desc}</div></div>
             ${hasData ? '<span class="badge success">已配置</span>' : '<span class="badge">未配置</span>'}
+            ${hasData ? `<button class="btn sm ghost ch-test-btn" data-ch="${ch}" title="发送测试消息验证配置">🧪 测试</button>` : ''}
           </div>
           <div class="form-grid">${fields.map(f => {
             const v = cfg[f.key] || '';
@@ -295,6 +296,28 @@
           }).join('')}</div>`;
         grid.appendChild(card);
       }
+      // 渠道测试按钮
+      grid.querySelectorAll('.ch-test-btn').forEach(btn => {
+        btn.onclick = async () => {
+          const ch = btn.dataset.ch;
+          const origText = btn.innerHTML;
+          btn.disabled = true;
+          btn.innerHTML = '⏳ 测试中...';
+          try {
+            const res = await api('/api/alerts/channels/' + ch + '/test', { method: 'POST' });
+            if (res.ok) {
+              toastSuccess('渠道测试成功，请检查接收端');
+            } else {
+              toastError('测试失败: ' + (res.detail || '未知错误'));
+            }
+          } catch (e) {
+            toastError('测试失败: ' + e.message);
+          } finally {
+            btn.disabled = false;
+            btn.innerHTML = origText;
+          }
+        };
+      });
       document.getElementById('chSaveAll').onclick = async () => {
         const payload = {};
         grid.querySelectorAll('input[data-ch]').forEach(inp => {

@@ -48,6 +48,9 @@ def _project_alert_filter(project_id=0):
     for code in codes:
         clauses.append("(target_info LIKE ? OR target_info LIKE ?)")
         params += [f'%"project":"{code}"%', f'%"project": "{code}"%']
+    # 到期监控告警（target_info 含 monitor_id）始终可见
+    clauses.append("(target_info LIKE ?)")
+    params.append('%"monitor_id":%')
     return "(" + " OR ".join(clauses) + ")", params
 
 
@@ -797,6 +800,20 @@ def put_channels():
     return jsonify({"ok": True})
 
 
+@alert_bp.route("/alerts/channels/<channel>/test", methods=["POST"])
+@require_auth
+@require_role("admin")
+def test_channel_route(channel):
+    """测试单个渠道连通性"""
+    if channel not in CHANNELS:
+        return jsonify({"error": f"未知渠道: {channel}"}), 400
+    from ..alert_channels import test_channel
+    db = current_app.config["DB_PATH"]
+    ok, detail = test_channel(db, channel)
+    audit("test_alert_channel", "config", 0, {"channel": channel, "ok": ok})
+    return jsonify({"ok": ok, "detail": detail})
+
+
 # ---------- 到期监控 CRUD ----------
 
 MONITOR_TYPES = ("ssl", "cloud_renewal", "license", "custom", "domain")
@@ -1181,6 +1198,24 @@ def _whois_lookup(domain: str) -> dict:
             "io": "whois.nic.io",
             "cc": "ccwhois.verisign-grs.com",
             "info": "whois.afilias.net",
+            "asia": "whois.nic.asia",
+            "co": "whois.nic.co",
+            "me": "whois.nic.me",
+            "tv": "whois.nic.tv",
+            "biz": "whois.biz",
+            "name": "whois.nic.name",
+            "mobi": "whois.afilias.net",
+            "pro": "whois.registrypro.pro",
+            "travel": "whois.nic.travel",
+            "jobs": "whois.nic.jobs",
+            "cat": "whois.nic.cat",
+            "tel": "whois.nic.tel",
+            "xxx": "whois.nic.xxx",
+            "aero": "whois.aero",
+            "coop": "whois.nic.coop",
+            "museum": "whois.nic.museum",
+            "post": "whois.dotpostregistry.net",
+            "geo": "whois.nic.geo",
         }
         whois_server = whois_servers.get(tld)
         if not whois_server:

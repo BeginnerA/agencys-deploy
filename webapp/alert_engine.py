@@ -369,18 +369,14 @@ class AlertEngine:
         default_warn = cfg.get("default_warn_days", 30)
         default_sev = cfg.get("default_severity", "P1")
         default_channels = cfg.get("default_channels", ["feishu"])
-        # 查找 custom_monitor 类型的种子规则
-        cm_rule = None
-        for r in snap.get("rules", []):
-            if r.get("metric_type") == "custom_monitor" and r.get("enabled"):
-                cm_rule = r
-                break
-        if not cm_rule:
-            return
         for m in monitors:
             days_left = m.get("days_left")
             if days_left is None:
                 continue
+            # 用监控项自身配置构造虚拟规则（无需种子规则）
+            m_channels = m.get("channels") or []
+            base_rule = {"id": 0, "escalation_interval": 30,
+                         "channels": m_channels if m_channels else default_channels}
             # 解析阶梯阈值
             tiered = self._parse_tiered(m.get("tiered_thresholds"))
             if tiered:
@@ -391,16 +387,13 @@ class AlertEngine:
                         matched_tier = (threshold_days, severity)
                 if matched_tier:
                     threshold, severity = matched_tier
-                    channels_raw = m.get("channels") or []
-                    channels = channels_raw if channels_raw else default_channels
                     subject = f"到期监控: {m['name']} ({m['target']})"
                     desc = f"剩余 {days_left} 天，阶梯阈值 {threshold} 天 / {severity}"
                     target_info = {"monitor_id": m["id"], "type": m["type"],
                                    "target": m["target"], "name": m["name"],
                                    "tier": threshold, "owner": m.get("owner", "")}
-                    fire_rule = dict(cm_rule)
+                    fire_rule = dict(base_rule)
                     fire_rule["severity"] = severity
-                    fire_rule["channels"] = channels
                     self._fire(fire_rule, f"custom_monitor:{m['id']}",
                                subject=subject, description=desc,
                                target_info=target_info,
@@ -410,23 +403,20 @@ class AlertEngine:
                 warn_days = m.get("warn_days") or 0
                 threshold = warn_days if warn_days > 0 else default_warn
                 severity = m.get("severity") or default_sev
-                channels_raw = m.get("channels") or []
-                channels = channels_raw if channels_raw else default_channels
                 if days_left <= threshold:
                     subject = f"到期监控: {m['name']} ({m['target']})"
                     desc = f"剩余 {days_left} 天，阈值 {threshold} 天"
                     target_info = {"monitor_id": m["id"], "type": m["type"],
                                    "target": m["target"], "name": m["name"],
                                    "owner": m.get("owner", "")}
-                    fire_rule = dict(cm_rule)
+                    fire_rule = dict(base_rule)
                     fire_rule["severity"] = severity
-                    fire_rule["channels"] = channels
                     self._fire(fire_rule, f"custom_monitor:{m['id']}",
                                subject=subject, description=desc,
                                target_info=target_info,
                                windows=snap.get("windows"))
         # 探测失败告警
-        self._evaluate_probe_failures(snap, cm_rule, default_channels)
+        self._evaluate_probe_failures(snap, default_channels)
 
     @staticmethod
     def _parse_tiered(raw) -> list:
@@ -459,7 +449,7 @@ class AlertEngine:
         except (ValueError, TypeError):
             return []
 
-    def _evaluate_probe_failures(self, snap, cm_rule, default_channels):
+    def _evaluate_probe_failures(self, snap, default_channels):
         """评估 SSL 探测失败告警：连续失败 >= PROBE_FAIL_THRESHOLD 次触发告警"""
         from .ssl_monitor import get_ssl_monitor, PROBE_FAIL_THRESHOLD
         mon = get_ssl_monitor()
@@ -471,16 +461,8 @@ class AlertEngine:
             return
         if not failures:
             return
-        # 查找或构造探测失败规则
-        fail_rule = None
-        for r in snap.get("rules", []):
-            if r.get("metric_type") == "custom_monitor" and r.get("enabled"):
-                fail_rule = dict(r)
-                fail_rule["severity"] = "P2"
-                fail_rule["channels"] = r.get("channels") or default_channels
-                break
-        if not fail_rule:
-            return
+        fail_rule = {"id": 0, "severity": "P2",
+                     "channels": default_channels, "escalation_interval": 30}
         for m in failures:
             fail_count = m.get("probe_fail_count", 0)
             subject = f"SSL 探测连续失败: {m['name']} ({m['target']})"
