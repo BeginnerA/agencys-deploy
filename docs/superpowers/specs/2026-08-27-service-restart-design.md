@@ -58,7 +58,7 @@
   2. 取环境：`dbm.get_env_by_name(db_path, task["project_id"], task["env"])` → `env_id`；服务器清单 `dbm.list_env_servers(db_path, env_id)`；环境级 ssh 凭据 `env.get("ssh")`
   3. `ThreadPoolExecutor` 并发处理每台服务器，单台流程：
      - `_merge_server_ssh(env_ssh, server)` 合并凭据
-     - 容器存在性：`docker ps --format '{{.Names}}' | grep -Fx <service_name>`（-F 字面量、-x 整行精确匹配，与 monitor 探测的容器名精确比较语义一致，避免子串误匹配如 hqb-auth 命中 hqb-auth-bak），无输出 → 日志 `[host] 容器不存在，跳过`，该台记 skipped
+     - 容器存在性：`docker ps -a --format '{{.Names}}' | grep -Fx <service_name>`（-a 含停止容器，容器存在即重启；-F 字面量、-x 整行精确匹配，与 monitor 探测的容器名精确比较语义一致，避免子串误匹配如 hqb-auth 命中 hqb-auth-bak），无输出 → 日志 `[host] 容器不存在，跳过`，该台记 skipped
      - `docker restart <service_name>`（timeout 60s），失败 → 记 failed 并记录原因
      - 重启成功且服务配置了 `health_port > 0`：轮询 `_probe_health_url(host, health_port, health_url)` 最多 60s（间隔 5s）；通过 → ok；超时 → ok（日志标注 `[host] 健康检查超时（应用启动慢？），仍视为成功`）
   4. 汇总：全部成功/跳过且至少一台成功 → `success`；全部跳过（未找到容器）→ `failed`（日志注明）；任一台 docker restart 失败 → `failed`

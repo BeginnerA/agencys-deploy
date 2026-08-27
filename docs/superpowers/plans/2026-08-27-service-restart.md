@@ -570,7 +570,7 @@ def _run_restart(db_path: str, task: dict, log_file: str,
                 # hqb-auth-bak）；docker restart 成功时 stdout 为容器名，失败时
                 # stderr 返回错误文本（_ssh_exec_multi 返回 out or err）
                 outs = monitor_mod._ssh_exec_multi(host, port, ssh_cfg, [
-                    "docker ps --format '{{.Names}}' | grep -Fx " + shlex.quote(svc_name),
+                    "docker ps -a --format '{{.Names}}' | grep -Fx " + shlex.quote(svc_name),
                     "docker restart " + shlex.quote(svc_name),
                 ], timeout=60)
             except Exception as exc:
