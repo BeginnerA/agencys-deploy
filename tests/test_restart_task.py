@@ -167,13 +167,15 @@ class TestRunRestart(unittest.TestCase):
 
     def test_all_servers_restart_ok(self):
         with mock.patch("webapp.monitor._ssh_exec_multi",
-                        return_value=["hqb-auth", "hqb-auth"]), \
+                        return_value=["hqb-auth", "hqb-auth"]) as m, \
              mock.patch("webapp.monitor._probe_health_url",
                         return_value={"ok": True, "ms": 12}):
             status = self._run()
         self.assertEqual(status, "success")
         with open(self.log_file, encoding="utf-8") as f:
             log = f.read()
+        self.assertEqual(m.call_args.args[3][0], "docker ps -a --format '{{.Names}}' | grep -Fx hqb-auth")
+        self.assertEqual(m.call_args.args[3][1], "docker restart hqb-auth")
         self.assertIn("[10.0.0.1] 重启成功（健康检查 12ms）", log)
         self.assertIn("汇总：2 台成功", log)
 

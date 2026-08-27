@@ -282,10 +282,12 @@ def _run_restart(db_path: str, task: dict, log_file: str,
                 return host, "cancelled", "任务已终止，跳过"
             try:
                 # 容器存在性精确匹配（grep -F 字面量、-x 整行，避免 hqb-auth 命中
-                # hqb-auth-bak）；docker restart 成功时 stdout 为容器名，失败时
+                # hqb-auth-bak）；docker ps -a 同时列出停止的容器，容器存在
+                # （无论运行/停止）即命中 → docker restart 将其拉起，日志「重启成功」
+                # 与行为一致；docker restart 成功时 stdout 为容器名，失败时
                 # stderr 返回错误文本（_ssh_exec_multi 返回 out or err）
                 outs = monitor_mod._ssh_exec_multi(host, port, ssh_cfg, [
-                    "docker ps --format '.Names' | grep -Fx " + shlex.quote(svc_name),
+                    "docker ps -a --format '{{.Names}}' | grep -Fx " + shlex.quote(svc_name),
                     "docker restart " + shlex.quote(svc_name),
                 ], timeout=60)
             except Exception as exc:
@@ -294,7 +296,9 @@ def _run_restart(db_path: str, task: dict, log_file: str,
                 return host, "skipped", "容器不存在，跳过"
             if outs[1].strip() != svc_name:
                 return host, "failed", f"docker restart 失败: {outs[1].strip() or '无输出'}"
-            if health_port <= 0 or handle.cancel.is_set():
+            if handle.cancel.is_set():
+                return host, "cancelled", "任务已终止，跳过"
+            if health_port <= 0:
                 return host, "ok", "重启成功"
             # 健康检查：轮询 health_port+health_url 最多 60s；超时仅警告（应用启动慢属常见）
             t0 = time.time()
@@ -319,6 +323,7 @@ def _run_restart(db_path: str, task: dict, log_file: str,
         results.sort(key=lambda r: order.get(r[0], len(servers)))
         for host, status, msg in results:
             f.write(f"[{host}] {msg}\n")
+            f.flush()
         ok_count = sum(1 for _, st, _ in results if st == "ok")
         fail_count = sum(1 for _, st, _ in results if st == "failed")
         skip_count = sum(1 for _, st, _ in results if st == "skipped")
