@@ -26,7 +26,7 @@ def _bool_field(body, key, default=False):
 
 def _resolve_ref(db_path, project_id, type_, ref_id):
     """按类型解析引用记录；不存在或不属于该项目返回 None（越权信息隐藏）"""
-    table = "services" if type_ == "project" else "pipelines"
+    table = "services" if type_ in ("project", "restart") else "pipelines"
     rec = dbm.get_record(db_path, table, ref_id)
     if not rec or rec["project_id"] != project_id:
         return None
@@ -45,8 +45,8 @@ def create_task():
     ref_id = body.get("ref_id")
     if not isinstance(project_id, int) or isinstance(project_id, bool) \
             or not isinstance(ref_id, int) or isinstance(ref_id, bool) \
-            or type_ not in ("project", "pipeline"):
-        return jsonify({"error": "project_id/ref_id 必填（整数），type 为 project/pipeline"}), 400
+            or type_ not in ("project", "pipeline", "restart"):
+        return jsonify({"error": "project_id/ref_id 必填（整数），type 为 project/pipeline/restart"}), 400
     rec = _resolve_ref(current_app.config["DB_PATH"], project_id, type_, ref_id)
     if not rec:
         return jsonify({"error": "引用的服务/流水线不存在"}), 404
@@ -62,7 +62,15 @@ def create_task():
     force_window = _bool_field(body, "force_window", False)
     if rollback is None or auto_version is None or skip_build is None or force_window is None:
         return jsonify({"error": "rollback/auto_version/skip_build/force_window 必须为布尔值"}), 400
-    if auto_version and (version or previous_version):
+    if type_ == "restart":
+        # 重启：env 必填且必须属于该项目；版本/构建类字段不适用，一律强制缺省
+        if not env:
+            return jsonify({"error": "重启任务 env 必填"}), 400
+        if not dbm.get_env_by_name(current_app.config["DB_PATH"], project_id, env):
+            return jsonify({"error": "env 不属于该项目"}), 400
+        rollback = auto_version = skip_build = False
+        version = previous_version = ""
+    elif auto_version and (version or previous_version):
         return jsonify({"error": "auto_version 与显式 version/previous_version 互斥"}), 400
     if rollback:
         if not version and not previous_version:
@@ -87,18 +95,23 @@ def create_task():
         if not force_window:
             return jsonify({"error": "window_warn",
                             "window": {"name": window["name"], "id": window["id"]}}), 409
-        extra.append("--force-window")
+        if type_ != "restart":
+            extra.append("--force-window")
     task_id = dbm.create_task(current_app.config["DB_PATH"], project_id, type_,
                               ref_id, rec["name"], env, version,
                               previous_version, g.user["id"], extra=extra,
-                              action='rollback' if rollback else 'deploy')
+                              action='rollback' if rollback else
+                              ('restart' if type_ == "restart" else 'deploy'))
     task = dbm.get_task(current_app.config["DB_PATH"], task_id)
     submit_task(current_app.config["DB_PATH"], task, extra)
-    detail_version = version or previous_version
-    if not detail_version and auto_version:
-        detail_version = "auto"
-    audit("deploy" if not rollback else "rollback", type_, ref_id,
-          {"name": rec["name"], "env": env, "version": detail_version})
+    if type_ == "restart":
+        audit("restart", "service", ref_id, {"name": rec["name"], "env": env})
+    else:
+        detail_version = version or previous_version
+        if not detail_version and auto_version:
+            detail_version = "auto"
+        audit("deploy" if not rollback else "rollback", type_, ref_id,
+              {"name": rec["name"], "env": env, "version": detail_version})
     return jsonify({"id": task_id, "status": "pending"}), 201
 
 
