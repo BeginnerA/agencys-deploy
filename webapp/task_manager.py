@@ -3,6 +3,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 import subprocess
 from pathlib import Path
@@ -18,8 +19,16 @@ _executor = ThreadPoolExecutor(max_workers=1)
 _task_registry = {}
 
 
+class _RestartHandle:
+    """restart 任务运行期句柄：协作取消（线程内每台服务器之间检查 cancel 事件）"""
+    def __init__(self):
+        self.cancel = threading.Event()
+
+
 def build_cli(task: dict, extra_args: list = None) -> list:
-    """根据任务记录组装 CLI 参数（db 模式）"""
+    """根据任务记录组装 CLI 参数（db 模式）；restart 类型不产 CLI（线程内执行）"""
+    if task["type"] == "restart":
+        return []
     script = "deploy_pipeline.py" if task["type"] == "pipeline" else "deploy.py"
     cmd = [sys.executable, str(DEPLOY_ROOT / script),
            "--config-source", "db",
@@ -170,6 +179,9 @@ def kill_task(task_id: int, db_path: str = None) -> bool:
     entry = _task_registry.get(task_id)
     if entry is None:
         return False
+    if isinstance(entry, _RestartHandle):
+        entry.cancel.set()
+        return True
     if isinstance(entry, Future):
         if entry.cancel():
             # 取消成功：任务不会执行，占位需手动清除（_run_task 不再有机会 pop）
@@ -187,6 +199,9 @@ def kill_task(task_id: int, db_path: str = None) -> bool:
         else:
             # 任务已在执行且注册窗口已过但 registry 无 Popen（异常退出被 pop）
             return False
+        if isinstance(entry, _RestartHandle):
+            entry.cancel.set()
+            return True
     proc = entry
     if proc.poll() is not None:
         return False

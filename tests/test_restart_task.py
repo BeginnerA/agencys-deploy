@@ -109,4 +109,32 @@ class TestRestartAPI(unittest.TestCase):
             self.assertEqual(extra, [])
 
 
+class TestTaskManagerInfra(unittest.TestCase):
+    """build_cli 对 restart 不产 CLI；kill_task 支持 restart 协作取消"""
+
+    def test_build_cli_restart_empty(self):
+        from webapp.task_manager import build_cli
+        cmd = build_cli(dict(type="restart", project_id=1, name="auth",
+                             env="prod", version="", previous_version=""))
+        self.assertEqual(cmd, [])
+
+    def test_build_cli_project_normal(self):
+        """回归：project 类型仍组装 deploy.py CLI"""
+        from webapp.task_manager import build_cli
+        cmd = build_cli(dict(type="project", project_id=1, name="auth",
+                             env="prod", version="1.0.0", previous_version=""))
+        self.assertTrue(any("deploy.py" in c for c in cmd))
+
+    def test_kill_task_restart_handle(self):
+        from webapp.task_manager import _RestartHandle, kill_task, _task_registry
+        handle = _RestartHandle()
+        _task_registry[99] = handle
+        try:
+            ok = kill_task(99)
+        finally:
+            _task_registry.pop(99, None)
+        self.assertTrue(ok)
+        self.assertTrue(handle.cancel.is_set())
+
+
 # ===== 后续任务追加的测试类锚点 =====
