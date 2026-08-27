@@ -174,12 +174,13 @@ def tail_log(log_file: str, offset: int = 0, max_chars: int = 8000, tail: bool =
 
 
 def kill_task(task_id: int, db_path: str = None) -> bool:
-    """终止任务：排队中直接取消 Future；运行中终止进程树（Windows taskkill /T；POSIX killpg）。
+    """终止任务：排队中取消 Future；运行中 restart 置协作取消标志（由 worker 落库终态）；其余类型终止进程树（Windows taskkill /T；POSIX killpg）。
     db_path 传入时，排队取消会同步落库 failed（避免大屏出现永久 pending 幽灵任务）"""
     entry = _task_registry.get(task_id)
     if entry is None:
         return False
     if isinstance(entry, _RestartHandle):
+        # 协作取消：仅置标志，终态（failed）由 worker 线程观察到 cancel 后落库
         entry.cancel.set()
         return True
     if isinstance(entry, Future):
