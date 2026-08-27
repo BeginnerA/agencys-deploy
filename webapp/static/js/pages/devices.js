@@ -145,7 +145,7 @@
     catch(e){ toastError('服务信息加载失败：' + e.message); return; }
     if (destroyed) return; // 路由切换后在途响应丢弃，防新页面弹出旧流程
     const svc = services.find(s => s.id === sid);
-    if (!svc) return;
+    if (!svc){ toastError('服务不存在或已被删除'); return; }
     if (!await confirmDialog(`确认重启服务「${svc.name}」？环境：${state.currentEnv}，将重启全部实例`)) return;
     const doRestart = async (forceWindow) => await api('/api/tasks', {method:'POST', body: JSON.stringify({
       project_id: pid, type: 'restart', ref_id: sid, env: state.currentEnv, force_window: forceWindow})});
