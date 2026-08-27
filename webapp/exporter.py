@@ -58,6 +58,9 @@ def export_projects_yaml(db_path: str, project_id: int) -> str:
             cfg["git_branch"] = s["git_branch"]
         if s.get("git_pull_before_build"):
             cfg["git_pull_before_build"] = True
+        # git_tag_enabled 仅关闭时输出（保持向后兼容，缺省 = 开启）
+        if s.get("git_tag_enabled", 1) == 0:
+            cfg["git_tag_enabled"] = False
         if s["health_url"]:
             cfg["health_url"] = s["health_url"]
         if s["health_port"]:

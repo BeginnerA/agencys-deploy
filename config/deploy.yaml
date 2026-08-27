@@ -51,6 +51,12 @@
 #   dist_dir            - 直传模式（registry.mode=direct）本地镜像 tar 导出目录（相对本项目目录）
 #   remote_tmp_dir      - 直传模式服务器上存放镜像 tar 的临时目录
 #
+# Git Tag 相关：
+#   git_tag_suffix      - （可选）发布成功打 Git Tag 时附加在版本号后的后缀，最终 tag =
+#                         v{version}-{后缀}；留空/省略则打 v{version}。测试/生产环境配不同后缀
+#                         可在 Git 上区分（如 test 环境配 test，prod 留空）；服务级开关 git_tag_enabled
+#                         见 projects.yaml 说明，CLI 参数 --no-git-tag 优先级最高
+#
 # 敏感信息（各账号密码）建议通过环境变量传入，脚本优先读取环境变量：
 #   REGISTRY_USERNAME / REGISTRY_PASSWORD / NACOS_USERNAME / NACOS_PASSWORD
 #   MYSQL_USERNAME / MYSQL_PASSWORD / SSH_PASSWORD

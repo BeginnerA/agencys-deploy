@@ -45,6 +45,7 @@
       { key:'canary_wait', label:'首台灰度等待（秒）', type:'number', hint:'0 = 不等待' },
       { key:'dist_dir', label:'直传临时目录（本地）', placeholder:'direct 模式镜像 tar 导出目录' },
       { key:'remote_tmp_dir', label:'直传临时目录（服务器）', placeholder:'direct 模式服务器存放 tar 的目录' },
+      { key:'git_tag_suffix', label:'Git Tag 后缀', placeholder:'如 test', hint:'发布成功打 Git Tag 时附加在版本号后，最终 tag = v{version}-{后缀}；留空则打 v{version}。测试/生产环境配不同后缀可在 Git 上区分（如 test 配 test，prod 留空）' },
     ],
   };
 

@@ -193,6 +193,7 @@
         rollback: extra.includes('--rollback'),
         auto_version: task.type !== 'restart' && (extra.includes('--auto-version') || (!task.version && !task.previous_version)),
         skip_build: extra.includes('--skip-build'),
+        no_git_tag: extra.includes('--no-git-tag'),
         force_window: forceWindow,
       })});
     };

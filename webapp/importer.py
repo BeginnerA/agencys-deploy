@@ -70,6 +70,7 @@ def _import_projects(db_path: str, path: Path) -> tuple:
             git_repo=cfg.get("git_repo", ""),
             git_branch=cfg.get("git_branch", ""),
             git_pull_before_build=1 if cfg.get("git_pull_before_build") else 0,
+            git_tag_enabled=1 if cfg.get("git_tag_enabled", True) else 0,
             enabled=1))
         n += 1
     return True, f"项目 code={code}，导入服务 {n} 个"

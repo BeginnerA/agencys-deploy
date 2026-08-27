@@ -59,16 +59,17 @@ def create_task():
     rollback = _bool_field(body, "rollback", False)
     auto_version = _bool_field(body, "auto_version", False)
     skip_build = _bool_field(body, "skip_build", False)
+    no_git_tag = _bool_field(body, "no_git_tag", False)
     force_window = _bool_field(body, "force_window", False)
-    if rollback is None or auto_version is None or skip_build is None or force_window is None:
-        return jsonify({"error": "rollback/auto_version/skip_build/force_window 必须为布尔值"}), 400
+    if rollback is None or auto_version is None or skip_build is None or force_window is None or no_git_tag is None:
+        return jsonify({"error": "rollback/auto_version/skip_build/no_git_tag/force_window 必须为布尔值"}), 400
     if type_ == "restart":
         # 重启：env 必填且必须属于该项目；版本/构建类字段不适用，一律强制缺省
         if not env:
             return jsonify({"error": "重启任务 env 必填"}), 400
         if not dbm.get_env_by_name(current_app.config["DB_PATH"], project_id, env):
             return jsonify({"error": "env 不属于该项目"}), 400
-        rollback = auto_version = skip_build = False
+        rollback = auto_version = skip_build = no_git_tag = False
         version = previous_version = ""
     elif auto_version and (version or previous_version):
         return jsonify({"error": "auto_version 与显式 version/previous_version 互斥"}), 400
@@ -85,6 +86,8 @@ def create_task():
         extra.append("--auto-version")
     if skip_build:
         extra.append("--skip-build")
+    if no_git_tag:
+        extra.append("--no-git-tag")
     if rollback:
         extra.append("--rollback")
     # 发布窗口检查

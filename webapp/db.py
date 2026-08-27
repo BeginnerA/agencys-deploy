@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS services (
     git_repo TEXT DEFAULT '',
     git_branch TEXT DEFAULT '',
     git_pull_before_build INTEGER DEFAULT 0,
+    git_tag_enabled INTEGER DEFAULT 1,
     enabled INTEGER DEFAULT 1,
     UNIQUE(project_id, name)
 );
@@ -435,6 +436,9 @@ def _migrate(conn):
         conn.execute("ALTER TABLE services ADD COLUMN git_branch TEXT DEFAULT ''")
     if "git_pull_before_build" not in srv_cols_now:
         conn.execute("ALTER TABLE services ADD COLUMN git_pull_before_build INTEGER DEFAULT 0")
+    # services 表新增 git_tag_enabled 列（发布成功后是否打 Git Tag，默认开启）
+    if "git_tag_enabled" not in srv_cols_now:
+        conn.execute("ALTER TABLE services ADD COLUMN git_tag_enabled INTEGER DEFAULT 1")
     # servers 表 role 列已废弃（发布顺序由 env_servers.order_no 决定），存量库删除该列
     srv_cols_now2 = {r["name"] for r in conn.execute("PRAGMA table_info(servers)")}
     if "role" in srv_cols_now2:

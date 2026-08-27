@@ -255,6 +255,7 @@ def create_service(pid):
                   git_repo=body.get("git_repo", ""),
                   git_branch=body.get("git_branch", ""),
                   git_pull_before_build=1 if _bool_field(body, "git_pull_before_build", False) else 0,
+                  git_tag_enabled=1 if _bool_field(body, "git_tag_enabled", True) else 0,
                   enabled=1 if enabled else 0)
     sid = dbm.create_record(current_app.config["DB_PATH"], "services", fields)
     audit("create_service", "service", sid, {"name": name, "pid": pid})
@@ -301,6 +302,11 @@ def update_service(pid, sid):
         if gpb is None:
             return _err("git_pull_before_build 必须为布尔值")
         fields["git_pull_before_build"] = 1 if gpb else 0
+    if "git_tag_enabled" in body:
+        gte = _bool_field(body, "git_tag_enabled")
+        if gte is None:
+            return _err("git_tag_enabled 必须为布尔值")
+        fields["git_tag_enabled"] = 1 if gte else 0
     if fields:
         dbm.update_record(current_app.config["DB_PATH"], "services", sid, fields)
     audit("update_service", "service", sid, {"name": rec["name"]})

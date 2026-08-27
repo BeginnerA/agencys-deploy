@@ -660,11 +660,12 @@ class Deployer:
             send_notify(self.config, "success", project=self.project, version=self.version,
                         previous_version=self.previous_version, env=self.env,
                         elapsed=f"{time.time() - start_ts:.0f}s")
-            if not self._no_git_tag:
+            if not self._no_git_tag and self.proj_cfg.get("git_tag_enabled", True):
                 from git_tag import tag_project
                 tag_project(self.proj_cfg, self.version,
                             self.config["deploy"]["project_root"],
-                            push=not self._skip_git_push)
+                            push=not self._skip_git_push,
+                            suffix=self.config["deploy"].get("git_tag_suffix", ""))
         else:
             log("发布中断，已回滚失败服务器")
             send_notify(self.config, "failed", project=self.project, version=self.version,

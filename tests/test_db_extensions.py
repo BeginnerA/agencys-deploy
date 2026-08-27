@@ -49,6 +49,38 @@ class TestDbExtensions(unittest.TestCase):
         self.assertIn("log_retention_days", cols)
         self.assertIn("log_collect_interval", cols)
 
+    def test_services_git_tag_enabled_default_on(self):
+        """git_tag_enabled 列存在且新建服务默认开启（发布后打 Git Tag）"""
+        conn = dbm.get_conn(self.db)
+        try:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
+        finally:
+            conn.close()
+        self.assertIn("git_tag_enabled", cols)
+        pid = dbm.create_record(self.db, "projects", dict(
+            name="p1", code="p1", created_at=1))
+        sid = dbm.create_record(self.db, "services", dict(
+            project_id=pid, name="svc", image_name="svc", service_name="svc",
+            git_repo="svc"))
+        rec = dbm.get_record(self.db, "services", sid)
+        self.assertEqual(rec["git_tag_enabled"], 1)
+
+    def test_services_git_tag_enabled_export(self):
+        """git_tag_enabled 关闭时导出 false，默认开启时不输出（向后兼容）"""
+        import yaml
+        from webapp.exporter import export_projects_yaml
+        pid = dbm.create_record(self.db, "projects", dict(
+            name="p1", code="p1", created_at=1))
+        dbm.create_record(self.db, "services", dict(
+            project_id=pid, name="svc-a", image_name="svc-a", service_name="svc-a",
+            git_repo="svc-a", enabled=1, git_tag_enabled=1))
+        dbm.create_record(self.db, "services", dict(
+            project_id=pid, name="svc-b", image_name="svc-b", service_name="svc-b",
+            git_repo="svc-b", enabled=1, git_tag_enabled=0))
+        data = yaml.safe_load(export_projects_yaml(self.db, pid))
+        self.assertNotIn("git_tag_enabled", data["projects"]["svc-a"])
+        self.assertIs(data["projects"]["svc-b"]["git_tag_enabled"], False)
+
     def test_task_extra_persist_roundtrip(self):
         """任务运行参数（--skip-build/--rollback）必须持久化，供"重新运行"恢复"""
         pid = dbm.create_record(self.db, "projects", dict(

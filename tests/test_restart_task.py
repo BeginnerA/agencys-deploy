@@ -108,6 +108,28 @@ class TestRestartAPI(unittest.TestCase):
             _, _, extra = submit.call_args.args  # (db_path, task, extra)
             self.assertEqual(extra, [])
 
+    def test_create_project_task_no_git_tag(self):
+        """no_git_tag=true → extra 追加 --no-git-tag（发布面板本次不打 tag）"""
+        with mock.patch("webapp.routes.deploy_routes.submit_task") as submit:
+            resp = self.client.post("/api/tasks", headers=self.headers, json={
+                "project_id": self.proj_id, "type": "project",
+                "ref_id": self.svc_id, "env": "prod",
+                "version": "1.0.0", "no_git_tag": True})
+        self.assertEqual(resp.status_code, 201)
+        submit.assert_called_once()
+        _, _, extra = submit.call_args.args  # (db_path, task, extra)
+        self.assertIn("--no-git-tag", extra)
+        task = dbm.get_task(self.db_path, resp.get_json()["id"])
+        self.assertIn("--no-git-tag", task["extra"])
+
+    def test_create_project_task_no_git_tag_invalid(self):
+        """no_git_tag 非布尔 → 400"""
+        resp = self.client.post("/api/tasks", headers=self.headers, json={
+            "project_id": self.proj_id, "type": "project",
+            "ref_id": self.svc_id, "env": "prod",
+            "version": "1.0.0", "no_git_tag": "yes"})
+        self.assertEqual(resp.status_code, 400)
+
 
 class TestTaskManagerInfra(unittest.TestCase):
     """build_cli 对 restart 不产 CLI；kill_task 支持 restart 协作取消"""
