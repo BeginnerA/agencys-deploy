@@ -191,7 +191,7 @@
         version: task.version || '',
         previous_version: task.previous_version || '',
         rollback: extra.includes('--rollback'),
-        auto_version: extra.includes('--auto-version') || (!task.version && !task.previous_version),
+        auto_version: task.type !== 'restart' && (extra.includes('--auto-version') || (!task.version && !task.previous_version)),
         skip_build: extra.includes('--skip-build'),
         force_window: forceWindow,
       })});
