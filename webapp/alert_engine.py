@@ -126,6 +126,8 @@ class AlertEngine:
             self._stop.wait(self._interval)
 
     def _cycle(self):
+        # 每轮刷新到期监控剩余天数：days_left 随 expiry_at 与当前时间自动递减
+        self._refresh_monitor_days()
         # 每轮只加载一次配置快照，评估全程复用（避免各评估方法重复全表查询 + 重复建连）
         snap = self._load_snapshot()
         self._evaluate_metric_rules(snap)
@@ -142,6 +144,22 @@ class AlertEngine:
         for key in [k for k, v in self._service_recover_since.items()
                     if v < stale_threshold]:
             del self._service_recover_since[key]
+
+    def _refresh_monitor_days(self):
+        """刷新到期监控剩余天数：按 expiry_at 与当前时间重算并回写库（仅变化行）
+
+        days_left 为创建/编辑/导入时的静态快照，非 SSL 类型（云产品续费/
+        license/自定义等）不随时间推进自动递减，导致剩余天数与到期告警均
+        停留在旧值；此处每轮统一重算，保证评估与导出基于实时天数。
+        """
+        now = int(time.time())
+        rows = dbm.list_records(self._db_path, "custom_monitors",
+                                "expiry_at IS NOT NULL")
+        for r in rows:
+            new_days = max(0, (int(r["expiry_at"]) - now) // 86400)
+            if r.get("days_left") != new_days:
+                dbm.update_record(self._db_path, "custom_monitors", r["id"],
+                                  {"days_left": new_days})
 
     def _load_snapshot(self) -> dict:
         """一轮评估的配置快照：规则/项目/环境/服务器/服务/静默窗口各加载一次

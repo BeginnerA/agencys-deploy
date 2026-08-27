@@ -6,6 +6,7 @@
 """
 import os
 import sys
+import time
 import shutil
 import subprocess
 import argparse
@@ -188,7 +189,25 @@ def find_pm(project_root: Path, step_path: Path) -> str:
     fail("未找到 npm：请安装 Node.js 并加入 PATH")
 
 
-def run(cmd: list, cwd: Path, env: dict = None, timeout: int = None):
+def is_clean_failure(output: str) -> bool:
+    """判断 Maven 失败是否为 clean 阶段无法删除构建目录
+
+    Windows 下 target 目录被其他进程（IDE 编译、杀毒扫描等）瞬时占用时，
+    maven-clean-plugin 会报 "Failed to clean project: Failed to delete ..."，
+    这种失败通常重试即可自愈，需要与编译错误等确定性失败区分。
+    """
+    return bool(output) and "Failed to clean project" in output and "maven-clean-plugin" in output
+
+
+def run(cmd: list, cwd: Path, env: dict = None, timeout: int = None,
+        retry_on_clean_failure: bool = False,
+        max_retries: int = 2, retry_delay: int = 3):
+    """执行命令并实时打印输出
+
+    retry_on_clean_failure: 当失败为 Maven clean 删除目录失败（Windows 下文件
+    被占用）时自动重试，间隔 retry_delay 秒，最多 max_retries 次；仍失败或
+    失败原因不是 clean 删除时按原逻辑报错。
+    """
     log(f"执行: {' '.join(cmd)}")
     try:
         result = subprocess.run(
@@ -200,6 +219,22 @@ def run(cmd: list, cwd: Path, env: dict = None, timeout: int = None):
         if result.stdout:
             for line in result.stdout.rstrip().splitlines():
                 print(f"  | {line}", flush=True)
+        if result.returncode != 0 and retry_on_clean_failure and is_clean_failure(result.stdout or ""):
+            for attempt in range(1, max_retries + 1):
+                log(f"clean 删除构建目录失败（文件可能被占用），{retry_delay} 秒后自动重试（第 {attempt}/{max_retries} 次）")
+                time.sleep(retry_delay)
+                result = subprocess.run(
+                    cmd, cwd=cwd, env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, timeout=timeout,
+                )
+                if result.stdout:
+                    for line in result.stdout.rstrip().splitlines():
+                        print(f"  | {line}", flush=True)
+                if result.returncode == 0:
+                    return
+                if not is_clean_failure(result.stdout or ""):
+                    break
         if result.returncode != 0:
             fail(f"命令执行失败 (rc={result.returncode}): {' '.join(cmd)}")
     except subprocess.TimeoutExpired:
@@ -302,7 +337,8 @@ def _run_maven_steps(proj: dict, project_root: Path, version: str,
             mvn, "-f", str(pom), "clean", step["goal"],
             f"-P{maven_profiles}", f"-Drevision={version}", "-DskipTests",
         ]
-        run(cmd, project_root, env=env_vars, timeout=600)
+        # Windows 下 target 可能被 IDE/杀毒等瞬时占用导致 clean 失败，自动重试自愈
+        run(cmd, project_root, env=env_vars, timeout=600, retry_on_clean_failure=True)
 
 
 def _run_frontend_steps(proj: dict, project_root: Path, version: str,

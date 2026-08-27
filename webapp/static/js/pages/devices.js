@@ -171,9 +171,8 @@
         <div class="field"><label>环境</label>
           <select id="dpEnv">${envs.map(e => `<option ${e.name === state.currentEnv ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</select></div>
         <div class="field"><label>版本号（可留空）</label><input id="dpVersion" placeholder="如 1.0.3"></div>
-        <div class="field"><label>回滚目标版本（回滚时填写）</label><input id="dpPrevVersion" placeholder="回滚到的版本"></div>
-        <div class="field check"><label><input type="checkbox" id="dpAuto"> 自动版本号</label></div>
-        <div class="field check"><label><input type="checkbox" id="dpSkip"> 跳过构建</label></div>
+        <div class="field full"><label>当前线上版本（失败回滚基线）</label><input id="dpPrevVersion" placeholder="发布失败时自动回滚到该版本"><div class="hint" id="dpPrevHint">手动指定版本时填写，发布失败自动回滚到该版本；留空视为首次发版（失败不自动回滚）；勾选「自动版本号」时由系统自动探测，无需填写</div></div>
+        <div class="field check full" style="gap:24px"><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpAuto"> 自动版本号</label><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpSkip"> 跳过构建</label></div>
       </div>
       <div style="display:flex;gap:10px;margin-top:20px">
         <button class="btn primary flex-1" id="dpSubmit">确认发布</button>
@@ -218,6 +217,26 @@
     const refSel = document.getElementById('dpRef');
     refSel.innerHTML = refOpts();
     document.getElementById('dpType').onchange = () => { refSel.innerHTML = refOpts(); };
+    // 自动版本号：由系统自动探测当前版本作为回滚基线，禁用「版本号」「当前线上版本」手动输入并清空，避免提交时残留值触发互斥校验
+    const dpVersionInp = document.getElementById('dpVersion');
+    const dpPrevInp = document.getElementById('dpPrevVersion');
+    const dpPrevHint = document.getElementById('dpPrevHint');
+    const syncVersionState = () => {
+      const auto = document.getElementById('dpAuto').checked;
+      dpVersionInp.disabled = auto;
+      dpPrevInp.disabled = auto;
+      if (auto) {
+        dpVersionInp.value = '';
+        dpPrevInp.value = '';
+        dpPrevInp.placeholder = '自动版本号下发，系统自动探测当前版本作为回滚基线';
+        if (dpPrevHint) dpPrevHint.textContent = '勾选「自动版本号」时，版本号与当前线上版本均由系统自动探测/生成，无需手动填写';
+      } else {
+        dpPrevInp.placeholder = '发布失败时自动回滚到该版本';
+        if (dpPrevHint) dpPrevHint.textContent = '手动指定版本时填写，发布失败自动回滚到该版本；留空视为首次发版（失败不自动回滚）';
+      }
+    };
+    document.getElementById('dpAuto').onchange = syncVersionState;
+    syncVersionState();
     const doDeploy = async (forceWindow) => {
       const typeSel = document.getElementById('dpType').value;
       const ref = document.getElementById('dpRef').value;
@@ -226,7 +245,7 @@
       const previous_version = document.getElementById('dpPrevVersion').value.trim();
       const auto_version = document.getElementById('dpAuto').checked;
       const skip_build = document.getElementById('dpSkip').checked;
-      if (auto_version && (version || previous_version)) throw new Error('自动版本与显式版本互斥');
+      if (auto_version && (version || previous_version)) throw new Error('自动版本号与显式版本互斥');
       const [t, rid] = ref.split(':');
       return await api('/api/tasks', {method:'POST', body: JSON.stringify({
         project_id: pid, type: t, ref_id: Number(rid), env, version, previous_version,

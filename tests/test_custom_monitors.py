@@ -77,6 +77,29 @@ class TestCustomMonitorRoutes(unittest.TestCase):
         data = r.get_json()
         self.assertIsInstance(data, list)
 
+    def test_days_left_recomputed_on_list(self):
+        """回归：库中 days_left 为陈旧快照时，列表接口必须按 expiry_at 实时重算
+
+        复现场景：创建时 days_left=30，库中被改写成陈旧值 100（模拟时间流逝后
+        快照未刷新），再次读取列表应返回按当前时间重算的天数而非陈旧值。
+        """
+        import time
+        from webapp import db as dbm
+        now = int(time.time())
+        expiry = now + 86400 * 30
+        r = self._post({"type": "cloud_renewal", "name": "刷新测试",
+                        "target": "ecs-refresh-test", "expiry_at": expiry})
+        mid = r.get_json()["id"]
+        # 模拟陈旧快照：把 days_left 写成与 expiry_at 不符的旧值
+        dbm.update_record(str(self.app.config["DB_PATH"]),
+                          "custom_monitors", mid, {"days_left": 100})
+        r2 = self.c.get("/api/alerts/monitors", headers=self._h(self.token))
+        data = r2.get_json()
+        item = next(m for m in data if m["id"] == mid)
+        self.assertNotEqual(item["days_left"], 100)
+        # 30 天前后误差允许 ±1 天（时区/执行耗时）
+        self.assertLessEqual(abs(item["days_left"] - 30), 1)
+
     def test_toggle_monitor(self):
         r = self._post({"type": "ssl", "name": "Toggle", "target": "toggle.com"})
         mid = r.get_json()["id"]

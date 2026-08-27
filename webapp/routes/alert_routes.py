@@ -822,9 +822,16 @@ MONITOR_TYPES = ("ssl", "cloud_renewal", "license", "custom", "domain")
 @alert_bp.route("/alerts/monitors")
 @require_auth
 def list_monitors():
-    """到期监控列表"""
+    """到期监控列表（读取时按 expiry_at 实时重算剩余天数）
+
+    days_left 为持久化快照，仅创建/编辑/导入/SSL 探测时写入，非 SSL 类型
+    不会随时间自动递减；此处读取时统一按当前时间重算，保证展示实时。
+    """
     db = current_app.config["DB_PATH"]
     rows = dbm.list_records(db, "custom_monitors", "", (), "id")
+    for r in rows:
+        if r.get("expiry_at"):
+            r["days_left"] = _calc_days_left(r["expiry_at"])
     return jsonify(rows)
 
 

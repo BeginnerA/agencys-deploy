@@ -125,9 +125,10 @@
 /* ==================== 告警详情抽屉 ==================== */
 .alert-detail{padding:4px 0}
 .alert-detail-head{display:flex;align-items:center;gap:8px;margin-bottom:16px;flex-wrap:wrap}
-.alert-detail-meta{display:grid;grid-template-columns:1fr 1fr;gap:8px 24px;margin-bottom:20px;
+.alert-detail-meta{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px 24px;margin-bottom:20px;
   padding:14px 16px;background:rgba(0,212,255,.03);border:1px solid var(--border);border-radius:var(--r-card);
   font-size:var(--fs-13)}
+.alert-detail-meta>div{min-width:0;overflow-wrap:anywhere}
 .alert-detail-meta .muted{font-size:var(--fs-12)}
 .alert-detail-section{margin-top:16px}
 .alert-detail-section-title{font-size:var(--fs-14);font-weight:600;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)}

@@ -266,7 +266,7 @@ class Deployer:
             self.image_prefix = f"{ns}/" if ns else ""
             self.full_image = f"{self.image_prefix}{self.image_name}:{self.version}"
             # 首次发版无回滚版本（previous_version 未指定）时 prev_image 置空，失败则跳过容器回滚
-            self.prev_image = f"{self.image_prefix}{self.image_name}:{self.previous_version}" if self.previous_version else None
+            self.prev_image = self._make_image(self.previous_version) if self.previous_version else None
             deploy_cfg = config["deploy"]
             self.dist_dir = Path(deploy_cfg.get("dist_dir", "dist"))
             if not self.dist_dir.is_absolute():
@@ -275,10 +275,16 @@ class Deployer:
         else:
             self.full_image = f"{self.registry_host}/{self.registry_namespace}/{self.image_name}:{self.version}"
             # 首次发版无回滚版本（previous_version 未指定）时 prev_image 置空，失败则跳过容器回滚
-            self.prev_image = f"{self.registry_host}/{self.registry_namespace}/{self.image_name}:{self.previous_version}" if self.previous_version else None
+            self.prev_image = self._make_image(self.previous_version) if self.previous_version else None
         self._docker_logged_in = set()  # 已登录的远程主机，避免重复登录
         self._no_git_tag = False
         self._skip_git_push = False
+
+    def _make_image(self, version: str) -> str:
+        """按当前 registry 模式拼装镜像全名（direct 直传模式不带仓库前缀）"""
+        if self.registry_mode == "direct":
+            return f"{self.image_prefix}{self.image_name}:{version}"
+        return f"{self.registry_host}/{self.registry_namespace}/{self.image_name}:{version}"
 
     def service_names(self) -> list:
         names = [self.service_name]
@@ -518,6 +524,20 @@ class Deployer:
             server.close()
 
     def run(self, servers: list, skip_build: bool = False, skip_snailjob: bool = False, clear_summary_flag: bool = False):
+        # 普通发布未指定回滚版本时，自动查询当前线上版本作为失败回滚目标；
+        # 首次发版（查不到容器）或查询失败时维持现状：previous_version 保持空，失败则跳过容器回滚
+        if not self.previous_version:
+            try:
+                current = get_current_remote_version(self.project, self.config, env=self.env)
+            except Exception as e:
+                log(f"自动查询回滚版本失败（{e}），本次发布失败时将跳过容器回滚")
+                current = None
+            if current:
+                self.previous_version = current
+                self.prev_image = self._make_image(current)
+                log(f"自动回滚兜底：未指定回滚版本，当前线上版本 {current} 将作为失败回滚目标")
+            else:
+                log("未指定回滚版本且未发现运行中容器（首次发版），发布失败时将跳过容器回滚")
         send_notify(self.config, "start", project=self.project, version=self.version,
                     previous_version=self.previous_version, env=self.env)
         start_ts = time.time()
@@ -537,6 +557,7 @@ class Deployer:
             log(">>> 步骤 2/5: 无需暂停 SnailJob")
 
         log(">>> 步骤 3/5: 滚动发布" + ("（金丝雀模式）" if self.canary else ""))
+        success_all = True  # 全部服务器成功的汇总标志，任一台失败或中断即置 False
         # canary batch: read from DB
         canary_batches = None
         if self.canary:

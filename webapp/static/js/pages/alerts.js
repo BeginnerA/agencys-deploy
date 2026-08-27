@@ -2137,10 +2137,16 @@
       destroyed = false;
       await loadProjectsForFilter();
       renderPage();
+      // 统一启动定时刷新（先清理旧 timer，避免重复 setInterval 泄漏）：
+      // 告警列表 / 到期监控 tab 每 15s 自动刷新，剩余天数随当前时间实时递减
+      if (timer) clearInterval(timer);
+      timer = setInterval(() => {
+        if (currentTab === 'alerts') { loadAlerts(); loadAlertCounts(); }
+        else if (currentTab === 'monitors') { loadMonitors(); }
+      }, 15000);
       if (currentTab === 'alerts') {
         await Promise.all([loadAlertCounts(), loadAlerts()]);
         if (destroyed) return [];
-        timer = setInterval(() => { loadAlerts(); loadAlertCounts(); }, 15000);
       } else if (currentTab === 'rules') {
         loadRules();
       } else if (currentTab === 'silences') {
