@@ -52,8 +52,8 @@
           ${list.map(t => `<tr>
             <td class="num">${t.id}</td>
             <td><span class="task-name" data-task="${t.id}">${esc(t.name)}</span></td>
-            <td>${t.action === 'rollback' ? '<span class="tag tag-warn">回滚</span>' : '<span class="tag tag-ok">发布</span>'}</td>
-            <td>${t.type === 'pipeline' ? '流水线' : '服务'}</td>
+            <td>${t.action === 'rollback' ? '<span class="tag tag-warn">回滚</span>' : t.action === 'restart' ? '<span class="tag tag-info">重启</span>' : '<span class="tag tag-ok">发布</span>'}</td>
+            <td>${t.type === 'pipeline' ? '流水线' : t.type === 'restart' ? '重启' : '服务'}</td>
             <td>${esc(t.env || '-')}</td>
             <td class="num">${esc(t.version || t.previous_version || '-')}</td>
             <td>${statusBadge(t.status)}</td>
@@ -76,10 +76,10 @@
     const body = openDrawer({ title: `任务 #${id} ${task.name}`, wide: true, onClose: () => { if (stopStream) stopStream(); }, body: `
       <div class="detail-grid">
         <div><div class="dg-label">状态</div><div style="margin-top:2px" id="taskStatusBadge">${statusBadge(task.status)}</div></div>
-        <div><div class="dg-label">操作</div><div style="margin-top:2px">${task.action === 'rollback' ? '<span class="tag tag-warn">回滚</span>' : '<span class="tag tag-ok">发布</span>'}</div></div>
-        <div><div class="dg-label">类型</div><div style="margin-top:2px">${task.type === 'pipeline' ? '流水线' : '服务'}</div></div>
+        <div><div class="dg-label">操作</div><div style="margin-top:2px">${task.action === 'rollback' ? '<span class="tag tag-warn">回滚</span>' : task.action === 'restart' ? '<span class="tag tag-info">重启</span>' : '<span class="tag tag-ok">发布</span>'}</div></div>
+        <div><div class="dg-label">类型</div><div style="margin-top:2px">${task.type === 'pipeline' ? '流水线' : task.type === 'restart' ? '重启' : '服务'}</div></div>
         <div><div class="dg-label">环境</div><div class="num" style="margin-top:2px">${esc(task.env || '-')}</div></div>
-        <div><div class="dg-label">发布版本</div><div class="num" style="margin-top:2px">${task.action === 'rollback' ? esc(task.version || task.previous_version || '-') : esc(task.previous_version || '-') + ' → ' + esc(task.version || '-')}</div></div>
+        <div><div class="dg-label">发布版本</div><div class="num" style="margin-top:2px">${task.action === 'restart' ? '-' : task.action === 'rollback' ? esc(task.version || task.previous_version || '-') : esc(task.previous_version || '-') + ' → ' + esc(task.version || '-')}</div></div>
         <div><div class="dg-label">启动</div><div class="num" style="margin-top:2px">${fmtTime(task.started_at)}</div></div>
       </div>
       <div class="log-console" id="taskLog">加载中...</div>
@@ -261,7 +261,7 @@
           ${statuses.map(([k, v]) => `<span class="chip ${k === statusFilter ? 'active' : ''}" data-st="${k}">${v}</span>`).join('')}
           <span style="width:1px;height:20px;background:var(--border);margin:0 4px"></span>
           <span class="weak" style="font-size:12px">操作</span>
-          ${[['all','全部'],['deploy','发布'],['rollback','回滚']].map(([k, v]) => `<span class="chip ${k === actionFilter ? 'active' : ''}" data-act="${k}">${v}</span>`).join('')}
+          ${[['all','全部'],['deploy','发布'],['rollback','回滚'],['restart','重启']].map(([k, v]) => `<span class="chip ${k === actionFilter ? 'active' : ''}" data-act="${k}">${v}</span>`).join('')}
           <span style="flex:1"></span>
           ${canDeploy() ? '<button class="btn primary" id="newTaskBtn">+ 新建发布</button>' : ''}
         </div>
