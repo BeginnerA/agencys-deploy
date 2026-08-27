@@ -199,14 +199,31 @@ def is_clean_failure(output: str) -> bool:
     return bool(output) and "Failed to clean project" in output and "maven-clean-plugin" in output
 
 
+def is_transient_io_failure(output: str) -> bool:
+    """判断 Maven 失败是否为可自愈的瞬时 I/O 错误（重试即可，区别于确定性失败）
+
+    两类场景（Windows 下常见）：
+    1. clean 阶段无法删除构建目录：target 被 IDE 编译/杀毒扫描等瞬时占用
+    2. 编译阶段读取生成文件失败：IDE 语言服务器（如 Java 扩展增量编译）与 Maven
+       并发写同一个 target/generated-sources 时，javac 读到的生成文件正被并发
+       删除/重写/锁定，报 "error reading file"（中文环境 "读取...时出错"）
+    """
+    if not output:
+        return False
+    if is_clean_failure(output):
+        return True
+    return "error reading file" in output or ("读取" in output and "时出错" in output)
+
+
 def run(cmd: list, cwd: Path, env: dict = None, timeout: int = None,
         retry_on_clean_failure: bool = False,
         max_retries: int = 2, retry_delay: int = 3):
     """执行命令并实时打印输出
 
-    retry_on_clean_failure: 当失败为 Maven clean 删除目录失败（Windows 下文件
-    被占用）时自动重试，间隔 retry_delay 秒，最多 max_retries 次；仍失败或
-    失败原因不是 clean 删除时按原逻辑报错。
+    retry_on_clean_failure: 当失败为瞬时 I/O 错误（Maven clean 删除目录失败、
+    编译读取生成文件失败，Windows 下文件被 IDE/杀毒等进程占用）时自动重试，
+    间隔 retry_delay 秒，最多 max_retries 次；仍失败或失败原因不是瞬时
+    I/O 错误时按原逻辑报错。
     """
     log(f"执行: {' '.join(cmd)}")
     try:
@@ -219,9 +236,9 @@ def run(cmd: list, cwd: Path, env: dict = None, timeout: int = None,
         if result.stdout:
             for line in result.stdout.rstrip().splitlines():
                 print(f"  | {line}", flush=True)
-        if result.returncode != 0 and retry_on_clean_failure and is_clean_failure(result.stdout or ""):
+        if result.returncode != 0 and retry_on_clean_failure and is_transient_io_failure(result.stdout or ""):
             for attempt in range(1, max_retries + 1):
-                log(f"clean 删除构建目录失败（文件可能被占用），{retry_delay} 秒后自动重试（第 {attempt}/{max_retries} 次）")
+                log(f"构建目录/生成文件可能被其他进程占用（IDE 编译、杀毒扫描等），{retry_delay} 秒后自动重试（第 {attempt}/{max_retries} 次）")
                 time.sleep(retry_delay)
                 result = subprocess.run(
                     cmd, cwd=cwd, env=env,
@@ -233,9 +250,11 @@ def run(cmd: list, cwd: Path, env: dict = None, timeout: int = None,
                         print(f"  | {line}", flush=True)
                 if result.returncode == 0:
                     return
-                if not is_clean_failure(result.stdout or ""):
+                if not is_transient_io_failure(result.stdout or ""):
                     break
         if result.returncode != 0:
+            if is_transient_io_failure(result.stdout or ""):
+                log("提示: 若本机 IDE 打开了该项目且正在编译，请关闭项目窗口后重试发布")
             fail(f"命令执行失败 (rc={result.returncode}): {' '.join(cmd)}")
     except subprocess.TimeoutExpired:
         fail(f"命令超时 ({timeout}s): {' '.join(cmd)}")
@@ -337,8 +356,10 @@ def _run_maven_steps(proj: dict, project_root: Path, version: str,
             mvn, "-f", str(pom), "clean", step["goal"],
             f"-P{maven_profiles}", f"-Drevision={version}", "-DskipTests",
         ]
-        # Windows 下 target 可能被 IDE/杀毒等瞬时占用导致 clean 失败，自动重试自愈
-        run(cmd, project_root, env=env_vars, timeout=600, retry_on_clean_failure=True)
+        # Windows 下 target 可能被 IDE 增量编译/杀毒等瞬时占用导致 clean 失败或
+        # 读取生成文件失败，自动重试自愈（间隔 5 秒 × 3 次，给足 IDE 编译窗口）
+        run(cmd, project_root, env=env_vars, timeout=600, retry_on_clean_failure=True,
+            max_retries=3, retry_delay=5)
 
 
 def _run_frontend_steps(proj: dict, project_root: Path, version: str,

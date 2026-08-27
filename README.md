@@ -271,10 +271,10 @@ servers:
 
 - 构建阶段：`docker build` 后**不推送**，镜像以短名 `{namespace}/{image_name}:{version}` 留在本地（如 `xxx/服务名称:1.0.29`，与 IDEA 直推格式一致）
 - 部署阶段：脚本自动执行 本地 `docker save` 导出 tar → SFTP 上传 → 服务器 `docker load` → 更新 compose 镜像名
-- 每台服务器只在镜像不存在时才传输（服务器已有同名镜像则跳过，多台滚动不会重复传大包）
+- 以镜像 ID（digest）为准判断是否需要传输：本地与远端一致才跳过（多台滚动不会重复传大包）；**同版本重复发布新代码时远端 digest 不同，会自动重新传输**，本地 `dist/` 的旧 tar 包也会校验内容后重新导出
 - 无需配置 `registry.host/username/password`（仅 push 模式使用），`docker login` 全流程跳过；`registry.namespace` 仍作为镜像名前缀使用
 
-直传模式回滚说明：回滚到 `--previous-version` 时，脚本优先使用服务器本地已存在的旧镜像；若服务器上没有，会尝试从本地导出旧版本镜像传输，此时本地也必须保留有旧版本镜像（或上次构建的 tar 包在 `dist/` 目录）。
+直传模式回滚说明：回滚到 `--previous-version` 时，脚本优先使用服务器本地与本地镜像一致的旧镜像；若服务器上没有，会尝试从本地导出旧版本镜像传输，此时本地也必须保留有旧版本镜像（或上次构建的 tar 包在 `dist/` 目录）。
 
 ## 回滚策略
 

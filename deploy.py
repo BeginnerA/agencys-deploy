@@ -67,6 +67,35 @@ def bump_patch_version(version: str) -> str:
     return f"{major}.{minor}.{patch + 1}"
 
 
+def local_image_id(image: str) -> str:
+    """查询本地镜像 ID（sha256:...）；镜像不存在返回 None"""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", image, "--format", "{{.Id}}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+
+
+def tar_image_id(tar_path: Path) -> str:
+    """读取 docker save 导出的 tar 包内镜像 ID（config 文件名）；无法解析返回 None"""
+    try:
+        import json
+        import tarfile
+        with tarfile.open(str(tar_path), "r") as tf:
+            manifest = json.loads(tf.extractfile("manifest.json").read())
+        cfg = manifest[0]["Config"]  # 形如 <sha256 十六进制>.json
+        if cfg.endswith(".json"):
+            cfg = cfg[:-5]
+        return cfg if cfg.startswith("sha256:") else f"sha256:{cfg}"
+    except Exception:
+        return None
+
+
 def _resolve_config_source(args) -> str:
     """auto 模式：DB 中存在该项目（任一服务匹配）→ db，否则 yaml"""
     if args.config_source != "auto":
@@ -232,6 +261,14 @@ class RemoteServer:
     def has_image(self, image: str) -> bool:
         """检查服务器本地是否已存在该镜像"""
         return self.try_exec(f"docker image inspect {image} >/dev/null 2>&1", timeout=15)
+
+    def image_id(self, image: str) -> str:
+        """查询远端镜像 ID（sha256:...）；镜像不存在返回 None"""
+        try:
+            out = self.exec(f"docker image inspect {image} --format '{{{{.Id}}}}'", timeout=15)
+            return out.strip() or None
+        except Exception:
+            return None
 
     def close(self):
         if self._sftp:
@@ -431,22 +468,36 @@ class Deployer:
         log(f"[{server.host}] Docker 登录成功")
 
     def ensure_image_ready(self, server: RemoteServer, version: str = None):
-        """直传模式：确保目标服务器存在指定版本镜像（本地 docker save → scp → docker load）
+        """直传模式：确保目标服务器存在与本地一致的指定版本镜像（save → scp → load）
 
-        服务器已有该镜像则跳过传输；本地缺少该版本镜像时抛异常，由调用方决定回滚或终止。
+        以镜像 ID（digest）为一致性依据：服务器已有同 tag 但内容不同（如同版本
+        重复发布新代码）时仍会重新传输；本地与远端一致则跳过。本地缺少该镜像且
+        远端已有（跳过构建场景）时维持现状不传输；都缺失时抛异常。
         """
         version = version or self.version
         image = f"{self.image_prefix}{self.image_name}:{version}"
-        if server.has_image(image):
-            log(f"[{server.host}] 镜像已存在，跳过传输: {image}")
-            return
+        local_id = local_image_id(image)
+        remote_id = server.image_id(image)
+        if remote_id:
+            if local_id is None:
+                log(f"[{server.host}] 本地无镜像 {image}（跳过构建场景），远端已存在，跳过传输")
+                return
+            if remote_id == local_id:
+                log(f"[{server.host}] 远端镜像与本地一致（{local_id[:12]}），跳过传输: {image}")
+                return
+            log(f"[{server.host}] 远端 {image} 与本地不一致（{remote_id[:12]} != {local_id[:12]}），重新传输")
         tar_name = f"{self.image_name}_{version}.tar"
         local_tar = self.dist_dir / tar_name
-        if not local_tar.exists():
+        if local_tar.exists() and (local_id is None or tar_image_id(local_tar) == local_id):
+            log(f"复用本地镜像包（与本地镜像一致）: {local_tar}")
+        else:
+            if local_id is None:
+                raise RuntimeError(f"本地缺少镜像 {image}，且本地镜像包不可用")
             log(f"本地导出镜像 {image} -> {local_tar}")
             self.dist_dir.mkdir(parents=True, exist_ok=True)
             with self._save_lock:
-                if local_tar.exists():
+                # 并行发布时其他任务可能已导出同一版本，校验内容一致才复用
+                if local_tar.exists() and tar_image_id(local_tar) == local_id:
                     log(f"镜像包已被其他任务导出，复用: {local_tar}")
                 else:
                     result = subprocess.run(
@@ -463,7 +514,11 @@ class Deployer:
         server.sftp_put_with_progress(str(local_tar), f"{self.remote_tmp_dir}/{tar_name}", label=tar_name)
         log(f"[{server.host}] docker load {tar_name} ...")
         server.exec(f"docker load -i {self.remote_tmp_dir}/{tar_name}", timeout=600)
-        if not server.has_image(image):
+        loaded_id = server.image_id(image)
+        if local_id:
+            if loaded_id != local_id:
+                raise RuntimeError(f"[{server.host}] docker load 后镜像 {image} 与本地不一致（{loaded_id} != {local_id}）")
+        elif not loaded_id:
             raise RuntimeError(f"[{server.host}] docker load 后仍未找到镜像 {image}")
         log(f"[{server.host}] 镜像就绪: {image}")
 
