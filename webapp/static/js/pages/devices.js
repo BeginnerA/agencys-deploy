@@ -81,7 +81,9 @@
     if (!wall) return;
     wall.innerHTML = services.map(s => {
       const st = svcStatus[s.name] || {};
-      const run = running.find(r => r.type === 'project' && r.name === s.name && r.env === state.currentEnv);
+      const run = running.find(r =>
+        (r.type === 'project' && r.name === s.name && r.env === state.currentEnv) ||
+        (r.type === 'restart' && r.ref_id === s.id && r.env === state.currentEnv));
       const ver = st.version || '—';
       const inst = st.instances !== undefined && st.instances !== -1 ? st.instances : '—';
       const ts = st.ts ? fmtTime(st.ts) : '';
@@ -102,13 +104,15 @@
         </div>
         <div class="svc-foot">
           ${canDeploy() ? `<button class="btn sm primary" data-pub="${s.id}">发布</button>
-          <button class="btn sm ghost" data-roll="${s.id}">回滚</button>` : '<span class="weak" style="font-size:11px">只读账号</span>'}
+          <button class="btn sm ghost" data-roll="${s.id}">回滚</button>
+          <button class="btn sm ghost" data-restart="${s.id}">⭯ 重启</button>` : '<span class="weak" style="font-size:11px">只读账号</span>'}
           <button class="svc-log-btn" data-svc="${esc(s.name)}" title="查看实时日志">📋 日志</button>
         </div>
       </div>`;
     }).join('') || emptyState('📭', '该项目暂无服务');
     wall.querySelectorAll('[data-pub]').forEach(b => b.onclick = () => openDeployDrawer(Number(b.dataset.pub), false));
     wall.querySelectorAll('[data-roll]').forEach(b => b.onclick = () => openDeployDrawer(Number(b.dataset.roll), true));
+    wall.querySelectorAll('[data-restart]').forEach(b => b.onclick = () => restartService(Number(b.dataset.restart)));
     wall.querySelectorAll('.svc-log-btn').forEach(btn => {
       btn.onclick = (e) => { e.stopPropagation(); openServiceLogDrawer(btn.dataset.svc); };
     });
@@ -131,6 +135,34 @@
           </tbody></table></div></div>`
       : `<div class="panel"><div class="panel-title">服务器列表</div>
           <div class="empty-state"><div class="e-ico">🖥️</div><div>实时探测未启用或暂无数据</div></div></div>`;
+  }
+
+  // ---- 服务重启：确认 → 创建 restart 任务 → 跳发布中心（与发布/回滚同款窗口二次确认）----
+  async function restartService(sid){
+    const pid = state.currentProject.id;
+    let services;
+    try{ services = await api(`/api/projects/${pid}/services`); }
+    catch(e){ toastError('服务信息加载失败：' + e.message); return; }
+    if (destroyed) return; // 路由切换后在途响应丢弃，防新页面弹出旧流程
+    const svc = services.find(s => s.id === sid);
+    if (!svc) return;
+    if (!await confirmDialog(`确认重启服务「${svc.name}」？环境：${state.currentEnv}，将重启全部实例`)) return;
+    const doRestart = async (forceWindow) => await api('/api/tasks', {method:'POST', body: JSON.stringify({
+      project_id: pid, type: 'restart', ref_id: sid, env: state.currentEnv, force_window: forceWindow})});
+    try{
+      const resp = await doRestart(false);
+      toastSuccess(`任务 #${resp.id} 已创建`);
+      location.hash = '#/deploy';
+    }catch(e){
+      if (e.message === 'window_warn' && e.data && e.data.window){
+        if (!await confirmDialog(`当前处于发布窗口「${e.data.window.name}」（软警告），确认仍要继续重启？`)) return;
+        try{
+          const resp2 = await doRestart(true);
+          toastSuccess(`任务 #${resp2.id} 已创建（已忽略窗口警告）`);
+          location.hash = '#/deploy';
+        }catch(e2){ toastError(e2.message); }
+      } else { toastError(e.message); }
+    }
   }
 
   // ---- 发布抽屉（规格 §9：卡片 → 抽屉表单 → 提交跳发布中心）----
