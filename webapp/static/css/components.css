@@ -67,6 +67,7 @@
 .tag{display:inline-block;padding:2px 8px;border-radius:var(--r-full);font-size:var(--fs-11);font-weight:500;white-space:nowrap}
 .tag.tag-ok{background:rgba(0,227,150,.12);color:var(--success);border:1px solid rgba(0,227,150,.35)}
 .tag.tag-warn{background:rgba(254,176,25,.12);color:var(--warning);border:1px solid rgba(254,176,25,.35)}
+.tag.tag-info{background:rgba(0,212,255,.12);color:var(--primary);border:1px solid rgba(0,212,255,.35)}
 
 /* ---- 表单 ---- */
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-3) var(--sp-4)}
