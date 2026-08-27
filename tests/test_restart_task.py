@@ -100,11 +100,13 @@ class TestRestartAPI(unittest.TestCase):
         self.assertEqual(resp.status_code, 409)
         self.assertEqual(resp.get_json()["error"], "window_warn")
         # force_window=true 二次确认放行
-        with mock.patch("webapp.routes.deploy_routes.submit_task"):
+        with mock.patch("webapp.routes.deploy_routes.submit_task") as submit:
             resp2 = self.client.post("/api/tasks", headers=self.headers, json={
                 "project_id": self.proj_id, "type": "restart",
                 "ref_id": self.svc_id, "env": "prod", "force_window": True})
-        self.assertEqual(resp2.status_code, 201)
+            submit.assert_called_once()
+            _, _, extra = submit.call_args.args  # (db_path, task, extra)
+            self.assertEqual(extra, [])
 
 
 # ===== 后续任务追加的测试类锚点 =====
