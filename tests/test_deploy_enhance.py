@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from webapp import db as dbm
 
@@ -286,6 +287,89 @@ class TestDeployEnhanceAPI(unittest.TestCase):
         })
         self.assertEqual(resp.status_code, 201)
 
+    def test_create_project_task_canary(self):
+        """canary=true → extra 追加 --canary，任务记录持久化"""
+        with mock.patch("webapp.routes.deploy_routes.submit_task") as submit:
+            resp = self.client.post("/api/tasks", headers=self.headers, json={
+                "project_id": self.proj_id, "type": "project",
+                "ref_id": self.svc_id, "env": "prod",
+                "version": "1.0.0", "canary": True})
+        self.assertEqual(resp.status_code, 201)
+        submit.assert_called_once()
+        _, _, extra = submit.call_args.args  # (db_path, task, extra)
+        self.assertIn("--canary", extra)
+        task = dbm.get_task(self.db_path, resp.get_json()["id"])
+        self.assertIn("--canary", task["extra"])
+
+    def test_create_task_canary_rollback_conflict(self):
+        """canary 与 rollback 互斥 → 400"""
+        resp = self.client.post("/api/tasks", headers=self.headers, json={
+            "project_id": self.proj_id, "type": "project",
+            "ref_id": self.svc_id, "env": "prod",
+            "version": "1.0.0", "canary": True, "rollback": True})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_create_task_canary_invalid(self):
+        """canary 非布尔 → 400"""
+        resp = self.client.post("/api/tasks", headers=self.headers, json={
+            "project_id": self.proj_id, "type": "project",
+            "ref_id": self.svc_id, "env": "prod",
+            "version": "1.0.0", "canary": "yes"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_canary_default_exclusive(self):
+        """新默认策略清除同项目旧默认策略；PUT 设默认同样互斥"""
+        steps = [{"batch": 1, "servers": 1, "observe_minutes": 5, "auto_advance": True}]
+        resp1 = self.client.post("/api/deploy/canary-configs", headers=self.headers, json={
+            "project_id": self.proj_id, "name": "a", "is_default": True, "steps": steps})
+        cid1 = resp1.get_json()["id"]
+        resp2 = self.client.post("/api/deploy/canary-configs", headers=self.headers, json={
+            "project_id": self.proj_id, "name": "b", "is_default": True, "steps": steps})
+        cid2 = resp2.get_json()["id"]
+        self.assertEqual(dbm.get_record(self.db_path, "canary_configs", cid1)["is_default"], 0)
+        self.assertEqual(dbm.get_record(self.db_path, "canary_configs", cid2)["is_default"], 1)
+        # PUT 将 cid1 设为默认 → cid2 被清除
+        resp = self.client.put(f"/api/deploy/canary-configs/{cid1}",
+                               headers=self.headers, json={"is_default": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(dbm.get_record(self.db_path, "canary_configs", cid1)["is_default"], 1)
+        self.assertEqual(dbm.get_record(self.db_path, "canary_configs", cid2)["is_default"], 0)
+
+    def test_canary_decision_api(self):
+        """灰度决策 API：无请求 → waiting → 提交决策 → 已决策；重复提交 404"""
+        tmp_dir = os.path.join(self.tmp, "decisions")
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        def fake_path(task_id):
+            return os.path.join(tmp_dir, f"canary_decision_{task_id}.json")
+
+        with mock.patch("deploy.canary_decision_path", side_effect=fake_path):
+            # 无请求文件 → none
+            resp = self.client.get("/api/deploy/canary-decisions/1", headers=self.headers)
+            self.assertEqual(resp.get_json()["state"], "none")
+            # 模拟 deploy.py 写入 waiting 请求
+            with open(fake_path(1), "w", encoding="utf-8") as f:
+                json.dump({"task_id": 1, "state": "waiting", "host": "10.0.0.1",
+                           "version": "1.0.0", "previous_version": "1.0.0",
+                           "updated_at": int(time.time())}, f, ensure_ascii=False)
+            resp = self.client.get("/api/deploy/canary-decisions/1", headers=self.headers)
+            self.assertEqual(resp.get_json()["state"], "waiting")
+            # 非法 action → 400
+            resp = self.client.post("/api/deploy/canary-decisions/1", headers=self.headers,
+                                    json={"action": "go"})
+            self.assertEqual(resp.status_code, 400)
+            # 提交 continue
+            resp = self.client.post("/api/deploy/canary-decisions/1", headers=self.headers,
+                                    json={"action": "continue"})
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.get_json()["action"], "continue")
+            resp = self.client.get("/api/deploy/canary-decisions/1", headers=self.headers)
+            self.assertEqual(resp.get_json()["state"], "continue")
+            # 已决策后重复提交 → 404
+            resp = self.client.post("/api/deploy/canary-decisions/1", headers=self.headers,
+                                    json={"action": "stop"})
+            self.assertEqual(resp.status_code, 404)
+
     def test_viewer_cannot_create(self):
         from werkzeug.security import generate_password_hash
         dbm.create_record(self.db_path, "users", dict(
@@ -426,3 +510,42 @@ class TestCanaryAutoAdvance(unittest.TestCase):
         batches = compute_canary_batches(steps, 1)
         self.assertEqual(len(batches), 1)
         self.assertEqual(batches[0]["server_count"], 1)
+
+    def test_wait_canary_decision(self):
+        """deploy.wait_canary_decision：轮询等待决策文件由 waiting 变为终态"""
+        from deploy import wait_canary_decision
+        tmp_dir = tempfile.mkdtemp()
+
+        def fake_path(task_id):
+            return os.path.join(tmp_dir, f"canary_decision_{task_id}.json")
+
+        with mock.patch("deploy.canary_decision_path", side_effect=fake_path):
+            p = fake_path(7)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"task_id": 7, "state": "waiting"}, f)
+
+            def decide():
+                time.sleep(0.5)
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump({"task_id": 7, "state": "continue"}, f)
+
+            import threading
+            threading.Thread(target=decide).start()
+            self.assertEqual(
+                wait_canary_decision(7, timeout_minutes=1, poll_interval=0.2),
+                "continue")
+
+    def test_wait_canary_decision_missing_file(self):
+        """无决策请求文件时，read 返回 none 状态（API 侧表现为无请求）"""
+        from deploy import read_canary_decision, canary_decision_path
+        tmp_dir = tempfile.mkdtemp()
+
+        def fake_path(task_id):
+            return os.path.join(tmp_dir, f"canary_decision_{task_id}.json")
+
+        with mock.patch("deploy.canary_decision_path", side_effect=fake_path):
+            self.assertEqual(read_canary_decision(9)["state"], "none")
+            # 损坏文件同样视为 none
+            with open(fake_path(9), "w", encoding="utf-8") as f:
+                f.write("{broken")
+            self.assertEqual(read_canary_decision(9)["state"], "none")

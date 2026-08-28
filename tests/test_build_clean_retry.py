@@ -60,6 +60,29 @@ def test_real_compile_error_not_io():
     assert not is_transient_io_failure(out)
 
 
+def test_repackage_ioobe_detected():
+    """spring-boot repackage 读 jar 索引越界（本次发布的真实报错）应识别为瞬时 I/O 错误"""
+    out = (
+        "[ERROR] Failed to execute goal org.springframework.boot:"
+        "spring-boot-maven-plugin:4.2.0-M1:repackage (default) on project hqb-expert: "
+        "Execution default of goal org.springframework.boot:"
+        "spring-boot-maven-plugin:4.2.0-M1:repackage failed: "
+        "Index 8 out of bounds for length 0 -> [Help 1]"
+    )
+    assert not is_clean_failure(out)
+    assert is_transient_io_failure(out)
+
+
+def test_repackage_other_error_not_io():
+    """repackage 的其他确定性错误（如 main class 缺失）不应误判"""
+    out = (
+        "[ERROR] Failed to execute goal org.springframework.boot:"
+        "spring-boot-maven-plugin:4.2.0-M1:repackage (default) on project hqb-expert: "
+        "Unable to find main class -> [Help 1]"
+    )
+    assert not is_transient_io_failure(out)
+
+
 def test_empty_output_not_detected():
     assert not is_clean_failure("")
     assert not is_clean_failure(None)

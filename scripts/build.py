@@ -202,17 +202,22 @@ def is_clean_failure(output: str) -> bool:
 def is_transient_io_failure(output: str) -> bool:
     """判断 Maven 失败是否为可自愈的瞬时 I/O 错误（重试即可，区别于确定性失败）
 
-    两类场景（Windows 下常见）：
+    三类场景（Windows 下常见）：
     1. clean 阶段无法删除构建目录：target 被 IDE 编译/杀毒扫描等瞬时占用
     2. 编译阶段读取生成文件失败：IDE 语言服务器（如 Java 扩展增量编译）与 Maven
        并发写同一个 target/generated-sources 时，javac 读到的生成文件正被并发
        删除/重写/锁定，报 "error reading file"（中文环境 "读取...时出错"）
+    3. spring-boot repackage 阶段读取 jar 失败：大 jar 在打包瞬间被杀毒扫描/
+       其他进程锁定，插件读到的 jar 结构损坏，报 "Index N out of bounds for
+       length 0" 类索引越界（失败后 target 常残留 22 字节空 jar）
     """
     if not output:
         return False
     if is_clean_failure(output):
         return True
-    return "error reading file" in output or ("读取" in output and "时出错" in output)
+    if "error reading file" in output or ("读取" in output and "时出错" in output):
+        return True
+    return "repackage failed" in output and "out of bounds for length" in output
 
 
 def run(cmd: list, cwd: Path, env: dict = None, timeout: int = None,

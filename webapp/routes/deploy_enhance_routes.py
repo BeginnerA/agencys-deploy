@@ -25,6 +25,16 @@ def _db_path():
     return current_app.config["DB_PATH"]
 
 
+def _clear_default_canary(conn, project_id: int, exclude_id: int = None):
+    """将同项目其余灰度策略的 is_default 置 0，保证默认策略唯一（幂等）"""
+    params = [project_id]
+    sql = "UPDATE canary_configs SET is_default=0 WHERE project_id=? AND is_default=1"
+    if exclude_id is not None:
+        sql += " AND id<>?"
+        params.append(exclude_id)
+    conn.execute(sql, tuple(params))
+
+
 # ========== 定时发布计划 ==========
 
 @deploy_enhance_bp.route("/deploy/schedules", methods=["GET"])
@@ -356,6 +366,14 @@ def create_canary_config():
         return jsonify({"error": "name 必填"}), 400
     if not isinstance(steps, list):
         return jsonify({"error": "steps 必须为数组"}), 400
+    if is_default:
+        # 设为默认时先清除同项目其他默认策略，保证唯一（deploy.py 按 is_default=1 读取）
+        conn = dbm.get_conn(_db_path())
+        try:
+            _clear_default_canary(conn, project_id)
+            conn.commit()
+        finally:
+            conn.close()
     cid = dbm.create_record(_db_path(), "canary_configs", dict(
         project_id=project_id, name=name.strip(),
         steps=json.dumps(steps, ensure_ascii=False),
@@ -384,6 +402,14 @@ def update_canary_config(cid):
         fields["steps"] = json.dumps(steps, ensure_ascii=False)
     if "is_default" in body:
         fields["is_default"] = 1 if body["is_default"] else 0
+    if fields.get("is_default") == 1:
+        # 设为默认时先清除同项目其他默认策略，保证唯一
+        conn = dbm.get_conn(_db_path())
+        try:
+            _clear_default_canary(conn, rec["project_id"], exclude_id=cid)
+            conn.commit()
+        finally:
+            conn.close()
     if fields:
         dbm.update_record(_db_path(), "canary_configs", cid, fields)
     audit("update_canary_config", "canary_config", cid, fields)
@@ -400,6 +426,41 @@ def delete_canary_config(cid):
     dbm.delete_record(_db_path(), "canary_configs", cid)
     audit("delete_canary_config", "canary_config", cid, {"name": rec["name"]})
     return jsonify({"ok": True})
+
+
+# ========== 灰度运行中决策（Web 子进程 ↔ deploy.py 文件协议） ==========
+
+@deploy_enhance_bp.route("/deploy/canary-decisions/<int:task_id>", methods=["GET"])
+@require_auth
+def get_canary_decision(task_id):
+    """读取灰度决策状态：none=无请求 / waiting=等待决策 / continue|stop|rollback=已决策"""
+    from deploy import read_canary_decision
+    return jsonify(read_canary_decision(task_id))
+
+
+@deploy_enhance_bp.route("/deploy/canary-decisions/<int:task_id>", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def post_canary_decision(task_id):
+    """提交灰度决策：continue 继续 / stop 停止 / rollback 回滚首台"""
+    body = _json_body()
+    action = body.get("action") if body else None
+    if action not in ("continue", "stop", "rollback"):
+        return jsonify({"error": "action 必须为 continue/stop/rollback"}), 400
+    from deploy import read_canary_decision, canary_decision_path
+    cur = read_canary_decision(task_id)
+    if cur.get("state") != "waiting":
+        return jsonify({"error": "当前无等待中的灰度决策"}), 404
+    path = canary_decision_path(task_id)
+    cur["state"] = action
+    cur["updated_at"] = int(time.time())
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False)
+    except OSError:
+        return jsonify({"error": "决策文件写入失败（任务可能已结束）"}), 500
+    audit("canary_decision", "task", task_id, {"action": action})
+    return jsonify({"ok": True, "action": action})
 
 
 # ========== 依赖拓扑 & 影响分析 ==========

@@ -123,6 +123,8 @@ def _run_task(db_path, task, extra_args):
             return
         cmd = build_cli(task, extra)
         env_map = dict(os.environ)
+        # 注入任务 ID：deploy.py 灰度决策（非终端子进程）依赖它定位决策文件
+        env_map["PLATFORM_TASK_ID"] = str(task["id"])
         with open(log_file, "w", encoding="utf-8") as f:
             # 日志开头记录实际命令行，便于核对参数（如 --skip-build）是否生效
             f.write("[platform] 执行命令: " + " ".join(cmd) + "\n")

@@ -106,6 +106,32 @@
     const delTaskBtn = document.getElementById('delTaskBtn');
     if (delTaskBtn) delTaskBtn.onclick = () => deleteTask(task);
   }
+  // 灰度运行中决策：任务抽屉内提供 继续/停止/回滚 操作（对应 deploy.py 等待 Web 确认）
+  function renderCanaryDecision(id, cd){
+    const box = document.getElementById('taskActionBtns');
+    if (!box || document.getElementById('canaryDecisionBtns')) return;
+    const canRollback = !!cd.previous_version;
+    box.insertAdjacentHTML('afterbegin', `
+      <div class="task-drawer-actions" id="canaryDecisionBtns">
+        <span class="tag tag-warn" style="margin-right:4px">🐤 灰度待确认：${esc(cd.host || '')} 已发布成功</span>
+        <button class="btn primary sm" id="canaryGo">继续发布</button>
+        <button class="btn sm" id="canaryStop">停止</button>
+        ${canRollback ? '<button class="btn danger ghost sm" id="canaryRollback">回滚首台</button>' : ''}
+      </div>`);
+    const act = (action) => async () => {
+      try{
+        await api(`/api/deploy/canary-decisions/${id}`, {method:'POST', body: JSON.stringify({action})});
+        toastSuccess({continue:'已确认继续发布', stop:'已确认停止发布', rollback:'已确认回滚首台'}[action]);
+        const el = document.getElementById('canaryDecisionBtns');
+        if (el) el.remove();
+      }catch(e){ toastError(e.message); }
+    };
+    document.getElementById('canaryGo').onclick = act('continue');
+    document.getElementById('canaryStop').onclick = act('stop');
+    const rb = document.getElementById('canaryRollback');
+    if (rb) rb.onclick = act('rollback');
+  }
+
   // 日志追尾轮询：interval 为流内局部变量，返回 stop() 供关抽屉/destroy 清理，防多流交叉误杀
   function streamLog(id, task){
     const logBox = document.getElementById('taskLog');
@@ -135,8 +161,21 @@
           if (!flushing){ flushing = true; requestAnimationFrame(flushDOM); }
         }
         offset = d.offset;
+        // 灰度决策：运行中若存在等待确认请求，展示决策按钮（操作角色）；已处理/超时则移除
+        if (d.status === 'running'){
+          try{
+            const cd = await api(`/api/deploy/canary-decisions/${id}`);
+            if (cd.state === 'waiting' && canDeploy()) renderCanaryDecision(id, cd);
+            else {
+              const el = document.getElementById('canaryDecisionBtns');
+              if (el) el.remove();
+            }
+          }catch(e){ /* 决策查询失败不影响日志流 */ }
+        }
         if (['success','failed','killed'].includes(d.status)){
-          // 终态：继续拉取直到日志全部读完（大日志需多个 8000 字符块）
+          // 终态：移除未决的灰度确认按钮，继续拉取直到日志全部读完（大日志需多个 8000 字符块）
+          const cdb = document.getElementById('canaryDecisionBtns');
+          if (cdb) cdb.remove();
           while (true){
             try{
               const d2 = await api(`/api/tasks/${id}/log?offset=${offset}`);
@@ -194,6 +233,7 @@
         auto_version: task.type !== 'restart' && (extra.includes('--auto-version') || (!task.version && !task.previous_version)),
         skip_build: extra.includes('--skip-build'),
         no_git_tag: extra.includes('--no-git-tag'),
+        canary: extra.includes('--canary'),
         force_window: forceWindow,
       })});
     };

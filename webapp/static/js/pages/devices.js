@@ -204,7 +204,8 @@
           <select id="dpEnv">${envs.map(e => `<option ${e.name === state.currentEnv ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</select></div>
         <div class="field"><label>版本号（可留空）</label><input id="dpVersion" placeholder="如 1.0.3"></div>
         <div class="field full"><label>当前线上版本（失败回滚基线）</label><input id="dpPrevVersion" placeholder="发布失败时自动回滚到该版本"><div class="hint" id="dpPrevHint">手动指定版本时填写，发布失败自动回滚到该版本；留空视为首次发版（失败不自动回滚）；勾选「自动版本号」时由系统自动探测，无需填写</div></div>
-        <div class="field check full" style="gap:24px"><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpAuto"> 自动版本号</label><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpSkip"> 跳过构建</label><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpNoTag"> 本次不打 Git Tag</label></div>
+        <div class="field check full" style="gap:24px"><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpAuto"> 自动版本号</label><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpSkip"> 跳过构建</label><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpNoTag"> 本次不打 Git Tag</label><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpCanary"> 🐤 灰度发布</label></div>
+        <div class="hint full" id="dpCanaryHint" style="display:none;width:100%;box-sizing:border-box;font-size:12px;color:var(--text-3);line-height:1.9;margin-top:8px;margin-bottom:8px;padding:8px 10px;border:1px solid var(--border);border-left:3px solid var(--primary);border-radius:var(--r-ctl);background:rgba(0,212,255,.05)"><b style="color:var(--text-2)">🐤 灰度发布说明：</b><br>按项目「灰度策略」页的默认策略分批发布；批次间等待人工确认时，在任务抽屉中操作「继续 / 停止 / 回滚首台」</div>
       </div>
       <div style="display:flex;gap:10px;margin-top:20px">
         <button class="btn primary flex-1" id="dpSubmit">确认发布</button>
@@ -269,6 +270,11 @@
     };
     document.getElementById('dpAuto').onchange = syncVersionState;
     syncVersionState();
+    // 灰度发布说明：仅勾选时显示
+    const dpCanaryHint = document.getElementById('dpCanaryHint');
+    const syncCanaryHint = () => { if (dpCanaryHint) dpCanaryHint.style.display = document.getElementById('dpCanary').checked ? 'block' : 'none'; };
+    document.getElementById('dpCanary').onchange = syncCanaryHint;
+    syncCanaryHint();
     const doDeploy = async (forceWindow) => {
       const typeSel = document.getElementById('dpType').value;
       const ref = document.getElementById('dpRef').value;
@@ -278,11 +284,12 @@
       const auto_version = document.getElementById('dpAuto').checked;
       const skip_build = document.getElementById('dpSkip').checked;
       const no_git_tag = document.getElementById('dpNoTag').checked;
+      const canary = document.getElementById('dpCanary').checked;
       if (auto_version && (version || previous_version)) throw new Error('自动版本号与显式版本互斥');
       const [t, rid] = ref.split(':');
       return await api('/api/tasks', {method:'POST', body: JSON.stringify({
         project_id: pid, type: t, ref_id: Number(rid), env, version, previous_version,
-        rollback, auto_version, skip_build, no_git_tag, force_window: forceWindow})});
+        rollback, auto_version, skip_build, no_git_tag, canary, force_window: forceWindow})});
     };
     document.getElementById('dpSubmit').onclick = async () => {
       try{

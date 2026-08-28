@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import re
+import json
 import argparse
 import tempfile
 import subprocess
@@ -25,6 +26,41 @@ from nacos_manager import NacosClient
 from snailjob_manager import backup_jobs, set_job_status, restore_jobs, clear_summary
 from health_check import wait_for_healthy
 from notify import send_notify
+
+
+# ---------- 灰度 Web 决策：deploy.py 子进程 ↔ Web 决策 API 的文件协议 ----------
+
+def canary_decision_path(task_id: int) -> Path:
+    """灰度决策文件：Web 子进程写请求、Web 决策 API 写结果，均落盘于 data/ 目录"""
+    return Path(__file__).resolve().parent / "data" / f"canary_decision_{int(task_id)}.json"
+
+
+def read_canary_decision(task_id: int) -> dict:
+    """读取灰度决策文件；文件不存在或损坏返回 {"state": "none"}"""
+    try:
+        with open(canary_decision_path(task_id), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {"state": "none"}
+    except (OSError, ValueError):
+        return {"state": "none"}
+
+
+def wait_canary_decision(task_id: int, timeout_minutes: int = 30,
+                         poll_interval: float = 5) -> str:
+    """Web 子进程无终端场景：轮询决策文件等待人工决策
+
+    返回 'continue' | 'stop' | 'rollback'；超时（默认 30 分钟）按 stop 处理，
+    避免任务无限挂起。
+    """
+    deadline = time.time() + max(1, int(timeout_minutes)) * 60
+    while True:
+        state = read_canary_decision(task_id).get("state")
+        if state in ("continue", "stop", "rollback"):
+            return state
+        if time.time() >= deadline:
+            log(f"[canary] 等待 Web 决策超时（{timeout_minutes} 分钟），默认停止发布")
+            return "stop"
+        time.sleep(max(0.2, float(poll_interval)))
 
 
 def get_current_remote_version(project: str, config: dict, env: str = None) -> str:
@@ -348,6 +384,14 @@ class Deployer:
         if self.previous_version:
             log(f"  [r] 回滚首台到 {self.previous_version}")
         log(f"{'=' * 60}")
+        # Web 子进程无终端：写决策请求文件并轮询等待 Web 端人工决策
+        task_id = os.environ.get("PLATFORM_TASK_ID")
+        if not sys.stdin.isatty() and task_id:
+            try:
+                return self._canary_file_decision(int(task_id), first_host)
+            except ValueError:
+                log(f"[canary] 非法 PLATFORM_TASK_ID: {task_id!r}，默认停止发布")
+                return "stop"
         while True:
             try:
                 choice = input(">>> 请选择 (y/n{}): ".format("/r" if self.previous_version else "")).strip().lower()
@@ -362,6 +406,35 @@ class Deployer:
                 return "rollback"
             else:
                 log("无效输入，请重新选择")
+
+    def _canary_file_decision(self, task_id: int, first_host: str) -> str:
+        """Web 子进程场景的灰度决策：写决策请求文件 → 轮询等待 Web 端结果 → 清理文件
+
+        Web 端通过 POST /api/deploy/canary-decisions/<task_id> 写入 continue/stop/rollback；
+        超时默认 30 分钟（CANARY_DECISION_TIMEOUT 环境变量可覆盖），超时按停止处理。
+        """
+        path = canary_decision_path(task_id)
+        timeout = int(os.environ.get("CANARY_DECISION_TIMEOUT", "30"))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "task_id": task_id,
+                    "state": "waiting",
+                    "host": first_host,
+                    "version": self.version,
+                    "previous_version": self.previous_version,
+                    "updated_at": int(time.time()),
+                }, f, ensure_ascii=False)
+            log(f"[canary] 已写入决策请求（task #{task_id}），等待 Web 端确认（超时 {timeout} 分钟）")
+            decision = wait_canary_decision(task_id, timeout_minutes=timeout)
+            log(f"[canary] Web 端决策: {decision}")
+            return decision
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def nacos_offline(self, host: str):
         for svc in self.service_names():
