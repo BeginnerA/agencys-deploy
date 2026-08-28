@@ -368,10 +368,10 @@ JSON_FIELDS = {
 
 # 表名白名单（泛型 CRUD 的标识符护栏，防 SQL 注入）
 TABLES = frozenset(("projects", "services", "environments", "servers",
-                    "env_servers", "pipelines", "u sers", "tasks", "audit_logs",
+                    "env_servers", "pipelines", "users", "tasks", "audit_logs",
                     "alert_rules", "alerts", "alert_events",
                     "silence_windows", "platform_settings",
-                    "log_entries", "log_scan_state",
+                    "log_entries", "log_scan_state", "scheduler_locks",
                     "deploy_schedules", "release_windows",
                     "service_dependencies", "deployment_snapshots",
                     "canary_configs",
