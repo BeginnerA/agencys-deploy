@@ -106,7 +106,8 @@ def _run_task(db_path, task, extra_args):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"task_{task['id']}.log"
     try:
-        update_task(db_path, task["id"], status="running", log_file=str(log_file))
+        update_task(db_path, task["id"], status="running", log_file=str(log_file),
+                    started_at=time.time())  # 启动时刻才计 started_at（排除排队时长）
         # 执行参数以持久化到任务记录的 extra 为准（submit 传入值与其一致），
         # 保证重新运行时恢复的参数与原始执行一致
         extra = extra_args if extra_args else (task.get("extra") or [])
@@ -172,16 +173,18 @@ def tail_log(log_file: str, offset: int = 0, max_chars: int = 8000, tail: bool =
         return "", 0, False
     file_size = resolved.stat().st_size
     with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
         if tail and offset == 0 and file_size > max_chars:
-            # 运行中任务首次打开：跳到尾部，标记截断
-            f.seek(file_size - max_chars)
-            text = f.read()
-            # 跳过可能不完整的行首
+            # 运行中任务首次打开：返回尾部窗口并标记截断（跳过可能不完整的行首）
+            text = content[-max_chars:]
             nl = text.find('\n')
             if nl != -1:
                 text = text[nl + 1:]
-            return text, file_size, True
-        content = f.read()
+            # offset 必须返回完整文件字符数（已读至末尾的位置）：前端以 offset 为
+            # 已读游标继续切片。若只返回 len(text)（尾部窗口长度），下次从字符偏移
+            # len(text) 处切片会与已显示内容错位 → 重复/乱序；返回字节数（原实现）
+            # 遇中文（字节>字符）时切片返回空 → 日志丢失
+            return text, len(content), True
     text = content[offset:offset + max_chars]
     return text, offset + len(text), False
 

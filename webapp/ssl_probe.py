@@ -95,47 +95,38 @@ def _cert_fingerprint(sock) -> str:
 
 
 def _key_info(sock) -> tuple:
-    """获取证书公钥类型和位数"""
+    """获取证书公钥类型和位数（DER → cryptography 精确解析）"""
     try:
         der = sock.getpeercert(binary_form=True)
         if not der:
             return ("", 0)
-        # 用 ssl 模块解析 DER 证书获取公钥信息
-        cert = sock.getpeercert()
-        # 通过 cipher() 推断密钥类型
-        cipher = sock.cipher()
-        if cipher:
-            cipher_name = cipher[0]
-            # TLS 1.3 cipher 名含 AES/GCM/CHACHA，不直接反映密钥类型
-            # 从证书 subject 的公钥算法推断更可靠
-            # Python ssl 不直接暴露公钥算法，通过 cipher 套件名启发式判断
-            if "ECDSA" in cipher_name or "ECDHE" in cipher_name:
-                # ECDHE 可能是 ECDSA 或 RSA，需要进一步判断
-                # 简化处理：从证书 notAfter 长度等启发式
-                return ("RSA", 0)  # 默认 RSA，实际位数从 DER 解析
-            elif "RSA" in cipher_name:
-                return ("RSA", 0)
-        # 尝试从 DER 证书解析公钥信息
         return _parse_pubkey_from_der(der)
     except Exception:
         return ("", 0)
 
 
 def _parse_pubkey_from_der(der: bytes) -> tuple:
-    """从 DER 编码的 X.509 证书中解析公钥信息（简化版）"""
+    """从 DER 编码的 X.509 证书中解析公钥类型和位数。
+
+    通过 SPKI 算法 OID 精确判定（RSA/EC/Ed25519/Ed448/DSA），
+    再按密钥对象 key_size 换算位数；替代原按证书长度猜类型的启发式
+    （ECDSA P-384 证书曾被误判为 RSA 2048，告警信息失真）。"""
     try:
-        # 使用 Python 内置 ssl 模块的 _ssl._test_decode_cert 或手动解析
-        # 这里使用 ssl 模块的底层能力
-        import struct
-        # 简化：通过 DER 长度和特征判断
-        # RSA 2048 证书约 ~1000 bytes, RSA 4096 约 ~1800 bytes
-        # ECDSA P-256 证书约 ~700 bytes
-        cert_len = len(der)
-        if cert_len < 800:
-            return ("ECDSA", 256)
-        elif cert_len < 1400:
-            return ("RSA", 2048)
-        else:
-            return ("RSA", 4096)
+        from cryptography import x509
+        from cryptography.hazmat.primitives.asymmetric import (
+            dsa, ec, ed25519, ed448, rsa
+        )
+        pub = x509.load_der_x509_certificate(der).public_key()
+        if isinstance(pub, rsa.RSAPublicKey):
+            return ("RSA", pub.key_size)
+        if isinstance(pub, ec.EllipticCurvePublicKey):
+            return ("ECDSA", pub.curve.key_size)
+        if isinstance(pub, ed25519.Ed25519PublicKey):
+            return ("Ed25519", 256)
+        if isinstance(pub, ed448.Ed448PublicKey):
+            return ("Ed448", 448)
+        if isinstance(pub, dsa.DSAPublicKey):
+            return ("DSA", pub.key_size)
+        return (pub.__class__.__name__.replace("PublicKey", ""), 0)
     except Exception:
         return ("", 0)

@@ -8,7 +8,9 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from webapp import db as dbm
-from webapp.log_collector import LogCollector, _parse_docker_log_line, _build_log_file_path
+from webapp.log_collector import (
+    LogCollector, _parse_docker_log_line, _build_log_file_path, _cursor_from_ts,
+)
 
 
 class TestParseDockerLogLine(unittest.TestCase):
@@ -43,6 +45,25 @@ class TestBuildLogFilePath(unittest.TestCase):
         self.assertEqual(normalized, "/tmp/logs/collect/prod/api-service/2026-08-18.log")
 
 
+class TestCursorFromTs(unittest.TestCase):
+    """#4 秒级游标改微秒：+1μs 跳过 docker logs --since 的含边界（>= 过滤），
+    避免最后一行（及同秒所有行）每轮重复采集"""
+
+    def test_plus_one_microsecond(self):
+        # 2026-08-18T10:30:45.123456Z + 1μs
+        self.assertEqual(_cursor_from_ts(1787049045, 123456),
+                         "2026-08-18T10:30:45.123457+00:00")
+
+    def test_microsecond_boundary_rolls_over(self):
+        # 2026-08-18T10:30:45.999999Z + 1μs → 10:30:46（微秒归零，isoformat 省略）
+        self.assertEqual(_cursor_from_ts(1787049045, 999999),
+                         "2026-08-18T10:30:46+00:00")
+
+    def test_zero_microseconds_advances(self):
+        self.assertEqual(_cursor_from_ts(1787049045, 0),
+                         "2026-08-18T10:30:45.000001+00:00")
+
+
 class TestLogCollector(unittest.TestCase):
     """采集器核心逻辑"""
 
@@ -71,7 +92,7 @@ class TestLogCollector(unittest.TestCase):
     def test_update_scan_state_insert_and_update(self):
         """游标更新：首次插入 + 后续更新"""
         self.collector._update_scan_state("prod", "10.0.0.1", "api-container", "api",
-                                          "2026-08-18T10:30:00Z", 100)
+                                          "2026-08-18T10:30:00Z", 100, "2026-08-18")
         conn = dbm.get_conn(self.db)
         try:
             row = conn.execute(
@@ -80,11 +101,12 @@ class TestLogCollector(unittest.TestCase):
             self.assertIsNotNone(row)
             self.assertEqual(row["last_ts"], "2026-08-18T10:30:00Z")
             self.assertEqual(row["last_line"], 100)
+            self.assertEqual(row["file_date"], "2026-08-18")
         finally:
             conn.close()
         # 更新
         self.collector._update_scan_state("prod", "10.0.0.1", "api-container", "api",
-                                          "2026-08-18T10:31:00Z", 200)
+                                          "2026-08-18T10:31:00Z", 200, "2026-08-18")
         conn = dbm.get_conn(self.db)
         try:
             row = conn.execute(
@@ -92,8 +114,51 @@ class TestLogCollector(unittest.TestCase):
             ).fetchone()
             self.assertEqual(row["last_ts"], "2026-08-18T10:31:00Z")
             self.assertEqual(row["last_line"], 200)
+            self.assertEqual(row["file_date"], "2026-08-18")
         finally:
             conn.close()
+
+    def test_load_scan_states_structure(self):
+        """#2 游标结构：last_ts + file_offset（文件级累计偏移）+ file_date（跨日重置依据）"""
+        self.collector._update_scan_state("prod", "10.0.0.1", "c1", "s1",
+                                          "2026-08-18T10:30:00Z", 1500, "2026-08-18")
+        states = self.collector._load_scan_states("prod", "10.0.0.1")
+        self.assertEqual(states["c1"]["last_ts"], "2026-08-18T10:30:00Z")
+        self.assertEqual(states["c1"]["file_offset"], 1500)
+        self.assertEqual(states["c1"]["file_date"], "2026-08-18")
+        # 无记录容器 → 空状态（file_offset 默认 0）
+        self.assertEqual(states.get("missing", {}).get("file_offset", 0), 0)
+
+    def test_collect_container_output_line_offset_continuous(self):
+        """#2 多轮采集：line_offset 从 file_offset 基准继续累加（文件级偏移连续）"""
+        out1 = "2026-08-18T10:30:01.123456789Z INFO first\n"
+        out2 = "2026-08-18T10:30:02.123456789Z ERROR second\n"
+        self.collector._collect_container_output(
+            "prod", 1, "10.0.0.1", "api", out1, "")
+        conn = dbm.get_conn(self.db)
+        try:
+            row = conn.execute(
+                "SELECT last_line, file_date FROM log_scan_state "
+                "WHERE container='api'"
+            ).fetchone()
+            first_end = row["last_line"]
+        finally:
+            conn.close()
+        # 第二轮带上第一轮累计偏移 → 新行偏移接续，且游标 +1μs
+        self.collector._collect_container_output(
+            "prod", 1, "10.0.0.1", "api", out2, "", first_end)
+        conn = dbm.get_conn(self.db)
+        try:
+            rows = conn.execute(
+                "SELECT line_offset, content FROM log_entries ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(len(rows), 2)
+        # 第一行 offset 0；第二行 offset = 第一行编码字节长
+        self.assertEqual(rows[0]["line_offset"], 0)
+        self.assertEqual(rows[1]["line_offset"], first_end)
+        self.assertEqual(rows[1]["content"], "ERROR second")
 
     def test_index_log_lines_writes_fts(self):
         """FTS5 索引：写入 log_entries + log_fts"""

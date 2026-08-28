@@ -128,9 +128,16 @@ class NacosClient:
         grp = group or self.group
         snap_key = (service_name, grp, ip)
         restored = 0
-        for s in self._snapshots.pop(snap_key, []):
+        # 快照恢复：全部 set_instance 成功后才移除快照；
+        # 先 pop 后 set 的话，任一实例恢复失败（网络/限流）快照即永久丢失，
+        # 离线实例将不再可恢复（list 接口不返回 enabled=false 的实例）
+        snapshots = list(self._snapshots.get(snap_key, []))
+        for s in snapshots:
             self.set_instance(service_name, ip, s["port"], enabled=True, weight=weight, cluster=s["cluster"], group=group, ephemeral=s.get("ephemeral"))
             restored += 1
+        if restored == len(snapshots) and snapshots:
+            self._snapshots.pop(snap_key, None)
+            self._snapshotted_keys.discard(snap_key)
         # 兜底：容器重启后应用重新注册的实例（默认 enabled=true），权重不符时纠正
         hosts = self.list_instances(service_name, group=group)
         for h in hosts:

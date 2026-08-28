@@ -1,5 +1,6 @@
 """SQLite 数据访问（通用部署平台版）：泛型 CRUD + JSON 序列化 + 删除保护 + 审计 + 告警系统"""
 import json
+import re
 import sqlite3
 import time
 
@@ -204,12 +205,19 @@ CREATE TABLE IF NOT EXISTS log_scan_state (
     service TEXT NOT NULL DEFAULT '',
     last_ts TEXT DEFAULT '',
     last_line INTEGER DEFAULT 0,
+    file_date TEXT DEFAULT '',
     updated_at INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_log_scan_state_key
     ON log_scan_state(env, server, container);
 CREATE VIRTUAL TABLE IF NOT EXISTS log_fts USING fts5(
     ts, env, service, content, content='log_entries', content_rowid='id'
+);
+CREATE TABLE IF NOT EXISTS scheduler_locks (
+    name TEXT PRIMARY KEY,
+    owner TEXT NOT NULL DEFAULT '',
+    acquired_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS deploy_schedules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -360,7 +368,7 @@ JSON_FIELDS = {
 
 # 表名白名单（泛型 CRUD 的标识符护栏，防 SQL 注入）
 TABLES = frozenset(("projects", "services", "environments", "servers",
-                    "env_servers", "pipelines", "users", "tasks", "audit_logs",
+                    "env_servers", "pipelines", "u sers", "tasks", "audit_logs",
                     "alert_rules", "alerts", "alert_events",
                     "silence_windows", "platform_settings",
                     "log_entries", "log_scan_state",
@@ -486,6 +494,10 @@ def _migrate(conn):
             created_at INTEGER NOT NULL
         )""")
         conn.execute("CREATE INDEX idx_renewal_logs_monitor ON renewal_logs(monitor_id, created_at)")
+    # log_scan_state 补 file_date 列（日志采集跨日重置文件级行偏移基准）
+    lsc_cols = {r["name"] for r in conn.execute("PRAGMA table_info(log_scan_state)")}
+    if "file_date" not in lsc_cols:
+        conn.execute("ALTER TABLE log_scan_state ADD COLUMN file_date TEXT DEFAULT ''")
 
 
 def _serialize(table: str, fields: dict) -> dict:
@@ -519,9 +531,15 @@ def get_record(db_path: str, table: str, record_id: int):
         conn.close()
 
 
+_ORDER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\s+(?:ASC|DESC))?$")
+
+
 def list_records(db_path: str, table: str, where: str = "", params: tuple = (),
                  order: str = "id"):
     _check_table(table)
+    # order 拼接前白名单校验：仅允许单列名 + 可选 ASC/DESC，防 SQL 注入
+    if not _ORDER_RE.match(order or ""):
+        order = "id"
     conn = get_conn(db_path)
     try:
         sql = f"SELECT * FROM {table}"
@@ -736,10 +754,12 @@ def reorder_env_servers(db_path: str, env_id: int, server_ids: list) -> None:
 def create_task(db_path: str, project_id: int, type_: str, ref_id: int, name: str,
                 env: str, version: str, previous_version: str, created_by: int,
                 extra: list = None, action: str = 'deploy') -> int:
+    # started_at 不在此处写入：pending 即计时会把排队时长计入执行耗时，
+    # 统计失真；由 task_manager 在任务真正启动（status=running）时落库
     fields = dict(project_id=project_id, type=type_, ref_id=ref_id, name=name,
                   env=env, version=version, previous_version=previous_version,
                   extra=extra or [], action=action, status="pending",
-                  created_by=created_by, started_at=int(time.time()))
+                  created_by=created_by)
     return create_record(db_path, "tasks", fields)
 
 

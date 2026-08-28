@@ -88,8 +88,8 @@ function computeHealth(overview, mon){
     resourceScore = Math.round((cpuScore + memScore) / 2);
   }
 
-  // 4. 安全：SSH 密钥配置率
-  const security = mon && mon.security ? mon.security.score : 95;
+  // 4. 安全：SSH 密钥配置率（后端无服务器数据时 score 为 null → 用中性默认 75，避免误导性满分）
+  const security = (mon && mon.security && mon.security.score != null) ? mon.security.score : 75;
 
   // 5. 可用性：发布成功率
   const availability = Math.round(rate * 100);

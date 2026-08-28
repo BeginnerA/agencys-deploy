@@ -8,50 +8,68 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import db as dbm
 from .alert_engine import get_engine
 
-# docker logs 时间戳解析正则
+# docker logs 时间戳解析正则（含可选纳秒/微秒部分）
 _DOCKER_TS_RE = re.compile(
-    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})"
+    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?"
 )
+
+
+def _parse_ts(line: str):
+    """解析行首 docker 时间戳：返回 (epoch_seconds, 微秒, 剩余内容)。
+    无时间戳或解析失败时返回 (0, 0, line)。"""
+    if not line:
+        return 0, 0, ""
+    m = _DOCKER_TS_RE.match(line)
+    if not m:
+        return 0, 0, line
+    frac = m.group(7) or ""
+    us = int((frac[1:] + "000000")[:6]) if frac else 0
+    try:
+        dt = datetime(
+            int(m.group(1)), int(m.group(2)), int(m.group(3)),
+            int(m.group(4)), int(m.group(5)), int(m.group(6)), us,
+            tzinfo=timezone.utc
+        )
+    except (ValueError, OverflowError):
+        return 0, 0, line
+    ts = int(dt.timestamp())
+    # 跳过时间戳部分（含可选纳秒 + Z + 空格）
+    rest = line[m.end():]
+    if rest and rest[0] == '.':
+        rest = rest[1:]  # skip '.'
+        rest = rest.lstrip('0123456789')  # strip nanosecond digits
+        if rest and rest[0] == 'Z':
+            rest = rest[1:]
+        if rest and rest[0] == ' ':
+            rest = rest[1:]
+    elif rest and rest[0] == 'Z':
+        rest = rest[1:]
+        if rest and rest[0] == ' ':
+            rest = rest[1:]
+    return ts, us, rest
 
 
 def _parse_docker_log_line(line: str):
     """解析 docker logs -t 输出行：提取时间戳 + 内容。
     格式：2026-08-18T10:30:45.123456789Z <content>
     返回 (epoch_seconds, content)。无时间戳时 ts=0。"""
-    if not line:
-        return 0, ""
-    m = _DOCKER_TS_RE.match(line)
-    if not m:
-        return 0, line
-    try:
-        dt = datetime(
-            int(m.group(1)), int(m.group(2)), int(m.group(3)),
-            int(m.group(4)), int(m.group(5)), int(m.group(6)),
-            tzinfo=timezone.utc
-        )
-        ts = int(dt.timestamp())
-        # 跳过时间戳部分（含可选纳秒 + Z + 空格）
-        rest = line[m.end():]
-        if rest and rest[0] == '.':
-            rest = rest[1:]  # skip '.'
-            rest = rest.lstrip('0123456789')  # strip nanosecond digits
-            if rest and rest[0] == 'Z':
-                rest = rest[1:]
-            if rest and rest[0] == ' ':
-                rest = rest[1:]
-        elif rest and rest[0] == 'Z':
-            rest = rest[1:]
-            if rest and rest[0] == ' ':
-                rest = rest[1:]
-        return ts, rest
-    except (ValueError, OverflowError):
-        return 0, line
+    ts, _, rest = _parse_ts(line)
+    return ts, rest
+
+
+def _cursor_from_ts(ts: int, us: int) -> str:
+    """由行时间戳构造下轮采集游标：微秒精度 +1μs 跳过边界。
+
+    docker logs --since 为含边界的 >= 过滤，游标直接取最后一行时间戳会导致
+    该行（及同秒所有行）每轮重复采集；+1μs 后既不重复也不遗漏。"""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc).replace(microsecond=us)
+    return (dt + timedelta(microseconds=1)).isoformat()
 
 
 def _build_log_file_path(base_dir: str, env: str, service: str, date_str: str) -> str:
@@ -191,23 +209,30 @@ class LogCollector:
         # 批量读取所有容器采集游标（1 次连接），构建各容器增量命令
         states = self._load_scan_states(env_name, host)
         cmds, metas = [], []
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         for container in containers:
-            last_ts = states.get(container, "")
+            st = states.get(container, {})
+            last_ts = st.get("last_ts", "")
             safe_container = shlex.quote(container)
+            # 截断用 tail（保留最新）而非 head（保留最旧）：增量窗口内超量时
+            # head 会丢弃最新日志且游标推进越过它们（永久丢失）；tail 只丢弃
+            # 窗口内较旧行，最新日志与游标连续性不受影响
             if last_ts:
-                cmd = f"docker logs --since '{last_ts}' -t {safe_container} 2>&1 | head -{self.max_lines}"
+                cmd = f"docker logs --since '{last_ts}' -t {safe_container} 2>&1 | tail -n {self.max_lines}"
             else:
-                cmd = f"docker logs --since 5m -t {safe_container} 2>&1 | head -{self.max_lines}"
+                cmd = f"docker logs --since 5m -t {safe_container} 2>&1 | tail -n {self.max_lines}"
             cmds.append(cmd)
-            metas.append((container, last_ts))
+            metas.append((container, last_ts, st))
         try:
             # 单连接顺序执行（每条命令独立 timeout）；任一失败整批标记，下轮重试
             outs = _ssh_exec_multi(host, port, ssh_cfg, cmds, timeout=30)
-            for (container, last_ts), out in zip(metas, outs):
+            for (container, last_ts, st), out in zip(metas, outs):
                 with self._lock:
                     self._fail_counts.pop((env_name, host, container), None)
+                # 跨日（或首次采集）：新日期文件，文件级偏移基准重置为 0
+                file_offset = st.get("file_offset", 0) if st.get("file_date") == today else 0
                 self._collect_container_output(env_name, env_id, host, container,
-                                               out, last_ts)
+                                               out, last_ts, file_offset)
         except Exception:
             with self._lock:
                 for container, _ in metas:
@@ -215,15 +240,21 @@ class LogCollector:
                         self._fail_counts.get((env_name, host, container), 0) + 1
 
     def _load_scan_states(self, env_name: str, host: str) -> dict:
-        """批量读取服务器所有容器采集游标：{container: last_ts}（1 次连接）"""
+        """批量读取服务器所有容器采集游标：
+        {container: {"last_ts", "file_offset", "file_date"}}（1 次连接）
+        file_offset 为文件级累计逻辑字节偏移（log_scan_state.last_line）"""
         conn = dbm.get_conn(self.db_path)
         try:
             rows = conn.execute(
-                "SELECT container, last_ts FROM log_scan_state "
+                "SELECT container, last_ts, last_line, file_date FROM log_scan_state "
                 "WHERE env=? AND server=?",
                 (env_name, host)
             ).fetchall()
-            return {r["container"]: r["last_ts"] or "" for r in rows}
+            return {r["container"]: {
+                "last_ts": r["last_ts"] or "",
+                "file_offset": r["last_line"] or 0,
+                "file_date": r["file_date"] or "",
+            } for r in rows}
         finally:
             conn.close()
 
@@ -231,12 +262,16 @@ class LogCollector:
                            ssh_cfg: dict, container: str, port: int):
         """采集单个容器（独立 SSH，兼容单容器路径）；批量采集走 _collect_server"""
         key = (env_name, host, container)
-        last_ts = self._load_scan_states(env_name, host).get(container, "")
+        states = self._load_scan_states(env_name, host)
+        st = states.get(container, {})
+        last_ts = st.get("last_ts", "")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         safe_container = shlex.quote(container)
+        # 截断用 tail（保留最新）而非 head（保留最旧），原因见 _collect_server
         if last_ts:
-            cmd = f"docker logs --since '{last_ts}' -t {safe_container} 2>&1 | head -{self.max_lines}"
+            cmd = f"docker logs --since '{last_ts}' -t {safe_container} 2>&1 | tail -n {self.max_lines}"
         else:
-            cmd = f"docker logs --since 5m -t {safe_container} 2>&1 | head -{self.max_lines}"
+            cmd = f"docker logs --since 5m -t {safe_container} 2>&1 | tail -n {self.max_lines}"
         try:
             out = self.ssh_func(host, port, ssh_cfg, cmd, timeout=30)
             with self._lock:
@@ -245,11 +280,20 @@ class LogCollector:
             with self._lock:
                 self._fail_counts[key] = self._fail_counts.get(key, 0) + 1
             return
-        self._collect_container_output(env_name, env_id, host, container, out, last_ts)
+        # 跨日（或首次采集）：新日期文件，文件级偏移基准重置为 0
+        file_offset = st.get("file_offset", 0) if st.get("file_date") == today else 0
+        self._collect_container_output(env_name, env_id, host, container, out,
+                                       last_ts, file_offset)
 
     def _collect_container_output(self, env_name: str, env_id: int, host: str,
-                                  container: str, out: str, last_ts: str):
-        """处理单容器采集输出：解析行 → 归档文件 → FTS 索引 → 关键词扫描 → 游标"""
+                                  container: str, out: str, last_ts: str,
+                                  file_offset: int = 0):
+        """处理单容器采集输出：解析行 → 归档文件 → FTS 索引 → 关键词扫描 → 游标
+
+        file_offset: 该容器当日日志文件的“文件级逻辑字节偏移”基准（跨日重置 0）。
+        line_offset 语义与 log_routes.log_context 的定位逻辑一致：
+        从文件头逐行累加源行字节长度（无 \r）得到的文件级偏移。
+        """
         if not out or not out.strip():
             return
 
@@ -264,12 +308,13 @@ class LogCollector:
         self._append_to_file(file_path, lines)
 
         entries = []
-        line_offset = 0
+        line_offset = file_offset
         last_line_ts = last_ts
         for i, raw_line in enumerate(lines):
-            ts, content = _parse_docker_log_line(raw_line.rstrip("\n"))
+            ts, us, content = _parse_ts(raw_line.rstrip("\n"))
             if ts > 0:
-                last_line_ts = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                # 游标推进到最后一行时间戳 +1μs（跳过 --since 含边界导致的重复）
+                last_line_ts = _cursor_from_ts(ts, us)
             entries.append((ts or int(time.time()), env_name, service, content,
                             file_path, line_offset, 1))
             line_offset += len(raw_line.encode("utf-8", "ignore"))
@@ -278,7 +323,7 @@ class LogCollector:
             rowids = self._index_log_entries(entries)
             self._scan_keywords_in_entries(entries, env_name, env_id, rowids)
             self._update_scan_state(env_name, host, container, service,
-                                    last_line_ts or "", line_offset)
+                                    last_line_ts or "", line_offset, today)
 
     def _append_to_file(self, file_path: str, lines: list):
         """追加日志行到文件（自动创建目录）"""
@@ -388,8 +433,9 @@ class LogCollector:
                     break  # 本规则已触发，不再扫描后续日志行（指纹去重）
 
     def _update_scan_state(self, env: str, server: str, container: str,
-                           service: str, last_ts: str, last_line: int):
-        """更新采集游标（upsert）"""
+                           service: str, last_ts: str, last_line: int,
+                           file_date: str = ""):
+        """更新采集游标（upsert）；last_line 为文件级累计逻辑字节偏移（跨日重置）"""
         conn = dbm.get_conn(self.db_path)
         try:
             existing = conn.execute(
@@ -398,14 +444,14 @@ class LogCollector:
             ).fetchone()
             if existing:
                 conn.execute(
-                    "UPDATE log_scan_state SET last_ts=?, last_line=?, updated_at=? WHERE id=?",
-                    (last_ts, last_line, int(time.time()), existing["id"])
+                    "UPDATE log_scan_state SET last_ts=?, last_line=?, file_date=?, updated_at=? WHERE id=?",
+                    (last_ts, last_line, file_date, int(time.time()), existing["id"])
                 )
             else:
                 conn.execute(
-                    "INSERT INTO log_scan_state (env, server, container, service, last_ts, last_line, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (env, server, container, service, last_ts, last_line, int(time.time()))
+                    "INSERT INTO log_scan_state (env, server, container, service, last_ts, last_line, file_date, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (env, server, container, service, last_ts, last_line, file_date, int(time.time()))
                 )
             conn.commit()
         finally:

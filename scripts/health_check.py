@@ -12,11 +12,9 @@ def check_http(url: str, timeout: int = 10) -> bool:
     try:
         resp = requests.get(url, timeout=timeout)
         if resp.status_code == 200:
-            # Spring Boot Actuator 会返回 UP
+            # Spring Boot Actuator 会返回 UP；空 body 端点（如静态健康页）视为健康
             body = resp.text
-            if "UP" in body or "ok" in body.lower():
-                return True
-            return True
+            return (not body.strip()) or "UP" in body or "ok" in body.lower()
         return False
     except Exception as e:
         log(f"健康检查请求失败: {e}")

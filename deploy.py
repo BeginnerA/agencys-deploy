@@ -118,11 +118,14 @@ def local_image_id(image: str) -> str:
 
 
 def tar_image_id(tar_path: Path) -> str:
-    """读取 docker save 导出的 tar 包内镜像 ID（config 文件名）；无法解析返回 None"""
+    """读取 docker save 导出的 tar/tar.gz 包内镜像 ID（config 文件名）；无法解析返回 None
+
+    "r:*" 模式自动识别 gzip 压缩，普通 tar 与 tar.gz 均可读取。
+    """
     try:
         import json
         import tarfile
-        with tarfile.open(str(tar_path), "r") as tf:
+        with tarfile.open(str(tar_path), "r:*") as tf:
             manifest = json.loads(tf.extractfile("manifest.json").read())
         cfg = manifest[0]["Config"]  # 形如 <sha256 十六进制>.json
         if cfg.endswith(".json"):
@@ -254,9 +257,13 @@ class RemoteServer:
         elapsed = time.time() - start_time
         log(f"[{self.host}] 上传完成 {label}，耗时 {elapsed:.1f}s")
 
-    def exec(self, cmd: str, timeout: int = 60) -> str:
+    def exec(self, cmd: str, timeout: int = 60, stdin_data: str = None) -> str:
+        """远程执行命令；stdin_data 非空时写入子进程 stdin（密码等敏感数据不落命令行）"""
         log(f"[{self.host}] {cmd}")
         stdin, stdout, stderr = self.client().exec_command(cmd, timeout=timeout)
+        if stdin_data:
+            stdin.write(stdin_data)
+            stdin.flush()
         out = stdout.read().decode("utf-8", errors="ignore")
         err = stderr.read().decode("utf-8", errors="ignore")
         rc = stdout.channel.recv_exit_status()
@@ -532,20 +539,71 @@ class Deployer:
             log(f"[{server.host}] 未配置镜像仓库账号，跳过 docker login")
             return
         log(f"[{server.host}] Docker 登录 {host} (用户: {username})")
-        # 通过 stdin 传递密码，避免密码出现在进程参数中
+        # 密码经 exec 的 stdin 通道传递（--password-stdin），shell 命令行/进程参数
+        # 中均不出现密码（echo 拼接仍会短暂暴露于 ps，禁止使用）
         server.exec(
-            f"echo '{password}' | docker login {host} -u {username} --password-stdin",
+            f"docker login {host} -u {username} --password-stdin",
             timeout=30,
+            stdin_data=password + "\n",
         )
         self._docker_logged_in.add(server.host)
         log(f"[{server.host}] Docker 登录成功")
 
-    def ensure_image_ready(self, server: RemoteServer, version: str = None):
-        """直传模式：确保目标服务器存在与本地一致的指定版本镜像（save → scp → load）
+    def _ensure_local_tar(self, version: str = None) -> tuple:
+        """确保本地镜像包已导出（gzip 压缩），返回 (local_tar, local_id, image)
 
-        以镜像 ID（digest）为一致性依据：服务器已有同 tag 但内容不同（如同版本
-        重复发布新代码）时仍会重新传输；本地与远端一致则跳过。本地缺少该镜像且
-        远端已有（跳过构建场景）时维持现状不传输；都缺失时抛异常。
+        复用规则：本地 tar 与当前本地镜像 digest 一致才复用；本地缺少镜像
+        （跳过构建场景）但已有可用 tar 时也复用。
+        """
+        version = version or self.version
+        image = f"{self.image_prefix}{self.image_name}:{version}"
+        local_id = local_image_id(image)
+        tar_name = f"{self.image_name}_{version}.tar.gz"
+        local_tar = self.dist_dir / tar_name
+        if local_tar.exists() and (local_id is None or tar_image_id(local_tar) == local_id):
+            log(f"复用本地镜像包（与本地镜像一致）: {local_tar}")
+        else:
+            if local_id is None:
+                raise RuntimeError(f"本地缺少镜像 {image}，且本地镜像包不可用")
+            log(f"本地导出镜像 {image} -> {local_tar}（gzip 压缩）")
+            self.dist_dir.mkdir(parents=True, exist_ok=True)
+            with self._save_lock:
+                # 并行发布/预传输时其他线程可能已导出同一版本，校验内容一致才复用
+                if local_tar.exists() and tar_image_id(local_tar) == local_id:
+                    log(f"镜像包已被其他任务导出，复用: {local_tar}")
+                else:
+                    # docker save 流式输出并 gzip 压缩：传输量约减 1/3，
+                    # 避免未压缩中间文件；远端 docker load 自动识别 gzip
+                    import gzip
+                    proc = subprocess.Popen(
+                        ["docker", "save", image],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    )
+                    try:
+                        with gzip.open(str(local_tar), "wb", compresslevel=6) as fout:
+                            while True:
+                                chunk = proc.stdout.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                fout.write(chunk)
+                    finally:
+                        proc.stdout.close()
+                    err = proc.stderr.read().decode("utf-8", errors="ignore")
+                    proc.stderr.close()
+                    rc = proc.wait()
+                    if rc != 0:
+                        local_tar.unlink(missing_ok=True)  # 清理残留的半成品包
+                        raise RuntimeError(
+                            f"本地 docker save {image} 失败（本地可能没有该版本镜像）: "
+                            f"{err.strip()}"
+                        )
+        return local_tar, local_id, image
+
+    def _transfer_image_to_server(self, server: RemoteServer, version: str = None):
+        """单台服务器镜像就绪：远端一致则跳过，否则上传镜像包并 docker load 校验
+
+        滚动发布（ensure_image_ready）与并行预传输（prefetch_images）共用；
+        幂等：远端已与本地一致时直接返回。
         """
         version = version or self.version
         image = f"{self.image_prefix}{self.image_name}:{version}"
@@ -559,29 +617,8 @@ class Deployer:
                 log(f"[{server.host}] 远端镜像与本地一致（{local_id[:12]}），跳过传输: {image}")
                 return
             log(f"[{server.host}] 远端 {image} 与本地不一致（{remote_id[:12]} != {local_id[:12]}），重新传输")
-        tar_name = f"{self.image_name}_{version}.tar"
-        local_tar = self.dist_dir / tar_name
-        if local_tar.exists() and (local_id is None or tar_image_id(local_tar) == local_id):
-            log(f"复用本地镜像包（与本地镜像一致）: {local_tar}")
-        else:
-            if local_id is None:
-                raise RuntimeError(f"本地缺少镜像 {image}，且本地镜像包不可用")
-            log(f"本地导出镜像 {image} -> {local_tar}")
-            self.dist_dir.mkdir(parents=True, exist_ok=True)
-            with self._save_lock:
-                # 并行发布时其他任务可能已导出同一版本，校验内容一致才复用
-                if local_tar.exists() and tar_image_id(local_tar) == local_id:
-                    log(f"镜像包已被其他任务导出，复用: {local_tar}")
-                else:
-                    result = subprocess.run(
-                        ["docker", "save", "-o", str(local_tar), image],
-                        capture_output=True, text=True,
-                    )
-                    if result.returncode != 0:
-                        raise RuntimeError(
-                            f"本地 docker save {image} 失败（本地可能没有该版本镜像）: "
-                            f"{result.stderr.strip() or result.stdout.strip()}"
-                        )
+        local_tar, local_id, image = self._ensure_local_tar(version)
+        tar_name = f"{self.image_name}_{version}.tar.gz"
         log(f"[{server.host}] 上传镜像包 {tar_name} 到 {self.remote_tmp_dir} ...")
         server.exec(f"mkdir -p {self.remote_tmp_dir}", timeout=15)
         server.sftp_put_with_progress(str(local_tar), f"{self.remote_tmp_dir}/{tar_name}", label=tar_name)
@@ -594,6 +631,49 @@ class Deployer:
         elif not loaded_id:
             raise RuntimeError(f"[{server.host}] docker load 后仍未找到镜像 {image}")
         log(f"[{server.host}] 镜像就绪: {image}")
+
+    def ensure_image_ready(self, server: RemoteServer, version: str = None):
+        """直传模式：确保目标服务器存在与本地一致的指定版本镜像（save → 上传 → load）
+
+        以镜像 ID（digest）为一致性依据：服务器已有同 tag 但内容不同（如同版本
+        重复发布新代码）时仍会重新传输；本地与远端一致则跳过。本地缺少该镜像且
+        远端已有（跳过构建场景）时维持现状不传输；都缺失时抛异常。
+        """
+        self._transfer_image_to_server(server, version)
+
+    def prefetch_images(self, servers: list) -> list:
+        """直传模式：并行预传输镜像包到所有服务器（上传 + docker load 并行）
+
+        本地导出只做一次（_ensure_local_tar 内 _save_lock 保证），各服务器使用
+        独立 SSH 连接并行传输，传输耗时从 N 倍降为 1 倍。滚动发布阶段会对失败
+        服务器自动重试（_transfer_image_to_server 幂等），因此预传输失败只记录、
+        不中断流程。仓库模式（push）镜像已在构建阶段推送，直接返回空列表。
+        """
+        if self.registry_mode != "direct":
+            return []
+        log(f">>> 并行预传输镜像到 {len(servers)} 台服务器（直传模式，上传+load 并行）")
+
+        def _prefetch_one(srv: dict) -> tuple:
+            host = srv["ip"]
+            server = RemoteServer(host, merge_server_ssh(self.ssh_cfg, srv))
+            try:
+                self._transfer_image_to_server(server)
+                log(f"[{host}] 镜像预传输完成")
+                return host, True
+            except Exception as e:
+                log(f"[{host}] 镜像预传输失败: {e}")
+                return host, False
+            finally:
+                server.close()
+
+        from concurrent.futures import ThreadPoolExecutor
+        workers = max(1, min(len(servers), 8))  # 上限 8，避免并发过多挤占带宽
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(_prefetch_one, servers))
+        failures = [host for host, ok in results if not ok]
+        log(f"镜像预传输完成：成功 {len(servers) - len(failures)} 台" +
+            (f"，失败 {len(failures)} 台: {failures}（滚动阶段自动重试）" if failures else "，全部就绪"))
+        return failures
 
     def _nacos_ip(self, server_entry: dict) -> str:
         """Nacos 操作使用的 IP：优先用 nacos_ip（内网），回退到 ip（外网）"""
@@ -684,7 +764,12 @@ class Deployer:
         else:
             log(">>> 步骤 2/5: 无需暂停 SnailJob")
 
-        log(">>> 步骤 3/5: 滚动发布" + ("（金丝雀模式）" if self.canary else ""))
+        log(">>> 步骤 3/6: 并行预传输镜像" +
+            ("（直传模式，上传+load 并行）" if self.registry_mode == "direct" else "（仓库模式，构建时已推送，跳过）"))
+        prefetch_failures = self.prefetch_images(servers)
+        if prefetch_failures:
+            log(f"预传输失败 {len(prefetch_failures)} 台（滚动发布时将自动重试）: {prefetch_failures}")
+        log(">>> 步骤 4/6: 滚动发布" + ("（金丝雀模式）" if self.canary else ""))
         success_all = True  # 全部服务器成功的汇总标志，任一台失败或中断即置 False
         # canary batch: read from DB
         canary_batches = None
@@ -771,17 +856,17 @@ class Deployer:
         finally:
             # 无论发布成功/失败/异常，都必须恢复 SnailJob，避免任务组长期停留在暂停状态
             if group and not skip_snailjob:
-                log(f">>> 步骤 4/5: 恢复 SnailJob group={group}")
+                log(f">>> 步骤 5/6: 恢复 SnailJob group={group}")
                 # 按备份快照精确恢复：只恢复备份前运行的任务，备份前暂停的保持暂停
                 restore_jobs(group, backup, env=self.env)
             else:
-                log(">>> 步骤 4/5: 无需恢复 SnailJob")
+                log(">>> 步骤 5/6: 无需恢复 SnailJob")
 
         if clear_summary_flag:
-            log(">>> 步骤 5/5: 清零 sj_job_summary 计数器")
+            log(">>> 步骤 6/6: 清零 sj_job_summary 计数器")
             clear_summary(env=self.env)
         else:
-            log(">>> 步骤 5/5: 不清零计数器")
+            log(">>> 步骤 6/6: 不清零计数器")
 
         if success_all:
             log("全部服务器发布完成")
@@ -790,10 +875,14 @@ class Deployer:
                         elapsed=f"{time.time() - start_ts:.0f}s")
             if not self._no_git_tag and self.proj_cfg.get("git_tag_enabled", True):
                 from git_tag import tag_project
+                # git_tag_suffix 显式配置优先；未配置时默认用环境名做后缀隔离，
+                # 避免多环境同版本发布互相覆盖 tag 指向（如 prod 已打 v1.0.30，
+                # test 再打会强制移动该 tag 到 test HEAD，prod 历史丢失）
+                suffix = self.config["deploy"].get("git_tag_suffix") or self.env or ""
                 tag_project(self.proj_cfg, self.version,
                             self.config["deploy"]["project_root"],
                             push=not self._skip_git_push,
-                            suffix=self.config["deploy"].get("git_tag_suffix", ""))
+                            suffix=suffix)
         else:
             log("发布中断，已回滚失败服务器")
             send_notify(self.config, "failed", project=self.project, version=self.version,
@@ -804,7 +893,7 @@ class Deployer:
     def rollback_all(self, servers: list, skip_snailjob: bool = False):
         """全量回滚：将所有服务器从当前版本回滚到 previous_version
 
-        流程与 run() 类似，但跳过构建，逐台执行：Nacos 下线 → 回滚容器 → 健康检查 → Nacos 上线。
+        流程与 run() 类似，但跳过构建，各服务器并行执行：Nacos 下线 → 回滚容器 → 健康检查 → Nacos 上线。
         某台失败不阻断后续服务器（尽量多回滚），最终汇总结果。
         """
         if not self.previous_version:
@@ -827,67 +916,75 @@ class Deployer:
         else:
             log(">>> 步骤 1/3: 无需暂停 SnailJob")
 
-        log(">>> 步骤 2/3: 逐台回滚")
-        rollback_results = {}  # {host: bool}
-        try:
-            for srv in servers:
-                host = srv["ip"]
-                log(f"\n========== 开始回滚 {host} ==========")
-                ssh_cfg = merge_server_ssh(self.ssh_cfg, srv)
-                server = RemoteServer(host, ssh_cfg)
-                nacos_ip = self._nacos_ip(srv)
-                snapshotted = False
-                container_rolled_back = False
-                try:
-                    self.nacos_offline(nacos_ip)
-                    # 记录回滚前 Nacos 是否确实有该服务的实例（用于后续判断是否需要等待 Nacos 上线）
-                    snapshotted = any(
-                        (svc, grp, nacos_ip) in self.nacos._snapshotted_keys
-                        for svc in self.service_names()
-                        for grp in self.nacos_groups()
-                    )
-                    self.rollback_container(server)
-                    container_rolled_back = True  # rollback_container 成功即标记
-                    wait_for_healthy(host, self.project, ssh_override=srv, env=self.env)
-                    # 容器回滚成功 + 健康检查通过
+        log(">>> 步骤 2/3: 并行回滚所有服务器（各服务器独立 SSH 连接，传输+容器回滚并行）")
+
+        def _rollback_one(srv: dict) -> tuple:
+            """单台回滚：Nacos 下线 → 回滚容器 → 健康检查 → Nacos 上线，返回 (host, ok)"""
+            host = srv["ip"]
+            log(f"\n========== 开始回滚 {host} ==========")
+            ssh_cfg = merge_server_ssh(self.ssh_cfg, srv)
+            server = RemoteServer(host, ssh_cfg)
+            nacos_ip = self._nacos_ip(srv)
+            snapshotted = False
+            container_rolled_back = False
+            try:
+                self.nacos_offline(nacos_ip)
+                # 记录回滚前 Nacos 是否确实有该服务的实例（用于后续判断是否需要等待 Nacos 上线）
+                snapshotted = any(
+                    (svc, grp, nacos_ip) in self.nacos._snapshotted_keys
+                    for svc in self.service_names()
+                    for grp in self.nacos_groups()
+                )
+                self.rollback_container(server)
+                container_rolled_back = True  # rollback_container 成功即标记
+                wait_for_healthy(host, self.project, ssh_override=srv, env=self.env)
+                # 容器回滚成功 + 健康检查通过
+                if snapshotted:
+                    # 回滚前服务在 Nacos 有注册，需要恢复上线并等待健康
+                    try:
+                        self.nacos_online(nacos_ip, weight=1.0)
+                    except Exception as ne:
+                        # 容器已回滚成功，仅 Nacos 上线失败，记为警告而非失败
+                        log(f"[{host}] 警告: 容器回滚成功，但 Nacos 上线异常: {ne}")
+                else:
+                    # 回滚前服务就未在 Nacos 注册，尝试上线但不等待健康
+                    try:
+                        self.nacos_online(nacos_ip, weight=1.0)
+                    except Exception:
+                        pass
+                log(f"========== {host} 回滚成功 ==========")
+                return host, True
+            except Exception as e:
+                log(f"[{host}] 回滚异常: {e}")
+                if container_rolled_back:
+                    # 容器已成功回滚到目标版本，仅 Nacos 等后续步骤失败
+                    log(f"[{host}] 警告: 容器已回滚到 {self.previous_version}，但后续步骤异常: {e}")
                     if snapshotted:
-                        # 回滚前服务在 Nacos 有注册，需要恢复上线并等待健康
-                        try:
-                            self.nacos_online(nacos_ip, weight=1.0)
-                        except Exception as ne:
-                            # 容器已回滚成功，仅 Nacos 上线失败，记为警告而非失败
-                            log(f"[{host}] 警告: 容器回滚成功，但 Nacos 上线异常: {ne}")
-                    else:
-                        # 回滚前服务就未在 Nacos 注册，尝试上线但不等待健康
                         try:
                             self.nacos_online(nacos_ip, weight=1.0)
                         except Exception:
                             pass
-                    log(f"========== {host} 回滚成功 ==========")
-                    rollback_results[host] = True
-                except Exception as e:
-                    log(f"[{host}] 回滚异常: {e}")
-                    if container_rolled_back:
-                        # 容器已成功回滚到目标版本，仅 Nacos 等后续步骤失败
-                        log(f"[{host}] 警告: 容器已回滚到 {self.previous_version}，但后续步骤异常: {e}")
-                        if snapshotted:
-                            try:
-                                self.nacos_online(nacos_ip, weight=1.0)
-                            except Exception:
-                                pass
-                        log(f"========== {host} 回滚成功（容器已回滚，Nacos 待恢复） ==========")
-                        rollback_results[host] = True
-                    else:
-                        # 容器未成功回滚
-                        if snapshotted:
-                            try:
-                                self.nacos_online(nacos_ip, weight=1.0)
-                            except Exception:
-                                pass
-                        log(f"========== {host} 回滚失败 ==========")
-                        rollback_results[host] = False
-                finally:
-                    server.close()
+                    log(f"========== {host} 回滚成功（容器已回滚，Nacos 待恢复） ==========")
+                    return host, True
+                # 容器未成功回滚
+                if snapshotted:
+                    try:
+                        self.nacos_online(nacos_ip, weight=1.0)
+                    except Exception:
+                        pass
+                log(f"========== {host} 回滚失败 ==========")
+                return host, False
+            finally:
+                server.close()
+
+        rollback_results = {}  # {host: bool}
+        try:
+            # 本地旧版本镜像包只导出一次（_ensure_local_tar 内 _save_lock 保证），
+            # 各服务器并行回滚，耗时从 N 倍降为 1 倍（受最慢服务器瓶颈）
+            from concurrent.futures import ThreadPoolExecutor
+            workers = max(1, min(len(servers), 8))  # 上限 8，与并行预传输一致
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                rollback_results = dict(pool.map(_rollback_one, servers))
         finally:
             if group and not skip_snailjob:
                 log(f">>> 步骤 3/3: 恢复 SnailJob group={group}")
@@ -911,8 +1008,8 @@ class Deployer:
     def push_image_only(self, servers: list):
         """仅推送镜像到服务器，不执行发布（不 Nacos 下线、不更新容器）
 
-        仅在直传模式下有效：docker save → scp → docker load。
-        仓库模式（push）的镜像已在构建阶段推送到 registry，无需额外操作。
+        直传模式：并行 docker save → 上传 → docker load；仓库模式（push）的
+        镜像已在构建阶段推送到 registry，无需额外操作。
         """
         if self.registry_mode != "direct":
             log(f"当前为仓库模式（{self.registry_mode}），构建阶段已将镜像推送到 registry，无需额外推送")
@@ -921,23 +1018,10 @@ class Deployer:
         log(f">>> 推送镜像模式：{self.project} {self.version}")
         log(f">>> 目标服务器: {[s['ip'] for s in servers]}")
 
-        success_count = 0
-        for srv in servers:
-            host = srv["ip"]
-            ssh_cfg = merge_server_ssh(self.ssh_cfg, srv)
-            server = RemoteServer(host, ssh_cfg)
-            try:
-                self.ensure_image_ready(server)
-                log(f"[{host}] 镜像推送成功")
-                success_count += 1
-            except Exception as e:
-                log(f"[{host}] 镜像推送失败: {e}")
-            finally:
-                server.close()
-
-        fail_count = len(servers) - success_count
-        log(f"\n推送结果：成功 {success_count} 台，失败 {fail_count} 台")
-        return fail_count == 0
+        failures = self.prefetch_images(servers)
+        success_count = len(servers) - len(failures)
+        log(f"\n推送结果：成功 {success_count} 台，失败 {len(failures)} 台")
+        return len(failures) == 0
 
 
 def main():

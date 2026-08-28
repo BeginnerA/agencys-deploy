@@ -302,9 +302,10 @@ def _probe_health_url(host: str, port: int, url: str, timeout: int = 5) -> dict:
 
 def _compute_security(servers: list) -> dict:
     """计算 SSH 安全配置评分
-    返回 {"score": int, "key_ratio": float, "total": int}"""
+    返回 {"score": int|None, "key_ratio": float|None, "total": int}；
+    total=0 时 score/key_ratio 为 None（无数据，前端显示占位而非误导性满分）"""
     if not servers:
-        return {"score": 95, "key_ratio": 1.0, "total": 0}
+        return {"score": None, "key_ratio": None, "total": 0}
     key_count = sum(1 for s in servers if s.get("ssh_key_file"))
     pwd_only = sum(1 for s in servers if not s.get("ssh_key_file") and s.get("ssh_password"))
     no_auth = sum(1 for s in servers if not s.get("ssh_key_file") and not s.get("ssh_password"))
@@ -865,7 +866,7 @@ class MonitorScheduler:
         if not envs:
             return {"services": {}, "servers": [], "ts": 0, "env": "",
                     "resources": {}, "health_checks": {},
-                    "security": {"score": 95, "key_ratio": 1.0, "total": 0},
+                    "security": {"score": None, "key_ratio": None, "total": 0},
                     "host_metrics": {}, "extended_metrics": {}}
         all_servers = {}  # host -> entry (取最新 ts)
         all_services = {}
@@ -899,7 +900,7 @@ class MonitorScheduler:
         return {"services": all_services, "servers": list(all_servers.values()),
                 "ts": latest_ts, "env": "",
                 "resources": all_resources, "health_checks": all_health,
-                "security": {"score": 95, "key_ratio": 1.0, "total": len(all_servers)},
+                "security": {"score": None, "key_ratio": None, "total": len(all_servers)},
                 "host_metrics": all_hm, "extended_metrics": all_ext}
 
     @staticmethod
@@ -915,7 +916,7 @@ class MonitorScheduler:
         if not cache_copy:
             return {"services": {}, "servers": [], "ts": 0, "env": "",
                     "resources": {}, "health_checks": {},
-                    "security": {"score": 95, "key_ratio": 1.0, "total": 0},
+                    "security": {"score": None, "key_ratio": None, "total": 0},
                     "host_metrics": {}, "extended_metrics": {}}
         all_servers = {}  # host -> entry (取最新 ts)
         all_services = {}
@@ -943,7 +944,7 @@ class MonitorScheduler:
         return {"services": all_services, "servers": list(all_servers.values()),
                 "ts": latest_ts, "env": "",
                 "resources": all_resources, "health_checks": all_health,
-                "security": {"score": 95, "key_ratio": 1.0, "total": len(all_servers)},
+                "security": {"score": None, "key_ratio": None, "total": len(all_servers)},
                 "host_metrics": all_hm, "extended_metrics": all_ext}
 
     def get_overview(self, project_id: int = None, env: str = None) -> dict:
@@ -966,13 +967,13 @@ class MonitorScheduler:
         if not data:
             return {"services": {}, "servers": [], "ts": 0, "env": env_obj["name"],
                     "resources": {}, "health_checks": {},
-                    "security": {"score": 95, "key_ratio": 1.0, "total": 0},
+                    "security": {"score": None, "key_ratio": None, "total": 0},
                     "host_metrics": {}, "extended_metrics": {}}
         return {"services": data["services"], "servers": data["servers"],
                 "ts": data["ts"], "env": env_obj["name"],
                 "resources": data.get("resources", {}),
                 "health_checks": data.get("health_checks", {}),
-                "security": data.get("security", {"score": 95, "key_ratio": 1.0, "total": 0}),
+                "security": data.get("security", {"score": None, "key_ratio": None, "total": 0}),
                 "host_metrics": data.get("host_metrics", {}),
                 "extended_metrics": data.get("extended_metrics", {})}
 

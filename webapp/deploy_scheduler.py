@@ -1,8 +1,63 @@
 """发布调度器：定时发布 + 窗口管控 + 灰度推进"""
 import json
+import os
+import socket
 import sys
 import threading
 import time
+
+
+# 调度执行互斥锁名（多实例/多 worker 部署时保证同一时刻仅一个实例处理到期计划）
+_SCHEDULER_LOCK = "deploy_scheduler"
+# 锁租约：单轮处理耗时 + 余量；崩溃残留锁过期后自动可重新获取
+_LOCK_TTL = 300
+
+
+def _lock_owner() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def try_acquire_scheduler_lock(db_path: str, ttl: int = _LOCK_TTL) -> bool:
+    """获取调度执行租约锁（SQLite 事务串行化，多进程安全）。
+
+    锁记录带过期时间：持有进程崩溃时残留锁在 TTL 后自动失效。"""
+    from . import db as dbm
+    owner = _lock_owner()
+    conn = dbm.get_conn(db_path)
+    try:
+        now = int(time.time())
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT expires_at FROM scheduler_locks WHERE name=?",
+            (_SCHEDULER_LOCK,)
+        ).fetchone()
+        if row and row["expires_at"] > now:
+            return False  # 其他实例持有中
+        conn.execute(
+            "INSERT INTO scheduler_locks (name, owner, acquired_at, expires_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET owner=excluded.owner, "
+            "acquired_at=excluded.acquired_at, expires_at=excluded.expires_at",
+            (_SCHEDULER_LOCK, owner, now, now + ttl)
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def release_scheduler_lock(db_path: str):
+    """释放本实例持有的调度锁（仅删除 owner 匹配的记录，防误删他人锁）"""
+    from . import db as dbm
+    conn = dbm.get_conn(db_path)
+    try:
+        conn.execute(
+            "DELETE FROM scheduler_locks WHERE name=? AND owner=?",
+            (_SCHEDULER_LOCK, _lock_owner())
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def compute_canary_batches(steps: list, total_servers: int) -> list:
@@ -156,7 +211,17 @@ class DeployScheduler:
             (now,), "next_run_at")
 
     def _process_due(self, schedules: list):
-        """处理到期计划：窗口检查 → 创建任务 → 更新下次执行时间"""
+        """处理到期计划（带租约锁）；锁被其他实例持有时跳过本轮"""
+        if not try_acquire_scheduler_lock(self._db_path):
+            print(f"[deploy-sched] 调度锁被其他实例持有，本轮跳过（{len(schedules)} 个到期计划）")
+            return
+        try:
+            self._process_due_locked(schedules)
+        finally:
+            release_scheduler_lock(self._db_path)
+
+    def _process_due_locked(self, schedules: list):
+        """持锁后的到期计划处理：窗口检查 → 创建任务 → 更新下次执行时间"""
         from . import db as dbm
         now = int(time.time())
         for sched in schedules:
@@ -205,6 +270,13 @@ class DeployScheduler:
         updates = {"last_run_at": now}
         if sched["type"] == "cron" and sched.get("cron_expr"):
             next_ts = self._calc_next_run("cron", sched["cron_expr"], now)
+            if next_ts is None:
+                # 解析失败：不推进 next_run_at（保留原值，下轮继续尝试触发日志），
+                # 避免写 0 导致计划静默失效且无任何告警
+                print(f"[deploy-sched] !! 计划 {sched['name']} (id={sched['id']}) CRON 解析失败"
+                      f" '{sched.get('cron_expr')}'，保留 next_run_at={sched.get('next_run_at')} 待修复",
+                      file=sys.stderr)
+                return
             updates["next_run_at"] = next_ts
         else:
             # once 模式：执行后禁用
@@ -213,10 +285,10 @@ class DeployScheduler:
         dbm.update_record(self._db_path, "deploy_schedules", sched["id"], updates)
 
     def _calc_next_run(self, sched_type: str, cron_expr: str,
-                       base_ts: int) -> int:
-        """计算下次执行时间"""
+                       base_ts: int):
+        """计算下次执行时间；解析失败返回 None（调用方不得写入 0）"""
         if sched_type != "cron" or not cron_expr:
-            return 0
+            return None
         try:
             from croniter import croniter
             from datetime import datetime
@@ -226,4 +298,4 @@ class DeployScheduler:
         except (ImportError, ValueError, KeyError) as e:
             print(f"[deploy-sched] CRON 解析失败 '{cron_expr}': {e!r}",
                   file=sys.stderr)
-            return 0
+            return None

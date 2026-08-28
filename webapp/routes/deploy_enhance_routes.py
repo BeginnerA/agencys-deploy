@@ -129,6 +129,20 @@ def update_schedule(sid):
     for k in ("name", "env", "version", "previous_version", "cron_expr"):
         if k in body:
             fields[k] = body[k]
+    # cron 表达式合法性校验（与 create_schedule 对齐）：非法表达式会导致
+    # 调度器解析失败且不推进 next_run_at，计划静默停摆；更新时同时重算
+    # next_run_at，保证新表达式立即生效（原实现只存表达式不重算）
+    if "cron_expr" in fields:
+        cron_expr = fields["cron_expr"]
+        if not cron_expr:
+            return jsonify({"error": "cron_expr 不能为空"}), 400
+        try:
+            from croniter import croniter
+            from datetime import datetime
+            cron = croniter(cron_expr, datetime.now())
+            fields["next_run_at"] = int(cron.get_next())
+        except (ImportError, ValueError, KeyError) as e:
+            return jsonify({"error": f"cron 表达式无效: {e}"}), 400
     if "ref_id" in body:
         fields["ref_id"] = body["ref_id"]
     if "service_id" in body:

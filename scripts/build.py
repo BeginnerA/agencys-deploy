@@ -108,8 +108,9 @@ def find_mvn(config: dict = None) -> str:
         candidates = [
             *Path(r"C:\Program Files\JetBrains").glob("IntelliJ IDEA*/plugins/maven-plugin/lib/maven3/bin/mvn.cmd"),
             Path(r"C:\ProgramData\chocolatey\bin\mvn.cmd"),
-            Path(r"C:\Program Files\apache-maven*/bin/mvn.cmd"),
-            Path(r"D:\apache-maven*/bin/mvn.cmd"),
+            # 路径带 * 时必须用 glob（Path 字面量不会展开通配符，直接 exists 恒为 False）
+            *Path(r"C:\Program Files").glob("apache-maven*/bin/mvn.cmd"),
+            *Path("D:\\").glob("apache-maven*/bin/mvn.cmd"),
         ]
         for cand in candidates:
             if cand.exists():

@@ -1,4 +1,5 @@
 """大屏聚合路由：/api/dashboard/overview + /api/audit"""
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -13,6 +14,9 @@ dash_bp = Blueprint("dash", __name__)
 # 消除每轮 N+1 查询（每项目 services/environments）与 7/30 天 trend 全量重算
 _OVERVIEW_TTL = 2.5
 _overview_cache = {"ts": 0.0, "payload": None}
+# 缓存读写锁：gunicorn 多 worker 下该对象为进程内单例，但同进程多线程并发
+# 轮询时避免读到半写状态（大 payload 构造期间的竞态）
+_overview_lock = threading.Lock()
 
 
 def _day_start(ts: float) -> str:
@@ -46,8 +50,9 @@ def overview():
     now = time.time()
     cache = _overview_cache
     # TTL 内直接返回上次结果（任务/配置变更的可见延迟 ≤ TTL，大屏可接受）
-    if now - cache["ts"] < _OVERVIEW_TTL and cache["payload"] is not None:
-        return jsonify(cache["payload"])
+    with _overview_lock:
+        if now - cache["ts"] < _OVERVIEW_TTL and cache["payload"] is not None:
+            return jsonify(cache["payload"])
     db = current_app.config["DB_PATH"]
     projects = dbm.list_records(db, "projects")
     # 统计窗口为最近 500 条任务（list_tasks 上限约定），高频率发布下 7/30 天窗口早期可能被截断
@@ -88,8 +93,9 @@ def overview():
                     "status": t["status"], "started_at": t["started_at"]}
                    for t in tasks[:10]],
     }
-    _overview_cache["ts"] = now
-    _overview_cache["payload"] = out
+    with _overview_lock:
+        _overview_cache["ts"] = now
+        _overview_cache["payload"] = out
     return jsonify(out)
 
 
