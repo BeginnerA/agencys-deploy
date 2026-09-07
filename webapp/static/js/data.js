@@ -36,14 +36,18 @@ function computeAlerts(tasks, overview, monitorByProject){
            `已运行 ${Math.round(runningSec / 60)} 分钟（>30 分钟）`, t.started_at);
     }
   });
-  // 规则 3：服务异常（probe_failed / not_deployed 且服务 enabled）
+  // 规则 3：服务异常（probe_failed / stopped / not_deployed 且服务 enabled）
   Object.entries(monitorByProject || {}).forEach(([projectName, mon]) => {
     const svcs = (mon && mon.services) || {};
     Object.entries(svcs).forEach(([svcName, st]) => {
-      if (st.status !== 'probe_failed' && st.status !== 'not_deployed') return;
+      if (!['probe_failed', 'not_deployed', 'stopped'].includes(st.status)) return;
+      const kind = st.status === 'probe_failed' ? '探测失败'
+        : st.status === 'stopped' ? '已停止' : '未部署';
       push('svc_' + projectName + '_' + svcName, 'warning', 'service',
-           `服务 ${svcName}（${projectName}）${st.status === 'probe_failed' ? '探测失败' : '未部署'}`,
-           st.status === 'probe_failed' ? 'SSH 探测无响应，请检查服务与网络' : '服务尚未部署到目标环境', st.ts || now);
+           `服务 ${svcName}（${projectName}）${kind}`,
+           st.status === 'probe_failed' ? 'SSH 探测无响应，请检查服务与网络'
+             : st.status === 'stopped' ? '容器已停止（Exited），请启动服务'
+             : '服务尚未部署到目标环境', st.ts || now);
     });
   });
   // 按时间倒序

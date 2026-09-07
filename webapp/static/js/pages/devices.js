@@ -21,13 +21,13 @@
     if (runningTask) return 'warn';
     const st = svc.status;
     if (st === 'online') return 'ok';
-    if (st === 'error') return 'bad';
+    if (st === 'error' || st === 'stopped') return 'bad';
     if (st === 'probe_failed') return 'warn';
     return 'gray';
   }
   function svcLabel(st, run){
     if (run) return '发布中';
-    const map = {online:'在线', error:'异常', not_deployed:'未部署', probe_failed:'探测失败'};
+    const map = {online:'在线', error:'异常', stopped:'已停止', not_deployed:'未部署', probe_failed:'探测失败'};
     return map[st.status] || '未知';
   }
 

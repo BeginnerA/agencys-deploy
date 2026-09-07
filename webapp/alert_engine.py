@@ -383,13 +383,14 @@ class AlertEngine:
                     if metric != "service_down":
                         continue
                     track_key = (env["id"], name)
-                    if st.get("status") != "not_deployed":
+                    # stopped（容器存在但未运行）与 not_deployed 均视为服务下线
+                    if st.get("status") not in ("not_deployed", "stopped"):
                         # 服务当前在线（或 probe_failed）→ 清除下线跟踪
                         self._service_down_since.pop(track_key, None)
                         if st.get("status") == "online":
                             active_online.add(track_key)
                         continue
-                    # 服务状态 = not_deployed → 持续确认后才触发
+                    # 服务状态 = not_deployed/stopped → 持续确认后才触发
                     now = time.time()
                     if track_key not in self._service_down_since:
                         self._service_down_since[track_key] = now

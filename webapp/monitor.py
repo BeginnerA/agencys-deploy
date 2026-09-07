@@ -156,19 +156,23 @@ def _probe_server_full(host: str, port: int, ssh_cfg: dict, services: list,
                        skip_extended: bool = False) -> dict:
     """单连接探测整台服务器：容器镜像 + docker stats 资源 + 主机指标 + 扩展指标
 
-    返回 {ssh_ok, containers, container_list, resources, host_metrics, extended, error}。
-    第一轮：3 条命令（ps/stats/主机指标），1 次 SSH 连接；
+    返回 {ssh_ok, containers, containers_stopped, container_list, resources, host_metrics, extended, error}。
+    第一轮：4 条命令（ps/ps -a/stats/主机指标），1 次 SSH 连接；
     第二轮：扩展指标（容器详情/swap/网络/diskIO/TCP/docker_df/SSL），1 次 SSH 连接。
     共 2 次连接，避免逐命令独立认证（探测热路径的主要开销）。
     skip_extended=True 时跳过第二轮（节流，降低 SSH 频率）。
     """
     result = {"ssh_ok": False, "containers": {}, "container_list": [],
-              "resources": {}, "host_metrics": {}, "extended": {}, "error": ""}
+              "containers_stopped": {}, "resources": {}, "host_metrics": {},
+              "extended": {}, "error": ""}
     try:
-        # 第一轮：基础指标（ps + stats + 主机指标）
-        ps_out, stats_out, hm_out = _ssh_exec_multi(
+        # 第一轮：基础指标（ps + ps -a + stats + 主机指标）
+        # ps -a 用于识别容器存在但未运行（Exited）的服务：docker ps 只看运行中容器，
+        # 否则已停止的服务会被误判为 not_deployed（从未部署）
+        ps_out, ps_a_out, stats_out, hm_out = _ssh_exec_multi(
             host, port, ssh_cfg,
             ["docker ps --format '{{.Names}}|{{.Image}}'",
+             "docker ps -a --format '{{.Names}}|{{.Status}}|{{.Image}}'",
              "docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemPerc}}'",
              "grep -c processor /proc/cpuinfo; "
              "cat /proc/loadavg; "
@@ -188,7 +192,22 @@ def _probe_server_full(host: str, port: int, ssh_cfg: dict, services: list,
                 if name == s["service_name"]:
                     containers[s["service_name"]] = image.strip()
                     break
+        # 已停止容器：docker ps -a 中存在、状态非 Up（Exited/Created/Restarting），
+        # 仅登记与配置服务同名的容器（基础设施容器不关心停止与否）
+        containers_stopped = {}
+        for line in ps_a_out.splitlines():
+            parts = line.split("|")
+            if len(parts) < 3:
+                continue
+            name, status = parts[0].strip(), parts[1].strip()
+            if not name or status.startswith("Up"):
+                continue
+            for s in services:
+                if name == s["service_name"]:
+                    containers_stopped[s["service_name"]] = parts[2].strip()
+                    break
         result["containers"] = containers
+        result["containers_stopped"] = containers_stopped
         result["container_list"] = container_names
         result["resources"] = _parse_docker_resources(stats_out, services)
         result["host_metrics"] = _parse_host_metrics(hm_out)
@@ -766,6 +785,15 @@ class MonitorScheduler:
                                 st["uptime_hours"] = c_info["uptime_hours"]
                             # 记录该服务在此服务器可达，用于后续 HTTP 健康检查
                             health_hosts.setdefault(svc["name"], []).append(s["host"])
+                        else:
+                            # 容器存在但未运行（docker ps -a 命中 Exited/Created）→ stopped，
+                            # 区分「部署过但已停止」与「从未部署」；仅当尚无在线实例时标记，
+                            # 避免多服务器场景下停止实例覆盖在线状态
+                            s_img = (r.get("containers_stopped") or {}).get(svc["service_name"])
+                            if s_img and st.get("status") in (None, "not_deployed"):
+                                m = re.search(r":(\d+\.\d+\.\d+)$", s_img)
+                                st["version"] = m.group(1) if m else s_img.rsplit("/", 1)[-1]
+                                st["status"] = "stopped"
         result["host_metrics"] = per_server_metrics
         # 扩展指标节流时保留上次采集结果：skip_extended 轮次不采集扩展指标，
         # 如果不从上一轮缓存回填，前端会看到数据"闪现几秒就消失"（缓存被空 dict 覆盖）
@@ -886,7 +914,7 @@ class MonitorScheduler:
                 h = sv["host"]
                 if h not in all_servers or sv.get("ts", 0) > all_servers[h].get("ts", 0):
                     all_servers[h] = sv
-            # 服务状态合并：online > probe_failed > not_deployed
+            # 服务状态合并：online > probe_failed > stopped > not_deployed
             for svc_name, svc_data in data.get("services", {}).items():
                 existing = all_services.get(svc_name)
                 if existing is None or self._svc_priority(svc_data) > self._svc_priority(existing):
@@ -905,9 +933,11 @@ class MonitorScheduler:
 
     @staticmethod
     def _svc_priority(svc_data: dict) -> int:
-        """服务状态优先级：online=2, probe_failed=1, not_deployed=0"""
+        """服务状态优先级：online=3 > probe_failed=2 > stopped=1 > not_deployed=0
+        stopped（容器存在但停止）信息量高于 not_deployed（从未部署）。"""
         st = svc_data.get("status", "")
-        return 2 if st == "online" else 1 if st == "probe_failed" else 0
+        return (3 if st == "online" else 2 if st == "probe_failed"
+                else 1 if st == "stopped" else 0)
 
     def _aggregate_all_projects(self) -> dict:
         """聚合所有项目所有环境的探测缓存，用于监控中心全局视图（无项目/环境筛选）"""
