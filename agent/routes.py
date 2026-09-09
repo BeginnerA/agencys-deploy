@@ -31,6 +31,52 @@ def _sse(obj: dict) -> str:
     return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
 
+def _session_rows(db_path: str, user_id: int = 0) -> list:
+    """会话聚合（按 session_id + created_by 分组，含归属/条数/最后活动摘要）
+
+    user_id=0 表示全部用户（admin scope=all 视角）；每组带 last_content
+    供前端展示摘要，列表按最后活动倒序。
+    """
+    conn = dbm.get_conn(db_path)
+    try:
+        sql = (
+            "SELECT m.session_id, m.created_by,"
+            " COALESCE((SELECT u.username FROM users u WHERE u.id = m.created_by)"
+            ", '#0') AS owner,"
+            " COUNT(*) AS n, MAX(m.created_at) AS last_at,"
+            " (SELECT m2.content FROM agent_messages m2"
+            "  WHERE m2.session_id = m.session_id"
+            "   AND m2.created_by = m.created_by"
+            "  ORDER BY m2.id DESC LIMIT 1) AS last_content"
+            " FROM agent_messages m")
+        params = ()
+        if user_id:
+            sql += " WHERE m.created_by = ?"
+            params = (user_id,)
+        sql += (" GROUP BY m.session_id, m.created_by"
+                " ORDER BY last_at DESC, m.session_id LIMIT 200")
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
+
+
+def _target_user_id() -> tuple:
+    """解析会话归属用户：默认当前登录用户；admin 可传 user_id 指定（含 0=CLI）
+
+    返回 (uid, None) 或 (None, error_response) 供路由短路。
+    """
+    user = g.user or {}
+    raw = request.args.get("user_id")
+    if raw is not None:
+        if (user.get("role") or "") != "admin":
+            return None, (jsonify({"error": "仅管理员可指定 user_id"}), 403)
+        try:
+            return int(raw), None
+        except (TypeError, ValueError):
+            return None, (jsonify({"error": "user_id 必须为整数"}), 400)
+    return int(user.get("id") or 0), None
+
+
 def _json_body():
     body = request.get_json(silent=True)
     return body if isinstance(body, dict) else None
@@ -366,21 +412,62 @@ def config_update():
                     "available": agent_config.llm_available(db)})
 
 
-# ---------- 会话消息（审计查询） ----------
+# ---------- 会话管理（历史回溯 / 删除） ----------
+
+@agent_bp.route("/agent/sessions")
+@require_auth
+@require_role("admin", "operator")
+def list_sessions():
+    """会话列表：operator 仅自己创建的；admin 加 scope=all 可看全部（含 CLI）"""
+    user = g.user or {}
+    scope_all = request.args.get("scope") == "all" and \
+        (user.get("role") == "admin")
+    rows = _session_rows(current_app.config["DB_PATH"],
+                         0 if scope_all else int(user.get("id") or 0))
+    return jsonify({"sessions": rows})
+
 
 @agent_bp.route("/agent/sessions/<session_id>/messages")
 @require_auth
 @require_role("admin", "operator")
 def session_messages(session_id):
+    """会话消息回溯：默认仅本用户会话；admin 可传 user_id 跨用户审计"""
+    uid, err = _target_user_id()
+    if err:
+        return err
     limit = max(1, min(request.args.get("limit", 50, type=int), 200))
     rows = dbm.list_records(
         current_app.config["DB_PATH"], "agent_messages",
-        "session_id=?", (session_id[:64],), "id ASC")
+        "session_id=? AND created_by=?", (session_id[:64], uid), "id ASC")
     out = [{"id": r["id"], "role": r["role"], "content": r["content"],
             "created_at": r["created_at"],
             "created_by": r.get("created_by", 0)}
            for r in rows[-limit:]]
     return jsonify({"messages": out})
+
+
+@agent_bp.route("/agent/sessions/<session_id>", methods=["DELETE"])
+@require_auth
+@require_role("admin", "operator")
+def delete_session(session_id):
+    """删除整段会话消息（不可恢复）；operator 仅能删自己的，admin 可指定 user_id"""
+    uid, err = _target_user_id()
+    if err:
+        return err
+    db_path = current_app.config["DB_PATH"]
+    conn = dbm.get_conn(db_path)
+    try:
+        cur = conn.execute(
+            "DELETE FROM agent_messages WHERE session_id=? AND created_by=?",
+            (session_id[:64], uid))
+        conn.commit()
+        deleted = cur.rowcount
+    finally:
+        conn.close()
+    audit("agent_session_delete", "session", 0,
+          {"session_id": session_id[:64], "user_id": uid,
+           "deleted": deleted})
+    return jsonify({"ok": True, "deleted": deleted})
 
 
 # ---------- 手动触发建议（供前端按钮/测试） ----------

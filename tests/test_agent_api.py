@@ -168,6 +168,107 @@ class AgentApiBase(unittest.TestCase):
                                 content_type="application/json")
         self.assertEqual(resp.status_code, 400)
 
+    # ---------- 会话管理 ----------
+
+    def _msg(self, session, role, content, user_id=1, ts=None):
+        dbm.create_record(self.db_path, "agent_messages", dict(
+            session_id=session, role=role, content=content,
+            created_by=user_id, created_at=ts or int(time.time())))
+
+    def test_sessions_list_scope_and_owner(self):
+        # setUp 用户：admin=1、viewer1=2；此处补 op1=3
+        self._mk_user("op1", "operator")
+        op_headers = self._login("op1")
+        t0 = int(time.time())
+        self._msg("sA", "user", "服务正常吗", user_id=1, ts=t0)
+        self._msg("sA", "assistant", "一切正常", user_id=1, ts=t0 + 2)
+        self._msg("sB", "user", "发布看看", user_id=3, ts=t0 + 1)
+        # viewer 无权看会话列表
+        r = self.client.get("/api/agent/sessions",
+                            headers=self.viewer_headers)
+        self.assertEqual(r.status_code, 403)
+        # admin 默认 mine：仅 sA（含条数/归属/最后消息摘要）
+        r = self.client.get("/api/agent/sessions", headers=self.headers)
+        self.assertEqual(r.status_code, 200)
+        sess = r.get_json()["sessions"]
+        self.assertEqual([s["session_id"] for s in sess], ["sA"])
+        self.assertEqual(sess[0]["n"], 2)
+        self.assertEqual(sess[0]["owner"], "admin")
+        self.assertEqual(sess[0]["last_content"], "一切正常")
+        # admin scope=all：sA + sB 都可见
+        r = self.client.get("/api/agent/sessions?scope=all",
+                            headers=self.headers)
+        names = {s["session_id"] for s in r.get_json()["sessions"]}
+        self.assertEqual(names, {"sA", "sB"})
+        # operator 只能看到自己的 sB
+        r = self.client.get("/api/agent/sessions", headers=op_headers)
+        self.assertEqual([s["session_id"] for s in r.get_json()["sessions"]],
+                         ["sB"])
+
+    def test_session_messages_user_scope(self):
+        self._mk_user("op1", "operator")
+        op_headers = self._login("op1")
+        t0 = int(time.time())
+        self._msg("sA", "user", "hi", user_id=1, ts=t0)
+        self._msg("sA", "assistant", "hello", user_id=1, ts=t0 + 1)
+        self._msg("sA", "user", "op 的消息", user_id=3, ts=t0 + 2)
+        # mine 语义：admin 只看到自己的两条
+        r = self.client.get("/api/agent/sessions/sA/messages",
+                            headers=self.headers)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.get_json()["messages"]), 2)
+        # viewer 角色无权限（require_role 先拦截）
+        r = self.client.get("/api/agent/sessions/sA/messages?user_id=3",
+                            headers=self.viewer_headers)
+        self.assertEqual(r.status_code, 403)
+        # operator 指定 user_id → 403（仅 admin 可跨用户审计）
+        r = self.client.get("/api/agent/sessions/sA/messages?user_id=3",
+                            headers=op_headers)
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("仅管理员", r.get_json()["error"])
+        # admin 指定 user_id=3 → 仅 op 消息
+        r = self.client.get("/api/agent/sessions/sA/messages?user_id=3",
+                            headers=self.headers)
+        msgs = r.get_json()["messages"]
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["content"], "op 的消息")
+        # admin user_id=0（CLI 会话归属）→ 无匹配
+        r = self.client.get("/api/agent/sessions/sA/messages?user_id=0",
+                            headers=self.headers)
+        self.assertEqual(r.get_json()["messages"], [])
+
+    def test_delete_session_permissions(self):
+        self._mk_user("op1", "operator")
+        op_headers = self._login("op1")
+        t0 = int(time.time())
+        self._msg("sA", "user", "admin 会话", user_id=1, ts=t0)
+        self._msg("sB", "user", "op 会话", user_id=3, ts=t0 + 1)
+        self._msg("cli-default", "user", "CLI 会话", user_id=0, ts=t0)
+        # viewer 无权删除
+        r = self.client.delete("/api/agent/sessions/sB",
+                               headers=self.viewer_headers)
+        self.assertEqual(r.status_code, 403)
+        # operator 删自己的 sB
+        r = self.client.delete("/api/agent/sessions/sB", headers=op_headers)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["deleted"], 1)
+        # operator 不指定 user_id 删 admin 的 sA → 无匹配（0 条），会话仍在
+        r = self.client.delete("/api/agent/sessions/sA", headers=op_headers)
+        self.assertEqual(r.get_json()["deleted"], 0)
+        # operator 指定 user_id → 403
+        r = self.client.delete("/api/agent/sessions/sA?user_id=1",
+                               headers=op_headers)
+        self.assertEqual(r.status_code, 403)
+        # admin 删自己的 sA + user_id=0 删 CLI 会话
+        r = self.client.delete("/api/agent/sessions/sA", headers=self.headers)
+        self.assertEqual(r.get_json()["deleted"], 1)
+        r = self.client.delete("/api/agent/sessions/cli-default?user_id=0",
+                               headers=self.headers)
+        self.assertEqual(r.get_json()["deleted"], 1)
+        r = self.client.get("/api/agent/sessions?scope=all",
+                            headers=self.headers)
+        self.assertEqual(r.get_json()["sessions"], [])
+
     # ---------- 审批单 ----------
 
     def _plan_run(self, **kw):
