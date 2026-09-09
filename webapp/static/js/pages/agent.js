@@ -15,7 +15,10 @@
 
   const role = currentUser().role || 'viewer';
   const canManage = ['admin','operator'].includes(role);
-  const SESSION = 'web';
+  // 当前会话 id：管理角色可在多会话间切换（localStorage 记住）；viewer 固定 web 单会话
+  let currentSession = canManage
+    ? (localStorage.getItem('agentCurSession') || 'web')
+    : 'web';
 
   const RUN_LABEL = {
     awaiting_approval: {label:'待审批', cls:'pending', ico:'📝'},
@@ -93,6 +96,13 @@
   function renderChatTab(){
     setPanel(`
       <div class="chat-wrap">
+        ${canManage ? `
+        <div class="chat-sessbar">
+          <select id="sessSel" class="filter-sel sess-sel"
+                  title="切换历史会话（含悬浮助手会话）"></select>
+          <button class="btn sm ghost" id="sessNew" title="新建会话（从空历史开始）">＋ 新建</button>
+          <button class="btn sm ghost" id="sessDel" title="删除当前会话全部消息（不可恢复）">🗑 删除</button>
+        </div>` : ''}
         <div class="chat-msgs" id="chatMsgs"></div>
         <div class="chat-input">
           <textarea id="chatInput" placeholder="${canManage ? '例：把 pay 服务回滚到上一版本（生成审批单）' : '例：pay 服务现在状态如何？'}（Enter 发送 / Shift+Enter 换行）"></textarea>
@@ -102,15 +112,16 @@
     const msgs = document.getElementById('chatMsgs');
     const ta = document.getElementById('chatInput');
     const btn = document.getElementById('chatSend');
-    if (msgs){
-      msgs.innerHTML = chatEmptyHtml();
-      // 恢复服务端历史（operator+ 可见；viewer 无权限时静默降级为空会话）
-      api('/api/agent/sessions/' + SESSION + '/messages?limit=40').then(data => {
-        if (destroyed || !document.getElementById('chatMsgs')) return;
-        const list = (data.messages || []).filter(m => ['user','assistant'].includes(m.role));
-        if (list.length){ renderChatHistory(list); }
-      }).catch(() => {});
+    if (msgs) loadMsgs(currentSession);
+    const sel = document.getElementById('sessSel');
+    if (sel){
+      refreshSessSel(); // 会话下拉（当前会话无消息时保留占位 option）
+      sel.onchange = () => switchSession(sel.value);
     }
+    const sessNew = document.getElementById('sessNew');
+    if (sessNew) sessNew.onclick = newSession;
+    const sessDel = document.getElementById('sessDel');
+    if (sessDel) sessDel.onclick = delSession;
     const send = () => {
       const text = (ta.value || '').trim();
       if (!text) return;
@@ -124,6 +135,99 @@
       };
       ta.focus();
     }
+  }
+
+  // ---- 会话管理（多会话切换 / 新建 / 删除） ----
+  function loadMsgs(sessionId){
+    // 渲染空态并恢复该会话服务端历史（operator+ 可见；viewer 无权限时静默降级为空会话）
+    const msgs = document.getElementById('chatMsgs');
+    if (!msgs) return;
+    msgs.innerHTML = chatEmptyHtml();
+    bindSugs(msgs);
+    api('/api/agent/sessions/' + encodeURIComponent(sessionId)
+        + '/messages?limit=40').then(data => {
+      if (destroyed || !document.getElementById('chatMsgs')) return;
+      const list = (data.messages || [])
+        .filter(m => ['user','assistant'].includes(m.role));
+      if (list.length) renderChatHistory(list);
+    }).catch(() => {});
+  }
+  function bindSugs(msgs){
+    msgs.querySelectorAll('[data-sug]').forEach(s => {
+      s.onclick = () => sendChat(s.dataset.sug);
+    });
+  }
+  async function refreshSessSel(){
+    // 会话下拉 = 当前用户全部会话；新会话（无消息）不在列表时补占位 option
+    const sel = document.getElementById('sessSel');
+    if (!sel) return;
+    let rows = [];
+    try{ rows = ((await api('/api/agent/sessions')).sessions) || []; }
+    catch(e){ /* 列表加载失败：仅保留当前会话占位 */ }
+    sel.innerHTML = '';
+    const opts = rows.filter(r => r.session_id !== currentSession)
+      .map(r => {
+        const o = document.createElement('option');
+        o.value = r.session_id;
+        o.text = `${r.session_id}（${r.n} 条 · ${fmtTime(r.last_at)}）`;
+        o.title = (r.last_content || '').slice(0, 80) || r.session_id;
+        o.dataset.n = r.n;
+        return o;
+      });
+    const cur = rows.find(r => r.session_id === currentSession);
+    if (cur){
+      const o = document.createElement('option');
+      o.value = cur.session_id;
+      o.text = `${cur.session_id}（${cur.n} 条 · ${fmtTime(cur.last_at)}）`;
+      o.title = (cur.last_content || '').slice(0, 80) || cur.session_id;
+      o.dataset.n = cur.n;
+      opts.unshift(o); // 当前会话置顶
+    }else{
+      const o = document.createElement('option');
+      o.value = currentSession;
+      o.text = currentSession + '（新会话，暂无消息）';
+      o.dataset.n = '0';
+      opts.unshift(o);
+    }
+    opts.forEach(o => sel.appendChild(o));
+    sel.value = currentSession;
+  }
+  function switchSession(sid){
+    if (!sid || sid === currentSession) return;
+    abortChat(); // 切换会话时中止进行中的流（其气泡已脱离文档）
+    currentSession = sid;
+    localStorage.setItem('agentCurSession', sid);
+    loadMsgs(sid);
+  }
+  function newSession(){
+    abortChat();
+    // 新会话：随机 id 本地记住，首次对话后消息才在服务端落库
+    currentSession = 'web-' + Date.now().toString(36)
+      + '-' + Math.random().toString(36).slice(2, 6);
+    localStorage.setItem('agentCurSession', currentSession);
+    loadMsgs(currentSession);
+    refreshSessSel();
+  }
+  async function delSession(){
+    const sel = document.getElementById('sessSel');
+    const opt = (sel && sel.selectedOptions && sel.selectedOptions[0]) || null;
+    const n = opt ? (opt.dataset.n || '') : '';
+    const ok = await confirmDialog(
+      `删除会话「${currentSession}」${n && n !== '0'
+        ? '（含 ' + n + ' 条消息记录）' : ''}？删除后不可恢复。`,
+      '删除会话');
+    if (!ok) return;
+    try{
+      await api('/api/agent/sessions/'
+        + encodeURIComponent(currentSession), {method: 'DELETE'});
+      toastSuccess('会话已删除');
+      newSession(); // 当前会话已删：落到新会话，消息区同时清空
+    }catch(e){
+      toastError('删除失败：' + (e.message || ''));
+    }
+  }
+  function abortChat(){
+    if (chatAbort){ try{ chatAbort(); }catch(e){} chatAbort = null; }
   }
   function chatEmptyHtml(){
     const sugs = CHAT_SUG.map(s => `<span data-sug="${esc(s)}">${esc(s)}</span>`).join('');
@@ -139,7 +243,7 @@
     const empty = msgs.querySelector('.chat-empty');
     if (empty) empty.remove();
     scrollBottom(msgs);
-    msgs.querySelectorAll('[data-sug]').forEach(s => { s.onclick = () => sendChat(s.dataset.sug); });
+    bindSugs(msgs);
   }
   function bubbleHtml(role, content, extra){
     return `
@@ -229,17 +333,17 @@
     scrollBottom(msgs);
     return true;
   }
-  async function sendChat(text){
+  function sendChat(text){
     const ta = document.getElementById('chatInput');
     const btn = document.getElementById('chatSend');
     const msgs = document.getElementById('chatMsgs');
+    if (!msgs) return;
     addChatBubble('user', text);
-    const bubble = msgs ? streamBubble(msgs) : null;
+    const bubble = streamBubble(msgs);
     if (ta) ta.disabled = true;
     if (btn){ btn.disabled = true; btn.textContent = '等待回复…'; }
-    const ctrl = new AbortController();
-    chatAbort = ctrl;
     let gotText = false, ended = false;
+    // 事件 → DOM 渲染（协议：text/tool/tool_result/done/error）
     const onEvent = (ev) => {
       const t = ev.type || '';
       if (t === 'text'){
@@ -261,62 +365,46 @@
         clearStreamHint(bubble);
         const runId = (ev.result || {}).plan_run_id;
         if (runId && bubble) attachPlanTip(bubble, runId);
+        // 本轮消息已落库：刷新会话下拉条数（新会话从占位变为真实条目）
+        refreshSessSel();
       } else if (t === 'error'){
         ended = true;
         appendStreamErr(bubble, ev.error || '对话出错', ev.hint || '');
+        refreshSessSel(); // 用户消息已落库：同样更新会话条数
       }
     };
-    const dispatch = (line) => {
-      if (!line.startsWith('data:')) return;
-      const raw = line.slice(5).trim();
-      if (!raw) return;
-      try{ onEvent(JSON.parse(raw)); }catch(e){ /* 单条事件解析失败跳过 */ }
+    // 流结束（正常/中止/异常均触发）：恢复输入并做中断兜底提示
+    const onClose = () => {
+      endChat();
+      if (destroyed) return;
+      if (bubble && !bubble.isConnected) return; // 会话已切换：气泡脱离文档，静默
+      if (!ended && !gotText) appendStreamErr(bubble, '连接中断，未收到完整回复', '');
+      else if (!ended && gotText) appendStreamErr(bubble, '\n\n⚠️ 回复中断（连接异常）', '');
     };
-    try{
-      const resp = await fetch('/api/agent/chat/stream', {
-        method: 'POST',
-        headers: {'Authorization': 'Bearer ' + token(), 'Content-Type': 'application/json'},
-        body: JSON.stringify({message: text, session_id: SESSION}),
-        signal: ctrl.signal
-      });
-      if (resp.status === 401){
+    const onFatal = (msg, hint) => {
+      ended = true;
+      appendStreamErr(bubble, msg, hint);
+    };
+    const cancel = streamAgentChat({
+      message: text,
+      sessionId: currentSession,
+      on401: () => {
         localStorage.removeItem('token'); localStorage.removeItem('user');
         location.href = '/';
-        return;
-      }
-      if (!resp.ok){
-        ended = true;
-        const d = await resp.json().catch(() => ({}));
-        appendStreamErr(bubble, d.error || ('HTTP ' + resp.status), d.hint || '');
-        return;
-      }
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-      for(;;){
-        if (destroyed){ try{ ctrl.abort(); }catch(e){} break; }
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        buf += decoder.decode(chunk.value, {stream: true});
-        let i;
-        while ((i = buf.indexOf('\n\n')) >= 0){
-          const part = buf.slice(0, i);
-          buf = buf.slice(i + 2);
-          part.split('\n').forEach(dispatch);
-        }
-      }
-      if (buf.trim()) buf.split('\n').forEach(dispatch); // 尾部无空行分隔的残余
-      if (!ended && !gotText && bubble) appendStreamErr(bubble, '连接中断，未收到完整回复', '');
-      else if (!ended && gotText && bubble) appendStreamErr(bubble, '\n\n⚠️ 回复中断（连接异常）', '');
-    }catch(e){
-      if (e.name === 'AbortError'){ /* 切页主动取消：静默 */ }
-      else appendStreamErr(bubble, e.message || '请求失败', '');
-    }finally{
-      chatAbort = null;
-      pendingTools = [];
-      if (ta){ ta.disabled = false; ta.focus(); }
-      if (btn){ btn.disabled = false; btn.textContent = '发送'; }
-    }
+      },
+      onEvent: onEvent,
+      onFatal: onFatal,
+      onClose: onClose
+    });
+    chatAbort = cancel;
+  }
+  function endChat(){
+    chatAbort = null;
+    pendingTools = [];
+    const ta = document.getElementById('chatInput');
+    const btn = document.getElementById('chatSend');
+    if (ta){ ta.disabled = false; ta.focus(); }
+    if (btn){ btn.disabled = false; btn.textContent = '发送'; }
   }
 
   // ==================== 审批单 Tab ====================
@@ -879,7 +967,7 @@
     },
     destroy: function(){
       destroyed = true;
-      if (chatAbort){ try{ chatAbort.abort(); }catch(e){} chatAbort = null; }
+      abortChat();
       if (timer) clearInterval(timer);
       timer = null;
     }
