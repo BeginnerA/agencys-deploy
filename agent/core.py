@@ -91,11 +91,41 @@ class AgentSession:
                                   now=_now_text())
 
     def run(self, text: str) -> dict:
-        """执行一轮对话；返回 {reply, plan_run_id, tool_calls, rounds}"""
+        """执行一轮对话（非流式入口）；返回 {reply, plan_run_id, tool_calls, rounds}
+
+        等价 run_stream 的全量收集形态，供 routes/CLI/测试使用。
+        """
+        result = {}
+        for ev in self._loop(text, stream=False):
+            if ev["type"] == "done":
+                result = ev["result"]
+        return result
+
+    def run_stream(self, text: str):
+        """流式执行一轮对话：生成器逐段 yield 事件
+
+        事件协议（路由/CLI 据此渲染）：
+            {"type": "text", "text": str}         最终回复正文增量（打字机效果）
+            {"type": "tool", "name": str}         工具开始执行
+            {"type": "tool_result", "name": str, "ok": bool}  工具结束
+            {"type": "done", "result": dict}    整轮结束（同 run() 返回）
+        网关/编排异常原样抛出（LlmError 等），由调用方决定错误呈现。
+        """
+        for ev in self._loop(text, stream=True):
+            yield ev
+
+    def _prompt(self) -> list:
+        return [{"role": "system", "content": self._system_prompt()}] \
+            + self.messages
+
+    def _loop(self, text: str, stream: bool):
+        """主循环（run/run_stream 共享）：stream=True 时逐段 yield 正文与工具事件"""
         text = (text or "").strip()
         if not text:
-            return {"reply": "请输入问题", "plan_run_id": None,
-                    "tool_calls": 0, "rounds": 0}
+            yield {"type": "done", "result": {
+                "reply": "请输入问题", "plan_run_id": None,
+                "tool_calls": 0, "rounds": 0}}
+            return
         self._save_message("user", text)
         self.messages.append({"role": "user", "content": text[:4000]})
         schemas = tools_mod.tool_schemas(self.role)
@@ -106,11 +136,18 @@ class AgentSession:
         reply = ""
         forced_summary = False
         for rounds in range(1, max_rounds + 1):
-            msg = llm_mod.chat(self.db_path,
-                               [{"role": "system",
-                                 "content": self._system_prompt()}]
-                               + self.messages,
-                               tools=schemas if schemas else None)
+            if stream:
+                # 流式：正文增量即时 yield（UI 打字机），message 收尾拼装
+                msg = None
+                for ev in llm_mod.stream_chat(self.db_path, self._prompt(),
+                                              tools=schemas if schemas else None):
+                    if ev["type"] == "delta":
+                        yield {"type": "text", "text": ev["text"]}
+                    elif ev["type"] == "message":
+                        msg = ev["message"]
+            else:
+                msg = llm_mod.chat(self.db_path, self._prompt(),
+                                   tools=schemas if schemas else None)
             self.messages.append(msg)
             tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
@@ -127,6 +164,8 @@ class AgentSession:
                         args = {}
                 except ValueError:
                     args = {}
+                if stream:
+                    yield {"type": "tool", "name": name}
                 result_text = tools_mod.execute_tool(self.role, name, args,
                                                      self._tool_ctx)
                 tool_count += 1
@@ -142,20 +181,27 @@ class AgentSession:
                 self.messages.append({"role": "tool",
                                       "tool_call_id": tc.get("id", ""),
                                       "content": result_text})
+                if stream:
+                    ok = True
+                    try:
+                        parsed = json.loads(result_text)
+                        if isinstance(parsed, dict) and parsed.get("error"):
+                            ok = False
+                    except ValueError:
+                        ok = False
+                    yield {"type": "tool_result", "name": name, "ok": ok}
             # 达到轮次上限且模型仍未收尾 → 强制一次总结（不带工具）
             if rounds >= max_rounds and not pending_run_id:
                 try:
-                    tail = llm_mod.chat(
-                        self.db_path,
-                        [{"role": "system", "content": self._system_prompt()}]
-                        + self.messages,
-                        tools=None)
+                    tail = llm_mod.chat(self.db_path, self._prompt(), tools=None)
                     summary = (tail.get("content") or "").strip()
                     if summary:
                         self.messages.append({"role": "assistant",
                                               "content": summary})
                         reply = summary
                         forced_summary = True
+                        if stream:
+                            yield {"type": "text", "text": summary}
                 except llm_mod.LlmError:
                     reply = ("已收集到相关信息，但模型输出中断。"
                              "可继续追问具体环节。")
@@ -165,8 +211,10 @@ class AgentSession:
             reply = "已完成一轮查询，但未能生成结论；请补充问题细节重试。"
         self._save_message("assistant", reply)
         self.messages.append({"role": "assistant", "content": reply})
-        return {"reply": reply, "plan_run_id": pending_run_id,
-                "tool_calls": tool_count, "rounds": rounds}
+        yield {"type": "done", "result": {
+            "reply": reply, "plan_run_id": pending_run_id,
+            "tool_calls": tool_count, "rounds": rounds}}
+
 
 
 def chat_once(db_path: str, user: dict, text: str,

@@ -17,14 +17,29 @@ if str(_ROOT) not in sys.path:
 
 
 def run_once(db_path: str, user: dict, text: str, session_id: str) -> int:
+    """单轮对话：流式逐字输出；Ctrl+C 可中断本轮"""
     from agent import core as core_mod
+    result = None
     try:
-        result = core_mod.chat_once(db_path, user, text, session_id=session_id)
+        session = core_mod.AgentSession(db_path, user, session_id=session_id)
+        for ev in session.run_stream(text):
+            t = ev.get("type")
+            if t == "text":
+                print(ev.get("text", ""), end="", flush=True)
+            elif t == "tool":
+                print(f"\n[工具] 调用 {ev.get('name', '')} …", end="", flush=True)
+            elif t == "tool_result":
+                print("完成" if ev.get("ok") else "失败", flush=True)
+            elif t == "done":
+                result = ev.get("result") or {}
+    except KeyboardInterrupt:
+        print("\n[中断] 本轮已终止（会话历史保留，可继续提问）")
+        return 130
     except Exception as e:
-        print(f"[错误] {e}", file=sys.stderr)
+        print(f"\n[错误] {e}", file=sys.stderr)
         return 1
-    print(result.get("reply", ""))
-    run_id = result.get("plan_run_id")
+    print()  # 收尾换行
+    run_id = (result or {}).get("plan_run_id")
     if run_id:
         print(f"\n[审批单] 已生成发布审批单 #{run_id}（awaiting_approval），"
               "请由管理员在 Web 端「智能助手 → 审批单」中审批或驳回。")

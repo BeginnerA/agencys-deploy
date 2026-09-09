@@ -5,10 +5,12 @@
     operator/admin   对话（含写工具）+ 审批发布单
     admin            网关配置与建议/案例删除
 """
+import json
 import re
 import time
 
-from flask import Blueprint, current_app, g, jsonify, request
+from flask import (Blueprint, Response, current_app, g, jsonify, request,
+                   stream_with_context)
 
 from webapp import db as dbm
 from webapp.auth import audit, require_auth, require_role
@@ -24,6 +26,11 @@ agent_bp = Blueprint("agent", __name__)
 _SAFE_SCOPE = re.compile(r"^[A-Za-z_]+$")
 
 
+def _sse(obj: dict) -> str:
+    """事件序列化为 SSE data 行（UTF-8 JSON）"""
+    return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
+
+
 def _json_body():
     body = request.get_json(silent=True)
     return body if isinstance(body, dict) else None
@@ -35,6 +42,54 @@ def _str(body, key, default="", maxlen=2000):
 
 
 # ---------- 对话 ----------
+
+@agent_bp.route("/agent/chat/stream", methods=["POST"])
+@require_auth
+def chat_stream():
+    """流式对话（SSE）：事件类型 text/tool/tool_result/done/error
+
+    与 /agent/chat 同一编排循环，正文增量实时下发；异常转为 error 事件
+    （配置缺失带 hint），HTTP 状态始终 200 以便前端持续读取数据流。
+    """
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    message = _str(body, "message", maxlen=2000).strip()
+    if not message:
+        return jsonify({"error": "message 不能为空"}), 400
+    session_id = _str(body, "session_id", "default", maxlen=64)
+    db_path = current_app.config["DB_PATH"]
+
+    @stream_with_context
+    def gen():
+        session = core_mod.AgentSession(db_path, g.user,
+                                        session_id=session_id)
+        try:
+            try:
+                audit("agent_chat", "session", 0,
+                      {"session_id": session_id,
+                       "length": len(message), "stream": True})
+            except Exception:
+                pass  # 审计失败不阻断对话流
+            for ev in session.run_stream(message):
+                yield _sse(ev)
+        except llm_mod.LlmConfigError as e:
+            yield _sse({"type": "error", "error": str(e),
+                        "hint": "管理员可在智能助手页配置网关，"
+                                "或设置 AGENT_LLM_* 环境变量"})
+        except llm_mod.LlmHttpError as e:
+            yield _sse({"type": "error", "error": str(e)})
+        except llm_mod.LlmApiError as e:
+            yield _sse({"type": "error", "error": str(e)})
+        except Exception as e:  # 编排层意外异常：流内兜底，不让连接半途中断
+            current_app.logger.exception("[agent] chat stream 异常")
+            yield _sse({"type": "error", "error": f"对话服务异常: {e}"})
+
+    resp = Response(gen(), mimetype="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    return resp
+
 
 @agent_bp.route("/agent/chat", methods=["POST"])
 @require_auth
