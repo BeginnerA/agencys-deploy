@@ -345,6 +345,22 @@ notify:
 - 权重灰度：新版本实例上线后先给低权重，逐步放大（`nacos_manager.py` 支持在线改权重）。
 - 1Panel 兼容：目前直接操作 docker-compose.yml，1Panel 仅用于查看日志。
 
+## AI 智能运维助手（Agent）
+
+Web 操作台之上叠加的 AI 层，四阶段演进：**只读智能运维助手**（LLM + 26 个运维工具 + Web/CLI/MCP 对话）→ **决策点 AI 化**（灰度继续/停止/回滚、发布失败归因+回滚建议、告警归因、发布前预检，规则引擎优先 + LLM 润色）→ **发布执行 Agent**（自然语言生成计划 → 人工审批 → 复用平台任务通道执行 → 审计闭环）→ **MCP Server + 长期记忆案例库**。
+
+```powershell
+# 配置 OpenAI 兼容 LLM 网关（也可在 Web「智能助手 → 网关配置」填写）
+$env:AGENT_LLM_BASE_URL = "https://your-gateway/v1"
+$env:AGENT_LLM_API_KEY  = "sk-xxx"
+
+python webapp/app.py          # 默认同时启动 AI 建议调度（30s 周期）
+# 浏览器打开 http://127.0.0.1:5678/#/agent 开始对话；
+# 或命令行：python agent/cli.py --once "auth 服务最近有异常吗"
+```
+
+零新增 Python 依赖（requests 直连）；未配置网关时自动降级纯规则，核心发布/监控功能不受影响；审批永远人工，viewer 全链路只读。完整说明见 [docs/agent-evolution.md](docs/agent-evolution.md)。
+
 ## 注意事项
 
 - 第一次使用前，务必在测试环境或首台服务器反复验证。
