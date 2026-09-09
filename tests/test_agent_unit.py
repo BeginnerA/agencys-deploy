@@ -213,6 +213,70 @@ class TestLlmGateway(AgentBase):
         self.assertEqual(s2["base_url"], "https://env/v1")
         self.assertTrue(agent_config.llm_available(self.db))
 
+    def test_stream_chat_sse_parse_and_tool_assembly(self):
+        from agent import llm as llm_mod
+        lines = [
+            "data: " + json.dumps({"choices": [{"delta": {"content": "你"}}]}),
+            "data: " + json.dumps({"choices": [{"delta": {"content": "好"}}]}),
+            "data: " + json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "c1", "type": "function",
+                 "function": {"name": "list_projects",
+                              "arguments": ""}}]}}]}),
+            "data: " + json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": '{"x"'}}]}}]}),
+            "data: " + json.dumps({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": ": 1}"}}]}}]}),
+            "data: [DONE]",
+        ]
+        fake = mock.Mock()
+        fake.status_code = 200
+        fake.headers = {"Content-Type": "text/event-stream"}
+        fake.iter_lines.return_value = iter(lines)
+        with mock.patch("requests.post", return_value=fake) as post:
+            with mock.patch.dict(os.environ, {
+                    "AGENT_LLM_BASE_URL": "https://x/v1",
+                    "AGENT_LLM_API_KEY": "sk-test"}, clear=False):
+                evs = list(llm_mod.stream_chat(self.db, []))
+        # stream: true 已置入请求体
+        self.assertTrue(post.call_args.kwargs["json"]["stream"])
+        deltas = "".join(e["text"] for e in evs if e["type"] == "delta")
+        self.assertEqual(deltas, "你好")
+        msg = [e for e in evs if e["type"] == "message"][-1]["message"]
+        self.assertEqual(msg["content"], "你好")
+        call = msg["tool_calls"][0]
+        self.assertEqual(call["function"]["name"], "list_projects")
+        # 分片 arguments 已拼装回完整 JSON
+        self.assertEqual(json.loads(call["function"]["arguments"]), {"x": 1})
+
+    def test_stream_chat_downgrade_when_not_sse(self):
+        # 网关忽略 stream 参数直接回完整 JSON：无 delta，仅 message 事件
+        from agent import llm as llm_mod
+        fake = mock.Mock()
+        fake.status_code = 200
+        fake.headers = {"Content-Type": "application/json"}
+        fake.json.return_value = {"choices": [{"message": {
+            "content": "完整回复"}}]}
+        with mock.patch("requests.post", return_value=fake):
+            with mock.patch.dict(os.environ, {
+                    "AGENT_LLM_BASE_URL": "https://x/v1",
+                    "AGENT_LLM_API_KEY": "sk-test"}, clear=False):
+                evs = list(llm_mod.stream_chat(self.db, []))
+        self.assertEqual([e["type"] for e in evs], ["message"])
+        self.assertEqual(evs[0]["message"]["content"], "完整回复")
+
+    def test_stream_chat_http_error(self):
+        from agent import llm as llm_mod
+        fake = mock.Mock()
+        fake.status_code = 401
+        fake.json.return_value = {"error": {"message": "invalid key"}}
+        with mock.patch("requests.post", return_value=fake):
+            with mock.patch.dict(os.environ, {
+                    "AGENT_LLM_BASE_URL": "https://x/v1",
+                    "AGENT_LLM_API_KEY": "bad"}, clear=False):
+                with self.assertRaises(llm_mod.LlmApiError) as cm:
+                    list(llm_mod.stream_chat(self.db, []))
+        self.assertEqual(cm.exception.status, 401)
+
 
 class TestTools(AgentBase):
     def test_role_filtering(self):
@@ -557,6 +621,67 @@ class TestCoreLoop(AgentBase):
             os.environ.pop("AGENT_LLM_API_KEY", None)
             with self.assertRaises(llm_mod.LlmConfigError):
                 core_mod.chat_once(self.db, USER, "hi", session_id="s3")
+
+    def test_run_stream_text_and_done_events(self):
+        from agent import core as core_mod
+        final = self._llm_msg(content="auth 服务运行正常。")
+        with mock.patch("agent.core.llm_mod.stream_chat",
+                        return_value=iter([
+                            {"type": "delta", "text": "auth 服务"},
+                            {"type": "delta", "text": "运行正常。"},
+                            {"type": "message", "message": final}])):
+            session = core_mod.AgentSession(self.db, USER, session_id="s4")
+            events = list(session.run_stream("auth 状态？"))
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertNotIn("tool", [e["type"] for e in events])
+        texts = "".join(e["text"] for e in events if e["type"] == "text")
+        self.assertEqual(texts, "auth 服务运行正常。")
+        self.assertEqual(events[-1]["result"]["reply"],
+                         "auth 服务运行正常。")
+
+    def test_run_stream_tool_events(self):
+        from agent import core as core_mod
+        tool_msg = self._llm_msg(tool_calls=[{
+            "id": "call_1", "type": "function",
+            "function": {"name": "list_projects", "arguments": "{}"}}])
+        final = self._llm_msg(content="共 1 个项目。")
+        with mock.patch("agent.core.llm_mod.stream_chat", side_effect=[
+                iter([{"type": "message", "message": tool_msg}]),
+                iter([{"type": "delta", "text": "共 1 个项目。"},
+                      {"type": "message", "message": final}])]):
+            session = core_mod.AgentSession(self.db, USER, session_id="s5")
+            events = list(session.run_stream("有哪些项目？"))
+        names = [e["name"] for e in events
+                 if e["type"] in ("tool", "tool_result")]
+        self.assertEqual(names, ["list_projects", "list_projects"])
+        tr = [e for e in events if e["type"] == "tool_result"][0]
+        self.assertTrue(tr["ok"])
+        done = events[-1]
+        self.assertEqual(done["type"], "done")
+        self.assertEqual(done["result"]["tool_calls"], 1)
+        self.assertEqual(done["result"]["reply"], "共 1 个项目。")
+
+    def test_run_stream_equivalent_to_run(self):
+        """流式与批量两通道最终结果一致（同一轮对话）"""
+        from agent import core as core_mod
+        final = self._llm_msg(content="两通道结论一致。")
+        with mock.patch("agent.core.llm_mod.chat", return_value=final):
+            out = core_mod.chat_once(self.db, USER, "hi", session_id="s6")
+        with mock.patch("agent.core.llm_mod.stream_chat",
+                        return_value=iter([
+                            {"type": "delta", "text": "两通道结论一致。"},
+                            {"type": "message", "message": final}])):
+            session = core_mod.AgentSession(self.db, USER, session_id="s7")
+            events = list(session.run_stream("hi"))
+        self.assertEqual(events[-1]["result"]["reply"], out["reply"])
+        self.assertEqual(events[-1]["result"]["tool_calls"],
+                         out["tool_calls"])
+
+    def test_run_stream_empty_input(self):
+        from agent import core as core_mod
+        session = core_mod.AgentSession(self.db, USER, session_id="s8")
+        events = list(session.run_stream("  "))
+        self.assertEqual(events[-1]["result"]["reply"], "请输入问题")
 
 
 class TestMcpServer(AgentBase):

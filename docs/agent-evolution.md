@@ -18,7 +18,7 @@ agent/
 ├── config.py      LLM 网关配置（环境变量 > platform_settings 表 > 默认值）
 ├── llm.py         OpenAI 兼容 function-calling 客户端（零第三方依赖，requests 直连）
 ├── tools.py       26 个运维工具注册表（read/write 两级权限）
-├── core.py        对话编排（ReAct 循环：模型思考 → 调工具 → 收敛）
+├── core.py        对话编排（ReAct 循环：模型思考 → 调工具 → 收敛；批量/SSE 流式双通道）
 ├── advisor.py     Phase 2 决策引擎：灰度建议 / 失败归因 / 告警归因 / 预检 / 案例沉淀
 ├── executor.py    Phase 3 发布执行：计划生成 / 审批状态机 / 任务提交 / 后台同步
 ├── memory.py      Phase 4 长期记忆：故障案例 CRUD + 字符 bigram 相似检索
@@ -67,7 +67,7 @@ python webapp/app.py
 
 ## 三、Phase 1：只读智能运维助手
 
-- **对话**：登录用户在「智能助手」页与 LLM 多轮对话；消息持久化到 `agent_messages`，可在 API/页面回溯（会话按用户隔离）。
+- **对话**：登录用户在「智能助手」页与 LLM 多轮对话，回复**流式输出**（SSE 打字机效果，工具调用过程可见）；消息持久化到 `agent_messages`，可在 API/页面回溯（会话按用户隔离）。CLI/MCP 入口同样支持流式/批量两种形态。
 - **工具**：20 个只读工具 + 6 个写工具（operator/admin 可见），全部以 JSON 结果回给模型：
   - 只读：`list_projects / get_project / list_services / list_environments / env_servers / service_status / recent_tasks / task_detail / list_alerts / alert_detail / search_logs / release_window / canary_configs / cert_monitors / audit_logs / search_cases / case_detail / advice_list / pending_approvals / run_detail`
   - 写：`analyze_alert / precheck / ack_alert / plan_operation / case_save / case_update`
@@ -124,7 +124,8 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 
 | 方法 | 路径 | 说明 | 权限 |
 | --- | --- | --- | --- |
-| POST | /agent/chat | 对话（body: message, session_id） | 登录用户 |
+| POST | /agent/chat | 对话（批量，body: message, session_id；返回 reply/plan_run_id） | 登录用户 |
+| POST | /agent/chat/stream | 对话（SSE 流式，事件：text 正文增量 / tool 工具开始 / tool_result 工具结束 / done 收尾 / error 异常） | 登录用户 |
 | GET | /agent/sessions/<id>/messages | 会话消息回溯 | operator/admin |
 | GET | /agent/runs | 审批单列表（status 过滤） | 登录用户 |
 | GET | /agent/runs/<id> | 审批单详情 | 登录用户 |
@@ -155,5 +156,5 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 1. **人工审批不可绕过**：任何写操作工具只生成审批单，执行必经 `decision=approve`。
 2. **密钥保护**：api_key 仅环境变量 / DB 读取，不落日志、不出现在工具输出与配置查询响应。
 3. **权限分层**：viewer 全链路只读（工具、API、前端按钮三级过滤）。
-4. **降级可用**：未配置 LLM 时对话返回 400 并带配置提示；建议引擎自动降级纯规则（记录 model=rule-based）。
+4. **降级可用**：未配置 LLM 时批量对话返回 400 带配置提示、流式对话返回 SSE `error` 事件（均含 hint）；建议引擎自动降级纯规则（记录 model=rule-based）。
 5. **防御性编码**：全部外部输入长度/类型约束；SQL 仅经白名单表名/列名或参数化查询。

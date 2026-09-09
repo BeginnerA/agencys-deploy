@@ -120,6 +120,54 @@ class AgentApiBase(unittest.TestCase):
                                 content_type="application/json")
         self.assertEqual(resp.status_code, 400)
 
+    def test_chat_stream_ok_and_persist(self):
+        with mock.patch("agent.core.llm_mod.stream_chat",
+                        return_value=iter([
+                            {"type": "delta", "text": "你好"},
+                            {"type": "delta", "text": "，我是助手。"},
+                            {"type": "message", "message": {
+                                "role": "assistant",
+                                "content": "你好，我是助手。",
+                                "tool_calls": []}}])):
+            resp = self.client.post("/api/agent/chat/stream",
+                                    headers=self.headers,
+                                    json={"message": "你好",
+                                          "session_id": "ws1"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/event-stream", resp.content_type)
+        body = resp.get_data(as_text=True)
+        # 事件序列：text 增量（core 层）+ done 收尾（含 reply）
+        self.assertIn('"type": "text"', body)
+        self.assertIn('"type": "done"', body)
+        self.assertIn("你好，我是助手。", body)
+        # 会话消息可回溯（assistant 已落库）
+        resp2 = self.client.get("/api/agent/sessions/ws1/messages",
+                                headers=self.headers)
+        roles = [m["role"] for m in resp2.get_json()["messages"]]
+        self.assertIn("user", roles)
+        self.assertIn("assistant", roles)
+
+    def test_chat_stream_error_event_when_no_config(self):
+        # 网关未配置：HTTP 200 + SSE error 事件（前端可读流内提示）
+        from agent import llm as llm_mod
+        with mock.patch("agent.core.llm_mod.stream_chat",
+                        side_effect=llm_mod.LlmConfigError(
+                            "LLM 网关未配置")):
+            resp = self.client.post("/api/agent/chat/stream",
+                                    headers=self.headers,
+                                    json={"message": "hi",
+                                          "session_id": "ws2"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_data(as_text=True)
+        self.assertIn('"type": "error"', body)
+        self.assertIn("LLM 网关未配置", body)
+
+    def test_chat_stream_bad_body(self):
+        resp = self.client.post("/api/agent/chat/stream", headers=self.headers,
+                                data="not-json",
+                                content_type="application/json")
+        self.assertEqual(resp.status_code, 400)
+
     # ---------- 审批单 ----------
 
     def _plan_run(self, **kw):
