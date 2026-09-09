@@ -54,6 +54,23 @@
     };
   }
 
+  // ---- 路由感知：智能助手页（#/agent）内隐藏整个入口（页内已有完整对话界面） ----
+  function isAgentRoute(){
+    // 与 router.js getRoute 同规则解析：去 #/ 前缀与 query，取首段比较（未来子页同判）
+    const hash = (location.hash || '').replace(/^#\/?/, '').split('?')[0] || '';
+    return hash.split('/')[0] === 'agent';
+  }
+  function syncRouteVisibility(){
+    const root = document.getElementById('floatAgentUi');
+    if (!root) return;
+    if (isAgentRoute()){
+      if (open) collapse();              // 收起面板并中止流（seq++ 作废旧回调）
+      root.classList.add('route-agent'); // 隐藏按钮与面板（见 floating-agent.css）
+    }else{
+      root.classList.remove('route-agent');
+    }
+  }
+
   // ---- 开合 ----
   function expand(){
     open = true;
@@ -273,4 +290,6 @@
 
   // ---- 初始化（script 位于 body 尾部，DOM 已就绪） ----
   build();
+  syncRouteVisibility(); // 深链直达 #/agent（或在该页刷新）时不显示入口
+  window.addEventListener('hashchange', syncRouteVisibility); // 进入/离开智能助手页时切换
 })();

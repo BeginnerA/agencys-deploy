@@ -61,7 +61,7 @@ python webapp/app.py
 
 | 入口 | 方式 |
 | --- | --- |
-| Web 对话 | 浏览器 `http://127.0.0.1:5678/#/agent`（侧栏「智能运维 → 智能助手」），含 对话/审批单/建议/案例 四个页签；另有全站右下角**悬浮智能助手**（独立 float 会话，任意页面随时对话） |
+| Web 对话 | 浏览器 `http://127.0.0.1:5678/#/agent`（侧栏「智能运维 → 智能助手」），含 对话/审批单/建议/案例 四个页签；另有全站右下角**悬浮智能助手**（独立 float 会话，任意页面随时对话，进入智能助手页自动隐藏避免重复） |
 | CLI | `python agent/cli.py --once "auth 服务最近有异常吗"` |
 | MCP | `python agent/mcp_server.py --db data/platform.db --role operator`（stdio，可接入支持 MCP 的客户端） |
 
