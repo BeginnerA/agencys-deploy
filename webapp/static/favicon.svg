@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- 站点 favicon：与站内 logo-ico 同款视觉（渐变圆角方块 + 闪电，呼应 ⚡ 品牌标） -->
+  <defs>
+    <linearGradient id="g" x1="4" y1="4" x2="124" y2="124" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#00D4FF"/>
+      <stop offset="1" stop-color="#0066FF"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#g)"/>
+  <!-- 白色闪电矢量（24 网格缩放 4 倍并平移居中，x/y 均对称于 64） -->
+  <path d="M13 2 L5 14 H11 L9 22 L19 9 H13.5 Z" fill="#fff" transform="translate(16,16) scale(4)"/>
+</svg>

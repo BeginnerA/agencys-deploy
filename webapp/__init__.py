@@ -105,7 +105,7 @@ def create_app():
     from agent.routes import register_agent
     register_agent(app)
 
-    from flask import render_template
+    from flask import redirect, render_template
 
     @app.route("/")
     def index():
@@ -117,6 +117,7 @@ def create_app():
 
     @app.route("/favicon.ico")
     def favicon():
-        return "", 204
+        # 模板已声明 SVG favicon；此路由仅为兼容老客户端/直连 .ico 的请求
+        return redirect("/static/favicon.svg")
 
     return app
