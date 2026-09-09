@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--monitor-interval", type=int, default=60,
                         help="实时探测周期（秒），0 关闭监控")
+    parser.add_argument("--agent-interval", type=int, default=30,
+                        help="AI 建议调度周期（秒），0 关闭（需监控开启）")
     args = parser.parse_args()
     if args.monitor_interval > 0:
         from webapp.monitor import init_monitor
@@ -38,6 +40,10 @@ def main():
                                         args.monitor_interval)
         deploy_sched.start()
         print(f"[deploy-sched] 发布调度器已启动，周期 {args.monitor_interval}s")
+        if args.agent_interval > 0:
+            from agent.scheduler import start_scheduler
+            start_scheduler(app.config["DB_PATH"], args.agent_interval)
+            print(f"[agent] AI 建议调度已启动，周期 {args.agent_interval}s")
     print(f"[platform] http://{args.host}:{args.port}")
     if app.config.get("ONBOARDED_ADMIN"):
         # 仅首次引导创建 admin 时提示；密码不打印明文，避免启动日志泄露默认凭据

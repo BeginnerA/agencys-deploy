@@ -346,6 +346,80 @@ CREATE TABLE IF NOT EXISTS renewal_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_renewal_logs_monitor
     ON renewal_logs(monitor_id, created_at);
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL DEFAULT 'operation',
+    project_id INTEGER DEFAULT 0,
+    ref_type TEXT DEFAULT '',
+    ref_id INTEGER DEFAULT 0,
+    name TEXT DEFAULT '',
+    env TEXT DEFAULT '',
+    version TEXT DEFAULT '',
+    previous_version TEXT DEFAULT '',
+    intent TEXT DEFAULT '',
+    plan TEXT DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'awaiting_approval',
+    task_id INTEGER DEFAULT 0,
+    force_window INTEGER DEFAULT 0,
+    created_by INTEGER DEFAULT 0,
+    created_by_name TEXT DEFAULT '',
+    created_at INTEGER NOT NULL,
+    decided_by INTEGER DEFAULT 0,
+    decided_by_name TEXT DEFAULT '',
+    decided_at INTEGER,
+    decision_note TEXT DEFAULT '',
+    executed_at INTEGER,
+    summary TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_status
+    ON agent_runs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_agent_runs_task
+    ON agent_runs(task_id);
+CREATE TABLE IF NOT EXISTS agent_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL DEFAULT 'default',
+    role TEXT NOT NULL,
+    content TEXT DEFAULT '',
+    created_by INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_session
+    ON agent_messages(session_id, id);
+CREATE TABLE IF NOT EXISTS agent_advice (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL DEFAULT '',
+    ref_id INTEGER NOT NULL DEFAULT 0,
+    title TEXT NOT NULL,
+    body TEXT DEFAULT '',
+    evidence TEXT DEFAULT '{}',
+    model TEXT DEFAULT '',
+    created_at INTEGER NOT NULL,
+    created_by INTEGER DEFAULT 0,
+    created_by_name TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_agent_advice_ref
+    ON agent_advice(scope, ref_id, id);
+CREATE TABLE IF NOT EXISTS agent_cases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    service TEXT DEFAULT '',
+    env TEXT DEFAULT '',
+    version TEXT DEFAULT '',
+    symptom TEXT DEFAULT '',
+    root_cause TEXT DEFAULT '',
+    action TEXT DEFAULT '',
+    result TEXT DEFAULT '',
+    lesson TEXT DEFAULT '',
+    tags TEXT DEFAULT '[]',
+    source TEXT DEFAULT 'manual',
+    advice_id INTEGER DEFAULT 0,
+    created_by INTEGER DEFAULT 0,
+    created_by_name TEXT DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_cases_svc
+    ON agent_cases(service, created_at);
 """
 
 # JSON 字段（读写时自动序列化/反序列化）
@@ -364,6 +438,9 @@ JSON_FIELDS = {
     "custom_monitors": {"channels", "detail", "san_domains"},
     "release_windows": {"scope"},
     "renewal_logs": {"detail"},
+    "agent_runs": {"plan"},
+    "agent_advice": {"evidence"},
+    "agent_cases": {"tags"},
 }
 
 # 表名白名单（泛型 CRUD 的标识符护栏，防 SQL 注入）
@@ -376,7 +453,9 @@ TABLES = frozenset(("projects", "services", "environments", "servers",
                     "service_dependencies", "deployment_snapshots",
                     "canary_configs",
                     "response_time_history", "monitor_snapshots",
-                    "custom_monitors", "renewal_logs"))
+                    "custom_monitors", "renewal_logs",
+                    "agent_runs", "agent_messages", "agent_advice",
+                    "agent_cases"))
 
 
 def _check_table(table: str):

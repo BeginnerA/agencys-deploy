@@ -101,6 +101,9 @@ def create_app():
     app.register_blueprint(alert_bp, url_prefix="/api")
     app.register_blueprint(log_bp, url_prefix="/api")
     app.register_blueprint(deploy_enhance_bp, url_prefix="/api")
+    # Agent 模块（Phase 1-4）：对话 / 审批单 / 决策建议 / 故障案例
+    from agent.routes import register_agent
+    register_agent(app)
 
     from flask import render_template
 

@@ -447,9 +447,24 @@ def delete_canary_config(cid):
 @deploy_enhance_bp.route("/deploy/canary-decisions/<int:task_id>", methods=["GET"])
 @require_auth
 def get_canary_decision(task_id):
-    """读取灰度决策状态：none=无请求 / waiting=等待决策 / continue|stop|rollback=已决策"""
+    """读取灰度决策状态：none=无请求 / waiting=等待决策 / continue|stop|rollback=已决策
+    等待中时附带 AI 建议（Phase 2：advisor 规则/LLM 产出的 agent_advice 记录）"""
     from deploy import read_canary_decision
-    return jsonify(read_canary_decision(task_id))
+    data = read_canary_decision(task_id)
+    if data.get("state") == "waiting":
+        try:
+            # 同模块内惰性导入，避免 agent 未装配时影响原接口
+            from agent.advisor import latest_advice
+            adv = latest_advice(_db_path(), "canary", task_id)
+            if adv:
+                data["advice"] = {"id": adv["id"], "title": adv["title"],
+                                  "body": adv["body"],
+                                  "created_at": adv["created_at"],
+                                  "model": adv.get("model", "")}
+        except Exception:
+            # 建议仅作增强展示，读取失败不影响决策主流程
+            pass
+    return jsonify(data)
 
 
 @deploy_enhance_bp.route("/deploy/canary-decisions/<int:task_id>", methods=["POST"])
