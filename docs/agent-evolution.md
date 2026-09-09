@@ -23,7 +23,7 @@ agent/
 ├── executor.py    Phase 3 发布执行：计划生成 / 审批状态机 / 任务提交 / 后台同步
 ├── memory.py      Phase 4 长期记忆：故障案例 CRUD + 字符 bigram 相似检索
 ├── scheduler.py   后台建议调度（daemon 线程，默认 30s 一轮）
-├── routes.py      Web API（/api/agent/*，18 条，RBAC 对齐平台）
+├── routes.py      Web API（/api/agent/*，20 条，RBAC 对齐平台）
 ├── cli.py         终端对话入口（交互式 / --once 单轮）
 └── mcp_server.py  MCP stdio server（JSON-RPC 2.0，零依赖）
 ```
@@ -61,13 +61,14 @@ python webapp/app.py
 
 | 入口 | 方式 |
 | --- | --- |
-| Web 对话 | 浏览器 `http://127.0.0.1:5678/#/agent`（侧栏「智能运维 → 智能助手」），含 对话/审批单/建议/案例 四个页签 |
+| Web 对话 | 浏览器 `http://127.0.0.1:5678/#/agent`（侧栏「智能运维 → 智能助手」），含 对话/审批单/建议/案例 四个页签；另有全站右下角**悬浮智能助手**（独立 float 会话，任意页面随时对话） |
 | CLI | `python agent/cli.py --once "auth 服务最近有异常吗"` |
 | MCP | `python agent/mcp_server.py --db data/platform.db --role operator`（stdio，可接入支持 MCP 的客户端） |
 
 ## 三、Phase 1：只读智能运维助手
 
 - **对话**：登录用户在「智能助手」页与 LLM 多轮对话，回复**流式输出**（SSE 打字机效果，工具调用过程可见）；消息持久化到 `agent_messages`，可在 API/页面回溯（会话按用户隔离）。CLI/MCP 入口同样支持流式/批量两种形态。
+- **会话管理**：对话页支持多会话（下拉切换/新建/删除，`localStorage` 记住当前会话）；`float` 会话由全站右下角悬浮助手产生，也可在此管理。列表/删除仅 operator/admin（默认自己的会话；admin 可 `scope=all`/`user_id=` 跨用户管理，含 CLI 的 id=0 会话），消息回溯同样按用户隔离。
 - **工具**：20 个只读工具 + 6 个写工具（operator/admin 可见），全部以 JSON 结果回给模型：
   - 只读：`list_projects / get_project / list_services / list_environments / env_servers / service_status / recent_tasks / task_detail / list_alerts / alert_detail / search_logs / release_window / canary_configs / cert_monitors / audit_logs / search_cases / case_detail / advice_list / pending_approvals / run_detail`
   - 写：`analyze_alert / precheck / ack_alert / plan_operation / case_save / case_update`
@@ -126,7 +127,9 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | --- | --- | --- | --- |
 | POST | /agent/chat | 对话（批量，body: message, session_id；返回 reply/plan_run_id） | 登录用户 |
 | POST | /agent/chat/stream | 对话（SSE 流式，事件：text 正文增量 / tool 工具开始 / tool_result 工具结束 / done 收尾 / error 异常） | 登录用户 |
-| GET | /agent/sessions/<id>/messages | 会话消息回溯 | operator/admin |
+| GET | /agent/sessions | 会话列表（mine：默认本人；admin 加 scope=all 看全部；含条数/归属/摘要） | operator/admin |
+| DELETE | /agent/sessions/<id> | 删除整段会话（不可恢复；默认删自己的，admin 可 user_id= 指定） | operator/admin |
+| GET | /agent/sessions/<id>/messages | 会话消息回溯（默认仅本人；admin 可 user_id= 跨用户审计） | operator/admin |
 | GET | /agent/runs | 审批单列表（status 过滤） | 登录用户 |
 | GET | /agent/runs/<id> | 审批单详情 | 登录用户 |
 | POST | /agent/runs/<id>/decision | 审批（action: approve/reject, force_window） | operator/admin |
