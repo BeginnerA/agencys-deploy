@@ -3,6 +3,8 @@
 (function(){
   let timer = null;
   let destroyed = false;
+  let chatAbort = null;    // 流式对话 AbortController（切页时中止）
+  let pendingTools = [];   // 流式对话中未收尾的工具行（tool → tool_result）
   let currentTab = 'chat';   // chat | runs | advice | cases
 
   // ---- 页面状态 ----
@@ -146,18 +148,65 @@
         <div class="msg-bubble">${esc(content)}${extra || ''}</div>
       </div>`;
   }
-  function addTyping(){
-    const msgs = document.getElementById('chatMsgs');
-    if (!msgs) return null;
+  function streamBubble(msgs){
+    // 创建流式回复气泡容器（含“思考中”占位，首个事件到达时移除）
     const empty = msgs.querySelector('.chat-empty');
     if (empty) empty.remove();
-    const div = document.createElement('div');
-    div.className = 'msg-row';
-    div.innerHTML = `<div class="msg-ava">🤖</div>
-      <div class="msg-bubble"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>`;
-    msgs.appendChild(div);
+    const row = document.createElement('div');
+    row.className = 'msg-row';
+    row.innerHTML = `<div class="msg-ava">🤖</div>
+      <div class="msg-bubble"><span class="stream-hint" id="streamHint">思考中…</span></div>`;
+    msgs.appendChild(row);
     scrollBottom(msgs);
-    return div;
+    return row.querySelector('.msg-bubble');
+  }
+  function clearStreamHint(bubble){
+    if (!bubble) return;
+    const h = bubble.querySelector('.stream-hint');
+    if (h) h.remove();
+  }
+  function addToolLine(bubble, name){
+    if (!bubble) return null;
+    clearStreamHint(bubble);
+    const line = document.createElement('div');
+    line.className = 'msg-tool';
+    line.dataset.name = name || '';
+    line.innerHTML = `<span class="mark">⏳</span><span>正在调用工具 ${esc(name || '')} …</span>`;
+    bubble.appendChild(line);
+    scrollBottom(document.getElementById('chatMsgs'));
+    return line;
+  }
+  function finishToolLine(line, ok){
+    if (!line) return;
+    const name = line.dataset.name || '';
+    line.classList.add(ok ? 'ok' : 'fail');
+    line.innerHTML = `<span class="mark">${ok ? '✅' : '❌'}</span>` +
+      `<span>${ok ? '工具调用完成：' : '工具调用失败：'}${esc(name)}</span>`;
+    scrollBottom(document.getElementById('chatMsgs'));
+  }
+  function attachPlanTip(bubble, runId){
+    if (!bubble || !runId) return;
+    const tip = document.createElement('div');
+    tip.className = 'plan-tip';
+    const t = document.createElement('span');
+    t.textContent = '📝 已生成审批单 #' + runId;
+    const go = document.createElement('button');
+    go.className = 'btn sm primary';
+    go.textContent = '查看并审批';
+    go.onclick = () => switchTab('runs');
+    tip.appendChild(t);
+    tip.appendChild(go);
+    bubble.appendChild(tip);
+    scrollBottom(document.getElementById('chatMsgs'));
+  }
+  function appendStreamErr(bubble, msg, hint){
+    if (!bubble){ addChatBubble('assistant', msg + (hint ? '\n💡 ' + hint : '')); return; }
+    clearStreamHint(bubble);
+    const d = document.createElement('div');
+    d.className = 'msg-err';
+    d.textContent = (msg || '请求失败') + (hint ? '\n💡 ' + hint : '');
+    bubble.appendChild(d);
+    scrollBottom(document.getElementById('chatMsgs'));
   }
   function addChatBubble(role, content, runId){
     const msgs = document.getElementById('chatMsgs');
@@ -173,24 +222,98 @@
     if (g) g.onclick = () => switchTab('runs');
     scrollBottom(msgs);
   }
+  function appendDelta(bubble, text, msgs){
+    if (!bubble || !text) return false;
+    clearStreamHint(bubble);
+    bubble.appendChild(document.createTextNode(text));
+    scrollBottom(msgs);
+    return true;
+  }
   async function sendChat(text){
     const ta = document.getElementById('chatInput');
     const btn = document.getElementById('chatSend');
+    const msgs = document.getElementById('chatMsgs');
     addChatBubble('user', text);
-    const typing = addTyping();
+    const bubble = msgs ? streamBubble(msgs) : null;
     if (ta) ta.disabled = true;
-    if (btn){ btn.disabled = true; btn.textContent = '分析中…'; }
+    if (btn){ btn.disabled = true; btn.textContent = '等待回复…'; }
+    const ctrl = new AbortController();
+    chatAbort = ctrl;
+    let gotText = false, ended = false;
+    const onEvent = (ev) => {
+      const t = ev.type || '';
+      if (t === 'text'){
+        gotText = appendDelta(bubble, ev.text || '', msgs) || gotText;
+      } else if (t === 'tool'){
+        const line = addToolLine(bubble, ev.name);
+        if (line) pendingTools.push(line);
+      } else if (t === 'tool_result'){
+        // 找到该工具最近的未完成行并收尾
+        for (let i = pendingTools.length - 1; i >= 0; i--){
+          if (pendingTools[i].dataset.name === (ev.name || '')){
+            finishToolLine(pendingTools[i], !!ev.ok);
+            pendingTools.splice(i, 1);
+            break;
+          }
+        }
+      } else if (t === 'done'){
+        ended = true;
+        clearStreamHint(bubble);
+        const runId = (ev.result || {}).plan_run_id;
+        if (runId && bubble) attachPlanTip(bubble, runId);
+      } else if (t === 'error'){
+        ended = true;
+        appendStreamErr(bubble, ev.error || '对话出错', ev.hint || '');
+      }
+    };
+    const dispatch = (line) => {
+      if (!line.startsWith('data:')) return;
+      const raw = line.slice(5).trim();
+      if (!raw) return;
+      try{ onEvent(JSON.parse(raw)); }catch(e){ /* 单条事件解析失败跳过 */ }
+    };
     try{
-      const data = await api('/api/agent/chat', {
-        method: 'POST', body: JSON.stringify({message: text, session_id: SESSION})
+      const resp = await fetch('/api/agent/chat/stream', {
+        method: 'POST',
+        headers: {'Authorization': 'Bearer ' + token(), 'Content-Type': 'application/json'},
+        body: JSON.stringify({message: text, session_id: SESSION}),
+        signal: ctrl.signal
       });
-      if (typing) typing.remove();
-      addChatBubble('assistant', data.reply || '（无回复）', data.plan_run_id || 0);
+      if (resp.status === 401){
+        localStorage.removeItem('token'); localStorage.removeItem('user');
+        location.href = '/';
+        return;
+      }
+      if (!resp.ok){
+        ended = true;
+        const d = await resp.json().catch(() => ({}));
+        appendStreamErr(bubble, d.error || ('HTTP ' + resp.status), d.hint || '');
+        return;
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      for(;;){
+        if (destroyed){ try{ ctrl.abort(); }catch(e){} break; }
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buf += decoder.decode(chunk.value, {stream: true});
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0){
+          const part = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          part.split('\n').forEach(dispatch);
+        }
+      }
+      if (buf.trim()) buf.split('\n').forEach(dispatch); // 尾部无空行分隔的残余
+      if (!ended && !gotText && bubble) appendStreamErr(bubble, '连接中断，未收到完整回复', '');
+      else if (!ended && gotText && bubble) appendStreamErr(bubble, '\n\n⚠️ 回复中断（连接异常）', '');
     }catch(e){
-      if (typing) typing.remove();
-      const hint = e.data && e.data.hint ? e.data.hint : '';
-      addChatBubble('assistant', (e.message || '请求失败') + (hint ? '\n💡 ' + hint : ''));
+      if (e.name === 'AbortError'){ /* 切页主动取消：静默 */ }
+      else appendStreamErr(bubble, e.message || '请求失败', '');
     }finally{
+      chatAbort = null;
+      pendingTools = [];
       if (ta){ ta.disabled = false; ta.focus(); }
       if (btn){ btn.disabled = false; btn.textContent = '发送'; }
     }
@@ -756,6 +879,7 @@
     },
     destroy: function(){
       destroyed = true;
+      if (chatAbort){ try{ chatAbort.abort(); }catch(e){} chatAbort = null; }
       if (timer) clearInterval(timer);
       timer = null;
     }
