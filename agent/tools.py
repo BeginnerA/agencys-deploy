@@ -693,12 +693,28 @@ def visible_tools(role: str) -> list:
             if t["permission"] == "read" or _role_rank(role) >= 2]
 
 
+def _schema_out(spec: dict) -> dict:
+    """深拷贝 schema 并剥除非法标记：required 在 JSON Schema 中只能是数组，
+    工具定义里内嵌的布尔 required（必填标记）与顶层 required 数组一并移除，
+    必填校验统一由工具侧执行；DeepSeek 等网关按严格 Schema 校验，残留会报 400"""
+    out = {}
+    for k, v in spec.items():
+        if k == "required":
+            continue
+        if isinstance(v, dict):
+            out[k] = _schema_out(v)
+        elif isinstance(v, list):
+            out[k] = [_schema_out(x) if isinstance(x, dict) else x for x in v]
+        else:
+            out[k] = v
+    return out
+
+
 def tool_schemas(role: str) -> list:
-    """OpenAI function-calling schema（角色过滤后）"""
+    """OpenAI function-calling schema（角色过滤后，不含布尔 required 标记）"""
     out = []
     for t in visible_tools(role):
-        params = dict(t["parameters"])
-        params.pop("required", None)  # 部分模型不支持 required，交给工具侧校验
+        params = _schema_out(t["parameters"])
         out.append({"type": "function",
                     "function": {"name": t["name"],
                                  "description": t["description"],
