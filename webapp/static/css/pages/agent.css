@@ -1,0 +1,90 @@
+﻿/* pages/agent.css — 智能助手页（对话 / 审批单 / 决策建议 / 故障案例 / 网关配置）
+   仅含本页私有样式；公共组件（btn/tbl/field/modal/tag）复用 components.css */
+.agent-tabs-bar{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+.agent-tabs-bar .spacer{flex:1}
+.gw-state{display:inline-flex;align-items:center;gap:6px;font-size:var(--fs-12);color:var(--text-2);
+  border:1px solid var(--border);border-radius:var(--r-full);padding:4px 12px;cursor:pointer;background:var(--bg-panel)}
+.gw-state:hover{border-color:var(--primary);color:var(--primary)}
+.gw-state .dot{margin:0}
+
+/* ---------- 对话 Tab ---------- */
+.chat-wrap{display:flex;flex-direction:column;height:calc(100vh - 210px);min-height:420px;
+  background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--r-panel);overflow:hidden}
+.chat-msgs{flex:1;overflow-y:auto;padding:16px 18px;display:flex;flex-direction:column;gap:12px}
+.chat-empty{margin:auto;text-align:center;color:var(--text-3);font-size:var(--fs-13);line-height:2}
+.chat-empty .big{font-size:30px;display:block;margin-bottom:6px}
+.chat-sug{display:inline-flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:10px}
+.chat-sug span{border:1px dashed var(--border-strong);color:var(--text-2);border-radius:var(--r-full);
+  padding:3px 12px;font-size:var(--fs-12);cursor:pointer}
+.chat-sug span:hover{color:var(--primary);border-color:var(--primary)}
+.msg-row{display:flex;gap:10px;max-width:86%}
+.msg-row.user{align-self:flex-end;flex-direction:row-reverse}
+.msg-ava{width:32px;height:32px;border-radius:var(--r-full);display:flex;align-items:center;justify-content:center;
+  font-size:var(--fs-14);background:linear-gradient(135deg,var(--primary),#0090FF);flex-shrink:0}
+.msg-row.user .msg-ava{background:linear-gradient(135deg,#7B5CFF,#4A3FE0)}
+.msg-bubble{padding:10px 14px;border-radius:var(--r-panel);font-size:var(--fs-13);line-height:1.75;
+  white-space:pre-wrap;word-break:break-word;background:var(--bg-panel-2);border:1px solid var(--border);
+  color:var(--text-1)}
+.msg-row.user .msg-bubble{background:rgba(0,212,255,.08);border-color:rgba(0,212,255,.25)}
+.msg-bubble .plan-tip{margin-top:8px;padding-top:8px;border-top:1px dashed var(--border-strong);
+  display:flex;align-items:center;gap:8px;font-size:var(--fs-12)}
+.msg-bubble .plan-tip .btn{padding:2px 10px}
+.msg-time{align-self:flex-end;font-size:var(--fs-11);color:var(--text-3);margin-top:2px}
+.typing-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--text-3);
+  margin-right:3px;animation:blink 1.2s infinite}
+.typing-dot:nth-child(2){animation-delay:.2s}.typing-dot:nth-child(3){animation-delay:.4s}
+.chat-input{display:flex;gap:10px;padding:12px 16px;border-top:1px solid var(--border);background:var(--bg-panel)}
+.chat-input textarea{flex:1;resize:none;height:44px;max-height:120px;min-height:44px;
+  background:var(--bg-panel-2);border:1px solid var(--border);border-radius:var(--r-card);
+  color:var(--text-1);font-size:var(--fs-13);padding:10px 12px;outline:none;font-family:inherit}
+.chat-input textarea:focus{border-color:var(--primary);box-shadow:var(--shadow-glow)}
+.chat-input .send-btn{align-self:flex-end;height:44px}
+
+/* ---------- 列表类 Tab（审批单/建议） ---------- */
+.agent-list-panel{padding:0;overflow:hidden}
+.list-toolbar{display:flex;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);
+  flex-wrap:wrap}
+.list-toolbar input[type="text"],.list-toolbar select{background:var(--bg-panel-2);
+  border:1px solid var(--border);color:var(--text-1);border-radius:var(--r-card);
+  padding:6px 10px;font-size:var(--fs-12);outline:none;width:220px}
+.list-toolbar select{width:auto}
+.list-toolbar input:focus,.list-toolbar select:focus{border-color:var(--primary)}
+.agent-item{display:flex;gap:12px;align-items:flex-start;padding:12px 16px;border-bottom:1px solid rgba(0,212,255,.06);
+  cursor:pointer;transition:var(--t-fast)}
+.agent-item:hover{background:var(--bg-hover)}
+.agent-item .ai-main{flex:1;min-width:0}
+.agent-item .ai-title{font-size:var(--fs-13);font-weight:600;color:var(--text-1);margin-bottom:4px;display:flex;
+  align-items:center;gap:8px;flex-wrap:wrap}
+.agent-item .ai-body{font-size:var(--fs-12);color:var(--text-2);line-height:1.7;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-line}
+.agent-item .ai-meta{margin-top:6px;font-size:var(--fs-11);color:var(--text-3);display:flex;gap:10px;flex-wrap:wrap;
+  align-items:center}
+.agent-item .ai-actions{margin-left:auto;display:flex;gap:6px;flex-shrink:0;align-items:center;flex-wrap:wrap;
+  justify-content:flex-end}
+.agent-item:hover .ai-actions{opacity:1}
+.agent-item:not(:hover) .ai-actions{opacity:.75}
+.agent-item .ai-actions .btn{padding:3px 10px;font-size:var(--fs-12)}
+
+/* 审批单卡片 */
+.run-status-ico{width:34px;height:34px;border-radius:var(--r-card);display:flex;align-items:center;
+  justify-content:center;font-size:var(--fs-16);background:var(--bg-panel-2);border:1px solid var(--border);
+  flex-shrink:0}
+.plan-detail{margin-top:10px;background:var(--bg-panel-2);border:1px solid var(--border);
+  border-radius:var(--r-card);padding:10px 12px;font-size:var(--fs-12);color:var(--text-2);line-height:1.8}
+.plan-detail .row{display:flex;gap:8px}
+.plan-detail .row b{color:var(--text-1);min-width:70px;flex-shrink:0;font-weight:500}
+.plan-detail code{background:rgba(0,0,0,.3);border:1px solid var(--border);border-radius:4px;
+  padding:2px 6px;font-family:var(--font-num);font-size:var(--fs-11);color:var(--primary);
+  display:block;margin-top:4px;white-space:pre-wrap;word-break:break-all}
+.warn-line{color:var(--warning);font-size:var(--fs-12)}
+
+/* ---------- 案例 Tab 网格 ---------- */
+.case-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
+.case-card{background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--r-panel);padding:14px;
+  cursor:pointer;transition:var(--t-fast);display:flex;flex-direction:column;gap:8px}
+.case-card:hover{border-color:var(--primary);transform:translateY(-2px)}
+.case-card .cc-title{font-size:var(--fs-13);font-weight:600;color:var(--text-1)}
+.case-card .cc-body{font-size:var(--fs-12);color:var(--text-2);line-height:1.7;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.case-card .cc-foot{margin-top:auto;font-size:var(--fs-11);color:var(--text-3);display:flex;gap:8px;
+  align-items:center;flex-wrap:wrap}

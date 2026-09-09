@@ -10,6 +10,7 @@ const ROUTES = [
   { path:'deploy/compare',   group:'运维操作', icon:'📊', name:'发布对比', page:'deploy_compare',   crumbs:['运维操作','发布中心','发布对比'], sub:true, parent:'deploy' },
   { path:'alerts',    group:'运维操作', icon:'🔔', name:'告警中心', page:'alerts',    crumbs:['运维操作','告警中心'] },
   { path:'logs',      group:'运维操作', icon:'📜', name:'日志中心', page:'logs',      crumbs:['运维操作','日志中心'] },
+  { path:'agent',     group:'智能运维', icon:'🤖', name:'智能助手', page:'agent',     crumbs:['智能运维','智能助手'] },
   { path:'config',    group:'系统管理', icon:'⚙️', name:'配置管理', page:'config',    crumbs:['系统管理','配置管理'], adminOnly:true, sub:true },
 ];
 // 惰性取页面模块：router.js 先于 pages/*.js 加载，顶层不能引用未定义变量

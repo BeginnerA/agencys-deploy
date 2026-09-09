@@ -1,0 +1,763 @@
+// pages/agent.js — 智能助手（对话 / 审批单 / 决策建议 / 故障案例 / 网关配置）
+// 消费后端 /api/agent/* API；角色：viewer=只读对话；operator/admin=审批/建议/案例
+(function(){
+  let timer = null;
+  let destroyed = false;
+  let currentTab = 'chat';   // chat | runs | advice | cases
+
+  // ---- 页面状态 ----
+  let gw = null;             // GET /api/agent/config 缓存
+  let runs = [], runStatus = 'all';
+  let adviceList = [], adviceScope = '';
+  let cases = [], caseKw = '', caseSvc = '';
+
+  const role = currentUser().role || 'viewer';
+  const canManage = ['admin','operator'].includes(role);
+  const SESSION = 'web';
+
+  const RUN_LABEL = {
+    awaiting_approval: {label:'待审批', cls:'pending', ico:'📝'},
+    rejected:         {label:'已驳回', cls:'failed',   ico:'🚫'},
+    executing:        {label:'执行中', cls:'running',  ico:'⚙️'},
+    success:          {label:'成功',   cls:'success',  ico:'✅'},
+    failed:           {label:'失败',   cls:'failed',   ico:'❌'}
+  };
+  const SCOPE_LABEL = {
+    canary:'灰度决策', task_failed:'失败归因', alert:'告警归因', precheck:'发布预检'
+  };
+  const OP_LABEL = {deploy:'发布', rollback:'回滚', restart:'重启'};
+  const CHAT_SUG = [
+    'pay 服务现在状态如何？',
+    '最近 1 小时有没有任务失败？',
+    '查看未解决告警并分析原因',
+    '把 order 服务回滚到上一个版本，先做计划'
+  ];
+
+  // ---- 工具 ----
+  function qs(obj){
+    const p = new URLSearchParams();
+    Object.entries(obj).forEach(([k,v]) => { if (v !== '' && v != null) p.set(k, v); });
+    const s = p.toString(); return s ? '?' + s : '';
+  }
+  function parsePlan(p){
+    if (!p) return {};
+    if (typeof p === 'string'){ try { return JSON.parse(p); }catch(e){ return {}; } }
+    return (p && typeof p === 'object') ? p : {};
+  }
+  function setPanel(html){
+    const tc = document.getElementById('tabContent');
+    if (tc){ tc.innerHTML = html || '<div class="muted" style="padding:30px;text-align:center">暂无内容</div>'; }
+  }
+  function scrollBottom(el){ if (el) el.scrollTop = el.scrollHeight; }
+
+  // ---- 主渲染 ----
+  function renderPage(){
+    const root = document.getElementById('pageRoot');
+    root.innerHTML = `
+      <div class="agent-tabs-bar">
+        <button class="tab-btn ${currentTab==='chat'?'active':''}" data-tab="chat">💬 对话助手</button>
+        <button class="tab-btn ${currentTab==='runs'?'active':''}" data-tab="runs">📝 发布审批单</button>
+        <button class="tab-btn ${currentTab==='advice'?'active':''}" data-tab="advice">🤖 决策建议</button>
+        <button class="tab-btn ${currentTab==='cases'?'active':''}" data-tab="cases">📚 故障案例库</button>
+        <span class="spacer"></span>
+        <span class="gw-state" id="gwChip" title="查看/配置 LLM 网关"></span>
+      </div>
+      <div id="tabContent"></div>`;
+    root.querySelectorAll('.tab-btn[data-tab]').forEach(btn => {
+      btn.onclick = () => switchTab(btn.dataset.tab);
+    });
+    const chip = document.getElementById('gwChip');
+    if (chip) chip.onclick = () => openGwModal();
+    switchTab(currentTab);
+  }
+
+  async function switchTab(tab){
+    currentTab = tab;
+    const root = document.getElementById('pageRoot');
+    if (!root) return;
+    root.querySelectorAll('.tab-btn[data-tab]').forEach(b =>
+      b.classList.toggle('active', b.dataset.tab === tab));
+    const tc = document.getElementById('tabContent');
+    if (!tc) return;
+    tc.innerHTML = skeletonHTML(3);
+    if (tab === 'chat') renderChatTab();
+    else if (tab === 'runs'){ renderRunsTab(); loadRuns(); }
+    else if (tab === 'advice'){ renderAdviceTab(); loadAdvice(); }
+    else if (tab === 'cases'){ renderCasesTab(); loadCases(); }
+    renderGwChip();
+  }
+
+  // ==================== 对话 Tab ====================
+  function renderChatTab(){
+    setPanel(`
+      <div class="chat-wrap">
+        <div class="chat-msgs" id="chatMsgs"></div>
+        <div class="chat-input">
+          <textarea id="chatInput" placeholder="${canManage ? '例：把 pay 服务回滚到上一版本（生成审批单）' : '例：pay 服务现在状态如何？'}（Enter 发送 / Shift+Enter 换行）"></textarea>
+          <button class="btn primary send-btn" id="chatSend">发送</button>
+        </div>
+      </div>`);
+    const msgs = document.getElementById('chatMsgs');
+    const ta = document.getElementById('chatInput');
+    const btn = document.getElementById('chatSend');
+    if (msgs){
+      msgs.innerHTML = chatEmptyHtml();
+      // 恢复服务端历史（operator+ 可见；viewer 无权限时静默降级为空会话）
+      api('/api/agent/sessions/' + SESSION + '/messages?limit=40').then(data => {
+        if (destroyed || !document.getElementById('chatMsgs')) return;
+        const list = (data.messages || []).filter(m => ['user','assistant'].includes(m.role));
+        if (list.length){ renderChatHistory(list); }
+      }).catch(() => {});
+    }
+    const send = () => {
+      const text = (ta.value || '').trim();
+      if (!text) return;
+      ta.value = '';
+      sendChat(text);
+    };
+    if (btn) btn.onclick = send;
+    if (ta){
+      ta.onkeydown = (e) => {
+        if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
+      };
+      ta.focus();
+    }
+  }
+  function chatEmptyHtml(){
+    const sugs = CHAT_SUG.map(s => `<span data-sug="${esc(s)}">${esc(s)}</span>`).join('');
+    return `<div class="chat-empty" id="chatEmpty">
+      <span class="big">🤖</span>你好，我是平台内置的运维智能助手。
+      可以询问服务状态、告警归因、发布记录，或描述发布意图让我生成审批单。
+      <div class="chat-sug">${sugs}</div></div>`;
+  }
+  function renderChatHistory(list){
+    const msgs = document.getElementById('chatMsgs');
+    if (!msgs) return;
+    msgs.innerHTML = list.map(m => bubbleHtml(m.role, m.content || '')).join('');
+    const empty = msgs.querySelector('.chat-empty');
+    if (empty) empty.remove();
+    scrollBottom(msgs);
+    msgs.querySelectorAll('[data-sug]').forEach(s => { s.onclick = () => sendChat(s.dataset.sug); });
+  }
+  function bubbleHtml(role, content, extra){
+    return `
+      <div class="msg-row ${role === 'user' ? 'user' : ''}">
+        <div class="msg-ava">${role === 'user' ? '🧑' : '🤖'}</div>
+        <div class="msg-bubble">${esc(content)}${extra || ''}</div>
+      </div>`;
+  }
+  function addTyping(){
+    const msgs = document.getElementById('chatMsgs');
+    if (!msgs) return null;
+    const empty = msgs.querySelector('.chat-empty');
+    if (empty) empty.remove();
+    const div = document.createElement('div');
+    div.className = 'msg-row';
+    div.innerHTML = `<div class="msg-ava">🤖</div>
+      <div class="msg-bubble"><span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span></div>`;
+    msgs.appendChild(div);
+    scrollBottom(msgs);
+    return div;
+  }
+  function addChatBubble(role, content, runId){
+    const msgs = document.getElementById('chatMsgs');
+    if (!msgs) return;
+    const empty = msgs.querySelector('.chat-empty');
+    if (empty) empty.remove();
+    const extra = runId ? `<div class="plan-tip">📝 已生成审批单 #${runId}
+      <button class="btn sm primary" id="gotoRun">查看并审批</button></div>` : '';
+    const holder = document.createElement('div');
+    holder.innerHTML = bubbleHtml(role, content, extra);
+    msgs.appendChild(holder.firstElementChild);
+    const g = document.getElementById('gotoRun');
+    if (g) g.onclick = () => switchTab('runs');
+    scrollBottom(msgs);
+  }
+  async function sendChat(text){
+    const ta = document.getElementById('chatInput');
+    const btn = document.getElementById('chatSend');
+    addChatBubble('user', text);
+    const typing = addTyping();
+    if (ta) ta.disabled = true;
+    if (btn){ btn.disabled = true; btn.textContent = '分析中…'; }
+    try{
+      const data = await api('/api/agent/chat', {
+        method: 'POST', body: JSON.stringify({message: text, session_id: SESSION})
+      });
+      if (typing) typing.remove();
+      addChatBubble('assistant', data.reply || '（无回复）', data.plan_run_id || 0);
+    }catch(e){
+      if (typing) typing.remove();
+      const hint = e.data && e.data.hint ? e.data.hint : '';
+      addChatBubble('assistant', (e.message || '请求失败') + (hint ? '\n💡 ' + hint : ''));
+    }finally{
+      if (ta){ ta.disabled = false; ta.focus(); }
+      if (btn){ btn.disabled = false; btn.textContent = '发送'; }
+    }
+  }
+
+  // ==================== 审批单 Tab ====================
+  function renderRunsTab(){
+    const chips = ['all', ...Object.keys(RUN_LABEL)].map(s => `
+      <button class="chip ${runStatus===s?'active':''}" data-status="${s}">
+        ${s==='all' ? '全部' : RUN_LABEL[s].label}</button>`).join('');
+    setPanel(`
+      <div class="agent-list-panel panel">
+        <div class="list-toolbar">
+          ${chips}
+          <span style="flex:1"></span>
+          <button class="btn sm ghost" id="runsRefresh">刷新</button>
+        </div>
+        <div id="runsList"></div>
+      </div>`);
+    document.querySelectorAll('[data-status]').forEach(c => {
+      c.onclick = () => { runStatus = c.dataset.status; loadRuns(); };
+    });
+    const rf = document.getElementById('runsRefresh');
+    if (rf) rf.onclick = loadRuns;
+  }
+  async function loadRuns(){
+    const box = document.getElementById('runsList');
+    if (!box) return;
+    box.innerHTML = skeletonHTML(3);
+    try{
+      const data = await api('/api/agent/runs' + qs({status: runStatus === 'all' ? '' : runStatus, limit: 100}));
+      runs = data.runs || [];
+    }catch(e){ runs = []; }
+    renderRunsList(box);
+    renderGwChip();
+  }
+  function renderRunsList(box){
+    if (!box) return;
+    if (!runs.length){
+      box.innerHTML = `<div class="agent-list-panel panel"><div class="panel">${emptyState('📝', '暂无审批单（可在对话中让助手生成发布计划）')}</div></div>`;
+      return;
+    }
+    box.innerHTML = runs.map(r => {
+      const st = RUN_LABEL[r.status] || {label: r.status, cls:'pending', ico:'📋'};
+      const plan = parsePlan(r.plan);
+      const actions = [];
+      if (r.status === 'awaiting_approval' && canManage){
+        actions.push(`<button class="btn sm primary" data-act="approve" data-id="${r.id}">通过</button>`);
+        actions.push(`<button class="btn sm danger" data-act="reject" data-id="${r.id}">驳回</button>`);
+      }
+      const title = `${OP_LABEL[plan.op] || plan.op || '操作'} · ${esc(r.name || r.intent || '#')}`
+        + (r.env ? `（${esc(r.env)}）` : '');
+      return `
+        <div class="agent-item" data-open="${r.id}">
+          <div class="run-status-ico">${st.ico}</div>
+          <div class="ai-main">
+            <div class="ai-title"><span>#${r.id} ${title}</span>
+              <span class="badge ${st.cls}">${st.label}</span>
+              ${plan.window_warning ? '<span class="tag tag-warn">⏱ 窗口外</span>' : ''}
+            </div>
+            <div class="ai-meta">
+              <span>🕐 ${fmtTime(r.created_at)}</span>
+              <span>👤 ${esc(r.created_by_name || '-')}</span>
+              ${r.version ? `<span>📦 ${esc(r.version)}</span>` : ''}
+              ${r.decided_by_name ? `<span>✅ ${esc(r.decided_by_name)}${r.decision_note ? '：' + esc(r.decision_note) : ''}</span>` : ''}
+            </div>
+          </div>
+          <div class="ai-actions">${actions.join('')}</div>
+        </div>`;
+    }).join('');
+    // 操作绑定
+    box.querySelectorAll('[data-act]').forEach(b => {
+      b.onclick = (ev) => { ev.stopPropagation(); onRunDecision(Number(b.dataset.id), b.dataset.act); };
+    });
+    box.querySelectorAll('[data-open]').forEach(item => {
+      item.onclick = () => openRunDetail(Number(item.dataset.open));
+    });
+  }
+  function getRun(id){ return runs.find(r => r.id === id) || null; }
+  async function onRunDecision(id, act){
+    const run = getRun(id);
+    if (!run) return;
+    const plan = parsePlan(run.plan);
+    if (act === 'approve'){
+      openDrawer({
+        title: `审批发布单 #${id} · ${esc(run.name)}`,
+        body: `
+          <div class="plan-detail">
+            <div class="row"><b>操作</b>${OP_LABEL[plan.op] || plan.op}</div>
+            <div class="row"><b>目标</b>${esc(plan.target || run.name)}</div>
+            <div class="row"><b>环境</b>${esc(run.env || '-')}</div>
+            ${run.version ? `<div class="row"><b>版本</b>${esc(run.version)}</div>` : ''}
+            ${plan.window_text ? `<div class="row"><b>窗口</b>${esc(plan.window_text)}</div>` : ''}
+            ${plan.steps ? `<div class="row"><b>步骤</b><span style="white-space:pre-line">${esc(plan.steps)}</span></div>` : ''}
+            ${run.intent ? `<div class="row"><b>意图</b><span style="white-space:pre-line">${esc(run.intent)}</span></div>` : ''}
+          </div>
+          ${plan.window_warning ? '<div class="warn-line">⚠️ ' + esc(plan.window_warning) + '</div>' : ''}
+          <div class="field" style="margin-top:12px"><label>审批意见（选填）</label>
+            <input type="text" id="decNote" maxlength="200" placeholder="补充审批意见，将写入审计"></div>
+          ${plan.window_warning ? `<div style="display:flex;align-items:center;gap:8px;margin-top:10px">
+            <input type="checkbox" id="decForce"><label style="color:var(--text-2);font-size:var(--fs-12)">非发布窗口期，强制提交执行</label></div>` : ''}`,
+        footer: `<button class="btn" id="decCancel">取消</button>
+                 <button class="btn primary" id="decOk">确认通过并提交执行</button>`,
+        onClose: () => {}
+      });
+      const doApprove = async () => {
+        const note = (document.getElementById('decNote') || {}).value || '';
+        const force = !!(document.getElementById('decForce') || {}).checked;
+        try{
+          await api(`/api/agent/runs/${id}/decision`, {method:'POST',
+            body: JSON.stringify({action:'approve', note:note, force_window:force})});
+          toastSuccess(`审批单 #${id} 已通过，任务进入执行队列`);
+          loadRuns();
+        }catch(e){ toastError('审批失败：' + (e.message || '')); }
+      };
+      const ok = document.getElementById('decOk');
+      const can = document.getElementById('decCancel');
+      if (ok) ok.onclick = doApprove;
+      if (can) can.onclick = () => { document.getElementById('drawerRoot').classList.add('hidden'); };
+    }else{
+      const yes = await confirmDialog('确认驳回该发布单？驳回后不可恢复。', `驳回审批单 #${id}`);
+      if (!yes) return;
+      try{
+        await api(`/api/agent/runs/${id}/decision`, {method:'POST',
+          body: JSON.stringify({action:'reject', note:'Web 端驳回'})});
+        toastSuccess(`审批单 #${id} 已驳回`);
+        loadRuns();
+      }catch(e){ toastError('驳回失败：' + (e.message || '')); }
+    }
+  }
+  function openRunDetail(id){
+    const run = getRun(id);
+    if (!run) return;
+    const st = RUN_LABEL[run.status] || {label:run.status, cls:'pending'};
+    const plan = parsePlan(run.plan);
+    const flags = plan.flags || {};
+    const flagText = Object.entries(flags)
+      .filter(([,v]) => v).map(([k]) => k).join(', ') || '-';
+    openDrawer({
+      title: `审批单 #${id} 详情`,
+      wide: true,
+      body: `
+        <div class="plan-detail">
+          <div class="row"><b>状态</b><span class="badge ${st.cls}">${st.label}</span>
+            ${run.task_id ? `关联任务 #${run.task_id}` : ''}</div>
+          <div class="row"><b>操作</b>${OP_LABEL[plan.op] || plan.op}</div>
+          <div class="row"><b>目标</b>${esc(plan.target || run.name)}</div>
+          <div class="row"><b>环境</b>${esc(run.env || '-')}</div>
+          ${run.version ? `<div class="row"><b>版本</b>${esc(run.version)}</div>` : ''}
+          ${run.previous_version ? `<div class="row"><b>回滚至</b>${esc(run.previous_version)}</div>` : ''}
+          <div class="row"><b>标记</b>${esc(flagText)}</div>
+          ${run.intent ? `<div class="row"><b>用户意图</b><span style="white-space:pre-line">${esc(run.intent)}</span></div>` : ''}
+          ${plan.window_text ? `<div class="row"><b>发布窗口</b>${esc(plan.window_text)}</div>` : ''}
+          ${plan.steps ? `<div class="row"><b>执行步骤</b><span style="white-space:pre-line">${esc(plan.steps)}</span></div>` : ''}
+          ${plan.cli ? `<div class="row"><b>等价 CLI</b><code>${esc(plan.cli)}</code></div>` : ''}
+          ${run.summary ? `<div class="row"><b>执行摘要</b><span style="white-space:pre-line">${esc(run.summary)}</span></div>` : ''}
+          <div class="row"><b>创建人</b>${esc(run.created_by_name || '-')} @ ${fmtTime(run.created_at)}</div>
+          ${run.decided_by_name ? `<div class="row"><b>审批人</b>${esc(run.decided_by_name)} @ ${fmtTime(run.decided_at)}
+            ${run.decision_note ? '（' + esc(run.decision_note) + '）' : ''}</div>` : ''}
+        </div>`
+    });
+  }
+
+  // ==================== 决策建议 Tab ====================
+  function renderAdviceTab(){
+    const chips = ['', ...Object.keys(SCOPE_LABEL)].map(s => `
+      <button class="chip ${adviceScope===s?'active':''}" data-scope="${s}">
+        ${s === '' ? '全部' : SCOPE_LABEL[s]}</button>`).join('');
+    setPanel(`
+      <div class="agent-list-panel panel">
+        <div class="list-toolbar">
+          ${chips}
+          <span style="flex:1"></span>
+          <button class="btn sm ghost" id="adviceRefresh">刷新</button>
+        </div>
+        <div id="adviceList"></div>
+      </div>
+      <div class="field" style="display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap">
+        <b style="color:var(--text-2)">快捷工具：</b>
+        <input type="text" id="preTarget" placeholder="发布预检：服务名（如 order）" style="width:200px">
+        <input type="text" id="preEnv" placeholder="环境（如 prod，可空）" style="width:120px">
+        <button class="btn sm" id="preGo">运行预检</button>
+        <input type="text" id="alertId" placeholder="告警归因：告警 ID" style="width:130px">
+        <button class="btn sm" id="alertGo">归因分析</button>
+      </div>`);
+    document.querySelectorAll('[data-scope]').forEach(c => {
+      c.onclick = () => { adviceScope = c.dataset.scope; loadAdvice(); };
+    });
+    const rf = document.getElementById('adviceRefresh');
+    if (rf) rf.onclick = loadAdvice;
+    const preGo = document.getElementById('preGo');
+    if (preGo) preGo.onclick = runPrecheck;
+    const alertGo = document.getElementById('alertGo');
+    if (alertGo) alertGo.onclick = runAlertAnalyze;
+  }
+  async function loadAdvice(){
+    const box = document.getElementById('adviceList');
+    if (!box) return;
+    box.innerHTML = skeletonHTML(3);
+    try{
+      const data = await api('/api/agent/advice' + qs({scope: adviceScope, limit: 100}));
+      adviceList = data.advice || [];
+    }catch(e){ adviceList = []; }
+    renderAdviceList(box);
+  }
+  function renderAdviceList(box){
+    if (!box) return;
+    if (!adviceList.length){
+      box.innerHTML = `<div class="panel">${emptyState('🤖', '暂无建议（后台调度会自动分析灰度 / 失败任务 / 告警）')}</div>`;
+      return;
+    }
+    const scopeIco = {canary:'🐤', task_failed:'🧯', alert:'🚨', precheck:'🛡️'};
+    box.innerHTML = adviceList.map(a => {
+      const actions = [];
+      if (canManage){
+        actions.push(`<button class="btn sm" data-to="${a.id}">📥 沉淀案例</button>`);
+      }
+      if (role === 'admin'){
+        actions.push(`<button class="btn sm danger" data-del="${a.id}">删除</button>`);
+      }
+      return `
+        <div class="agent-item" data-open="${a.id}">
+          <div class="run-status-ico">${scopeIco[a.scope] || '💡'}</div>
+          <div class="ai-main">
+            <div class="ai-title">${esc(a.title || '建议')}
+              <span class="tag tag-info">${SCOPE_LABEL[a.scope] || esc(a.scope)}</span>
+              ${a.model ? `<span class="muted" style="font-size:var(--fs-11)">${esc(a.model)}</span>` : ''}
+            </div>
+            <div class="ai-body">${esc(a.body || '')}</div>
+            <div class="ai-meta">
+              <span>🕐 ${fmtTime(a.created_at)}</span>
+              <span>👤 ${esc(a.created_by_name || 'advisor')}</span>
+              <span>🔗 ref #${a.ref_id}</span>
+            </div>
+          </div>
+          <div class="ai-actions">${actions.join('')}</div>
+        </div>`;
+    }).join('');
+    box.querySelectorAll('[data-open]').forEach(item => {
+      item.onclick = () => openAdviceDetail(Number(item.dataset.open));
+    });
+    box.querySelectorAll('[data-to]').forEach(b => {
+      b.onclick = async (ev) => {
+        ev.stopPropagation();
+        try{
+          const data = await api(`/api/agent/advice/${b.dataset.to}/to_case`, {method:'POST'});
+          toastSuccess('已生成案例草稿 #' + data.case_id + '，可在故障案例库查看');
+        }catch(e){ toastError('沉淀失败：' + (e.message || '')); }
+      };
+    });
+    box.querySelectorAll('[data-del]').forEach(b => {
+      b.onclick = async (ev) => {
+        ev.stopPropagation();
+        const yes = await confirmDialog('确认删除该建议？', '删除建议');
+        if (!yes) return;
+        try{
+          await api(`/api/agent/advice/${b.dataset.del}`, {method:'DELETE'});
+          toastSuccess('已删除');
+          loadAdvice();
+        }catch(e){ toastError('删除失败：' + (e.message || '')); }
+      };
+    });
+  }
+  function openAdviceDetail(id){
+    const a = adviceList.find(x => x.id === id);
+    if (!a) return;
+    let evHtml = '';
+    try{
+      const ev = typeof a.evidence === 'string' ? JSON.parse(a.evidence) : a.evidence;
+      if (ev) evHtml = `<div class="row"><b>证据</b><code style="font-size:11px">${esc(JSON.stringify(ev, null, 2))}</code></div>`;
+    }catch(e){}
+    openDrawer({
+      title: '决策建议 #' + id,
+      wide: true,
+      body: `
+        <div class="plan-detail">
+          <div class="row"><b>标题</b>${esc(a.title || '-')}</div>
+          <div class="row"><b>类型</b>${SCOPE_LABEL[a.scope] || esc(a.scope)}（ref #${a.ref_id}）</div>
+          <div class="row"><b>内容</b><span style="white-space:pre-line">${esc(a.body || '-')}</span></div>
+          ${evHtml}
+          <div class="row"><b>产出</b>${esc(a.model || '规则引擎')} · ${esc(a.created_by_name || 'advisor')} @ ${fmtTime(a.created_at)}</div>
+        </div>`
+    });
+  }
+  async function runPrecheck(){
+    const target = (document.getElementById('preTarget') || {}).value || '';
+    const env = (document.getElementById('preEnv') || {}).value || '';
+    if (!target){ toastError('请输入要预检的服务名'); return; }
+    try{
+      const data = await api('/api/agent/precheck', {method:'POST',
+        body: JSON.stringify({target: target, env: env})});
+      const checks = (data.checks || []).map(c =>
+        `<div class="row"><b>${c.ok ? '✅' : '❌'}</b>${esc(c.name || '')}：${esc(c.detail || c.message || '')}</div>`).join('');
+      openDrawer({
+        title: `发布预检 · ${esc(target)}${env ? '（' + esc(env) + '）' : ''}`,
+        wide: true,
+        body: `
+          <div style="margin-bottom:10px">
+            ${data.passed
+              ? '<span class="badge success">预检通过，可以进入发布</span>'
+              : '<span class="badge failed">预检未通过，建议先处理阻断项</span>'}
+          </div>
+          <div class="plan-detail">${checks || '<div class="row"><b>ℹ️</b>无检查项输出</div>'}</div>
+          <div class="plan-detail" style="margin-top:10px"><div class="row"><b>结论</b>
+            <span style="white-space:pre-line">${esc(data.body || '')}</span></div></div>`
+      });
+      loadAdvice();
+    }catch(e){ toastError('预检失败：' + (e.message || '')); }
+  }
+  async function runAlertAnalyze(){
+    const id = (document.getElementById('alertId') || {}).value || '';
+    if (!id || !/^\d+$/.test(id)){ toastError('请输入正确的告警 ID'); return; }
+    try{
+      const data = await api(`/api/agent/analyze/alert/${id}`, {method:'POST'});
+      const a = data.advice || {};
+      openDrawer({
+        title: '告警归因分析 #' + id,
+        wide: true,
+        body: `<div class="plan-detail">
+          <div class="row"><b>标题</b>${esc(a.title || '-')}</div>
+          <div class="row"><b>内容</b><span style="white-space:pre-line">${esc(a.body || '-')}</span></div>
+          <div class="row"><b>产出</b>${esc(a.model || '规则引擎')} @ ${fmtTime(a.created_at)}</div>
+        </div>`
+      });
+      toastSuccess('归因分析完成（建议 #' + a.id + '）');
+      loadAdvice();
+    }catch(e){ toastError('归因失败：' + (e.message || '')); }
+  }
+
+  // ==================== 故障案例 Tab ====================
+  function renderCasesTab(){
+    setPanel(`
+      <div class="agent-list-panel panel">
+        <div class="list-toolbar">
+          <input type="text" id="caseKw" placeholder="搜索症状 / 根因 / 教训关键字" value="${esc(caseKw)}">
+          <input type="text" id="caseSvc" placeholder="服务名（可空）" value="${esc(caseSvc)}" style="width:140px">
+          <button class="btn sm" id="caseSearch">搜索</button>
+          <span style="flex:1"></span>
+          ${canManage ? '<button class="btn sm primary" id="caseNew">＋ 新案例</button>' : ''}
+        </div>
+        <div style="padding:14px" id="caseGrid"></div>
+      </div>`);
+    const search = () => {
+      caseKw = (document.getElementById('caseKw') || {}).value || '';
+      caseSvc = (document.getElementById('caseSvc') || {}).value || '';
+      loadCases();
+    };
+    const sb = document.getElementById('caseSearch');
+    if (sb) sb.onclick = search;
+    const kw = document.getElementById('caseKw');
+    if (kw){ kw.onkeydown = (e) => { if (e.key === 'Enter') search(); }; }
+    const cn = document.getElementById('caseNew');
+    if (cn) cn.onclick = () => openCaseForm(null);
+  }
+  async function loadCases(){
+    const box = document.getElementById('caseGrid');
+    if (!box) return;
+    box.innerHTML = skeletonHTML(4);
+    try{
+      const data = await api('/api/agent/cases' + qs({keyword: caseKw, service: caseSvc, limit: 100}));
+      cases = data.cases || [];
+    }catch(e){ cases = []; }
+    renderCases(box);
+  }
+  function renderCases(box){
+    if (!box) return;
+    if (!cases.length){
+      box.innerHTML = emptyState('📚', '暂无故障案例。可在「决策建议」中将 AI 建议一键沉淀为案例');
+      return;
+    }
+    box.innerHTML = `<div class="case-grid">${cases.map(c => `
+      <div class="case-card" data-open="${c.id}">
+        <div class="cc-title">${esc(c.title)}</div>
+        <div class="cc-body">${esc(c.symptom || c.root_cause || c.lesson || '')}</div>
+        <div class="cc-foot">
+          <span class="tag tag-${c.result === 'resolved' || c.result === '成功' ? 'ok' : 'warn'}">${esc(c.result || '待验证')}</span>
+          ${c.service ? `<span>🔧 ${esc(c.service)}</span>` : ''}
+          ${c.env ? `<span>🌐 ${esc(c.env)}</span>` : ''}
+          <span style="margin-left:auto">🕐 ${fmtTime(c.updated_at || c.created_at)}</span>
+        </div>
+      </div>`).join('')}</div>`;
+    box.querySelectorAll('[data-open]').forEach(card => {
+      card.onclick = () => openCaseDetail(Number(card.dataset.open));
+    });
+  }
+  function getCase(id){ return cases.find(c => c.id === id) || null; }
+  function openCaseDetail(id){
+    const c = getCase(id);
+    if (!c) return;
+    const tags = (c.tags || []).map(t => `<span class="tag tag-info">${esc(t)}</span>`).join(' ');
+    openDrawer({
+      title: `故障案例 #${id}`,
+      wide: true,
+      body: `
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+          <b style="font-size:var(--fs-16)">${esc(c.title)}</b>
+          <span class="tag tag-${c.result === 'resolved' || c.result === '成功' ? 'ok' : 'warn'}">${esc(c.result || '待验证')}</span>
+        </div>
+        <div class="plan-detail">
+          ${c.service ? `<div class="row"><b>服务</b>${esc(c.service)}</div>` : ''}
+          ${c.env ? `<div class="row"><b>环境</b>${esc(c.env)}</div>` : ''}
+          ${c.version ? `<div class="row"><b>版本</b>${esc(c.version)}</div>` : ''}
+          <div class="row"><b>症状</b><span style="white-space:pre-line">${esc(c.symptom || '-')}</span></div>
+          <div class="row"><b>根因</b><span style="white-space:pre-line">${esc(c.root_cause || '-')}</span></div>
+          <div class="row"><b>处置</b><span style="white-space:pre-line">${esc(c.action || '-')}</span></div>
+          <div class="row"><b>教训</b><span style="white-space:pre-line">${esc(c.lesson || '-')}</span></div>
+          ${c.source ? `<div class="row"><b>来源</b>${esc(c.source)} ${c.advice_id ? `（建议 #${c.advice_id}）` : ''}</div>` : ''}
+          <div class="row"><b>维护</b>${esc(c.created_by_name || '-')} @ ${fmtTime(c.created_at)}</div>
+        </div>
+        <div style="margin-top:10px">${tags}</div>`,
+      footer: (canManage ? `<button class="btn sm primary" id="caseEdit">编辑</button>` : '') +
+        (role === 'admin' ? `<button class="btn sm danger" id="caseDel">删除</button>` : '')
+    });
+    const eb = document.getElementById('caseEdit');
+    if (eb) eb.onclick = () => { openCaseForm(c); };
+    const db2 = document.getElementById('caseDel');
+    if (db2) db2.onclick = async () => {
+      const yes = await confirmDialog('删除后不可恢复，确认删除该案例？', '删除案例');
+      if (!yes) return;
+      try{
+        await api(`/api/agent/cases/${c.id}`, {method:'DELETE'});
+        toastSuccess('已删除');
+        document.getElementById('drawerRoot').classList.add('hidden');
+        loadCases();
+      }catch(e){ toastError('删除失败：' + (e.message || '')); }
+    };
+  }
+  function openCaseForm(c){
+    const isEdit = !!c;
+    const F = (k, label, val, ph, ta) => `
+      <div class="field"><label>${label}</label>
+        ${ta
+          ? `<textarea id="f_${k}" placeholder="${esc(ph || '')}">${esc(val || '')}</textarea>`
+          : `<input type="text" id="f_${k}" value="${esc(val || '')}" placeholder="${esc(ph || '')}">`}
+      </div>`;
+    const d = openDrawer({
+      title: (isEdit ? '编辑' : '新建') + '故障案例',
+      wide: true,
+      body: `
+        ${F('title','标题 *', c && c.title, '如：order 服务磁盘写满导致发布失败', false)}
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+          ${F('service','服务', c && c.service, 'order')}
+          ${F('env','环境', c && c.env, 'prod')}
+          ${F('version','版本', c && c.version, 'v1.2.3')}
+        </div>
+        ${F('symptom','症状描述 *', c && c.symptom, '故障现场与报错', true)}
+        ${F('root_cause','根因分析', c && c.root_cause, '最终定位的原因', true)}
+        ${F('action','处置动作', c && c.action, '回滚 / 扩容 / 修配置…', true)}
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          ${F('result','处置结果', c && c.result, '成功 / 失败 / 待验证', false)}
+          ${F('tags','标签（逗号分隔）', c && (c.tags || []).join(','), 'mysql, 磁盘, 回滚', false)}
+        </div>
+        ${F('lesson','经验教训', c && c.lesson, '下次如何避免 / 快速恢复', true)}`,
+      footer: `<button class="btn" id="caseFormCancel">取消</button>
+               <button class="btn primary" id="caseFormOk">${isEdit ? '保存修改' : '创建'}</button>`
+    });
+    const cancel = document.getElementById('caseFormCancel');
+    if (cancel) cancel.onclick = () => { document.getElementById('drawerRoot').classList.add('hidden'); };
+    const ok = document.getElementById('caseFormOk');
+    if (ok) ok.onclick = async () => {
+      const val = id => ((document.getElementById('f_' + id) || {}).value || '').trim();
+      const body = {
+        title: val('title'), service: val('service'), env: val('env'),
+        version: val('version'), symptom: val('symptom'), root_cause: val('root_cause'),
+        action: val('action'), result: val('result'), lesson: val('lesson'),
+        tags: val('tags') ? val('tags').split(/[,，]/).map(s => s.trim()).filter(Boolean) : []
+      };
+      if (!body.title || !body.symptom){ toastError('标题与症状为必填'); return; }
+      ok.disabled = true;
+      try{
+        if (isEdit){
+          await api(`/api/agent/cases/${c.id}`, {method:'PUT', body: JSON.stringify(body)});
+          toastSuccess('案例已更新');
+        }else{
+          await api('/api/agent/cases', {method:'POST', body: JSON.stringify(body)});
+          toastSuccess('案例已创建');
+        }
+        document.getElementById('drawerRoot').classList.add('hidden');
+        loadCases();
+      }catch(e){
+        toastError('保存失败：' + (e.message || ''));
+        ok.disabled = false;
+      }
+    };
+    return d;
+  }
+
+  // ==================== 网关配置 ====================
+  async function renderGwChip(){
+    const chip = document.getElementById('gwChip');
+    if (!chip) return;
+    try{ gw = await api('/api/agent/config'); }catch(e){ gw = null; }
+    if (!chip) return;
+    const ok = gw && gw.available;
+    chip.innerHTML = `<span class="dot ${ok ? 'ok' : 'warn'}"></span>` +
+      (ok ? `LLM 网关就绪${gw.model ? ' · ' + esc(gw.model) : ''}`
+          : '未配置 LLM 网关（点击配置）');
+  }
+  function openGwModal(){
+    if (!gw){
+      toastError('网关状态读取失败，请刷新页面');
+      return;
+    }
+    const isAdmin = role === 'admin';
+    openDrawer({
+      title: 'LLM 网关配置',
+      body: `
+        <div style="margin-bottom:14px" class="plan-detail">
+          <div class="row"><b>状态</b>
+            ${gw.available ? '<span class="badge success">可用</span>' : '<span class="badge warning">未配置</span>'}</div>
+          <div class="row"><b>服务地址</b>${esc(gw.base_url_host || '-')}</div>
+          <div class="row"><b>模型</b>${esc(gw.model || '（服务端默认）')}</div>
+          <div class="row"><b>当前角色</b>${esc(gw.role || role)}</div>
+        </div>
+        <div class="muted" style="font-size:var(--fs-12);line-height:1.8;margin-bottom:12px">
+          支持任意 OpenAI 兼容 /chat/completions 网关。viewer/operator 仅可查看；由 admin 在下方维护，也可通过 AGENT_LLM_BASE_URL / AGENT_LLM_API_KEY / AGENT_LLM_MODEL 环境变量启动时注入。
+        </div>
+        ${isAdmin ? `
+          <div class="field"><label>Base URL（如 https://api.deepseek.com/v1）</label>
+            <input type="text" id="gwBase" placeholder="https://…/v1"></div>
+          <div class="field"><label>API Key</label>
+            <input type="password" id="gwKey" placeholder="sk-…（留空表示不修改）"></div>
+          <div class="field"><label>模型名（可空，由服务端决定）</label>
+            <input type="text" id="gwModel" placeholder="deepseek-chat"></div>`
+          : '<div class="muted">请联系管理员（admin）配置或通过环境变量注入。</div>'}`,
+      footer: isAdmin
+        ? `<button class="btn" id="gwCancel">关闭</button><button class="btn primary" id="gwSave">保存</button>`
+        : `<button class="btn" id="gwCancel">关闭</button>`
+    });
+    const cancel = document.getElementById('gwCancel');
+    if (cancel) cancel.onclick = () => { document.getElementById('drawerRoot').classList.add('hidden'); };
+    const save = document.getElementById('gwSave');
+    if (save) save.onclick = async () => {
+      const body = {
+        base_url: (document.getElementById('gwBase') || {}).value || '',
+        api_key: (document.getElementById('gwKey') || {}).value || '',
+        model: (document.getElementById('gwModel') || {}).value || ''
+      };
+      if (!body.base_url && !body.api_key && !body.model){ toastError('请至少填写一项'); return; }
+      try{
+        await api('/api/agent/config', {method:'POST', body: JSON.stringify(body)});
+        toastSuccess('网关配置已保存');
+        document.getElementById('drawerRoot').classList.add('hidden');
+        renderGwChip();
+      }catch(e){ toastError('保存失败：' + (e.message || '')); }
+    };
+  }
+
+  // ==================== 模块导出 ====================
+  window.agent = {
+    render: async function(root){
+      destroyed = false;
+      renderPage();
+      if (timer) clearInterval(timer);
+      // 列表页 15s 自动刷新（后台 advisor 建议/执行态会持续变化）
+      timer = setInterval(() => {
+        if (destroyed) return;
+        if (currentTab === 'runs' && !document.hidden) loadRuns();
+        else if (currentTab === 'advice' && !document.hidden) loadAdvice();
+        else if (currentTab === 'cases' && !document.hidden) loadCases();
+      }, 15000);
+      return [timer];
+    },
+    destroy: function(){
+      destroyed = true;
+      if (timer) clearInterval(timer);
+      timer = null;
+    }
+  };
+})();
