@@ -440,7 +440,9 @@ def main():
 
     # 启动前确认环境信息
     log(f"目标环境: {args.env or '默认/生产'}")
-    log(f"Nacos 地址: {config['nacos']['url']}，命名空间: {config['nacos'].get('namespace', 'public')}")
+    nacos_conf = config.get("nacos") or {}
+    log(f"Nacos 地址: {nacos_conf.get('url') or '未配置（跳过 Nacos 操作）'}，"
+        f"命名空间: {nacos_conf.get('namespace') or 'public'}")
 
     # 校验每个服务都有版本号：服务级 > 全局；previous_version 可选（首次发版无回滚版本）
     missing_version = []

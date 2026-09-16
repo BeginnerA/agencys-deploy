@@ -90,12 +90,14 @@ def get_registry_mode(config: dict) -> str:
 
 
 def get_nacos_auth(config: dict):
+    """Nacos 连接信息；url 为空表示环境未接入 Nacos（发布时跳过全部 Nacos 操作）"""
+    nacos_cfg = config.get("nacos") or {}
     return {
-        "url": config["nacos"]["url"].rstrip("/"),
-        "namespace": config["nacos"].get("namespace", ""),
-        "group": config["nacos"].get("group", "DEFAULT_GROUP"),
-        "username": env_or_config(config["nacos"].get("username"), "NACOS_USERNAME"),
-        "password": env_or_config(config["nacos"].get("password"), "NACOS_PASSWORD"),
+        "url": (nacos_cfg.get("url") or "").rstrip("/"),
+        "namespace": nacos_cfg.get("namespace") or "",
+        "group": nacos_cfg.get("group") or "DEFAULT_GROUP",
+        "username": env_or_config(nacos_cfg.get("username"), "NACOS_USERNAME"),
+        "password": env_or_config(nacos_cfg.get("password"), "NACOS_PASSWORD"),
     }
 
 

@@ -15,6 +15,8 @@ class NacosClient:
         config = load_config(env=env)
         auth = get_nacos_auth(config)
         self.base = auth["url"]
+        # url 为空 = 环境未接入 Nacos：调用方（deploy.Deployer.nacos_groups）据此跳过全部 Nacos 操作
+        self.configured = bool(self.base)
         self.namespace = auth["namespace"]
         self.group = auth["group"]
         self.username = auth["username"]
@@ -58,6 +60,8 @@ class NacosClient:
         return params
 
     def list_instances(self, service_name: str, group: str = None) -> list:
+        if not self.base:
+            raise RuntimeError("Nacos 未配置（nacos.url 为空），无法查询服务实例")
         url = f"{self.base}/nacos/v1/ns/instance/list"
         params = self._params({"serviceName": service_name, "healthyOnly": "false"}, group=group)
         try:
@@ -74,6 +78,8 @@ class NacosClient:
         ephemeral 须与实例注册时一致（Spring Cloud 注册的临时实例为 True），
         缺失时更新可能作用于错误的实例存储，故调用方应尽量传入。
         """
+        if not self.base:
+            raise RuntimeError("Nacos 未配置（nacos.url 为空），无法更新实例状态")
         url = f"{self.base}/nacos/v1/ns/instance"
         params = self._params({
             "serviceName": service_name,

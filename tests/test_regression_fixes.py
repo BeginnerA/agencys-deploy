@@ -1,4 +1,4 @@
-"""全量修复回归测试：覆盖 #1-#15 的关键行为（含 verify 阶段发现的 tail 偏移语义补充）"""
+"""全量修复回归测试：覆盖 #1-#16 的关键行为（含 verify 阶段发现的 tail 偏移语义补充）"""
 import datetime
 import os
 import shutil
@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from webapp import db as dbm
 
+from common import get_nacos_auth
+from deploy import Deployer
 from git_tag import tag_project
 from health_check import check_http
 from nacos_manager import NacosClient
@@ -487,6 +489,80 @@ class TestUpdateScheduleCronValidation(unittest.TestCase):
         rec = dbm.get_record(self.db_path, "deploy_schedules", self.sid)
         self.assertEqual(rec["cron_expr"], "*/5 * * * *")
         self.assertGreater(rec["next_run_at"], 0)
+
+
+class TestNoNacosEnvironment(unittest.TestCase):
+    """#16 环境未接入 Nacos（nacos.url 为空）时发布跳过全部 Nacos 操作：
+    空 url 不再拼出无 scheme 的 Invalid URL 中断发布（无 Nacos 服务发布回归）"""
+
+    def test_get_nacos_auth_empty_url(self):
+        """表单保存过的全空 nacos 段：url 为空、group 回退默认值"""
+        auth = get_nacos_auth({"nacos": {"url": "", "namespace": "", "group": "",
+                                         "username": "", "password": ""}})
+        self.assertEqual(auth["url"], "")
+        self.assertEqual(auth["group"], "DEFAULT_GROUP")
+
+    def test_get_nacos_auth_missing_section(self):
+        """历史配置完全缺失 nacos 段：不再 KeyError"""
+        auth = get_nacos_auth({})
+        self.assertEqual(auth["url"], "")
+        self.assertEqual(auth["group"], "DEFAULT_GROUP")
+
+    def test_client_guard_when_unconfigured(self):
+        """url 为空时实例操作抛可诊断错误（而非 requests 的 Invalid URL）"""
+        c = object.__new__(NacosClient)
+        c.base = ""
+        with self.assertRaises(RuntimeError) as ctx:
+            c.list_instances("im-platform")
+        self.assertIn("未配置", str(ctx.exception))
+
+    def _deployer(self, configured: bool, groups: list) -> Deployer:
+        d = Deployer.__new__(Deployer)  # 绕过 __init__（不加载真实配置）
+        d.nacos = mock.Mock()
+        d.nacos.configured = configured
+        d.nacos.group = "DEFAULT_GROUP"
+        d.proj_cfg = {"nacos_groups": groups}
+        return d
+
+    def test_groups_empty_when_unconfigured(self):
+        """未接入 Nacos：即使服务级配了分组也返回空列表（跳过全部 Nacos 操作）"""
+        d = self._deployer(configured=False, groups=["DEFAULT_GROUP"])
+        self.assertEqual(d.nacos_groups(), [])
+
+    def test_groups_service_level_priority(self):
+        """已接入 Nacos：服务级分组优先；缺失时回退全局 group"""
+        d = self._deployer(configured=True, groups=["DUBBO_GROUP"])
+        self.assertEqual(d.nacos_groups(), ["DUBBO_GROUP"])
+        d.proj_cfg = {}
+        self.assertEqual(d.nacos_groups(), ["DEFAULT_GROUP"])
+
+    def test_deploy_server_succeeds_without_nacos(self):
+        """端到端：未接入 Nacos 的服务发布成功且零 Nacos 实例调用（原 bug 场景）"""
+        d = Deployer.__new__(Deployer)
+        d.project = "im-platform"
+        d.version = "1.0.0"
+        d.previous_version = None
+        d.env = "test"
+        d.ssh_cfg = {}
+        d.config = {"deploy": {"canary_wait": 0}}
+        d.service_name = "im-platform"
+        d.proj_cfg = {"nacos_groups": [], "dubbo_services": [],
+                      "service_name": "im-platform"}
+        d.container_modified = False
+        d.nacos = mock.Mock()
+        d.nacos.configured = False
+        d.nacos.group = ""
+        server = mock.Mock()
+        with mock.patch("deploy.RemoteServer", return_value=server), \
+                mock.patch.object(d, "ensure_docker_login"), \
+                mock.patch.object(d, "update_container"), \
+                mock.patch("deploy.wait_for_healthy"), \
+                mock.patch("deploy.log"):
+            ok = d.deploy_server("47.95.172.17", None)
+        self.assertTrue(ok)
+        server.close.assert_called_once()
+        d.nacos.offline_ip.assert_not_called()
+        d.nacos.online_ip.assert_not_called()
 
 
 if __name__ == "__main__":

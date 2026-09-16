@@ -372,7 +372,13 @@ class Deployer:
         return names
 
     def nacos_groups(self) -> list:
-        """Nacos 分组列表：优先用项目级 nacos_groups，回退到全局配置的单个 group"""
+        """Nacos 分组列表：优先用项目级 nacos_groups，回退到全局配置的单个 group
+
+        全局未配置 Nacos（nacos.url 为空，环境未接入 Nacos）时返回空列表：
+        nacos_offline/nacos_online 遍历零次，发布流程自动跳过全部 Nacos 操作。
+        """
+        if not self.nacos.configured:
+            return []
         groups = self.proj_cfg.get("nacos_groups")
         if groups:
             return groups
@@ -686,7 +692,7 @@ class Deployer:
         ssh_cfg = merge_server_ssh(self.ssh_cfg, server_entry) if server_entry else self.ssh_cfg
         server = RemoteServer(host, ssh_cfg)
         nacos_ip = self._nacos_ip(server_entry)
-        if nacos_ip != host:
+        if self.nacos_groups() and nacos_ip != host:
             log(f"Nacos 使用内网 IP: {nacos_ip}（SSH 外网 IP: {host}）")
         self.container_modified = False  # 跟踪容器是否已被修改（docker pull 成功后置 True）
         try:
@@ -1110,7 +1116,9 @@ def main():
     server_ips = [s["ip"] for s in servers]
     log(f"目标环境: {args.env or '默认/生产'}")
     log(f"服务器清单: {Path(servers_file).name} => {server_ips}")
-    log(f"Nacos 地址: {config['nacos']['url']}，命名空间: {config['nacos'].get('namespace', 'public')}")
+    nacos_conf = config.get("nacos") or {}
+    log(f"Nacos 地址: {nacos_conf.get('url') or '未配置（跳过 Nacos 操作）'}，"
+        f"命名空间: {nacos_conf.get('namespace') or 'public'}")
 
     deployer = Deployer(args.project, args.version, args.previous_version, config, env=args.env, canary=args.canary)
     deployer._no_git_tag = args.no_git_tag
