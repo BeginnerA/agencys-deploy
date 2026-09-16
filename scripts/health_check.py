@@ -5,7 +5,7 @@ import re
 import argparse
 import requests
 import paramiko
-from common import load_config, get_project_config, get_ssh_config, connect_ssh, merge_server_ssh, log
+from common import load_config, get_project_config, get_ssh_config, connect_ssh, merge_server_ssh, log, as_number
 
 
 def check_http(url: str, timeout: int = 10) -> bool:
@@ -73,8 +73,13 @@ def wait_for_healthy(host: str, project_name: str, version: str = None, ssh_over
     if ssh_override:
         ssh_cfg = merge_server_ssh(ssh_cfg, ssh_override)
     health_url = (proj.get("health_url") or "").format(ip=host)
-    timeout = config["deploy"].get("health_timeout", 120)
-    interval = config["deploy"].get("health_interval", 5)
+    # 数字字段容错：Dashboard 清空数字字段会存为空串；非正数同样无效（timeout<=0 时 deadline 立即过期必判超时）
+    timeout = as_number(config["deploy"].get("health_timeout"), 120)
+    interval = as_number(config["deploy"].get("health_interval"), 5)
+    if timeout <= 0:
+        timeout = 120
+    if interval <= 0:
+        interval = 5
     service_name = proj["service_name"]
 
     if health_url:

@@ -72,6 +72,20 @@ def env_or_config(config_value: str, env_name: str) -> str:
     return os.environ.get(env_name) or config_value or ""
 
 
+def as_number(value, default: int = 0):
+    """配置数字容错：空串/None/非法值回退默认值（整数结果保持 int 便于日志展示）
+
+    Dashboard 表单清空数字字段会存为空串（如 health_timeout: ''），
+    dict.get(key, default) 只兜底"键缺失"，空串会被原样取出参与算术运算，
+    抛 unsupported operand type(s) for +: 'float' and 'str' 使发布误判失败。
+    """
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return default
+    return int(num) if num.is_integer() else num
+
+
 def get_registry_auth(config: dict):
     return {
         "host": config["registry"]["host"],
@@ -104,7 +118,7 @@ def get_nacos_auth(config: dict):
 def get_mysql_auth(config: dict):
     return {
         "host": config["mysql_snailjob"]["host"],
-        "port": config["mysql_snailjob"].get("port", 3306),
+        "port": int(as_number(config["mysql_snailjob"].get("port"), 3306)) or 3306,
         "database": config["mysql_snailjob"]["database"],
         "username": env_or_config(config["mysql_snailjob"].get("username"), "MYSQL_USERNAME"),
         "password": env_or_config(config["mysql_snailjob"].get("password"), "MYSQL_PASSWORD"),
@@ -115,7 +129,7 @@ def get_ssh_config(config: dict):
     return {
         "user": config["ssh"]["user"],
         "key_file": Path(config["ssh"]["key_file"]).expanduser(),
-        "port": config["ssh"].get("port", 22),
+        "port": int(as_number(config["ssh"].get("port"), 22)) or 22,
         "password": env_or_config(config["ssh"].get("password"), "SSH_PASSWORD"),
     }
 

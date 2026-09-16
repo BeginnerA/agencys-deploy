@@ -1,4 +1,4 @@
-"""全量修复回归测试：覆盖 #1-#16 的关键行为（含 verify 阶段发现的 tail 偏移语义补充）"""
+"""全量修复回归测试：覆盖 #1-#17 的关键行为（含 verify 阶段发现的 tail 偏移语义补充）"""
 import datetime
 import os
 import shutil
@@ -14,9 +14,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from webapp import db as dbm
 
-from common import get_nacos_auth
+from common import get_nacos_auth, get_mysql_auth, get_ssh_config, as_number
 from deploy import Deployer
 from git_tag import tag_project
+import health_check as hc
 from health_check import check_http
 from nacos_manager import NacosClient
 
@@ -563,6 +564,103 @@ class TestNoNacosEnvironment(unittest.TestCase):
         server.close.assert_called_once()
         d.nacos.offline_ip.assert_not_called()
         d.nacos.online_ip.assert_not_called()
+
+
+class TestEmptyNumberConfig(unittest.TestCase):
+    """#17 Dashboard 清空数字字段会存为空串（health_timeout: '' 等），
+    空串被原样取出参与算术，曾抛 unsupported operand type(s) for +: 'float' and 'str'
+    使已成功上线的发布被误判失败并触发回滚流程（无 Nacos 服务的重发布回归）"""
+
+    def test_as_number_semantics(self):
+        """空串/None/非法值回退默认；数字字符串可解析；整数结果保持 int"""
+        self.assertEqual(as_number("", 120), 120)
+        self.assertEqual(as_number(None, 5), 5)
+        self.assertEqual(as_number("abc", 5), 5)
+        self.assertEqual(as_number("120", 5), 120)
+        self.assertEqual(as_number(120.0, 5), 120)
+        self.assertEqual(as_number(2.5, 5), 2.5)
+
+    def _wait(self, deploy_cfg: dict, is_running=None):
+        """在空串/非法数字配置下执行 wait_for_healthy，返回 (结果, sleep_mock, log_mock)"""
+        cfg = {"deploy": deploy_cfg}
+        proj = {"service_name": "im-platform", "health_url": "", "log_error_keywords": []}
+        sleep_mock = mock.Mock()
+        with mock.patch.object(hc, "load_config", return_value=cfg), \
+                mock.patch.object(hc, "get_project_config", return_value=proj), \
+                mock.patch.object(hc, "get_ssh_config", return_value={}), \
+                mock.patch.object(hc, "check_container_running", side_effect=is_running or [False, True]), \
+                mock.patch.object(hc, "check_container_logs", return_value=True), \
+                mock.patch.object(hc.time, "sleep", sleep_mock), \
+                mock.patch.object(hc, "log") as log_mock:
+            ok = hc.wait_for_healthy("47.95.172.17", "im-platform")
+        return ok, sleep_mock, log_mock
+
+    def test_wait_for_healthy_empty_numeric_config(self):
+        """health_timeout/health_interval 为空串：回退 120/5，不再 float+str 崩溃（原 bug 场景）"""
+        ok, sleep_mock, log_mock = self._wait({"health_timeout": "", "health_interval": ""})
+        self.assertTrue(ok)
+        sleep_mock.assert_called_once_with(5)  # interval 回退 5
+        self.assertTrue(any("超时 120 秒" in str(c) for c in log_mock.call_args_list))
+
+    def test_wait_for_healthy_zero_timeout_falls_back(self):
+        """health_timeout=0 视为无效：回退 120（否则 deadline 立即过期必判超时）"""
+        ok, _, log_mock = self._wait({"health_timeout": 0, "health_interval": 0}, is_running=[True])
+        self.assertTrue(ok)
+        self.assertTrue(any("超时 120 秒" in str(c) for c in log_mock.call_args_list))
+
+    def _deployer_for_canary(self, canary_wait):
+        d = Deployer.__new__(Deployer)  # 绕过 __init__（不加载真实配置）
+        d.project = "im-platform"
+        d.version = "1.0.0"
+        d.previous_version = None
+        d.env = "test"
+        d.ssh_cfg = {}
+        d.config = {"deploy": {"canary_wait": canary_wait}}
+        d.service_name = "im-platform"
+        d.proj_cfg = {"nacos_groups": [], "service_name": "im-platform"}
+        d.container_modified = False
+        d.nacos = mock.Mock()
+        d.nacos.configured = False
+        d.nacos.group = ""
+        return d
+
+    def _deploy_canary(self, canary_wait, sleep_mock):
+        d = self._deployer_for_canary(canary_wait)
+        server = mock.Mock()
+        with mock.patch("deploy.RemoteServer", return_value=server), \
+                mock.patch.object(d, "ensure_docker_login"), \
+                mock.patch.object(d, "update_container"), \
+                mock.patch("deploy.wait_for_healthy"), \
+                mock.patch("deploy.time.sleep", sleep_mock), \
+                mock.patch("deploy.log"):
+            return d.deploy_server("47.95.172.17", None, is_canary=True)
+
+    def test_canary_empty_wait_not_crash(self):
+        """canary_wait 为空串：灰度发布不再 ''.0 > 0 的 TypeError 崩溃"""
+        ok = self._deploy_canary("", mock.Mock())
+        self.assertTrue(ok)
+
+    def test_canary_string_wait_sleeps(self):
+        """canary_wait 为数字字符串：解析后灰度观察等待"""
+        sleep_mock = mock.Mock()
+        ok = self._deploy_canary("60", sleep_mock)
+        self.assertTrue(ok)
+        sleep_mock.assert_called_once_with(60)
+
+    def test_ssh_port_empty_falls_back(self):
+        """ssh.port 为空串：回退 22（paramiko 收到空串会连接失败）"""
+        ssh = get_ssh_config({"ssh": {"user": "root", "port": "",
+                                        "key_file": "~/.ssh/id_rsa_deploy", "password": ""}})
+        self.assertEqual(ssh["port"], 22)
+        ssh2 = get_ssh_config({"ssh": {"user": "root", "port": "2222",
+                                         "key_file": "~/.ssh/id_rsa_deploy", "password": ""}})
+        self.assertEqual(ssh2["port"], 2222)
+
+    def test_mysql_port_empty_falls_back(self):
+        """mysql_snailjob.port 为空串：回退 3306（pymysql 收到空串会连接失败）"""
+        auth = get_mysql_auth({"mysql_snailjob": {"host": "10.0.0.1", "port": "",
+                                                   "database": "snailjob", "username": "", "password": ""}})
+        self.assertEqual(auth["port"], 3306)
 
 
 if __name__ == "__main__":

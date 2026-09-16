@@ -20,7 +20,7 @@ import paramiko
 # 把 scripts 目录加入模块搜索路径
 sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 
-from common import load_config, get_project_config, get_ssh_config, get_registry_auth, get_registry_mode, connect_ssh, merge_server_ssh, log, fail, load_yaml, default_servers_file
+from common import load_config, get_project_config, get_ssh_config, get_registry_auth, get_registry_mode, connect_ssh, merge_server_ssh, log, fail, load_yaml, default_servers_file, as_number
 from build import build_project
 from nacos_manager import NacosClient
 from snailjob_manager import backup_jobs, set_job_status, restore_jobs, clear_summary
@@ -701,8 +701,8 @@ class Deployer:
             self.update_container(server)
             wait_for_healthy(host, self.project, ssh_override=server_entry, env=self.env)
             self.nacos_online(nacos_ip, weight=1.0)
-            if is_canary and self.config["deploy"].get("canary_wait", 0) > 0:
-                wait_sec = self.config["deploy"]["canary_wait"]
+            wait_sec = as_number(self.config["deploy"].get("canary_wait"), 0)
+            if is_canary and wait_sec > 0:
                 log(f"首台灰度观察 {wait_sec} 秒，请观察业务指标...")
                 time.sleep(wait_sec)
             log(f"========== {host} 发布成功 ==========\n")
