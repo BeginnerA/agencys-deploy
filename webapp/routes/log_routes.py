@@ -1,4 +1,4 @@
-"""日志中心 API：检索 + 上下文 + 服务列表 + 保留设置"""
+"""日志中心 API：检索 + 上下文 + 服务列表 + 保留设置 + 存储维护"""
 import json
 import os
 import time
@@ -8,6 +8,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from .. import db as dbm
 from ..auth import audit, require_auth, require_role
+from ..log_collector import get_collector, run_manual_cleanup
 
 log_bp = Blueprint("log", __name__)
 
@@ -328,3 +329,92 @@ def put_log_settings():
         conn.close()
     audit("update_log_settings", "config", 0, {"settings": list(body.keys())})
     return jsonify({"ok": True})
+
+
+# ---------- 存储概况与手动清理 ----------
+
+def _log_dir():
+    """日志目录：优先 app.config（与采集器同源），兜底 root_path 推导"""
+    return current_app.config.get("LOG_DIR") or os.path.join(
+        current_app.root_path, "..", "data", "logs")
+
+
+def _dir_stats(base: str) -> dict:
+    """目录统计：文件数 + 总字节数（不存在返回零值）"""
+    files = bytes_total = 0
+    if os.path.isdir(base):
+        for p in Path(base).rglob("*"):
+            if p.is_file():
+                try:
+                    files += 1
+                    bytes_total += p.stat().st_size
+                except OSError:
+                    pass
+    return {"files": files, "bytes": bytes_total}
+
+
+@log_bp.route("/logs/storage")
+@require_auth
+@require_role("admin")
+def log_storage_stats():
+    """存储概况：日志行数/目录占用/DB 大小与空闲页（手动清理入口展示用）"""
+    db_path = current_app.config["DB_PATH"]
+    log_dir = _log_dir()
+    conn = dbm.get_conn(db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n, MIN(ts) AS oldest FROM log_entries"
+        ).fetchone()
+        entries, oldest_ts = row[0], row[1]
+        # freelist 空闲页（auto_vacuum 库可被手动/增量清理回收）
+        freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        settings = {}
+        for key, default in (("log_retention_days", 7),
+                             ("log_archive_days", 30)):
+            srow = conn.execute(
+                "SELECT value FROM platform_settings WHERE key=?", (key,)
+            ).fetchone()
+            try:
+                settings[key] = int(json.loads(srow["value"])) if srow else default
+            except (ValueError, TypeError):
+                settings[key] = default
+    finally:
+        conn.close()
+
+    try:
+        db_size = os.path.getsize(db_path)
+    except OSError:
+        db_size = 0
+
+    return jsonify({
+        "log_entries": entries,
+        "oldest_ts": oldest_ts,
+        "db_size": db_size,
+        "db_freelist_bytes": freelist * page_size,
+        "collect": _dir_stats(os.path.join(log_dir, "collect")),
+        "archive": _dir_stats(os.path.join(log_dir, "archive")),
+        "retention_days": settings["log_retention_days"],
+        "archive_days": settings["log_archive_days"],
+        # 采集器未启动（监控关闭）时手动清理仍可用，仅提示状态
+        "collector_running": get_collector() is not None,
+    })
+
+
+@log_bp.route("/logs/maintenance", methods=["POST"])
+@require_auth
+@require_role("admin")
+def run_log_maintenance():
+    """手动清理：按保留策略立即清理过期日志并回收空间（见
+    log_collector.run_manual_cleanup；与每日自动维护同一套逻辑）"""
+    stats = run_manual_cleanup(current_app.config["DB_PATH"], _log_dir())
+    if stats.get("busy"):
+        return jsonify({"error": "清理正在进行中，请稍后重试"}), 409
+    audit("manual_log_cleanup", "config", 0, {
+        "deleted_entries": stats.get("deleted_entries", 0),
+        "archived_files": stats.get("archived_files", 0),
+        "purged_files": stats.get("purged_files", 0),
+        "db_mb_before": round(stats.get("db_size_before", 0) / 1048576, 1),
+        "db_mb_after": round(stats.get("db_size_after", 0) / 1048576, 1),
+    })
+    return jsonify(stats)

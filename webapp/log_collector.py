@@ -1,9 +1,12 @@
 """日志采集器：SSH 增量拉取 docker logs + FTS5 索引 + 归档清理"""
 import gzip
+import json
 import os
 import re
+import secrets
 import shlex
 import shutil
+import sqlite3
 import sys
 import threading
 import time
@@ -77,6 +80,31 @@ def _build_log_file_path(base_dir: str, env: str, service: str, date_str: str) -
     return os.path.join(base_dir, "collect", env, service, f"{date_str}.log")
 
 
+def _marker(token: str, container: str) -> str:
+    """单通道批量采集的分段标记（在输出中独占一行）"""
+    return f"@@LOGCUT:{token}:{container}"
+
+
+def _split_marker_output(out: str, token: str, containers: list) -> dict:
+    """按 @@LOGCUT 标记把单通道批量输出切分为 {container: 输出文本}
+
+    仅认同行首完整匹配的标记行（token 每轮随机，日志内容碰撞概率可忽略）；
+    标记缺失的容器值为 None（由调用方记失败，下轮重试）；
+    标记存在但无日志行 → 空字符串（正常空拉取）。
+    """
+    prefix = f"@@LOGCUT:{token}:"
+    chunks, buf, current = {}, None, None
+    for line in out.splitlines(keepends=True):
+        if line.startswith(prefix):
+            current = line.rstrip("\r\n")[len(prefix):]
+            buf = []
+            chunks[current] = buf
+            continue
+        if current is not None:
+            buf.append(line)
+    return {c: ("".join(chunks[c]) if c in chunks else None) for c in containers}
+
+
 class LogCollector:
     """日志采集器（后台守护线程）"""
 
@@ -107,7 +135,7 @@ class LogCollector:
             self._thread.join(timeout=5)
 
     def _run_loop(self):
-        """主循环：每 interval 秒执行一轮采集 + 每日归档检查"""
+        """主循环：每 interval 秒执行一轮采集 + 每小时归档检查 + FTS 维护"""
         last_archive_check = 0
         while not self._stop.is_set():
             try:
@@ -115,13 +143,22 @@ class LogCollector:
                 now = time.time()
                 if now - last_archive_check >= 3600:
                     self._archive_and_cleanup()
+                    self._fts_maintenance()  # 每日一次：FTS optimize + 空间回收
                     last_archive_check = now
             except Exception as e:
                 print(f"[log-collector] 采集周期异常: {e!r}", file=sys.stderr)
             self._stop.wait(self.interval)
 
     def _collect_round(self):
-        """单轮采集：遍历所有启用了监控的环境 × 服务器 × 容器"""
+        """单轮采集：全部启用监控的环境按「主机」聚合后去重采集
+
+        同一主机被多个环境绑定时（共用测试机），旧实现每个环境各拉一遍同主机
+        全部容器日志（5 环境 × 29 容器 = 每轮 145 次 docker logs）；现按
+        (host, port) 聚合，每容器每轮仅 1 次 docker logs，输出同时分发到各
+        绑定环境（文件/FTS/游标仍按环境隔离，上层语义不变）；
+        同名环境（跨项目 prod/test）共用同一日志目录与游标，按环境名去重
+        避免同一份日志被重复追加/重复索引。
+        """
         if not self.ssh_func:
             return
         # 本轮启用的日志关键词规则（每轮加载一次，供所有容器复用）
@@ -136,15 +173,16 @@ class LogCollector:
         finally:
             conn.close()
 
+        # 按主机聚合环境：jobs[(host, port)] = {"host","port","ssh_cfg","envs"}
+        from .monitor import _merge_server_ssh
+        jobs = {}
         for env_row in envs:
             env_name = env_row["name"]
             env_id = env_row["id"]
-            env_ssh = {}
             try:
-                import json
                 env_ssh = json.loads(env_row["ssh"] or "{}")
             except (ValueError, TypeError):
-                pass
+                env_ssh = {}
             if not env_ssh:
                 continue
             conn = dbm.get_conn(self.db_path)
@@ -157,38 +195,58 @@ class LogCollector:
                 ).fetchall()
             finally:
                 conn.close()
-
-            # 环境串联、服务器并发批量采集：
-            # 整轮时长 ≈ 最慢服务器（原实现为所有服务器 SSH 时长之和）。
-            # 每环境并发上限 8（SSH 连接限流，防连接风暴）；
-            # _fail_counts 的 key 含 host，各 key 仅由对应服务器线程读写，
-            # 且修改在 _lock 内完成（get+1+set 非原子）
-            with ThreadPoolExecutor(max_workers=min(8, len(servers))) as pool:
-                futures = [pool.submit(self._collect_server, env_name, env_id,
-                                       env_ssh, dict(srv)) for srv in servers]
-                for fut in futures:
-                    try:
-                        # _collect_server 内部各 SSH 命令已有超时，此处仅防意外
-                        fut.result(timeout=60)
-                    except Exception:
-                        pass
+            for srv in servers:
+                srv = dict(srv)
+                key = (srv["host"], int(srv.get("ssh_port") or 22))
+                job = jobs.get(key)
+                if job is None:
+                    job = {"host": srv["host"], "port": key[1],
+                           "ssh_cfg": _merge_server_ssh(env_ssh, srv),
+                           "envs": []}
+                    jobs[key] = job
+                job["envs"].append((env_name, env_id))
+        if not jobs:
+            self._current_kw_rules = None
+            return
+        # 主机间并发 8（SSH 限流，防连接风暴）；_fail_counts 的 key 含 host，
+        # 各 key 仅由对应主机线程读写，且修改在 _lock 内完成（get+1+set 非原子）
+        with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as pool:
+            futures = [pool.submit(self._collect_host, job) for job in jobs.values()]
+            for fut in futures:
+                try:
+                    # _collect_host 内部 SSH 命令已有超时，此处仅防意外
+                    fut.result(timeout=360)
+                except Exception:
+                    pass
         self._current_kw_rules = None
 
-    def _collect_server(self, env_name: str, env_id: int, env_ssh: dict, server: dict):
-        """采集单台服务器：一次 SSH 连接完成所有容器增量日志
+    def _collect_host(self, job: dict):
+        """采集单台主机：一次 SSH 单通道批量拉取所有容器增量日志
 
         优先复用 monitor 探测缓存的容器列表（省去独立 docker ps SSH 连接）；
         缓存不可用时退化为自己执行 docker ps。
+        每个容器前打印唯一 @@LOGCUT 标记，单条命令一次拉取全部容器；输出按
+        标记切分后分发给绑定该主机的各环境（原来的每容器、每环境各一条
+        SSH 命令/channel → 每主机 1 条命令）。
         """
-        from .monitor import _merge_server_ssh, _ssh_exec_multi
-        ssh_cfg = _merge_server_ssh(env_ssh, server)
-        host = server["host"]
-        port = server.get("ssh_port") or 22
-        # 优先复用 monitor 探测缓存的容器列表（省去独立 docker ps SSH 连接）
+        from .monitor import _ssh_exec_multi
+        host, port = job["host"], job["port"]
+        ssh_cfg = job["ssh_cfg"]
+        env_pairs = job["envs"]
+        # 同名环境（跨项目 prod/test）共用同一日志目录与游标：按环境名去重，
+        # 避免同一份日志被重复追加/重复索引
+        out_envs = []
+        seen_names = set()
+        for env_name, env_id in env_pairs:
+            if env_name in seen_names:
+                continue
+            seen_names.add(env_name)
+            out_envs.append((env_name, env_id))
+        # 优先复用 monitor 探测缓存的容器列表
         containers = None
         if self.monitor:
             cached = self.monitor._server_containers.get(host)
-            if cached and (time.time() - cached["ts"]) < self.interval * 2:
+            if cached and (time.time() - cached["ts"]) < max(self.interval * 2, 60):
                 containers = cached["containers"]
         if containers is None:
             # 缓存不可用（首轮或 monitor 未覆盖此服务器），退化为自己 docker ps
@@ -206,38 +264,68 @@ class LogCollector:
                         containers.append(name)
         if not containers:
             return
-        # 批量读取所有容器采集游标（1 次连接），构建各容器增量命令
-        states = self._load_scan_states(env_name, host)
-        cmds, metas = [], []
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # 各环境游标：批量读取（每环境 1 次查询）
+        states_by_env = {env_name: self._load_scan_states(env_name, host)
+                         for env_name, _ in out_envs}
+        # 单通道批量：每容器前打印唯一分段标记（token 每轮随机，防日志内容碰撞）
+        token = secrets.token_hex(4)
+        parts, metas = [], []
         for container in containers:
-            st = states.get(container, {})
-            last_ts = st.get("last_ts", "")
+            # 取各环境最早游标（最小时间窗），任一环境缺失游标 → 首次窗口 5m，
+            # 保证所有分发环境都不丢新日志（游标偏差仅在启用先后不同时出现，
+            # 下一轮即收敛）
+            cursors = [st.get(container, {}).get("last_ts", "")
+                       for st in states_by_env.values()]
+            valid = [c for c in cursors if c]
+            last_ts = min(valid) if len(valid) == len(out_envs) else ""
             safe_container = shlex.quote(container)
             # 截断用 tail（保留最新）而非 head（保留最旧）：增量窗口内超量时
             # head 会丢弃最新日志且游标推进越过它们（永久丢失）；tail 只丢弃
             # 窗口内较旧行，最新日志与游标连续性不受影响
             if last_ts:
-                cmd = f"docker logs --since '{last_ts}' -t {safe_container} 2>&1 | tail -n {self.max_lines}"
+                logs_cmd = (f"docker logs --since '{last_ts}' -t "
+                            f"{safe_container} 2>&1 | tail -n {self.max_lines}")
             else:
-                cmd = f"docker logs --since 5m -t {safe_container} 2>&1 | tail -n {self.max_lines}"
-            cmds.append(cmd)
-            metas.append((container, last_ts, st))
+                logs_cmd = (f"docker logs --since 5m -t "
+                            f"{safe_container} 2>&1 | tail -n {self.max_lines}")
+            parts.append("echo " + shlex.quote(_marker(token, container)))
+            parts.append(logs_cmd)
+            metas.append((container, last_ts))
+        cmd = "; ".join(parts)
+        # 批量总超时随容器数放宽（单容器通常 <1s）
+        timeout = max(30, min(300, 10 + 4 * len(metas)))
         try:
-            # 单连接顺序执行（每条命令独立 timeout）；任一失败整批标记，下轮重试
-            outs = _ssh_exec_multi(host, port, ssh_cfg, cmds, timeout=30)
-            for (container, last_ts, st), out in zip(metas, outs):
-                with self._lock:
-                    self._fail_counts.pop((env_name, host, container), None)
-                # 跨日（或首次采集）：新日期文件，文件级偏移基准重置为 0
-                file_offset = st.get("file_offset", 0) if st.get("file_date") == today else 0
-                self._collect_container_output(env_name, env_id, host, container,
-                                               out, last_ts, file_offset)
+            # 单连接单命令顺序拉取（原为每容器一条命令，逐条 channel）
+            out = self.ssh_func(host, port, ssh_cfg, cmd, timeout=timeout)
         except Exception:
             with self._lock:
                 for container, _ in metas:
-                    self._fail_counts[(env_name, host, container)] = \
-                        self._fail_counts.get((env_name, host, container), 0) + 1
+                    for env_name, _ in out_envs:
+                        k = (env_name, host, container)
+                        self._fail_counts[k] = self._fail_counts.get(k, 0) + 1
+            return
+        chunks = _split_marker_output(out, token, [c for c, _ in metas])
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for container, _ in metas:
+            out_container = chunks.get(container)
+            if out_container is None:
+                # 标记缺失（命令中途失败/容器消失）：记失败，下轮重试
+                with self._lock:
+                    for env_name, _ in out_envs:
+                        k = (env_name, host, container)
+                        self._fail_counts[k] = self._fail_counts.get(k, 0) + 1
+                continue
+            with self._lock:
+                for env_name, _ in out_envs:
+                    self._fail_counts.pop((env_name, host, container), None)
+            for env_name, env_id in out_envs:
+                st = (states_by_env.get(env_name) or {}).get(container, {})
+                # 跨日（或首次采集）：新日期文件，文件级偏移基准重置为 0
+                file_offset = (st.get("file_offset", 0)
+                               if st.get("file_date") == today else 0)
+                self._collect_container_output(env_name, env_id, host, container,
+                                               out_container,
+                                               st.get("last_ts") or "", file_offset)
 
     def _load_scan_states(self, env_name: str, host: str) -> dict:
         """批量读取服务器所有容器采集游标：
@@ -260,7 +348,7 @@ class LogCollector:
 
     def _collect_container(self, env_name: str, env_id: int, host: str,
                            ssh_cfg: dict, container: str, port: int):
-        """采集单个容器（独立 SSH，兼容单容器路径）；批量采集走 _collect_server"""
+        """采集单个容器（独立 SSH，兼容单容器路径）；批量采集走 _collect_host"""
         key = (env_name, host, container)
         states = self._load_scan_states(env_name, host)
         st = states.get(container, {})
@@ -458,93 +546,268 @@ class LogCollector:
             conn.close()
 
     def _archive_and_cleanup(self):
-        """归档过期日志 + 清理过期 FTS5 条目"""
+        """归档过期日志 + 清理过期 FTS5 条目（每轮自动执行；实现见模块级
+        _archive_and_cleanup_files，与手动清理共用同一套策略）"""
+        return _archive_and_cleanup_files(self.db_path, self.log_dir)
+
+    def _fts_maintenance(self):
+        """每日一次 FTS5 optimize + incremental_vacuum（控制 DB 膨胀与碎片）
+
+        optimize 合并 FTS 增量段（降低查询放大、减少文件碎片）；
+        incremental_vacuum 回收 freelist 空闲页（auto_vacuum=INCREMENTAL 的库
+        生效；存量库先执行 scripts/db_vacuum.py 转换）；并按 log_archive_days
+        上限兜底清理孤儿日志行（归档清扫仅按 file_path 精确匹配，路径变化时
+        会永久残留）。日期记录在 platform_settings.log_fts_optimize_date。
+        """
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         conn = dbm.get_conn(self.db_path)
         try:
-            settings = conn.execute(
-                "SELECT value FROM platform_settings WHERE key='log_retention_days'"
+            row = conn.execute(
+                "SELECT value FROM platform_settings WHERE key='log_fts_optimize_date'"
             ).fetchone()
-            retention_days = 7
-            if settings:
+            if row:
                 try:
-                    import json
-                    retention_days = int(json.loads(settings["value"]))
+                    if json.loads(row["value"]) == today:
+                        return  # 当日已执行
                 except (ValueError, TypeError):
                     pass
-
-            settings = conn.execute(
-                "SELECT value FROM platform_settings WHERE key='log_archive_days'"
-            ).fetchone()
-            archive_days = 30
-            if settings:
-                try:
-                    import json
-                    archive_days = int(json.loads(settings["value"]))
-                except (ValueError, TypeError):
-                    pass
+            # 兜底清理：文件归档清扫按 file_path 精确匹配，路径迁移等场景会残留
+            # 孤儿日志行（永久占空间）；按 archive_days 上限删除，防止 DB 复胀
+            try:
+                crow = conn.execute(
+                    "SELECT value FROM platform_settings"
+                    " WHERE key='log_archive_days'"
+                ).fetchone()
+                archive_days = int(json.loads(crow["value"])) if crow else 30
+            except (ValueError, TypeError):
+                archive_days = 30
+            cur = conn.execute(
+                "DELETE FROM log_entries WHERE ts < ?",
+                (int(time.time()) - archive_days * 86400,))
+            if cur.rowcount:
+                conn.execute("INSERT INTO log_fts(log_fts) VALUES('rebuild')")
+                print(f"[log-collector] 已清理孤儿日志行 {cur.rowcount} 条",
+                      file=sys.stderr)
+            conn.commit()
+            conn.execute("INSERT INTO log_fts(log_fts) VALUES('optimize')")
+            conn.commit()
+            conn.execute("PRAGMA incremental_vacuum(2000)")
+            conn.commit()
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO platform_settings (key, value, updated_at) "
+                "VALUES ('log_fts_optimize_date', ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_at=excluded.updated_at",
+                (json.dumps(today), now))
+            conn.commit()
+        except Exception as e:
+            print(f"[log-collector] FTS 维护失败: {e!r}", file=sys.stderr)
         finally:
             conn.close()
 
-        now = time.time()
-        retention_cutoff = datetime.fromtimestamp(
-            now - retention_days * 86400, tz=timezone.utc
-        ).strftime("%Y-%m-%d")
-        archive_cutoff = datetime.fromtimestamp(
-            now - archive_days * 86400, tz=timezone.utc
-        ).strftime("%Y-%m-%d")
 
-        collect_base = os.path.join(self.log_dir, "collect")
-        archive_base = os.path.join(self.log_dir, "archive")
+def _cleanup_fts_for_file(db_path: str, env: str, service: str, file_path: str):
+    """清理指定文件的 FTS5 + log_entries 条目"""
+    conn = dbm.get_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id FROM log_entries WHERE env=? AND service=? AND file_path=?",
+            (env, service, file_path)
+        ).fetchall()
+        for row in rows:
+            conn.execute("DELETE FROM log_fts WHERE rowid=?", (row["id"],))
+            conn.execute("DELETE FROM log_entries WHERE id=?", (row["id"],))
+        conn.commit()
+    finally:
+        conn.close()
 
-        if not os.path.isdir(collect_base):
-            return
 
-        for env_dir in Path(collect_base).iterdir():
+def _archive_and_cleanup_files(db_path: str, log_dir: str) -> dict:
+    """归档过期日志文件 + 清理对应索引条目（自动轮与手动清理共用）
+
+    collect/ 下超过 log_retention_days 的 .log 压缩到 archive/ 后删除原文件
+    （并按 file_path 清理索引行）；archive/ 下超过 log_archive_days 的 .gz
+    永久删除。返回 {"archived": n, "purged": n}。
+    """
+    conn = dbm.get_conn(db_path)
+    try:
+        retention_days = 7
+        row = conn.execute(
+            "SELECT value FROM platform_settings WHERE key='log_retention_days'"
+        ).fetchone()
+        if row:
+            try:
+                retention_days = int(json.loads(row["value"]))
+            except (ValueError, TypeError):
+                pass
+        archive_days = 30
+        row = conn.execute(
+            "SELECT value FROM platform_settings WHERE key='log_archive_days'"
+        ).fetchone()
+        if row:
+            try:
+                archive_days = int(json.loads(row["value"]))
+            except (ValueError, TypeError):
+                pass
+    finally:
+        conn.close()
+
+    now = time.time()
+    retention_cutoff = datetime.fromtimestamp(
+        now - retention_days * 86400, tz=timezone.utc
+    ).strftime("%Y-%m-%d")
+    archive_cutoff = datetime.fromtimestamp(
+        now - archive_days * 86400, tz=timezone.utc
+    ).strftime("%Y-%m-%d")
+
+    collect_base = os.path.join(log_dir, "collect")
+    archive_base = os.path.join(log_dir, "archive")
+    archived = purged = 0
+
+    if not os.path.isdir(collect_base):
+        return {"archived": archived, "purged": purged}
+
+    for env_dir in Path(collect_base).iterdir():
+        if not env_dir.is_dir():
+            continue
+        env_name = env_dir.name
+        for svc_dir in env_dir.iterdir():
+            if not svc_dir.is_dir():
+                continue
+            service = svc_dir.name
+            for log_file in svc_dir.glob("*.log"):
+                date_str = log_file.stem
+                if date_str <= retention_cutoff:
+                    archive_dir = Path(archive_base) / env_name / service
+                    archive_dir.mkdir(parents=True, exist_ok=True)
+                    archive_path = archive_dir / (log_file.name + ".gz")
+                    with open(log_file, "rb") as f_in:
+                        with gzip.open(archive_path, "wb") as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+                    log_file.unlink()
+                    archived += 1
+                    _cleanup_fts_for_file(db_path, env_name, service, str(log_file))
+
+    if os.path.isdir(archive_base):
+        for env_dir in Path(archive_base).iterdir():
             if not env_dir.is_dir():
                 continue
-            env_name = env_dir.name
             for svc_dir in env_dir.iterdir():
                 if not svc_dir.is_dir():
                     continue
-                service = svc_dir.name
-                for log_file in svc_dir.glob("*.log"):
-                    date_str = log_file.stem
-                    if date_str <= retention_cutoff:
-                        archive_dir = Path(archive_base) / env_name / service
-                        archive_dir.mkdir(parents=True, exist_ok=True)
-                        archive_path = archive_dir / (log_file.name + ".gz")
-                        with open(log_file, "rb") as f_in:
-                            with gzip.open(archive_path, "wb") as f_out:
-                                shutil.copyfileobj(f_in, f_out)
-                        log_file.unlink()
-                        self._cleanup_fts_for_file(env_name, service, str(log_file))
+                for gz_file in svc_dir.glob("*.gz"):
+                    date_str = gz_file.stem.replace(".log", "")
+                    if date_str <= archive_cutoff:
+                        gz_file.unlink()
+                        purged += 1
+    return {"archived": archived, "purged": purged}
 
-        if os.path.isdir(archive_base):
-            for env_dir in Path(archive_base).iterdir():
-                if not env_dir.is_dir():
-                    continue
-                for svc_dir in env_dir.iterdir():
-                    if not svc_dir.is_dir():
-                        continue
-                    for gz_file in svc_dir.glob("*.gz"):
-                        date_str = gz_file.stem.replace(".log", "")
-                        if date_str <= archive_cutoff:
-                            gz_file.unlink()
 
-    def _cleanup_fts_for_file(self, env: str, service: str, file_path: str):
-        """清理指定文件的 FTS5 + log_entries 条目"""
-        conn = dbm.get_conn(self.db_path)
+# 手动清理互斥：防止 Web 端并发触发两次清理；与采集线程的并发由
+# busy_timeout + 幂等清理语义兑底（每日自动轮面对同样的并发场景）
+_manual_cleanup_lock = threading.Lock()
+
+
+def run_manual_cleanup(db_path: str, log_dir: str) -> dict:
+    """手动触发一次性日志存储清理（Web 端「立即清理」入口）
+
+    与采集器每日自动维护同一套策略，立即执行：
+    1) 删除超 log_retention_days 的索引行并整体重建 FTS（替代逐行删除）；
+    2) 文件归档清扫：collect 超期 → archive 压缩；archive 超期 → 删除；
+    3) 孤儿行兑底（archive_days 上限）+ FTS optimize + incremental_vacuum
+       全量回收空闲页；顺手写入当日维护标记（当日自动维护跳过）。
+    返回统计 dict；并发调用未抢到锁时返回 {"busy": True}。
+    """
+    if not _manual_cleanup_lock.acquire(blocking=False):
+        return {"busy": True}
+    try:
+        settings = {}
+        conn = dbm.get_conn(db_path)
         try:
-            rows = conn.execute(
-                "SELECT id FROM log_entries WHERE env=? AND service=? AND file_path=?",
-                (env, service, file_path)
-            ).fetchall()
-            for row in rows:
-                conn.execute("DELETE FROM log_fts WHERE rowid=?", (row["id"],))
-                conn.execute("DELETE FROM log_entries WHERE id=?", (row["id"],))
+            for key, default in (("log_retention_days", 7),
+                                 ("log_archive_days", 30)):
+                row = conn.execute(
+                    "SELECT value FROM platform_settings WHERE key=?", (key,)
+                ).fetchone()
+                try:
+                    settings[key] = int(json.loads(row["value"])) if row else default
+                except (ValueError, TypeError):
+                    settings[key] = default
+        finally:
+            conn.close()
+        retention_days = settings["log_retention_days"]
+        archive_days = settings["log_archive_days"]
+        now = int(time.time())
+
+        def _db_size():
+            try:
+                return os.path.getsize(db_path)
+            except OSError:
+                return 0
+
+        size_before = _db_size()
+
+        # 1) 超保留期索引行：DELETE + FTS rebuild（高效路径，行级删除仅用于归档文件）
+        deleted_entries = 0
+        conn = dbm.get_conn(db_path)
+        try:
+            cur = conn.execute(
+                "DELETE FROM log_entries WHERE ts < ?",
+                (now - retention_days * 86400,))
+            deleted_entries = cur.rowcount or 0
+            if deleted_entries:
+                conn.execute("INSERT INTO log_fts(log_fts) VALUES('rebuild')")
             conn.commit()
         finally:
             conn.close()
+
+        # 2) 文件归档清扫（与自动轮共用实现）
+        files = _archive_and_cleanup_files(db_path, log_dir)
+
+        orphan_deleted = 0
+        conn = dbm.get_conn(db_path)
+        try:
+            # 3) 孤儿行兑底（用户把 retention 调得比 archive 大时仍能收口）
+            cur = conn.execute(
+                "DELETE FROM log_entries WHERE ts < ?",
+                (now - archive_days * 86400,))
+            orphan_deleted = cur.rowcount or 0
+            if orphan_deleted:
+                conn.execute("INSERT INTO log_fts(log_fts) VALUES('rebuild')")
+            conn.commit()
+            conn.execute("INSERT INTO log_fts(log_fts) VALUES('optimize')")
+            conn.commit()
+            try:
+                # 无参 = 全量回收可回收空闲页（auto_vacuum=INCREMENTAL 的库）
+                conn.execute("PRAGMA incremental_vacuum")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # 未转换的旧库不可增量回收，可用 scripts/db_vacuum.py 处理
+            # 当日维护标记：手动已做，自动维护当日跳过
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            conn.execute(
+                "INSERT INTO platform_settings (key, value, updated_at) "
+                "VALUES ('log_fts_optimize_date', ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_at=excluded.updated_at",
+                (json.dumps(today), int(time.time())))
+            conn.commit()
+        finally:
+            conn.close()
+
+        return {
+            "retention_days": retention_days,
+            "archive_days": archive_days,
+            "deleted_entries": deleted_entries,
+            "orphan_deleted": orphan_deleted,
+            "archived_files": files["archived"],
+            "purged_files": files["purged"],
+            "db_size_before": size_before,
+            "db_size_after": _db_size(),
+        }
+    finally:
+        _manual_cleanup_lock.release()
 
 
 _collector = None
@@ -561,7 +824,8 @@ def init_collector(app) -> None:
     if _collector is not None:
         return
     from .monitor import _ssh_exec, get_monitor
-    log_dir = str(Path(app.root_path).parent / "data" / "logs")
+    log_dir = app.config.get("LOG_DIR") or str(
+        Path(app.root_path).parent / "data" / "logs")
     mon_interval = app.config.get("MONITOR_INTERVAL", 60)
     log_interval = mon_interval * 2  # 日志采集频率为监控的一半，减少 SSH 连接数
     _collector = LogCollector(app.config["DB_PATH"], log_dir, interval=log_interval,

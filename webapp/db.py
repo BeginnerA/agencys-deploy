@@ -501,6 +501,9 @@ def get_conn(db_path: str):
 def init_db(db_path: str):
     conn = get_conn(db_path)
     try:
+        # auto_vacuum 仅能在建表前开启（对存量库无效，需 scripts/db_vacuum.py
+        # 重建生效）：新库直接启用增量回收，配合 FTS 维护控制膨胀
+        conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
         # WAL 为数据库级持久设置（写入库文件头），初始化时开启一次即可
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
@@ -1008,9 +1011,17 @@ def project_count(db_path: str) -> int:
 
 # ---------- 监控时序数据 ----------
 
+_rth_last_cleanup = 0.0  # response_time 过期清理上次执行时间（节流用）
+
+
 def save_response_time(db_path: str, env_id: int, service: str,
                        host: str, response_ms: float, ok: bool):
-    """持久化健康检查响应时间（保留 7 天，每次写入清理过期）"""
+    """持久化健康检查响应时间（保留 7 天，过期清理每 10 分钟至多一次）
+
+    原实现每次写入都执行全表 DELETE（健康检查每 30s × 服务数 × 环境
+    → 高频扫描写放大）；改为每次插入 + 至多每 600s 清理一次过期行。
+    """
+    global _rth_last_cleanup
     now = int(time.time())
     conn = get_conn(db_path)
     try:
@@ -1019,9 +1030,11 @@ def save_response_time(db_path: str, env_id: int, service: str,
             " (env_id, service, host, response_ms, ok, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?)",
             (env_id, service, host, response_ms, int(ok), now))
-        conn.execute(
-            "DELETE FROM response_time_history WHERE created_at < ?",
-            (now - 7 * 86400,))
+        if now - _rth_last_cleanup >= 600:
+            conn.execute(
+                "DELETE FROM response_time_history WHERE created_at < ?",
+                (now - 7 * 86400,))
+            _rth_last_cleanup = now
         conn.commit()
     finally:
         conn.close()

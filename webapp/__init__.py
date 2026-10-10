@@ -75,6 +75,8 @@ def create_app():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     app.config["SECRET_KEY"] = _resolve_secret_key(app)
     app.config["DB_PATH"] = str(DATA_DIR / "platform.db")
+    # 日志目录（采集/归档/手动清理共用；独立成配置便于测试隔离）
+    app.config["LOG_DIR"] = str(DATA_DIR / "logs")
     app.config["MONITOR_INTERVAL"] = int(os.environ.get("DASHBOARD_MONITOR_INTERVAL", "30"))
     init_db(app.config["DB_PATH"])
     # 历史自动版本任务回填：从日志解析实际版本号写入 DB（幂等，仅处理 version 为空的记录）

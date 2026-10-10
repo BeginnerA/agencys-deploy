@@ -680,7 +680,9 @@ python webapp/app.py          # 默认 http://127.0.0.1:5678
 - 首次启动自动导入 `config/` 旧配置（原 11 个服务 + 4 条流水线 + prod/test 环境），创建默认管理员 `admin/admin`（首次登录强制改密）。
 - 大屏主页：服务状态卡片墙（在线/异常/发布中/未部署 + 镜像版本 + Nacos 实例数）、发布趋势/成功率图表、实时任务日志；点击卡片直接发布/回滚。
 - 「管理」抽屉（admin）：项目管理、服务/环境/服务器/流水线 CRUD、用户与角色、YAML 导入导出。
-- 实时监控：默认 30s 周期 SSH 探测容器 + Nacos 查询实例（`--monitor-interval 0` 关闭）。
+- 实时监控：默认 30s 周期 SSH 探测容器 + Nacos 查询实例（`--monitor-interval 0` 关闭）。为降低被监控服务器负载：同一服务器被多个环境绑定时整轮只探测 1 次（服务名取并集，环境视图从结果切片）；`docker stats` 仅对配置服务容器采样；CPU 使用率由 `/proc/stat` 累计值跨轮差分计算（不在被监控服务器上做 `sleep` 采样）；扩展指标（swap/网络/磁盘 IO/TCP/docker df）每 3 轮采集 1 次，节流轮复用上一轮缓存且不写快照（数据库写放大 3× → 1×）。
+- 日志采集：周期为监控的 2 倍；按主机聚合为单条 SSH 批量拉取（`@@LOGCUT` 分段标记），同名环境跨项目去重，避免重复追加与重复索引。
+- 数据库维护：新库自动启用 `auto_vacuum=INCREMENTAL`，采集器每日执行 FTS optimize + 增量空间回收；存量库执行 `python scripts/db_vacuum.py` 一次性 VACUUM 回收空洞（需先停止平台）。也可在「日志监控 → 服务日志 → ⚙ 保留设置」抽屉（admin）查看存储概况并点「立即清理」手动执行同套策略（删过期索引行、归档过期文件、回收空闲页；与每日自动维护同一实现）。
 - 配置存 `data/platform.db`（权威源）；`config/` 目录为导出产物 + CLI 兼容（`deploy.py --config-source yaml`）。
 - 角色：admin（全部）/ operator（发布回滚）/ viewer（只读）。
 - 默认仅监听 `127.0.0.1`；对外提供服务时用 `--host 0.0.0.0`，建议前置 Nginx 等反代，生产务必注入 `DASHBOARD_SECRET_KEY`。

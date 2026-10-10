@@ -32,6 +32,7 @@
     create_pipeline:'创建流水线', update_pipeline:'更新流水线', delete_pipeline:'删除流水线',
     import_config:'导入配置', export_config:'导出配置',
     deploy:'发布', rollback:'回滚', kill_task:'终止任务', delete_task:'删除任务',
+    update_log_settings:'更新日志设置', manual_log_cleanup:'手动清理日志',
   };
   const TARGET_CN = {user:'用户', project:'项目', service:'服务', environment:'环境',
                      server:'服务器', pipeline:'流水线', config:'配置', task:'任务'};
@@ -414,7 +415,32 @@
     };
   }
 
-  // ---- 日志保留设置抽屉 ----
+  // ---- 日志保留设置 + 手动清理抽屉 ----
+  function fmtMB(b){ return (Number(b || 0) / 1048576).toFixed(1) + ' MB'; }
+
+  function renderStorageInfo(s, result){
+    let html = `数据库 ${fmtMB(s.db_size)}${s.db_freelist_bytes > 1048576 ? `（含可回收空闲 ${fmtMB(s.db_freelist_bytes)}）` : ''} · 日志 ${Number(s.log_entries || 0).toLocaleString()} 条`
+      + `<br>未归档 ${s.collect?.files || 0} 个 / ${fmtMB(s.collect?.bytes)} · 已归档 ${s.archive?.files || 0} 个 / ${fmtMB(s.archive?.bytes)}`
+      + `<br>保留策略：日志 ${s.retention_days} 天 / 归档 ${s.archive_days} 天${s.collector_running ? '' : ' · ⚠ 采集器未运行（手动清理仍可用）'}`;
+    if (result){
+      html += `<div style="color:var(--success);margin-top:6px">本次清理：删除 ${result.deleted_entries || 0} 条索引、归档 ${result.archived_files || 0} 个文件、永久删除 ${result.purged_files || 0} 个归档；数据库 ${fmtMB(result.db_size_before)} → ${fmtMB(result.db_size_after)}</div>`;
+    }
+    return html;
+  }
+
+  async function refreshStorageInfo(){
+    const info = document.getElementById('logStorageInfo');
+    if (!info) return null;
+    try {
+      const s = await api('/api/logs/storage');
+      info.innerHTML = renderStorageInfo(s);
+      return s;
+    } catch(e){
+      info.innerHTML = '<span class="muted">存储概况加载失败：' + esc(e.message || '') + '</span>';
+      return null;
+    }
+  }
+
   async function openLogSettingsDrawer() {
     let settings = { log_retention_days: 7, log_archive_days: 30 };
     try { settings = await api('/api/logs/settings'); } catch(e) { /* ignore */ }
@@ -434,8 +460,20 @@
           <button class="btn" id="logSetCancel">取消</button>
           <button class="btn primary" id="logSetSave">保存</button>
         </div>
+      </div>
+      <div style="border-top:1px solid var(--border);margin:18px 0"></div>
+      <div class="form-grid">
+        <div class="full">
+          <label style="font-weight:600">存储维护</label>
+          <div id="logStorageInfo" class="muted" style="font-size:12px;line-height:1.9;padding:4px 0">加载中...</div>
+          <div class="field-hint">立即按上述保留策略执行一次清理（删除过期索引行、归档过期文件、回收数据库空闲空间）；平台每日也会自动维护，通常在调整保留天数后或磁盘紧张时手动执行即可。</div>
+          <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
+            <button class="btn danger ghost" id="logCleanupBtn">🧹 立即清理</button>
+          </div>
+        </div>
       </div>`;
-    openDrawer({ title: '日志保留设置', body: bodyHTML });
+    openDrawer({ title: '日志保留与清理', body: bodyHTML });
+    const storage = await refreshStorageInfo();
     document.getElementById('logSetCancel').onclick = () => {
       const c = document.getElementById('dwClose'); if (c) c.click();
     };
@@ -447,9 +485,38 @@
       }
       try {
         await api('/api/logs/settings', { method: 'PUT', body: JSON.stringify({ log_retention_days: retention, log_archive_days: archive }) });
-        toastSuccess('设置已保存');
-        const c = document.getElementById('dwClose'); if (c) c.click();
+        toastSuccess('设置已保存，清理将在下一轮自动维护时按新策略执行');
+        refreshStorageInfo();
       } catch(e) { toastError(e.message || '保存失败'); }
+    };
+    const cleanupBtn = document.getElementById('logCleanupBtn');
+    if (cleanupBtn) cleanupBtn.onclick = async () => {
+      const s = storage || {};
+      const retention = s.retention_days || settings.log_retention_days || 7;
+      const ok = await confirmDialog(
+        `将按保留策略立即清理：删除超过 ${retention} 天的日志索引行、归档过期文件并回收数据库空闲空间。清理期间日志检索可能短暂变慢，确认执行？`,
+        '手动清理');
+      if (!ok) return;
+      cleanupBtn.disabled = true;
+      cleanupBtn.textContent = '清理中...';
+      try {
+        const r = await api('/api/logs/maintenance', { method: 'POST' });
+        toastSuccess(`清理完成：删除 ${r.deleted_entries || 0} 条、归档 ${r.archived_files || 0} 个文件`);
+        const info = document.getElementById('logStorageInfo');
+        if (info){
+          try {
+            const fresh = await api('/api/logs/storage');
+            info.innerHTML = renderStorageInfo(fresh, r);
+          } catch(e2){
+            if (s) info.innerHTML = renderStorageInfo(s, r);
+          }
+        }
+      } catch(e) {
+        toastError(e.message || '清理失败');
+      } finally {
+        cleanupBtn.disabled = false;
+        cleanupBtn.textContent = '🧹 立即清理';
+      }
     };
   }
 

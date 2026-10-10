@@ -371,6 +371,31 @@ class TestLogCollector(unittest.TestCase):
             self.collector._scan_keywords_in_entries(entries, "prod", 1)
         mock_engine.trigger_log_alert.assert_not_called()
 
+    def test_fts_maintenance_orphan_cleanup(self):
+        """每日维护：兜底清理超 archive_days 的孤儿日志行并保持 FTS 一致"""
+        now = int(time.time())
+        self.collector._index_log_entries([
+            (now - 40 * 86400, "prod", "api", "ancient orphan line",
+             "/tmp/old.log", 0, 1),
+            (now, "prod", "api", "recent keep line",
+             "/tmp/new.log", 0, 1),
+        ])
+        self.collector._fts_maintenance()
+        conn = dbm.get_conn(self.db)
+        try:
+            cnt = conn.execute("SELECT COUNT(*) FROM log_entries").fetchone()[0]
+            self.assertEqual(cnt, 1)
+            hit_keep = conn.execute(
+                "SELECT COUNT(*) FROM log_fts WHERE log_fts MATCH 'recent'"
+            ).fetchone()[0]
+            hit_old = conn.execute(
+                "SELECT COUNT(*) FROM log_fts WHERE log_fts MATCH 'ancient'"
+            ).fetchone()[0]
+            self.assertEqual(hit_keep, 1)
+            self.assertEqual(hit_old, 0)
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 """实时探测调度器：周期 SSH 容器状态 + Nacos 实例健康，内存缓存供大屏轮询"""
 import json
 import re
+import shlex
 import sys
 import threading
 import time
@@ -151,86 +152,87 @@ def _merge_server_ssh(env_ssh: dict, s: dict) -> dict:
     return ssh
 
 
-def _probe_server_full(host: str, port: int, ssh_cfg: dict, services: list,
-                       timeout: int = 10, health_hosts: dict = None,
-                       skip_extended: bool = False) -> dict:
+def _probe_server_full(host: str, port: int, ssh_cfg: dict, service_names: set,
+                       timeout: int = 10, skip_extended: bool = False) -> dict:
     """单连接探测整台服务器：容器镜像 + docker stats 资源 + 主机指标 + 扩展指标
 
-    返回 {ssh_ok, containers, containers_stopped, container_list, resources, host_metrics, extended, error}。
-    第一轮：4 条命令（ps/ps -a/stats/主机指标），1 次 SSH 连接；
-    第二轮：扩展指标（容器详情/swap/网络/diskIO/TCP/docker_df/SSL），1 次 SSH 连接。
-    共 2 次连接，避免逐命令独立认证（探测热路径的主要开销）。
+    返回 {ssh_ok, containers, containers_stopped, container_list, container_status,
+         resources, host_metrics, extended, error}。
+    第一轮：2 条命令（ps -a 一次覆盖全部容器状态 + 仅服务容器的 stats/主机指标），
+    1 次 SSH 连接；第二轮：扩展指标 4 条命令，1 次 SSH 连接。
+    service_names 为需采集资源指标的容器名集合（跨环境合并后的并集）。
+    container_status 每轮从第一轮 ps -a 输出构建（节流轮也保持运行时长新鲜）。
     skip_extended=True 时跳过第二轮（节流，降低 SSH 频率）。
     """
     result = {"ssh_ok": False, "containers": {}, "container_list": [],
-              "containers_stopped": {}, "resources": {}, "host_metrics": {},
-              "extended": {}, "error": ""}
+              "containers_stopped": {}, "container_status": {}, "resources": {},
+              "host_metrics": {}, "extended": {}, "error": ""}
     try:
-        # 第一轮：基础指标（ps + ps -a + stats + 主机指标）
-        # ps -a 用于识别容器存在但未运行（Exited）的服务：docker ps 只看运行中容器，
-        # 否则已停止的服务会被误判为 not_deployed（从未部署）
-        ps_out, ps_a_out, stats_out, hm_out = _ssh_exec_multi(
-            host, port, ssh_cfg,
-            ["docker ps --format '{{.Names}}|{{.Image}}'",
-             "docker ps -a --format '{{.Names}}|{{.Status}}|{{.Image}}'",
-             "docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemPerc}}'",
-             "grep -c processor /proc/cpuinfo; "
-             "cat /proc/loadavg; "
-             "vmstat 1 2 | tail -1; "
-             "awk '/MemTotal|MemFree|Buffers|Cached/' /proc/meminfo; "
-             "df -P / | tail -1"],
-            timeout=timeout)
+        # 第一轮：基础指标。ps -a 一次覆盖运行中/已停止（原 ps + ps -a 两次
+        # dockerd 调用合并为一次，并用 shell 变量复用输出避免重复调用 dockerd）；
+        # docker stats 仅对「运行中且属于配置服务」的容器采样（原为全容器采样，
+        # 容器多时 dockerd CPU 采样是服务器端主要负载），@@STATS@@ 分段
+        stats_fmt = ("docker stats --no-stream "
+                     "--format '{{.Name}}|{{.CPUPerc}}|{{.MemPerc}}'")
+        if service_names:
+            grep_args = " ".join("-e " + shlex.quote(n) for n in sorted(service_names))
+            filter_stats = ("N=$(echo \"$PS\" | awk -F'|' '$2 ~ /^Up/ {print $1}' "
+                            "| grep -xF " + grep_args + "); "
+                            "[ -n \"$N\" ] && " + stats_fmt + " $N")
+        else:
+            filter_stats = "true"
+        base_cmd = ("PS=$(docker ps -a --format '{{.Names}}|{{.Status}}|{{.Image}}'); "
+                    "echo \"$PS\"; echo '@@STATS@@'; " + filter_stats)
+        # 主机指标：/proc/stat 累计值（CPU 使用率由调度器跨轮差分计算，取代
+        # vmstat 1 2 的 1s 阻塞采样——被监控服务器上少一次 sleep 1 采样窗口）
+        host_cmd = ("head -1 /proc/stat; "
+                    "cat /proc/loadavg; "
+                    "grep -c processor /proc/cpuinfo; "
+                    "awk '/MemTotal|MemFree|Buffers|Cached/' /proc/meminfo; "
+                    "df -P / | tail -1")
+        base_out, hm_out = _ssh_exec_multi(
+            host, port, ssh_cfg, [base_cmd, host_cmd], timeout=timeout)
+        ps_part, _, stats_out = base_out.partition("@@STATS@@")
         containers = {}
         container_names = []
-        for line in ps_out.splitlines():
-            if "|" not in line:
-                continue
-            name, image = line.split("|", 1)
-            name = name.strip()
-            container_names.append(name)
-            for s in services:
-                if name == s["service_name"]:
-                    containers[s["service_name"]] = image.strip()
-                    break
-        # 已停止容器：docker ps -a 中存在、状态非 Up（Exited/Created/Restarting），
-        # 仅登记与配置服务同名的容器（基础设施容器不关心停止与否）
         containers_stopped = {}
-        for line in ps_a_out.splitlines():
+        for line in ps_part.splitlines():
             parts = line.split("|")
             if len(parts) < 3:
                 continue
-            name, status = parts[0].strip(), parts[1].strip()
-            if not name or status.startswith("Up"):
+            name, status, image = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if not name:
                 continue
-            for s in services:
-                if name == s["service_name"]:
-                    containers_stopped[s["service_name"]] = parts[2].strip()
-                    break
+            if status.startswith("Up"):
+                container_names.append(name)  # 运行中容器（供日志采集复用）
+                if name in service_names:
+                    containers[name] = image
+            elif name in service_names:
+                # 已停止容器（Exited/Created/Restarting）：仅登记配置服务同名容器
+                # （基础设施容器不关心停止与否），区分「部署过已停止」与「从未部署」
+                containers_stopped[name] = image
         result["containers"] = containers
         result["containers_stopped"] = containers_stopped
         result["container_list"] = container_names
-        result["resources"] = _parse_docker_resources(stats_out, services)
+        result["container_status"] = _parse_container_status(ps_part)
+        result["resources"] = _parse_docker_resources(stats_out, service_names)
         result["host_metrics"] = _parse_host_metrics(hm_out)
         result["ssh_ok"] = True
-        # 第二轮：扩展指标（容器详情/swap/网络/diskIO/TCP/docker_df/SSL）
+        # 第二轮：扩展指标（swap/网络/diskIO/TCP/docker_df）
         # skip_extended 时节流跳过，降低 SSH 频率（每 N 轮才采集一次）
         if not skip_extended:
             try:
-                ext_cmds = _build_extended_cmds(services, health_hosts or {})
-                (cs_out, sw_out, net_out,
-                 dio_out, tcp_out, ddf_out, ssl_out) = _ssh_exec_multi(
+                ext_cmds = _build_extended_cmds()
+                sw_out, netdio_out, tcp_out, ddf_out = _ssh_exec_multi(
                     host, port, ssh_cfg, ext_cmds, timeout=25)
                 result["extended"] = {
-                    "container_status": _parse_container_status(cs_out, services),
                     "swap": _parse_swap(sw_out),
-                    **_parse_network(net_out),
-                    **_parse_diskio(dio_out),
+                    **_parse_network(netdio_out),
+                    **_parse_diskio(netdio_out),
                     "tcp": _parse_tcp(tcp_out),
                     "docker_df": _parse_docker_df(ddf_out),
-                    "ssl_days": _parse_ssl_days(ssl_out),
                 }
             except Exception as ext_err:
-                import sys
                 print(f"[monitor] 扩展指标采集失败({host}): {ext_err!r}",
                       file=sys.stderr)  # 扩展指标失败不影响基础探测
     except Exception as e:
@@ -282,8 +284,9 @@ def _probe_nacos_instances(env_cfg: dict, svc_name: str, groups: list) -> int:
         return -1  # 查询失败
 
 
-def _parse_docker_resources(out: str, services: list) -> dict:
+def _parse_docker_resources(out: str, service_names: set) -> dict:
     """解析 docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemPerc}}' 输出
+    （仅保留 service_names 集合中的服务容器）
     返回 {service_name: {"cpu": float, "mem": float}}"""
     resources = {}
     for line in out.splitlines():
@@ -293,16 +296,30 @@ def _parse_docker_resources(out: str, services: list) -> dict:
         if len(parts) < 3:
             continue
         name = parts[0].strip()
-        for s in services:
-            if name == s["service_name"]:
-                try:
-                    cpu = float(parts[1].strip().rstrip("%"))
-                    mem = float(parts[2].strip().rstrip("%"))
-                    resources[name] = {"cpu": cpu, "mem": mem}
-                except (ValueError, IndexError):
-                    pass
-                break
+        if name not in service_names:
+            continue
+        try:
+            cpu = float(parts[1].strip().rstrip("%"))
+            mem = float(parts[2].strip().rstrip("%"))
+            resources[name] = {"cpu": cpu, "mem": mem}
+        except (ValueError, IndexError):
+            pass
     return resources
+
+
+_http_local = threading.local()
+
+
+def _http_session() -> requests.Session:
+    """每线程复用一个 requests.Session：健康检查连接池复用（避免每次新建 TCP），
+    连接错误重试 1 次（服务重启后 keep-alive 旧连接可能已失效，防止误判失败）"""
+    session = getattr(_http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_maxsize=16, max_retries=1)
+        session.mount("http://", adapter)
+        _http_local.session = session
+    return session
 
 
 def _probe_health_url(host: str, port: int, url: str, timeout: int = 5) -> dict:
@@ -312,7 +329,7 @@ def _probe_health_url(host: str, port: int, url: str, timeout: int = 5) -> dict:
     full_url = f"http://{host}:{port}{url}"
     try:
         t0 = time.time()
-        r = requests.get(full_url, timeout=timeout, allow_redirects=False)
+        r = _http_session().get(full_url, timeout=timeout, allow_redirects=False)
         ms = int((time.time() - t0) * 1000)
         return {"ok": r.status_code == 200, "ms": ms}
     except Exception:
@@ -337,21 +354,28 @@ def _compute_security(servers: list) -> dict:
 
 def _parse_host_metrics(out: str) -> dict:
     """解析主机指标命令输出
-    命令: vmstat 1 2 | tail -1; awk '/MemTotal|MemFree|Buffers|Cached/' /proc/meminfo; df -P / | tail -1; cat /proc/loadavg /proc/cpuinfo | grep -c processor
-    返回 {cpu, mem, disk, load} 百分比（0-100），失败字段为 None"""
-    metrics = {"cpu": None, "mem": None, "disk": None, "load": None}
+
+    命令: head -1 /proc/stat; cat /proc/loadavg; grep -c processor /proc/cpuinfo;
+    awk '/MemTotal|MemFree|Buffers|Cached/' /proc/meminfo; df -P / | tail -1
+    返回 {cpu, mem, disk, load, cpu_raw}：
+    cpu 由 cpu_raw 跨轮差分计算（调度器 _apply_cpu_delta），解析阶段为 None；
+    cpu_raw={"busy": 累计非空闲, "total": 累计总量}（/proc/stat 前 8 列）。
+    失败字段为 None。
+    """
+    metrics = {"cpu": None, "mem": None, "disk": None, "load": None,
+               "cpu_raw": None}
     lines = [l.strip() for l in out.splitlines() if l.strip()]
-    # vmstat 最后一行: r b swpd free buff cache si so bi bo in cs us sy id wa st
-    for i in range(len(lines) - 1, -1, -1):
-        parts = lines[i].split()
-        if len(parts) >= 15:
+    # /proc/stat 首行: cpu user nice system idle iowait irq softirq steal...
+    for l in lines:
+        parts = l.split()
+        if parts and parts[0] == "cpu" and len(parts) >= 5:
             try:
-                int(parts[0])  # r 列应为数字
-                idle = float(parts[14])
-                metrics["cpu"] = round(max(0, min(100, 100 - idle)), 1)
-                break
-            except (ValueError, IndexError):
-                continue
+                vals = [int(v) for v in parts[1:9]]
+                idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                metrics["cpu_raw"] = {"busy": sum(vals) - idle, "total": sum(vals)}
+            except ValueError:
+                pass
+            break
     # /proc/meminfo
     mi = {}
     for l in lines:
@@ -376,13 +400,13 @@ def _parse_host_metrics(out: str) -> dict:
                         pass
                     break
             break
-    # load average（1min）/ CPU 核数 → 百分比
-    # 注意：先输出 CPU 核数，再输出 loadavg，避免 grep -c 结果拼到 loadavg 行末尾
+    # CPU 核数（grep -c 输出纯数字行）
     ncpu = 1
     for l in lines:
         if l.isdigit():
             ncpu = max(1, int(l))
             break
+    # load average（1min）/ CPU 核数 → 百分比
     for l in lines:
         parts = l.split()
         if len(parts) >= 3 and "." in parts[0]:
@@ -397,62 +421,48 @@ def _parse_host_metrics(out: str) -> dict:
 
 # ---------- 扩展指标解析函数 ----------
 
-def _build_extended_cmds(services: list, health_hosts: dict) -> list:
-    """构造第二轮 SSH 命令列表：容器详情 + swap + 网络 + diskIO + TCP + docker_df + SSL
+def _build_extended_cmds() -> list:
+    """构造第二轮 SSH 命令列表：swap + 网络/磁盘IO + TCP + docker_df
 
-    返回 7 条命令的列表，直接传给 _ssh_exec_multi 作为 cmds 参数，
+    返回 4 条命令的列表，直接传给 _ssh_exec_multi 作为 cmds 参数，
     避免字符串拼接/拆分导致的 shell 语法破坏（for 循环内分号等）。
+    相比旧实现 7 条命令的优化：
+    - 网络与磁盘 IO 合并一条命令共享一次 sleep 1（原为两次独立 sleep，
+      采样窗口串行阻塞 2s）；
+    - TCP 分布 1 个 ss + awk 聚合取代 3 个 ss 进程（原每状态起一个 ss）；
+    - 删除 SSL 探测（health_hosts 恒为空 → 死代码；证书过期检查已由平台侧
+      ssl_monitor 每小时执行，不在被监控服务器上跑 openssl）。
     """
-    # 1. 容器重启次数 + 运行时长（从 docker ps Status 解析）
-    # 采集所有容器（含未注册为服务的基础设施容器如 RocketMQ 等），
-    # 避免服务器上有容器但 container_status 为空导致运行时长永远为空。
-    c1 = "docker ps -a --format '{{.Names}}|{{.Status}}'"
-    # 2. Swap（/proc/meminfo）
-    c2 = "grep -E 'SwapTotal|SwapFree' /proc/meminfo 2>/dev/null || true"
-    # 3. 网络流量（两次采样间隔 1s，计算每秒字节数）
-    c3 = "head -5 /proc/net/dev; sleep 1; head -5 /proc/net/dev"
-    # 4. 磁盘 IO（两次采样 /proc/diskstats，间隔 1s）
-    c4 = ("grep -E 'sd[a-z]+|vd[a-z]+|xvd[a-z]+' /proc/diskstats 2>/dev/null; "
+    # 1. Swap（/proc/meminfo）
+    c1 = "grep -E 'SwapTotal|SwapFree' /proc/meminfo 2>/dev/null || true"
+    # 2. 网络流量 + 磁盘 IO：两次采样共享一次 sleep 1
+    #    （_parse_network / _parse_diskio 从同一输出中各取所需行，互不干扰）
+    c2 = ("head -5 /proc/net/dev; "
+          "grep -E 'sd[a-z]+|vd[a-z]+|xvd[a-z]+' /proc/diskstats 2>/dev/null; "
           "sleep 1; "
+          "head -5 /proc/net/dev; "
           "grep -E 'sd[a-z]+|vd[a-z]+|xvd[a-z]+' /proc/diskstats 2>/dev/null")
-    # 5. TCP 连接状态分布（输出带标签的计数，便于解析）
-    c5 = ("echo ESTABLISHED:$(ss -tan state established 2>/dev/null | tail -n +2 | wc -l); "
-          "echo TIME_WAIT:$(ss -tan state time-wait 2>/dev/null | tail -n +2 | wc -l); "
-          "echo CLOSE_WAIT:$(ss -tan state close-wait 2>/dev/null | tail -n +2 | wc -l)")
-    # 6. Docker 磁盘占用
-    c6 = "docker system df 2>/dev/null || true"
-    # 7. SSL 证书到期（自动检测 HTTPS 端口：先试 443，否则从 openresty/nginx 容器找）
-    ssl_hosts = list({h for hosts in (health_hosts or {}).values() for h in hosts[:1]})[:3]
-    if ssl_hosts:
-        targets = " ".join(ssl_hosts)
-        c7 = ("for h in " + targets + "; do "
-              "port=443; "
-              # 先测 443 是否可达
-              "if ! echo | timeout 2 bash -c \"cat < /dev/tcp/$h/443\" 2>/dev/null; then "
-              # 443 不通，从 openresty/nginx 容器找 443 映射
-              "eport=$(docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null "
-              "| grep -iE 'openresty|nginx' | head -1 "
-              "| grep -oE '[0-9]+->443/tcp' | cut -d'>' -f1); "
-              "if [ -n \"$eport\" ]; then port=$eport; fi; "
-              "fi; "
-              "echo \"$h:$port|$(echo | openssl s_client -connect $h:$port "
-              "-servername $h 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null)\"; "
-              "done || true")
-    else:
-        c7 = "true"
-    return [c1, c2, c3, c4, c5, c6, c7]
+    # 3. TCP 连接状态分布（单次 ss + awk 聚合，输出带标签计数便于解析）
+    c3 = ("ss -tan 2>/dev/null | awk 'NR>1 {c[$1]++} "
+          "END {printf \"ESTABLISHED:%d\\nTIME_WAIT:%d\\nCLOSE_WAIT:%d\\n\", "
+          "c[\"ESTAB\"]+c[\"ESTABLISHED\"], c[\"TIME-WAIT\"], c[\"CLOSE-WAIT\"]}'")
+    # 4. Docker 磁盘占用
+    c4 = "docker system df 2>/dev/null || true"
+    return [c1, c2, c3, c4]
 
 
-def _parse_container_status(out: str, services: list) -> dict:
-    """解析容器重启次数和运行时长
+def _parse_container_status(out: str, services: list = None) -> dict:
+    """解析容器重启次数和运行时长（docker ps -a --format '{{.Names}}|{{.Status}}[|{{.Image}}]'）
     返回 {container_name: {"restart_count": int, "uptime_hours": float}}
-    包含服务器上所有容器（含未注册为服务的基础设施容器）。"""
+    包含服务器上所有容器（含未注册为服务的基础设施容器）。
+    services 参数保留兼容（解析不区分服务）。"""
     result = {}
     for line in out.splitlines():
         if "|" not in line:
             continue
-        name = line.split("|", 1)[0].strip()
-        status = line.split("|", 1)[1]
+        parts = line.split("|")
+        name = parts[0].strip()
+        status = parts[1] if len(parts) > 1 else ""
         if not name:
             continue
         info = {"restart_count": 0, "uptime_hours": -1}
@@ -640,24 +650,6 @@ def _parse_docker_df(out: str) -> dict:
     return result
 
 
-def _parse_ssl_days(out: str) -> float:
-    """解析 SSL 证书到期天数（取最小值），失败返回 None"""
-    import datetime
-    min_days = None
-    for line in out.splitlines():
-        if "notAfter=" not in line:
-            continue
-        try:
-            date_str = line.split("notAfter=", 1)[1].strip()
-            exp = datetime.datetime.strptime(date_str, "%b %d %H:%M:%S %Y %Z")
-            days = (exp - datetime.datetime.utcnow()).days
-            if min_days is None or days < min_days:
-                min_days = days
-        except (ValueError, IndexError):
-            pass
-    return float(min_days) if min_days is not None else None
-
-
 class MonitorScheduler:
     """守护线程周期探测；结果缓存 _cache: {env_id: {"servers": [...], "services": {...}, "ts": ...}}"""
 
@@ -670,6 +662,7 @@ class MonitorScheduler:
         self._stop = threading.Event()
         self._thread = None
         self._round = 0  # 探测轮次计数器（扩展指标节流用）
+        self._prev_cpu = {}  # {host: /proc/stat 累计值} 跨轮差分算 CPU 使用率
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -703,107 +696,184 @@ class MonitorScheduler:
         self._probe_envs(tasks)
 
     def _probe_envs(self, env_tasks: list):
-        """环境间并发探测（全局池限流）：整轮时长收敛到单环境水平而非环境之和
+        """两阶段探测：跨环境主机去重（主机只探一次）→ 环境级结果组装并发
 
-        每个环境内部保留自己的 8 并发 SSH 池（限流），
-        全局并发上限 = 环境池 4 × 环境内 8 = 32 连接，避免环境增多时连接风暴。
+        同一主机可被多个环境绑定（共用测试机）：旧实现每环境各探测一遍全套
+        命令（绑定 5 个环境的主机 → 每轮 5 次 SSH + 5 份 docker 命令）；
+        现按 (host, port) 去重为主机作业（服务名取各环境并集），主机阶段
+        16 并发；环境阶段 4 并发（Nacos/健康检查等平台侧动作，不重复 SSH）。
         """
         if not env_tasks:
             return
-        with ThreadPoolExecutor(max_workers=min(4, len(env_tasks))) as pool:
-            futures = [pool.submit(self._probe_env, proj, env)
-                       for proj, env in env_tasks]
+        env_ctxs = []
+        host_jobs = {}  # (host, port) -> {"host","port","ssh_cfg","service_names": set}
+        for proj, env in env_tasks:
+            services = dbm.list_services(self._db_path, proj["id"], enabled_only=True)
+            servers = dbm.list_env_servers(self._db_path, env["id"])
+            env_ssh = env.get("ssh") or {}
+            env_ctxs.append({"proj": proj, "env": env, "services": services,
+                             "servers": servers})
+            svc_names = [svc["service_name"] for svc in services
+                         if svc.get("service_name")]
+            for s in servers:
+                key = (s["host"], int(s.get("ssh_port") or 22))
+                job = host_jobs.get(key)
+                if job is None:
+                    job = {"host": s["host"], "port": key[1],
+                           "ssh_cfg": _merge_server_ssh(env_ssh, s),
+                           "service_names": set()}
+                    host_jobs[key] = job
+                job["service_names"].update(svc_names)
+        skip_extended = (self._round % 3) != 0
+        host_results = self._probe_hosts(host_jobs, skip_extended)
+        with ThreadPoolExecutor(max_workers=min(4, len(env_ctxs))) as pool:
+            futures = [pool.submit(self._probe_env, ctx, host_results)
+                       for ctx in env_ctxs]
             for fut in futures:
                 try:
-                    # 单环境探测含 3 个顺序阶段（服务器/nacos/健康检查），
-                    # 各阶段内部已有单任务超时兜底，外层仅防意外卡死
+                    # 环境阶段含 Nacos/健康检查（各自内部已有超时兜底），
+                    # 外层仅防意外卡死
                     fut.result(timeout=120)
                 except Exception as e:
                     print(f"[monitor] 环境探测异常: {e!r}", file=sys.stderr)
 
-    def _probe_env(self, proj: dict, env: dict):
-        services = dbm.list_services(self._db_path, proj["id"], enabled_only=True)
-        servers = dbm.list_env_servers(self._db_path, env["id"])
-        ssh_cfg = env.get("ssh") or {}
+    def _probe_hosts(self, host_jobs: dict, skip_extended: bool) -> dict:
+        """并发探测去重后的主机集合（单主机单连接），返回 {(host, port): 探测结果}。
+
+        旧实现在每个环境的内部池里探测同一主机，主机负载随绑定环境数倍增；
+        去重后一台主机整轮只执行一次 _probe_server_full。
+        """
+        results = {}
+        if not host_jobs:
+            return results
+        with ThreadPoolExecutor(max_workers=min(16, len(host_jobs))) as pool:
+            futures = {pool.submit(_probe_server_full, job["host"], job["port"],
+                                   job["ssh_cfg"], job["service_names"],
+                                   10, skip_extended): key
+                       for key, job in host_jobs.items()}
+            for fut, key in futures.items():
+                try:
+                    r = fut.result(timeout=30 if skip_extended else 50)
+                except Exception:
+                    # 与 Nacos 分支对齐：单主机超时降级，不中断整轮探测
+                    r = {"ssh_ok": False, "containers": {}, "containers_stopped": {},
+                         "container_list": [], "container_status": {},
+                         "resources": {}, "host_metrics": {}, "extended": {},
+                         "error": "timeout"}
+                if r.get("ssh_ok"):
+                    # CPU 使用率：/proc/stat 跨轮差分（取代 vmstat sleep 采样）
+                    self._apply_cpu_delta(key[0], r.get("host_metrics") or {})
+                    # 缓存容器列表供日志采集复用（省去 log_collector 独立 docker ps）
+                    if r.get("container_list"):
+                        self._server_containers[key[0]] = {
+                            "containers": r["container_list"], "ts": time.time()}
+                results[key] = r
+        return results
+
+    def _apply_cpu_delta(self, host: str, hm: dict):
+        """用 /proc/stat 两轮累计值差分计算 CPU 使用率（取代 vmstat 1s 阻塞采样）
+
+        首次探测无基准（cpu 保持 None，前端显示占位）；计数回绕（主机重启）
+        时丢弃基准。cpu_raw 属内部状态，计算后从指标 dict 中移除。
+        """
+        raw = hm.pop("cpu_raw", None)
+        if not raw:
+            return
+        prev = self._prev_cpu.get(host)
+        self._prev_cpu[host] = raw
+        if not prev:
+            return
+        d_total = raw["total"] - prev["total"]
+        d_busy = raw["busy"] - prev["busy"]
+        if d_total > 0 and d_busy >= 0:
+            hm["cpu"] = round(min(100.0, max(0.0, d_busy / d_total * 100)), 1)
+
+    def _probe_env(self, ctx: dict, host_results: dict):
+        """环境级组装：把去重后的主机探测结果切片为本环境视图并叠加平台侧检查
+
+        ctx: {"proj","env","services","servers"}（_probe_envs 构建）；
+        host_results: {(host, port): _probe_server_full 结果}（整轮共享，不重复 SSH）。
+        """
+        env = ctx["env"]
+        services = ctx["services"]
+        servers = ctx["servers"]
         result = {"ts": time.time(), "servers": [], "services": {},
                   "resources": {}, "health_checks": {}}
         health_hosts = {}  # {svc_name: [host, ...]} 用于健康检查
         per_server_metrics = {}  # {host: {cpu, mem, disk, load}} 按服务器存储主机指标
-        per_server_extended = {}  # {host: {swap, net_rx, ...}} 扩展指标
-        # 扩展指标节流时先从缓存回填（供后续服务循环读取 container_status/uptime_hours）
-        # 非 skip 轮次会被本轮新鲜数据覆盖；skip 轮次保证前端持续有运行时长数据
-        prev_ext_cache = self._cache.get(env["id"])
-        if prev_ext_cache:
-            per_server_extended = dict(prev_ext_cache.get("extended_metrics") or {})
-        # 扩展指标节流：每 3 轮采集一次（@60s 间隔 ≈ 3 分钟一次），
-        # 大幅减少 SSH 连接数（跳过时每台服务器每轮仅 1 次连接而非 2 次）
-        skip_extended = (self._round % 3) != 0
-        # 每台服务器整体一个任务（单连接内串行 ps/stats/主机指标，任务间全并发）：
-        # 避免旧实现中 stats/指标在调度线程串行执行，整轮时长随服务器数线性增长
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(_probe_server_full, s["host"], s["ssh_port"],
-                                   _merge_server_ssh(ssh_cfg, s), services,
-                                   10, health_hosts, skip_extended): s for s in servers}
-            for fut, s in futures.items():
-                try:
-                    r = fut.result(timeout=30 if skip_extended else 50)
-                except Exception:
-                    # 与 Nacos 分支对齐：单服务器超时降级，不中断整轮探测
-                    r = {"ssh_ok": False, "containers": {}, "resources": {},
-                         "host_metrics": {}, "extended": {}, "error": "timeout"}
-                entry = {"host": s["host"], "ssh_ok": r["ssh_ok"],
-                         "containers": len(r["containers"]), "ts": time.time(),
-                         "error": r["error"], "remark": s.get("remark", "")}
-                result["servers"].append(entry)
-                if r["ssh_ok"]:
-                    # 资源使用率 + 主机指标（docker stats / vmstat 等，单连接内已取回）
-                    result["resources"].update(r.get("resources") or {})
-                    per_server_metrics[s["host"]] = r.get("host_metrics") or {}
-                    ext = r.get("extended") or {}
-                    if ext:
-                        per_server_extended[s["host"]] = ext
-                    # 缓存容器列表供日志采集复用（省去 log_collector 独立 docker ps SSH）
-                    if r.get("container_list"):
-                        self._server_containers[s["host"]] = {
-                            "containers": r["container_list"],
-                            "ts": time.time()
-                        }
-                    for svc in services:
-                        image = r["containers"].get(svc["service_name"])
-                        st = result["services"].setdefault(svc["name"],
-                                                           {"status": "not_deployed",
-                                                            "version": "", "instances": -1,
-                                                            "ts": time.time()})
-                        if image:
-                            m = re.search(r":(\d+\.\d+\.\d+)$", image)
-                            st["version"] = m.group(1) if m else image.rsplit("/", 1)[-1]
-                            st["status"] = "online"
-                            # 服务运行时长（从容器状态中按 service_name 匹配）
-                            ext_cs = (per_server_extended.get(s["host"]) or {}).get("container_status") or {}
-                            c_info = ext_cs.get(svc["service_name"])
-                            if c_info and c_info.get("uptime_hours", -1) >= 0:
-                                st["uptime_hours"] = c_info["uptime_hours"]
-                            # 记录该服务在此服务器可达，用于后续 HTTP 健康检查
-                            health_hosts.setdefault(svc["name"], []).append(s["host"])
-                        else:
-                            # 容器存在但未运行（docker ps -a 命中 Exited/Created）→ stopped，
-                            # 区分「部署过但已停止」与「从未部署」；仅当尚无在线实例时标记，
-                            # 避免多服务器场景下停止实例覆盖在线状态
-                            s_img = (r.get("containers_stopped") or {}).get(svc["service_name"])
-                            if s_img and st.get("status") in (None, "not_deployed"):
-                                m = re.search(r":(\d+\.\d+\.\d+)$", s_img)
-                                st["version"] = m.group(1) if m else s_img.rsplit("/", 1)[-1]
-                                st["status"] = "stopped"
-        result["host_metrics"] = per_server_metrics
-        # 扩展指标节流时保留上次采集结果：skip_extended 轮次不采集扩展指标，
-        # 如果不从上一轮缓存回填，前端会看到数据"闪现几秒就消失"（缓存被空 dict 覆盖）
-        if not per_server_extended and not skip_extended:
-            pass  # 本轮采集了但全部为空（可能全部失败），正常写入空
-        elif not per_server_extended:
-            # 本轮跳过了采集 → 从上次缓存回填，保证前端持续有数据
+        # 扩展指标：先从上一轮缓存回填（节流轮/采集失败轮保证前端持续有数据）；
+        # 每轮做 per-host 浅拷贝，避免跨轮对象别名被就地修改
+        with self._lock:
             prev_cache = self._cache.get(env["id"])
-            if prev_cache:
-                per_server_extended = dict(prev_cache.get("extended_metrics") or {})
+        per_server_extended = {}
+        if prev_cache:
+            for h, ext in (prev_cache.get("extended_metrics") or {}).items():
+                per_server_extended[h] = dict(ext)
+        fresh_hosts = set()  # 本轮扩展指标为新采集的 host（仅这些落库，避免写放大）
+        svc_name_set = {svc["service_name"] for svc in services
+                        if svc.get("service_name")}
+        for s in servers:
+            key = (s["host"], int(s.get("ssh_port") or 22))
+            r = host_results.get(key)
+            if r is None:
+                r = {"ssh_ok": False, "containers": {}, "containers_stopped": {},
+                     "resources": {}, "host_metrics": {}, "extended": {},
+                     "container_status": {}, "error": "timeout"}
+            # 服务资源/状态按本环境服务集合从主机结果中切片（主机结果为跨环境并集）
+            matched = sum(1 for n in (r.get("containers") or {}) if n in svc_name_set)
+            result["servers"].append(
+                {"host": s["host"], "ssh_ok": r["ssh_ok"], "containers": matched,
+                 "ts": time.time(), "error": r.get("error", ""),
+                 "remark": s.get("remark", "")})
+            if not r["ssh_ok"]:
+                continue
+            for name, val in (r.get("resources") or {}).items():
+                if name in svc_name_set:
+                    result["resources"][name] = val
+            per_server_metrics[s["host"]] = r.get("host_metrics") or {}
+            ext = r.get("extended") or {}
+            if ext:
+                per_server_extended[s["host"]] = ext
+                fresh_hosts.add(s["host"])
+            # 第一轮 ps -a 的 container_status 每轮新鲜（节流轮也持续更新运行时长/
+            # 重启数）；快照仅 fresh_hosts 落库，避免写放大（旧实现 3 轮均回填写库）
+            fresh_cs = r.get("container_status") or {}
+            cur_ext = per_server_extended.get(s["host"])
+            if fresh_cs:
+                if cur_ext:
+                    merged_cs = dict(cur_ext.get("container_status") or {})
+                    merged_cs.update(fresh_cs)
+                    cur_ext["container_status"] = merged_cs
+                else:
+                    cur_ext = {"container_status": fresh_cs}
+                    per_server_extended[s["host"]] = cur_ext
+            ext_cs = (cur_ext or {}).get("container_status") or {}
+            for svc in services:
+                image = (r.get("containers") or {}).get(svc["service_name"])
+                st = result["services"].setdefault(svc["name"],
+                                                   {"status": "not_deployed",
+                                                    "version": "", "instances": -1,
+                                                    "ts": time.time()})
+                if image:
+                    m = re.search(r":(\d+\.\d+\.\d+)$", image)
+                    st["version"] = m.group(1) if m else image.rsplit("/", 1)[-1]
+                    st["status"] = "online"
+                    # 服务运行时长（从容器状态中按 service_name 匹配）
+                    c_info = ext_cs.get(svc["service_name"])
+                    if c_info and c_info.get("uptime_hours", -1) >= 0:
+                        st["uptime_hours"] = c_info["uptime_hours"]
+                    # 记录该服务在此服务器可达，用于后续 HTTP 健康检查
+                    health_hosts.setdefault(svc["name"], []).append(s["host"])
+                else:
+                    # 容器存在但未运行（docker ps -a 命中 Exited/Created）→ stopped，
+                    # 区分「部署过但已停止」与「从未部署」；仅当尚无在线实例时标记，
+                    # 避免多服务器场景下停止实例覆盖在线状态
+                    s_img = (r.get("containers_stopped") or {}).get(svc["service_name"])
+                    if s_img and st.get("status") in (None, "not_deployed"):
+                        m = re.search(r":(\d+\.\d+\.\d+)$", s_img)
+                        st["version"] = m.group(1) if m else s_img.rsplit("/", 1)[-1]
+                        st["status"] = "stopped"
+        result["host_metrics"] = per_server_metrics
         result["extended_metrics"] = per_server_extended
         # SSH 全部失败时服务状态标 probe_failed（区分"确实未部署"与"探测不到"，
         # 避免把运行中的服务误报为未部署）
@@ -850,8 +920,12 @@ class MonitorScheduler:
                             pass
                     except Exception:
                         pass
-        # 持久化扩展指标快照
-        for host, ext in per_server_extended.items():
+        # 持久化扩展指标快照：仅本轮新采集的 host（节流轮与采集失败轮不落库，
+        # 快照写放大 3× → 1×）
+        for host in fresh_hosts:
+            ext = per_server_extended.get(host)
+            if not ext:
+                continue
             try:
                 dbm.save_monitor_snapshot(self._db_path, env["id"], host, ext)
             except Exception:
