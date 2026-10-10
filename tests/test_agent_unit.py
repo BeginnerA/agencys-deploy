@@ -792,6 +792,7 @@ class TestAgentManageTools(AgentBase):
         viewer_names = {t["name"] for t in tools_mod.visible_tools("viewer")}
         admin_names = {t["name"] for t in tools_mod.visible_tools("admin")}
         for n in ("manage_projects", "manage_services",
+                  "manage_environments", "manage_servers",
                   "manage_schedules", "manage_windows", "manage_canary",
                   "canary_decision", "set_alert_status"):
             self.assertNotIn(n, viewer_names)
@@ -867,6 +868,116 @@ class TestAgentManageTools(AgentBase):
         dele_p = self._call("manage_projects",
                             {"action": "delete", "project_id": pid})
         self.assertTrue(dele_p["ok"])
+
+    def test_environments_servers_tool_lifecycle(self):
+        # viewer 拒绝
+        denied = self._call("manage_environments",
+                            {"action": "list"}, role="viewer")
+        self.assertIn("error", denied)
+        # create 环境：白名单 + 项目内唯一 + JSON 块（字符串形态）
+        out = self._call("manage_environments", {
+            "action": "create", "project": "plat", "name": "staging",
+            "ssh": '{"port": 22, "user": "root", "password": "secret"}',
+            "registry": {"host": "registry.local"}})
+        self.assertIn("id", out)
+        eid = out["id"]
+        bad_name = self._call("manage_environments", {
+            "action": "create", "project": "plat", "name": "非法!"})
+        self.assertIn("error", bad_name)
+        dup = self._call("manage_environments", {
+            "action": "create", "project": "plat", "name": "staging"})
+        self.assertIn("error", dup)
+        # list：ssh 口令脱敏
+        rows = self._call("manage_environments", {"action": "list",
+                                                   "project": "plat"})
+        envs = {e["name"]: e for e in rows["environments"]}
+        self.assertIn("staging", envs)
+        self.assertEqual(envs["staging"]["ssh"]["password"], "***")
+        self.assertEqual(envs["staging"]["registry"]["host"], "registry.local")
+        # update：改 maven_profile
+        upd = self._call("manage_environments", {
+            "action": "update", "environment_id": eid,
+            "maven_profile": "stage"})
+        self.assertTrue(upd["ok"])
+        # bind upsert：新 host 注册并绑定（口令入参但不回显）
+        bound = self._call("manage_servers", {
+            "action": "bind", "project": "plat", "environment": "staging",
+            "host": "10.0.0.9", "ssh_user": "root",
+            "ssh_password": "pw123", "nacos_ip": "10.0.0.2"})
+        self.assertTrue(bound["ok"])
+        self.assertTrue(bound["created"])
+        sid9 = bound["server_id"]
+        # 重复 bind → 幂等 already_bound
+        again = self._call("manage_servers", {
+            "action": "bind", "project": "plat", "environment": "staging",
+            "host": "10.0.0.9"})
+        self.assertTrue(again["already_bound"])
+        # list by env：口令脱敏
+        srvs = self._call("manage_servers", {
+            "action": "list", "project": "plat", "environment": "staging"})
+        hosts = [s["host"] for s in srvs["servers"]]
+        self.assertIn("10.0.0.9", hosts)
+        for s in srvs["servers"]:
+            if s["host"] == "10.0.0.9":
+                self.assertEqual(s["ssh_password"], "***")
+        # 已注册 host 直接绑定另一环境（不新建）
+        bound2 = self._call("manage_servers", {
+            "action": "bind", "project": "plat", "environment": "prod",
+            "host": "10.0.0.9"})
+        self.assertTrue(bound2["ok"])
+        self.assertFalse(bound2["created"])
+        # 环境删除被绑定阻塞 → 解绑后成功
+        blocked = self._call("manage_environments", {
+            "action": "delete", "environment_id": eid})
+        self.assertIn("error", blocked)
+        for env_name in ("staging", "prod"):
+            un = self._call("manage_servers", {
+                "action": "unbind", "project": "plat",
+                "environment": env_name, "host": "10.0.0.9"})
+            self.assertTrue(un["ok"])
+        dele = self._call("manage_environments", {
+            "action": "delete", "environment_id": eid})
+        self.assertTrue(dele["ok"])
+        dbm.delete_record(self.db, "servers", sid9)  # 清理夹具外数据
+
+    def test_clone_environment_copies_server_bindings(self):
+        # 新项目 → clone plat/prod 环境（含服务器绑定，order 保持）
+        proj = self._call("manage_projects", {
+            "action": "create", "name": "订单", "code": "order"})
+        pid = proj["id"]
+        cloned = self._call("manage_environments", {
+            "action": "clone", "project": "order", "name": "prod",
+            "source_project": "plat", "source_env": "prod"})
+        self.assertIn("id", cloned)
+        self.assertEqual(cloned["servers_bound"], 1)  # 夹具 plat/prod 绑 1 台
+        src = dbm.get_env_by_name(self.db, self.proj_id, "prod")
+        dst = dbm.get_env_by_name(self.db, pid, "prod")
+        self.assertEqual(dst["registry"], src["registry"])
+        self.assertEqual(dst["ssh"], src["ssh"])
+        # 源/目标环境绑定同一台服务器
+        self.assertEqual([s["host"] for s in dbm.list_env_servers(self.db, dst["id"])],
+                         [s["host"] for s in dbm.list_env_servers(self.db, src["id"])])
+
+    def test_end_to_end_onboarding_chain(self):
+        """对话式接入链全通：建项目 → 注册服务 → clone 环境 → 生成发布审批单"""
+        from agent import executor as executor_mod
+        proj = self._call("manage_projects", {
+            "action": "create", "name": "新应用", "code": "app2"})
+        self._call("manage_services", {
+            "action": "create", "project": "app2", "name": "web-api",
+            "image_name": "web", "service_name": "hqb-web",
+            "git_repo": "https://git.example.com/web-api.git"})
+        cloned = self._call("manage_environments", {
+            "action": "clone", "project": "app2", "name": "prod",
+            "source_project": "plat", "source_env": "prod"})
+        self.assertGreaterEqual(cloned["servers_bound"], 1)
+        run = executor_mod.plan_operation(
+            self.db, USER, op="deploy", target="web-api",
+            project_code="app2", env="prod", version="1.0.0")
+        self.assertEqual(run["status"], "awaiting_approval")
+        rec = dbm.get_record(self.db, "agent_runs", run["id"])
+        self.assertEqual(rec["kind"], "operation")
+        # 审批链后续（submit）由既有 TestExecutor 覆盖，此处验证到审批单生成
 
     def test_schedules_lifecycle(self):
         out = self._call("manage_schedules", {

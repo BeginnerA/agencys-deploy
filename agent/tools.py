@@ -1191,6 +1191,347 @@ def _manage_services(ctx, action=None, project=None, service_id=None,
     raise ToolError("action 仅支持 list/create/update/delete")
 
 
+def _mask_ssh(secret: str) -> str:
+    """SSH 口令脱敏：非空遮蔽为 ***（与 Web 端 _mask_ssh_password 一致，凭据不回显）"""
+    return "***" if secret else ""
+
+
+def _env_out(e: dict, server_count: int = 0) -> dict:
+    ssh = dict(e.get("ssh") or {})
+    if ssh.get("password"):
+        ssh["password"] = "***"
+    return {"id": e["id"], "name": e["name"],
+            "project_id": e["project_id"],
+            "is_default": bool(e.get("is_default")),
+            "monitor_enabled": bool(e.get("monitor_enabled", 1)),
+            "servers": server_count,
+            "registry": e.get("registry") or {},
+            "nacos": e.get("nacos") or {},
+            "ssh": ssh,
+            "build": e.get("build") or {},
+            "deploy": e.get("deploy") or {},
+            "docker_compose_path": e.get("docker_compose_path", ""),
+            "maven_profile": e.get("maven_profile", "")}
+
+
+def _resolve_env(db: str, project: str, env: str) -> dict:
+    """项目 + 环境名 → 环境记录（发布链同款查法）"""
+    proj = _resolve_project(db, project)
+    if not proj:
+        raise ToolError("缺少项目 project（id/code/name）")
+    env_obj = dbm.get_env_by_name(db, proj["id"], env or "")
+    if not env_obj:
+        raise ToolError(f"项目「{proj['code']}」下不存在环境「{env}」")
+    return env_obj
+
+
+_ENV_JSON_KEYS = ("registry", "nacos", "mysql_snailjob", "ssh", "build", "deploy")
+
+
+def _manage_environments(ctx, action=None, project=None,
+                          environment_id=None, name="", is_default=None,
+                          monitor_enabled=None, registry=None, nacos=None,
+                          mysql_snailjob=None, ssh=None, build=None,
+                          deploy=None, docker_compose_path="",
+                          maven_profile="", source_project="",
+                          source_env="", **kw) -> dict:
+    """环境管理（仅 admin，与 Web 端一致）：list/create/clone/update/delete
+
+    clone 为接入链捷径：从既有项目复制环境（六配置块 + 独立列 + 服务器绑定）
+    到目标项目，基础设施配置（registry/nacos/ssh 等）多项目间往往共享。
+    """
+    db = ctx.db_path
+    _require_admin(ctx, "环境管理")
+    action = action or "list"
+    if action == "list":
+        proj = _resolve_project(db, project or "")
+        if proj:
+            rows = dbm.list_environments(db, proj["id"])
+        else:
+            rows = dbm.list_records(db, "environments", order="id")
+        return {"environments": [
+            _env_out(e, len(dbm.list_env_servers(db, e["id"])))
+            for e in rows[:50]]}
+    if action == "create":
+        proj = _resolve_project(db, project or "")
+        if not proj:
+            raise ToolError("缺少项目 project（id/code/name）")
+        name = (name or "").strip()
+        if not name:
+            raise ToolError("缺少环境名 name（如 prod/test，仅字母数字 _ -）")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise ToolError("环境名仅允许字母数字 _ -（导出时用作文件名）")
+        for e in dbm.list_environments(db, proj["id"]):
+            if e["name"] == name:
+                raise ToolError(f"项目内环境名 {name} 已存在")
+        blocks = {}
+        for k, v in (("registry", registry), ("nacos", nacos),
+                     ("mysql_snailjob", mysql_snailjob), ("ssh", ssh),
+                     ("build", build), ("deploy", deploy)):
+            if v is not None:
+                blocks[k] = _jsonish(v, k)
+                if not isinstance(blocks[k], dict):
+                    raise ToolError(f"{k} 必须为对象")
+        eid = dbm.create_record(db, "environments", dict(
+            project_id=proj["id"], name=name,
+            is_default=1 if is_default else 0,
+            **{k: json.dumps(v, ensure_ascii=False)
+               for k, v in blocks.items()},
+            docker_compose_path=(docker_compose_path or "").strip(),
+            maven_profile=(maven_profile or "").strip(),
+            monitor_enabled=1 if monitor_enabled is None or monitor_enabled else 0))
+        if is_default:
+            _clear_other_default_envs(db, proj["id"], eid)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_create_environment", "environments", eid,
+                         {"name": name, "pid": proj["id"], "via": "agent"})
+        return {"id": eid, "project": proj["code"], "name": name,
+                "hint": "环境已创建；可用 manage_servers 绑定服务器，"
+                        "或 clone 复制既有项目的环境（含服务器绑定）"}
+    if action == "clone":
+        proj = _resolve_project(db, project or "")
+        if not proj:
+            raise ToolError("缺少目标项目 project（id/code/name）")
+        name = (name or "").strip()
+        if not name:
+            raise ToolError("缺少新环境名 name")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise ToolError("环境名仅允许字母数字 _ -（导出时用作文件名）")
+        for e in dbm.list_environments(db, proj["id"]):
+            if e["name"] == name:
+                raise ToolError(f"项目内环境名 {name} 已存在")
+        src = _resolve_env(db, source_project or project, source_env)
+        fields = {k: json.dumps(src.get(k) or {}, ensure_ascii=False)
+                  for k in _ENV_JSON_KEYS}
+        fields.update(
+            docker_compose_path=src.get("docker_compose_path", ""),
+            maven_profile=src.get("maven_profile", ""),
+            monitor_enabled=src.get("monitor_enabled", 1))
+        eid = dbm.create_record(db, "environments", dict(
+            project_id=proj["id"], name=name,
+            is_default=1 if is_default else 0, **fields))
+        if is_default:
+            _clear_other_default_envs(db, proj["id"], eid)
+        # 复制源环境的服务器绑定（同一批机器多项目共享是常态；order 保持）
+        bound = 0
+        for s in dbm.list_env_servers(db, src["id"]):
+            dbm.bind_server(db, eid, s["id"], s.get("order_no", 0))
+            bound += 1
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_clone_environment", "environments", eid,
+                         {"name": name, "from": f"{source_project or project}"
+                                               f"/{source_env}",
+                          "servers": bound, "via": "agent"})
+        return {"id": eid, "project": proj["code"], "name": name,
+                "servers_bound": bound,
+                "hint": "环境已克隆（含服务器绑定）；服务注册后即可"
+                        "plan_operation 生成发布审批单"}
+    env_obj = dbm.get_record(db, "environments", int(environment_id or 0)) \
+        if environment_id else None
+    if not env_obj:
+        raise ToolError("缺少或不存在 environment_id")
+    if action == "update":
+        fields = {}
+        if name:
+            n = name.strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", n):
+                raise ToolError("环境名仅允许字母数字 _ -（导出时用作文件名）")
+            for e in dbm.list_environments(db, env_obj["project_id"]):
+                if e["name"] == n and e["id"] != env_obj["id"]:
+                    raise ToolError(f"项目内环境名 {n} 已存在")
+            fields["name"] = n
+        for k, v in (("registry", registry), ("nacos", nacos),
+                     ("mysql_snailjob", mysql_snailjob), ("ssh", ssh),
+                     ("build", build), ("deploy", deploy)):
+            if v is not None:
+                obj = _jsonish(v, k)
+                if not isinstance(obj, dict):
+                    raise ToolError(f"{k} 必须为对象")
+                fields[k] = json.dumps(obj, ensure_ascii=False)
+        if docker_compose_path:
+            fields["docker_compose_path"] = docker_compose_path.strip()
+        if maven_profile:
+            fields["maven_profile"] = maven_profile.strip()
+        if is_default is not None:
+            fields["is_default"] = 1 if is_default else 0
+        if monitor_enabled is not None:
+            fields["monitor_enabled"] = 1 if monitor_enabled else 0
+        if not fields:
+            raise ToolError("未提供任何要修改的字段")
+        if fields.get("is_default") == 1:
+            _clear_other_default_envs(db, env_obj["project_id"], env_obj["id"])
+        dbm.update_record(db, "environments", env_obj["id"], fields)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_update_environment", "environments",
+                         env_obj["id"], {"name": env_obj["name"],
+                                          "updated": list(fields)})
+        return {"ok": True, "updated": list(fields)}
+    if action == "delete":
+        ok, msg = dbm.delete_environment(db, env_obj["id"])
+        if not ok:
+            raise ToolError(msg)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_delete_environment", "environments",
+                         env_obj["id"],
+                         {"name": env_obj["name"], "via": "agent"})
+        return {"ok": True, "deleted": env_obj["name"]}
+    raise ToolError("action 仅支持 list/create/clone/update/delete")
+
+
+def _clear_other_default_envs(db: str, project_id: int, keep_id: int) -> None:
+    """设默认环境时取消同项目其它默认（与 Web 端 create/update_environment 对齐）"""
+    for e in dbm.list_environments(db, project_id):
+        if e["is_default"] and e["id"] != keep_id:
+            dbm.update_record(db, "environments", e["id"], {"is_default": 0})
+
+
+def _server_out(s: dict) -> dict:
+    return {"id": s["id"], "host": s["host"],
+            "ssh_port": s.get("ssh_port"),
+            "ssh_user": s.get("ssh_user", "") or "",
+            "ssh_password": _mask_ssh(s.get("ssh_password", "") or ""),
+            "nacos_ip": s.get("nacos_ip", ""),
+            "remark": s.get("remark", ""),
+            "enabled": bool(s.get("enabled", 1)),
+            "order_no": s.get("order_no")}
+
+
+def _manage_servers(ctx, action=None, host="", server_id=None,
+                     project=None, environment="", ssh_port=None,
+                     ssh_user=None, ssh_password=None, ssh_key_file=None,
+                     nacos_ip="", remark="", enabled=None, **kw) -> dict:
+    """服务器管理（仅 admin，与 Web 端一致）：list/create/bind/unbind/update
+
+    bind 为 upsert 语义：服务器未注册时按传入参数先注册再绑定，已注册直接绑定
+    （幂等）；发布目标即环境绑定的服务器清单。
+    """
+    db = ctx.db_path
+    _require_admin(ctx, "服务器管理")
+    action = action or "list"
+    if action == "list":
+        if environment:
+            env_obj = _resolve_env(db, project or "", environment)
+            rows = dbm.list_env_servers(db, env_obj["id"])
+            return {"servers": [_server_out(s) for s in rows],
+                    "environment": env_obj["name"],
+                    "project_id": env_obj["project_id"]}
+        rows = dbm.list_records(db, "servers", order="id")
+        return {"servers": [_server_out(s) for s in rows[:100]]}
+    if action == "create":
+        host = (host or "").strip()
+        if not host:
+            raise ToolError("缺少服务器地址 host")
+        for s in dbm.list_records(db, "servers"):
+            if s["host"] == host:
+                raise ToolError(f"服务器 {host} 已存在（id={s['id']}）")
+        sid = dbm.create_record(db, "servers", dict(
+            host=host,
+            # ssh 三态：不传 = NULL（继承环境级），传了（含空串）才是覆盖（与 Web 一致）
+            ssh_port=int(ssh_port) if ssh_port is not None else None,
+            ssh_user=ssh_user, ssh_password=ssh_password,
+            ssh_key_file=ssh_key_file,
+            nacos_ip=(nacos_ip or "").strip(),
+            remark=(remark or "").strip(),
+            enabled=1 if enabled is None or enabled else 0))
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_create_server", "servers", sid,
+                         {"host": host, "via": "agent"})
+        # 与 Web 差异：不自动绑定到所有启用监控的环境（对话场景意图是
+        # 绑定到指定环境，用 bind 显式绑定）
+        return {"id": sid, "host": host,
+                "hint": "服务器已注册（未绑定环境）；"
+                        "用 bind 动作绑定到指定环境"}
+    if action == "bind":
+        env_obj = _resolve_env(db, project or "", environment)
+        host = (host or "").strip()
+        if not host:
+            raise ToolError("缺少服务器地址 host")
+        rows = dbm.list_records(db, "servers", "host=?", (host,))
+        if rows:
+            sid = rows[0]["id"]
+            created = False
+        else:
+            # upsert：未注册则按传入参数注册（ssh 三态同 create）
+            sid = dbm.create_record(db, "servers", dict(
+                host=host,
+                ssh_port=int(ssh_port) if ssh_port is not None else None,
+                ssh_user=ssh_user, ssh_password=ssh_password,
+                ssh_key_file=ssh_key_file,
+                nacos_ip=(nacos_ip or "").strip(),
+                remark=(remark or "").strip(),
+                enabled=1 if enabled is None or enabled else 0))
+            created = True
+            dbm.create_audit(db, ctx.user_id, ctx.username,
+                             "agent_create_server", "servers", sid,
+                             {"host": host, "via": "agent-bind"})
+        for s in dbm.list_env_servers(db, env_obj["id"]):
+            if s["id"] == sid:
+                return {"ok": True, "already_bound": True,
+                        "server_id": sid, "host": host,
+                        "environment": env_obj["name"]}
+        order = len(dbm.list_env_servers(db, env_obj["id"]))
+        dbm.bind_server(db, env_obj["id"], sid, order)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_bind_server", "environments",
+                         env_obj["id"],
+                         {"server_id": sid, "host": host,
+                          "created": created, "via": "agent"})
+        return {"ok": True, "server_id": sid, "host": host,
+                "environment": env_obj["name"], "created": created,
+                "hint": "已绑定到环境（发布目标即环境绑定清单，按 order 顺序）"}
+    if action == "unbind":
+        env_obj = _resolve_env(db, project or "", environment)
+        if host:
+            rows = dbm.list_records(db, "servers", "host=?", ((host or "").strip(),))
+            if not rows:
+                raise ToolError(f"服务器 {host} 未注册")
+            sid = rows[0]["id"]
+        else:
+            try:
+                sid = int(server_id)
+            except (TypeError, ValueError):
+                raise ToolError("缺少 host 或 server_id")
+        dbm.unbind_server(db, env_obj["id"], sid)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_unbind_server", "environments",
+                         env_obj["id"], {"server_id": sid, "via": "agent"})
+        return {"ok": True, "server_id": sid,
+                "environment": env_obj["name"]}
+    # update：按 server_id 改覆盖字段
+    rec = dbm.get_record(db, "servers", int(server_id or 0)) \
+        if server_id else None
+    if not rec:
+        raise ToolError("缺少或不存在 server_id")
+    if action == "update":
+        fields = {}
+        if host:
+            h = host.strip()
+            for s in dbm.list_records(db, "servers"):
+                if s["host"] == h and s["id"] != rec["id"]:
+                    raise ToolError(f"服务器 {h} 已存在")
+            fields["host"] = h
+        if nacos_ip:
+            fields["nacos_ip"] = nacos_ip.strip()
+        if remark:
+            fields["remark"] = remark.strip()
+        if enabled is not None:
+            fields["enabled"] = 1 if enabled else 0
+        for k, v in (("ssh_port", ssh_port), ("ssh_user", ssh_user),
+                     ("ssh_password", ssh_password),
+                     ("ssh_key_file", ssh_key_file)):
+            if v is not None:
+                fields[k] = int(v) if k == "ssh_port" else v
+        if not fields:
+            raise ToolError("未提供任何要修改的字段")
+        dbm.update_record(db, "servers", rec["id"], fields)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_update_server", "servers", rec["id"],
+                         {"host": rec["host"], "updated": list(fields)})
+        # 口令不回显：审计与返回均不含敏感值
+        return {"ok": True, "updated": [k for k in fields if k != "ssh_password"]}
+    raise ToolError("action 仅支持 list/create/bind/unbind/update")
+
+
 def _canary_decision(ctx, task_id=None, action=None, **kw) -> dict:
     """灰度运行中决策（与 Web 端 POST /deploy/canary-decisions 同语义）"""
     if action not in ("continue", "stop", "rollback"):
@@ -1389,6 +1730,32 @@ def build_tools() -> list:
                "log_error_keywords": {"type": "array", "items": {"type": "string"}},
                "build_order": {"type": "array", "items": {"type": "object"}}},
               "write", _manage_services),
+        _spec("manage_environments",
+              "环境管理（仅 admin）。action=list/create/clone/update/delete；"
+              "create 需 project+name（仅字母数字_-）；registry/nacos/mysql_snailjob/"
+              "ssh/build/deploy 为配置对象；clone 为接入捷径：从既有项目"
+              "source_project/source_env 复制环境（含服务器绑定）到 project；"
+              "新项目无环境时 plan_operation 会拒单，须先建环境",
+              {"action": str_req, "project": str_opt,
+               "environment_id": num_opt, "name": str_opt,
+               "is_default": bool_opt, "monitor_enabled": bool_opt,
+               "registry": {"type": "object"}, "nacos": {"type": "object"},
+               "mysql_snailjob": {"type": "object"}, "ssh": {"type": "object"},
+               "build": {"type": "object"}, "deploy": {"type": "object"},
+               "docker_compose_path": str_opt, "maven_profile": str_opt,
+               "source_project": str_opt, "source_env": str_opt},
+              "write", _manage_environments),
+        _spec("manage_servers",
+              "服务器管理（仅 admin）。action=list/create/bind/unbind/update；"
+              "bind 为 upsert：host 未注册时按参数先注册再绑定到"
+              "project+environment（幂等）；发布目标即环境绑定清单；"
+              "ssh_port/ssh_user/ssh_password/ssh_key_file 不传则继承环境级配置",
+              {"action": str_req, "host": str_opt, "server_id": num_opt,
+               "project": str_opt, "environment": str_opt,
+               "ssh_port": num_opt, "ssh_user": str_opt,
+               "ssh_password": str_opt, "ssh_key_file": str_opt,
+               "nacos_ip": str_opt, "remark": str_opt, "enabled": bool_opt},
+              "write", _manage_servers),
         _spec("manage_schedules",
               "管理定时发布计划。action=list/create/update/delete/toggle/run；"
               "create 需 project+name+type（once 需 schedule_at Unix 秒，"
