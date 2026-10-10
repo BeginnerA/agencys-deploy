@@ -362,6 +362,107 @@ class TestTools(AgentBase):
         self.assertEqual(rec["status"], "awaiting_approval")
         self.assertIn("cli", out["plan"])
 
+    def test_logs_context_and_search_link(self):
+        # search_logs 结果带 id（logs_context 的入参来源，链路闭环）
+        from agent import tools as tools_mod
+        now = int(time.time())
+        # 造日志文件与索引行：line_offset 定位第 2 行（0 基）报错行
+        root = os.path.dirname(os.path.dirname(
+            os.path.abspath(tools_mod.__file__)))
+        collect = os.path.join(root, "data", "logs", "collect")
+        os.makedirs(collect, exist_ok=True)
+        fname = f"ut_ctx_{now}_{os.getpid()}.log"
+        fpath = os.path.join(collect, fname)
+        # Linux 行尾口径（采集端按源行长度累加，无 \r；binary 写入不转换）
+        lines = [b"line0 start ok", b"line1 ok", b"line2 ERROR boom",
+                 b"line3 after", b"line4 end"]
+        with open(fpath, "wb") as f:
+            f.write(b"\n".join(lines) + b"\n")
+        offset = sum(len(l) + 1 for l in lines[:2])  # 行 2 的字节起点
+        entry_id = dbm.create_record(self.db, "log_entries", dict(
+            ts=now, env="prod", service="hqb-auth", container="hqb-auth",
+            file_path=fpath, line_offset=offset, line_count=1,
+            content="line2 ERROR boom", keywords="[]"))
+        try:
+            out = json.loads(tools_mod.execute_tool(
+                "viewer", "search_logs",
+                {"service": "hqb-auth", "minutes": 60},
+                self._ctx("viewer")))
+            self.assertEqual(out["count"], 1)
+            self.assertEqual(out["rows"][0]["id"], entry_id)
+            # 上下文：2 前 + 目标 + 2 后，定位与行内容准确
+            ctx_out = json.loads(tools_mod.execute_tool(
+                "viewer", "logs_context", {"id": entry_id, "lines": 2},
+                self._ctx("viewer")))
+            self.assertEqual(ctx_out["target_line"], 2)
+            self.assertEqual(len(ctx_out["lines"]), 5)
+            self.assertIn("ERROR boom", "\n".join(ctx_out["lines"]))
+            self.assertNotIn("\r", "\n".join(ctx_out["lines"]))
+            # id 不存在
+            miss = json.loads(tools_mod.execute_tool(
+                "viewer", "logs_context", {"id": 99999},
+                self._ctx("viewer")))
+            self.assertIn("error", miss)
+            # 路径防护：file_path 指向 collect 目录外直接拒绝
+            dbm.update_record(self.db, "log_entries", entry_id,
+                              {"file_path": os.path.join(root, "README.md")})
+            evil = json.loads(tools_mod.execute_tool(
+                "viewer", "logs_context", {"id": entry_id},
+                self._ctx("viewer")))
+            self.assertIn("非法", evil["error"])
+        finally:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+
+    def test_monitor_metrics_queries(self):
+        from agent import tools as tools_mod
+        now = int(time.time())
+        # 响应时间历史：2 成功 1 失败（-1 探测失败不计入均值）
+        for ms, ok in ((100.0, 1), (300.0, 1), (-1, 0)):
+            dbm.create_record(self.db, "response_time_history", dict(
+                env_id=self.env_id, service="auth", host="10.0.0.1",
+                response_ms=ms, ok=ok, created_at=now))
+        out = json.loads(tools_mod.execute_tool(
+            "viewer", "monitor_metrics",
+            {"metric": "response_times", "project": "plat", "env": "prod",
+             "service": "auth", "hours": 24}, self._ctx("viewer")))
+        self.assertEqual(out["stats"]["count"], 3)
+        self.assertEqual(out["stats"]["ok_rate"], 0.667)
+        self.assertEqual(out["stats"]["avg_ms"], 200.0)
+        self.assertEqual(out["stats"]["max_ms"], 300.0)
+        self.assertEqual(out["returned"], 3)
+        # 只给 env 不给 project → 报错（环境名需在项目内解析）
+        bad = json.loads(tools_mod.execute_tool(
+            "viewer", "monitor_metrics",
+            {"metric": "response_times", "env": "prod"},
+            self._ctx("viewer")))
+        self.assertIn("error", bad)
+        # metric 非法
+        bad2 = json.loads(tools_mod.execute_tool(
+            "viewer", "monitor_metrics", {"metric": "cpu"},
+            self._ctx("viewer")))
+        self.assertIn("error", bad2)
+        # 快照：嵌套形态落库 → 工具输出平铺 + env_id → 环境名映射
+        dbm.save_monitor_snapshot(self.db, self.env_id, "10.0.0.1", dict(
+            swap=12.5, net_rx=1024.0, net_tx=512.0,
+            disk_read=100.0, disk_write=50.0,
+            tcp={"ESTABLISHED": 80, "TIME_WAIT": 5, "CLOSE_WAIT": 0},
+            container_status={"c1": {"restart_count": 1, "uptime_hours": 10.5}},
+            docker_df={"images": 10 * 1048576, "containers": 2 * 1048576,
+                       "volumes": 1 * 1048576},
+            ssl_days=45.0))
+        snap = json.loads(tools_mod.execute_tool(
+            "viewer", "monitor_metrics",
+            {"metric": "snapshots", "hours": 24}, self._ctx("viewer")))
+        self.assertEqual(snap["count"], 1)
+        row = snap["rows"][0]
+        self.assertEqual(row["env"], "prod")  # env_id → 名字映射
+        self.assertEqual(row["tcp_established"], 80)
+        self.assertEqual(row["restart_count"], 1)
+        self.assertEqual(row["uptime_hours"], 10.5)
+        self.assertEqual(row["docker_images_mb"], 10.0)
+        self.assertEqual(row["ssl_days"], 45.0)
+
 
 class TestExecutor(AgentBase):
     def _plan(self, op="deploy", **kw):
@@ -878,8 +979,13 @@ class TestAgentManageTools(AgentBase):
                   "manage_schedules", "manage_windows", "manage_canary",
                   "canary_decision", "set_alert_status",
                   "manage_alert_rules", "manage_silences",
+                  "manage_log_storage",
                   "decide_run"):
             self.assertNotIn(n, viewer_names)
+            self.assertIn(n, admin_names)
+        # 观测类 read 工具对 viewer 可见（含第十三档新增）
+        for n in ("search_logs", "logs_context", "monitor_metrics"):
+            self.assertIn(n, viewer_names)
             self.assertIn(n, admin_names)
 
     def test_projects_services_tool_lifecycle(self):
@@ -1193,6 +1299,63 @@ class TestAgentManageTools(AgentBase):
             "action": "delete", "silence_id": wid})
         self.assertTrue(dele["ok"])
         self.assertIsNone(dbm.get_record(self.db, "silence_windows", wid))
+
+    def test_log_storage_tool_lifecycle(self):
+        # viewer/operator 拒绝（仅 admin，与 Web 端三路由权限对齐）
+        for role in ("viewer", "operator"):
+            denied = self._call("manage_log_storage", {"action": "status"},
+                                role=role)
+            self.assertIn("error", denied)
+        # settings 不传参 → 查当前（默认 7/30）
+        cur = self._call("manage_log_storage", {"action": "settings"})
+        self.assertEqual(cur["settings"]["log_retention_days"], 7)
+        self.assertEqual(cur["settings"]["log_archive_days"], 30)
+        # settings 更新 + 越界拒绝 + 审计落库
+        up = self._call("manage_log_storage", {
+            "action": "settings", "log_retention_days": 14,
+            "log_archive_days": 60})
+        self.assertEqual(up["updated"], {"log_retention_days": 14,
+                                         "log_archive_days": 60})
+        bad = self._call("manage_log_storage", {
+            "action": "settings", "log_retention_days": 400})
+        self.assertIn("error", bad)
+        logs = dbm.list_audit_logs(self.db, 10)
+        entry = next((l for l in logs
+                      if l["action"] == "agent_update_log_settings"), None)
+        self.assertIsNotNone(entry)
+        detail = json.loads(entry["detail"] or "{}")
+        self.assertEqual(detail.get("via"), "agent")
+        self.assertEqual(detail.get("settings", {}).get("log_retention_days"), 14)
+        # status 反映新设置与日志行数
+        now = int(time.time())
+        dbm.create_record(self.db, "log_entries", dict(
+            ts=now, env="prod", service="hqb-auth", container="hqb-auth",
+            file_path="", line_offset=0, line_count=0,
+            content="boom", keywords="[]"))
+        st = self._call("manage_log_storage", {"action": "status"})
+        self.assertEqual(st["log_entries"], 1)
+        self.assertEqual(st["retention_days"], 14)
+        self.assertEqual(st["archive_days"], 60)
+        # cleanup：mock 引擎函数（真实清理会动仓库 data/logs 目录）
+        with mock.patch("webapp.log_collector.run_manual_cleanup",
+                        return_value={"deleted_entries": 5, "archived_files": 1,
+                                      "purged_files": 2, "db_size_before": 100,
+                                      "db_size_after": 80}):
+            clean = self._call("manage_log_storage", {"action": "cleanup"})
+        self.assertTrue(clean["ok"])
+        self.assertEqual(clean["stats"]["deleted_entries"], 5)
+        # busy 分支（并发清理未抢到锁）
+        with mock.patch("webapp.log_collector.run_manual_cleanup",
+                        return_value={"busy": True}):
+            busy = self._call("manage_log_storage", {"action": "cleanup"})
+        self.assertIn("error", busy)
+        # cleanup 审计落库
+        logs = dbm.list_audit_logs(self.db, 10)
+        entry = next((l for l in logs
+                      if l["action"] == "agent_manual_log_cleanup"), None)
+        self.assertIsNotNone(entry)
+        detail = json.loads(entry["detail"] or "{}")
+        self.assertEqual(detail.get("deleted_entries"), 5)
 
     def test_clone_environment_copies_server_bindings(self):
         # 新项目 → clone plat/prod 环境（含服务器绑定，order 保持）

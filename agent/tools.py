@@ -8,6 +8,7 @@
     - 敏感信息（SSH 私钥/密码/Nacos 口令）一律不出现在工具输出中
 """
 import json
+import os
 import re
 import time
 
@@ -131,11 +132,12 @@ def _search_log_entries(db_path: str, keyword: str = "", service: str = "",
         conds.append("le.ts >= ?")
         params.append(from_ts)
         rows = conn.execute(
-            "SELECT le.ts, le.env, le.service, le.container, "
+            "SELECT le.id, le.ts, le.env, le.service, le.container, "
             "substr(le.content,1,200) AS content FROM log_entries le "
             "WHERE " + " AND ".join(conds) + " ORDER BY le.ts DESC LIMIT ?",
             params + [max(1, min(limit, 100))]).fetchall()
-        return [{"ts": _fmt_ts(r["ts"]), "env": r["env"], "service": r["service"],
+        return [{"id": r["id"], "ts": _fmt_ts(r["ts"]),
+                 "env": r["env"], "service": r["service"],
                  "container": r["container"], "content": r["content"]}
                 for r in rows]
     except Exception:
@@ -353,7 +355,137 @@ def _search_logs(ctx, keyword="", service="", env="", minutes=60,
     rows = _search_log_entries(ctx.db_path, keyword=keyword, service=service,
                                env=env, minutes=minutes, limit=limit)
     return {"rows": rows, "count": len(rows),
-            "hint": "结果按时间倒序；可用 service/env 收窄"}
+            "hint": "结果按时间倒序；可用 service/env 收窄；"
+                    "用 logs_context 传某条的 id 查看前后文"}
+
+
+def _logs_context(ctx, id=None, lines=5, **kw) -> dict:
+    """日志上下文：按条目 id 取目标行前后 N 行（与 Web 日志中心同等语义）
+
+    line_offset 是"逻辑字节偏移"（采集端按 Linux 源行长度累加，无 \r）；
+    Windows 文本模式追加会把 \n 写为 \r\n，故按行读取时需补偿行尾 \r，
+    保证与 line_offset 同单位定位（跨平台自洽）。
+    """
+    if not isinstance(id, int) or isinstance(id, bool) or id <= 0:
+        raise ToolError("缺少日志条目 id（来自 search_logs 结果的 id 字段）")
+    if isinstance(lines, bool) or not isinstance(lines, int) or lines < 1:
+        lines = 5
+    lines = min(lines, 50)
+    db = ctx.db_path
+    entry = dbm.get_record(db, "log_entries", id)
+    if not entry:
+        raise ToolError(f"日志条目不存在: id={id}")
+    file_path = entry.get("file_path") or ""
+    offset = entry.get("line_offset") or 0
+    # 路径遍历防护：日志文件必须落在 data/logs/collect 目录内（与 Web 端一致）
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    log_base = os.path.realpath(os.path.join(root, "data", "logs", "collect"))
+    real_path = os.path.realpath(file_path)
+    if not real_path.startswith(log_base + os.sep):
+        raise ToolError("非法日志文件路径")
+    if not os.path.isfile(real_path):
+        raise ToolError(f"日志文件不存在: {file_path}")
+    try:
+        target_line = 0
+        prev, pos = [], 0
+        with open(real_path, "rb") as f:
+            while pos < offset:
+                line = f.readline()
+                if not line:
+                    break
+                pos += len(line) - (1 if line.endswith(b"\r\n") else 0)
+                target_line += 1
+                if len(prev) >= lines:
+                    prev.pop(0)
+                prev.append(line)
+            tail = []
+            target = f.readline()
+            if target:
+                tail.append(target)
+            for _ in range(lines):
+                line = f.readline()
+                if not line:
+                    break
+                tail.append(line)
+        context_lines = [l.decode("utf-8", "ignore").rstrip("\r\n")
+                         for l in prev[-lines:] + tail]
+    except (ValueError, OSError):
+        raise ToolError("日志文件读取失败")
+    start = max(0, target_line - lines)
+    return {"id": id, "file": file_path, "target_line": target_line,
+            "start": start, "end": start + len(context_lines),
+            "env": entry.get("env", ""), "service": entry.get("service", ""),
+            "lines": context_lines,
+            "hint": f"行号区间 {start}~{start + len(context_lines)}"
+                    f"（0 基，目标行 {target_line}）"}
+
+
+def _monitor_metrics(ctx, metric="response_times", project=None, env="",
+                     service="", hours=24, limit=100, **kw) -> dict:
+    """监控指标查询：response_times（服务响应时间历史，含汇总）/ snapshots（服务器最新快照扩展指标）"""
+    db = ctx.db_path
+    if metric not in ("response_times", "snapshots"):
+        raise ToolError("metric 仅支持 response_times / snapshots")
+    if isinstance(hours, bool) or not isinstance(hours, int) or hours < 1:
+        hours = 24
+    hours = min(hours, 168 if metric == "response_times" else 72)
+    env_id = None
+    if env or project:
+        # 环境名在项目内解析（跨项目可重名）；查全局时 project/env 全部省略
+        if not (env and project):
+            raise ToolError("按环境过滤需同时提供 project 与 env；查全局时两者均省略")
+        proj = _resolve_project(db, project)
+        env_obj = dbm.get_env_by_name(db, proj["id"], env)
+        if not env_obj:
+            raise ToolError(f"项目 {proj['code']} 下不存在环境「{env}」")
+        env_id = env_obj["id"]
+    if metric == "response_times":
+        rows = dbm.get_response_time_history(db, env_id, service or None, hours)
+        total = len(rows)
+        ok_n = sum(1 for r in rows if r.get("ok"))
+        mss = [r["response_ms"] for r in rows
+               if isinstance(r.get("response_ms"), (int, float))
+               and r["response_ms"] > 0]
+        stats = {"count": total,
+                 "ok_rate": round(ok_n / total, 3) if total else None,
+                 "avg_ms": round(sum(mss) / len(mss), 1) if mss else None,
+                 "max_ms": max(mss) if mss else None,
+                 "min_ms": min(mss) if mss else None}
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            limit = 100
+        limit = min(limit, 500)
+        out_rows = [{"ts": _fmt_ts(r["created_at"]), "env_id": r["env_id"],
+                     "service": r["service"], "host": r["host"],
+                     "response_ms": r["response_ms"], "ok": bool(r["ok"])}
+                    for r in rows[:limit]]
+        return {"metric": "response_times", "hours": hours, "stats": stats,
+                "rows": out_rows, "returned": len(out_rows),
+                "hint": "response_ms<0 表示探测失败；可用 service 或 project+env 收窄；"
+                        "stats 汇总覆盖查询窗口内全部样本（上限 500 条）"}
+    # snapshots：每台服务器取最新一条快照（扩展指标）
+    rows = dbm.get_monitor_latest(db, env_id, hours)
+    env_names = {e["id"]: e["name"]
+                 for e in dbm.list_records(db, "environments")}
+    out = [{"ts": _fmt_ts(r["created_at"]),
+            "env": env_names.get(r["env_id"], r["env_id"]), "host": r["host"],
+            "swap": r.get("swap"),
+            "net_rx": r.get("net_rx"), "net_tx": r.get("net_tx"),
+            "disk_read": r.get("disk_read"), "disk_write": r.get("disk_write"),
+            "tcp_established": r.get("tcp_established"),
+            "tcp_time_wait": r.get("tcp_time_wait"),
+            "tcp_close_wait": r.get("tcp_close_wait"),
+            "restart_count": r.get("restart_count"),
+            "uptime_hours": r.get("uptime_hours"),
+            "docker_images_mb": round((r.get("docker_images_bytes") or 0) / 1048576, 1),
+            "docker_containers_mb": round((r.get("docker_containers_bytes") or 0) / 1048576, 1),
+            "docker_volumes_mb": round((r.get("docker_volumes_bytes") or 0) / 1048576, 1),
+            "ssl_days": r.get("ssl_days")}
+           for r in rows]
+    return {"metric": "snapshots", "hours": hours, "rows": out,
+            "count": len(out),
+            "hint": "每台服务器最新一条快照；swap 为使用率百分比(%)、"
+                    "net_rx/net_tx 为 bytes/s、disk_read/write 为 sectors/s、"
+                    "docker_*_mb 为占用 MB、ssl_days 为证书剩余天数"}
 
 
 def _release_window(ctx, project=None, **kw) -> dict:
@@ -2178,6 +2310,137 @@ def _manage_silences(ctx, action=None, silence_id=None, name="",
     return {"ok": True, "id": win["id"]}
 
 
+# ---------- 日志存储治理（仅 admin） ----------
+
+
+def _dir_stats(base: str) -> dict:
+    """目录统计：文件数 + 总字节数（与 Web 端 /logs/storage 同口径；不存在返回零值）"""
+    files = bytes_total = 0
+    if os.path.isdir(base):
+        from pathlib import Path
+        for p in Path(base).rglob("*"):
+            if p.is_file():
+                try:
+                    files += 1
+                    bytes_total += p.stat().st_size
+                except OSError:
+                    pass
+    return {"files": files, "mb": round(bytes_total / 1048576, 1)}
+
+
+def _manage_log_storage(ctx, action="status", log_retention_days=None,
+                        log_archive_days=None, **kw) -> dict:
+    """日志存储治理（仅 admin，与 Web 日志中心同等效力）：
+    status 存储概况 / settings 保留期调整 / cleanup 手动清理（与每日自动维护同一逻辑）"""
+    _require_admin(ctx, "日志存储治理")
+    db = ctx.db_path
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    log_dir = os.path.join(root, "data", "logs")
+
+    def _settings_map(conn) -> dict:
+        out = {}
+        for key, default in (("log_retention_days", 7),
+                             ("log_archive_days", 30)):
+            row = conn.execute(
+                "SELECT value FROM platform_settings WHERE key=?", (key,)
+            ).fetchone()
+            try:
+                out[key] = int(json.loads(row["value"])) if row else default
+            except (ValueError, TypeError):
+                out[key] = default
+        return out
+
+    if action == "status":
+        conn = dbm.get_conn(db)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, MIN(ts) AS oldest FROM log_entries"
+            ).fetchone()
+            entries, oldest_ts = row[0], row[1]
+            freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+            settings = _settings_map(conn)
+        finally:
+            conn.close()
+        try:
+            db_size = os.path.getsize(db)
+        except OSError:
+            db_size = 0
+        try:
+            from webapp.log_collector import get_collector
+            collector_running = get_collector() is not None
+        except Exception:
+            collector_running = False
+        return {"log_entries": entries, "oldest": _fmt_ts(oldest_ts),
+                "db_size_mb": round(db_size / 1048576, 1),
+                "db_freelist_mb": round(freelist * page_size / 1048576, 1),
+                "retention_days": settings["log_retention_days"],
+                "archive_days": settings["log_archive_days"],
+                "collect_dir": _dir_stats(os.path.join(log_dir, "collect")),
+                "archive_dir": _dir_stats(os.path.join(log_dir, "archive")),
+                "collector_running": collector_running,
+                "hint": "cleanup 立即按保留策略清理过期日志并回收空间"
+                        "（与每日自动维护同一逻辑）"}
+    if action == "settings":
+        labels = {"log_retention_days": "日志保留天数",
+                  "log_archive_days": "归档保留天数"}
+        fields = {}
+        for key, val in (("log_retention_days", log_retention_days),
+                         ("log_archive_days", log_archive_days)):
+            if val is None:
+                continue
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ToolError(f"{labels[key]}需为整数")
+            if val < 1 or val > 365:
+                raise ToolError(f"{labels[key]}需在 1~365 之间")
+            fields[key] = val
+        if not fields:
+            conn = dbm.get_conn(db)
+            try:
+                current = _settings_map(conn)
+            finally:
+                conn.close()
+            return {"ok": True, "settings": current}
+        now = int(time.time())
+        conn = dbm.get_conn(db)
+        try:
+            for key, val in fields.items():
+                existing = conn.execute(
+                    "SELECT id FROM platform_settings WHERE key=?", (key,)
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        "UPDATE platform_settings SET value=?, updated_at=? WHERE key=?",
+                        (json.dumps(val), now, key))
+                else:
+                    conn.execute(
+                        "INSERT INTO platform_settings (key, value, updated_at) "
+                        "VALUES (?, ?, ?)", (key, json.dumps(val), now))
+            conn.commit()
+        finally:
+            conn.close()
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_update_log_settings", "config", 0,
+                         {"settings": fields, "via": "agent"})
+        return {"ok": True, "updated": fields}
+    if action == "cleanup":
+        from webapp.log_collector import run_manual_cleanup
+        stats = run_manual_cleanup(db, log_dir)
+        if stats.get("busy"):
+            raise ToolError("清理正在进行中，请稍后重试")
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_manual_log_cleanup", "config", 0,
+                         {"deleted_entries": stats.get("deleted_entries", 0),
+                          "archived_files": stats.get("archived_files", 0),
+                          "purged_files": stats.get("purged_files", 0),
+                          "db_mb_before": round(stats.get("db_size_before", 0) / 1048576, 1),
+                          "db_mb_after": round(stats.get("db_size_after", 0) / 1048576, 1),
+                          "via": "agent"})
+        return {"ok": True, "stats": stats,
+                "hint": "清理按当前保留策略执行；可用 action=settings 调整保留期"}
+    raise ToolError("action 仅支持 status/settings/cleanup")
+
+
 # ---------- 注册表 ----------
 
 def _spec(name, description, params, permission, fn):
@@ -2209,6 +2472,13 @@ def build_tools() -> list:
         _spec("service_status", "查询服务监控状态（可空参查全局摘要；monitor 未启动时返回提示）",
               {"project": str_opt, "env": str_opt, "service": str_opt},
               "read", _service_status),
+        _spec("monitor_metrics", "监控指标历史查询：metric=response_times（服务"
+              "响应时间历史，含成功率/均值汇总）/ snapshots（每台服务器最新"
+              "快照扩展指标：swap/网络/磁盘IO/TCP/重启/证书天数）。service_status"
+              "看实时状态，本工具看历史与扩展指标",
+              {"metric": str_req, "project": str_opt, "env": str_opt,
+               "service": str_opt, "hours": num_opt, "limit": num_opt},
+              "read", _monitor_metrics),
         _spec("recent_tasks", "查看发布任务记录（可按项目/状态过滤）",
               {"project": str_opt, "status": str_opt, "limit": num_opt},
               "read", _recent_tasks),
@@ -2223,6 +2493,9 @@ def build_tools() -> list:
         _spec("search_logs", "检索采集的容器日志（keyword 走全文检索；可按服务/环境/时间窗过滤）",
               {"keyword": str_opt, "service": str_opt, "env": str_opt,
                "minutes": num_opt, "limit": num_opt}, "read", _search_logs),
+        _spec("logs_context", "查看某条日志的前后上下文（排障定位报错前后文；"
+              "id 来自 search_logs 结果，与 Web 日志中心同等语义）",
+              {"id": num, "lines": num_opt}, "read", _logs_context),
         _spec("release_window", "查看项目的发布窗口状态（block 禁发/warn 告警确认/无窗口）",
               {"project": str_req}, "read", _release_window),
         _spec("canary_configs", "查看项目灰度策略（分批步骤）",
@@ -2413,6 +2686,15 @@ def build_tools() -> list:
                "weekdays": {"type": "array"}, "scope": {"type": "object"},
                "enabled": bool_opt, "remark": str_opt},
               "write", _manage_silences),
+        _spec("manage_log_storage",
+              "日志存储治理（仅 admin，与 Web 日志中心同等效力）：action=status"
+              "（存储概况：日志行数/DB 占用/目录大小）/ settings（调整保留期"
+              " log_retention_days/log_archive_days，1~365，不传参时查当前值）/"
+              " cleanup（立即按保留策略清理过期日志并回收空间，与每日自动维护"
+              "同一逻辑）",
+              {"action": str_req, "log_retention_days": num_opt,
+               "log_archive_days": num_opt},
+              "write", _manage_log_storage),
 _spec("send_digest",
               "立即聚合并推送一次巡检日报（服务健康/告警/近24h发布/待审审批单"
               "/定时计划）到已配置的通知渠道；渠道未配置时提示先配置",
