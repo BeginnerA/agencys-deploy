@@ -330,6 +330,25 @@ class TestTools(AgentBase):
         self.assertIn("error", out)
         self.assertIn("operator/admin", out["error"])
 
+    def test_case_update_full_fields(self):
+        # 工具入口与 Web PUT 字段白名单对齐（含 service/env/version/symptom）
+        from agent import tools as tools_mod
+        from agent import memory as memory_mod
+        cid = memory_mod.create_case(self.db, "初始案例", service="auth",
+                                     symptom="初始症状", user_id=1,
+                                     username="tester")
+        out = json.loads(tools_mod.execute_tool(
+            "admin", "case_update",
+            {"case_id": cid, "service": "order", "env": "staging",
+             "version": "2.0.0", "symptom": "更新后的症状"},
+            self._ctx("admin")))
+        self.assertNotIn("error", out)
+        rec = memory_mod.get_case(self.db, cid)
+        self.assertEqual(rec["service"], "order")
+        self.assertEqual(rec["env"], "staging")
+        self.assertEqual(rec["version"], "2.0.0")
+        self.assertEqual(rec["symptom"], "更新后的症状")
+
     def test_plan_operation_tool_creates_run(self):
         from agent import tools as tools_mod
         out = json.loads(tools_mod.execute_tool(

@@ -124,6 +124,7 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 - 告警归因 / 失败归因生成建议后可「一键沉淀为案例」（`POST /api/agent/advice/<id>/to_case`，对话工具 `case_save` 亦可）；案例可补全 `root_cause / action / result / lesson / tags`。
 - 检索用字符 bigram Jaccard 相似度 + service/tag 过滤，命中案例会作为证据带入下一次建议（归因 → 记忆 → 归因的飞轮）。
 - 案例检索与溯源：列表支持 `tag` 参数过滤（JSON tags 参数化 LIKE）；详情页附「相似案例」推荐（`search_cases` 新增 `exclude_id` 排除自身，点击跳转）；来源三态标识（manual 手工 / advice 建议沉淀 / agent_run 执行沉淀）在列表卡片与详情展示，详情页标签可点击发起过滤。
+- 案例⇆建议互链：案例详情来源行的「建议 #n」与建议详情的关联案例条目均可点击互跳（详情缓存未命中时自动回退取单条接口）；`case_update` 对话工具字段白名单与 Web PUT 对齐（补齐 symptom/service/env/version）。
 - 案例与建议均按 RBAC：viewer 只读，operator 可建/改案例，admin 可删除。
 
 ## 七、周期巡检日报
@@ -149,6 +150,7 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | POST | /agent/runs/<id>/decision | 审批（action: approve/reject, force_window） | operator/admin |
 | POST | /agent/runs/<id>/to_case | 已完结审批单一键沉淀案例 | operator/admin |
 | GET | /agent/advice | 建议列表（scope/ref_id/status 过滤，status: pending/adopted/dismissed） | 登录用户 |
+| GET | /agent/advice/<id> | 建议单条详情（登录用户） | 登录用户 |
 | GET | /agent/advice/badge | 待处理建议计数（全局导航角标） | 登录用户 |
 | POST | /agent/advice/<id>/to_case | 建议沉淀为案例 | operator/admin |
 | POST | /agent/advice/<id>/to_run | 建议一键采纳（失败归因→回滚审批单；灰度→写决策，自动标 adopted） | operator/admin |

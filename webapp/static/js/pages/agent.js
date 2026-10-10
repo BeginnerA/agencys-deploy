@@ -787,9 +787,15 @@
     if (a.scope === 'canary') return !!(ev.decision && (ev.task || {}).id);
     return false;
   }
-  function openAdviceDetail(id){
-    const a = adviceList.find(x => x.id === id);
-    if (!a) return;
+  function openAdviceDetail(id, adviceObj){
+    const a = adviceObj || adviceList.find(x => x.id === id);
+    if (!a){
+      // 缓存未命中（如从案例详情互链跳入）：异步取单条详情
+      api('/api/agent/advice/' + id).then(d => {
+        if (d.advice) openAdviceDetail(id, d.advice);
+      }).catch(() => { toastError('建议 #' + id + ' 不存在或加载失败'); });
+      return;
+    }
     let evHtml = '';
     try{
       const ev = typeof a.evidence === 'string' ? JSON.parse(a.evidence) : a.evidence;
@@ -823,8 +829,14 @@
           if (!box) return;
           const cs = data.cases || [];
           box.innerHTML = cs.length
-            ? cs.map(c => `<span class="tag tag-info" style="margin-right:4px">#${c.id} ${esc(c.title || '')}</span>`).join('')
+            ? cs.map(c => `<span class="tag tag-info" data-case="${c.id}" style="cursor:pointer;margin-right:4px" title="查看案例详情">#${c.id} ${esc(c.title || '')}</span>`).join('')
             : '无（可点击列表中「沉淀案例」生成）';
+          box.querySelectorAll('[data-case]').forEach(el => {
+            el.onclick = () => {
+              const cc = cs.find(x => x.id === Number(el.dataset.case));
+              if (cc) openCaseDetail(cc.id, cc);
+            };
+          });
         }catch(e){
           const box = document.getElementById('advCaseBox');
           if (box) box.textContent = '读取失败';
@@ -940,7 +952,13 @@
   function getCase(id){ return cases.find(c => c.id === id) || null; }
   function openCaseDetail(id, caseObj){
     const c = caseObj || getCase(id);
-    if (!c) return;
+    if (!c){
+      // 缓存未命中（如从建议详情互链跳入）：异步取单条详情
+      api('/api/agent/cases/' + id).then(d => {
+        if (d.case) openCaseDetail(id, d.case);
+      }).catch(() => { toastError('案例 #' + id + ' 不存在或加载失败'); });
+      return;
+    }
     const tags = (c.tags || []).map(t =>
       `<span class="tag tag-info" data-tag="${esc(t)}" style="cursor:pointer" title="按该标签过滤案例">${esc(t)}</span>`).join(' ');
     openDrawer({
@@ -959,7 +977,7 @@
           <div class="row"><b>根因</b><span style="white-space:pre-line">${esc(c.root_cause || '-')}</span></div>
           <div class="row"><b>处置</b><span style="white-space:pre-line">${esc(c.action || '-')}</span></div>
           <div class="row"><b>教训</b><span style="white-space:pre-line">${esc(c.lesson || '-')}</span></div>
-          ${c.source ? `<div class="row"><b>来源</b>${CASE_SRC_LABEL[c.source] || esc(c.source)}${c.advice_id ? `（建议 #${c.advice_id}）` : ''}</div>` : ''}
+          ${c.source ? `<div class="row"><b>来源</b>${CASE_SRC_LABEL[c.source] || esc(c.source)}${c.advice_id ? `（<span data-adv="${c.advice_id}" style="cursor:pointer;color:var(--primary)" title="查看建议详情">建议 #${c.advice_id}</span>）` : ''}</div>` : ''}
           <div class="row"><b>维护</b>${esc(c.created_by_name || '-')} @ ${fmtTime(c.created_at)}</div>
         </div>
         ${tags ? `<div style="margin-top:10px">${tags}</div>` : ''}
@@ -969,6 +987,9 @@
         </div>`,
       footer: (canManage ? `<button class="btn sm primary" id="caseEdit">编辑</button>` : '') +
         (role === 'admin' ? `<button class="btn sm danger" id="caseDel">删除</button>` : '')
+    });
+    document.querySelectorAll('#drawerRoot [data-adv]').forEach(el => {
+      el.onclick = () => openAdviceDetail(Number(el.dataset.adv));
     });
     document.querySelectorAll('#drawerRoot [data-tag]').forEach(el => {
       el.onclick = () => {

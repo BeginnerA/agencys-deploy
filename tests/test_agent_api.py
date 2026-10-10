@@ -586,6 +586,24 @@ class AgentApiBase(unittest.TestCase):
                                 headers=self.headers)
         self.assertEqual(resp.status_code, 409)
 
+    def test_advice_detail_endpoint(self):
+        from agent import advisor as adv
+        aid = adv.save_advice(
+            self.db_path, "alert", 0, "告警归因：auth P1", "## 分析",
+            evidence={"target": {"service": "auth"}},
+            model="rule-based", actor={"id": 0, "username": "advisor"})
+        # viewer 也可读单条（登录用户即可，互链跳转用）
+        resp = self.client.get(f"/api/agent/advice/{aid}",
+                               headers=self.viewer_headers)
+        self.assertEqual(resp.status_code, 200)
+        row = resp.get_json()["advice"]
+        self.assertEqual(row["id"], aid)
+        self.assertEqual(row["scope"], "alert")
+        # 不存在 → 404
+        resp = self.client.get("/api/agent/advice/99999",
+                               headers=self.headers)
+        self.assertEqual(resp.status_code, 404)
+
     # ---------- 案例 CRUD ----------
 
     def test_cases_crud_permissions(self):

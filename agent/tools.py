@@ -573,14 +573,18 @@ def _case_save(ctx, advice_id=None, **kw) -> dict:
 
 
 def _case_update(ctx, case_id=None, root_cause=None, action=None,
-                 result=None, lesson=None, title=None, tags=None, **kw) -> dict:
+                 result=None, lesson=None, title=None, tags=None,
+                 service=None, env=None, version=None, symptom=None,
+                 **kw) -> dict:
     try:
         case_id = int(case_id)
     except (TypeError, ValueError):
         raise ToolError("缺少 case_id（整数）")
     fields = {}
     for k, v in (("root_cause", root_cause), ("action", action),
-                 ("result", result), ("lesson", lesson), ("title", title)):
+                 ("result", result), ("lesson", lesson), ("title", title),
+                 ("service", service), ("env", env), ("version", version),
+                 ("symptom", symptom)):
         if v is not None:
             fields[k] = v
     if tags is not None:
@@ -1105,9 +1109,11 @@ def build_tools() -> list:
                "intent": str_opt}, "write", _plan_operation),
         _spec("case_save", "把一条 AI 建议（告警归因/失败归因）沉淀为案例草稿",
               {"advice_id": num}, "write", _case_save),
-        _spec("case_update", "补全/修正案例内容（root_cause/action/result/lesson/title/tags）",
+        _spec("case_update", "补全/修正案例内容（title/symptom/service/env/version/root_cause/action/result/lesson/tags）",
               {"case_id": num, "root_cause": str_opt, "action": str_opt,
                "result": str_opt, "lesson": str_opt, "title": str_opt,
+               "symptom": str_opt, "service": str_opt, "env": str_opt,
+               "version": str_opt,
                "tags": {"type": "array", "items": {"type": "string"}}},
               "write", _case_update),
         _spec("manage_schedules",
