@@ -433,6 +433,16 @@ CREATE TABLE IF NOT EXISTS agent_digest_logs (
     detail TEXT DEFAULT '',
     summary TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS agent_session_meta (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL DEFAULT 0,
+    title TEXT DEFAULT '',
+    updated_at INTEGER NOT NULL,
+    UNIQUE(session_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_session_meta_user
+    ON agent_session_meta(user_id, session_id);
 """
 
 # JSON 字段（读写时自动序列化/反序列化）
@@ -468,7 +478,8 @@ TABLES = frozenset(("projects", "services", "environments", "servers",
                     "response_time_history", "monitor_snapshots",
                     "custom_monitors", "renewal_logs",
                     "agent_runs", "agent_messages", "agent_advice",
-                    "agent_cases", "agent_digest_logs"))
+                    "agent_cases", "agent_digest_logs",
+                    "agent_session_meta"))
 
 
 def _check_table(table: str):
@@ -614,6 +625,21 @@ def _migrate(conn):
             detail TEXT DEFAULT '',
             summary TEXT DEFAULT ''
         )""")
+    # agent_session_meta 表（会话重命名元数据，存量库需补建）
+    smeta_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='agent_session_meta'"
+    ).fetchone()
+    if not smeta_exists:
+        conn.execute("""CREATE TABLE agent_session_meta (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL DEFAULT 0,
+            title TEXT DEFAULT '',
+            updated_at INTEGER NOT NULL,
+            UNIQUE(session_id, user_id)
+        )""")
+        conn.execute("CREATE INDEX idx_agent_session_meta_user "
+                     "ON agent_session_meta(user_id, session_id)")
 
 
 def _serialize(table: str, fields: dict) -> dict:

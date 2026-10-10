@@ -269,6 +269,54 @@ class AgentApiBase(unittest.TestCase):
                             headers=self.headers)
         self.assertEqual(r.get_json()["sessions"], [])
 
+    def test_session_rename_and_badge(self):
+        t0 = int(time.time())
+        self._msg("sA", "user", "pay 服务为什么发布失败？请帮我分析原因并给出建议",
+                  user_id=1, ts=t0)
+        self._msg("sA", "assistant", "根据日志分析…", user_id=1, ts=t0 + 1)
+        # 自动标题 = 首条用户消息（无重命名时）
+        r = self.client.get("/api/agent/sessions", headers=self.headers)
+        sess = r.get_json()["sessions"]
+        self.assertEqual(
+            sess[0]["title"],
+            "pay 服务为什么发布失败？请帮我分析原因并给出建议")
+        # 重命名：viewer 403 / admin 200 且列表展示手动标题
+        r = self.client.put("/api/agent/sessions/sA/title",
+                            headers=self.viewer_headers, json={"title": "x"})
+        self.assertEqual(r.status_code, 403)
+        r = self.client.put("/api/agent/sessions/sA/title",
+                            headers=self.headers, json={"title": "pay 发布排障"})
+        self.assertEqual(r.status_code, 200)
+        r = self.client.get("/api/agent/sessions", headers=self.headers)
+        self.assertEqual(r.get_json()["sessions"][0]["title"], "pay 发布排障")
+        # 空标题 = 清除重命名，回退自动标题
+        r = self.client.put("/api/agent/sessions/sA/title",
+                            headers=self.headers, json={"title": "  "})
+        self.assertEqual(r.status_code, 200)
+        r = self.client.get("/api/agent/sessions", headers=self.headers)
+        self.assertEqual(
+            r.get_json()["sessions"][0]["title"],
+            "pay 服务为什么发布失败？请帮我分析原因并给出建议")
+        # 删除会话同步清理重命名元数据（防孤儿行）
+        r = self.client.put("/api/agent/sessions/sA/title",
+                            headers=self.headers, json={"title": "临时名"})
+        r = self.client.delete("/api/agent/sessions/sA", headers=self.headers)
+        self.assertEqual(r.get_json()["deleted"], 2)  # user + assistant 各一条
+        rows = dbm.list_records(self.db_path, "agent_session_meta",
+                                "session_id=? AND user_id=?", ("sA", 1))
+        self.assertEqual(rows, [])
+        # 待处理建议角标：登录用户可查，计数随状态流转变化
+        from agent import advisor as adv
+        a1 = adv.save_advice(self.db_path, "alert", 0, "t1", "b", actor={})
+        adv.save_advice(self.db_path, "alert", 0, "t2", "b", actor={})
+        r = self.client.get("/api/agent/advice/badge",
+                            headers=self.viewer_headers)
+        self.assertEqual(r.get_json()["pending"], 2)
+        adv.set_advice_status(self.db_path, a1, "dismissed",
+                              {"id": 1, "username": "admin"})
+        r = self.client.get("/api/agent/advice/badge", headers=self.headers)
+        self.assertEqual(r.get_json()["pending"], 1)
+
     # ---------- 审批单 ----------
 
     def _plan_run(self, **kw):

@@ -103,6 +103,7 @@
         <div class="chat-sessbar">
           <select id="sessSel" class="filter-sel sess-sel"
                   title="切换历史会话（含悬浮助手会话）"></select>
+          <button class="btn sm ghost" id="sessRename" title="重命名当前会话">✏️</button>
           <button class="btn sm ghost" id="sessNew" title="新建会话（从空历史开始）">＋ 新建</button>
           <button class="btn sm ghost" id="sessDel" title="删除当前会话全部消息（不可恢复）">🗑 删除</button>
         </div>` : ''}
@@ -125,6 +126,8 @@
     if (sessNew) sessNew.onclick = newSession;
     const sessDel = document.getElementById('sessDel');
     if (sessDel) sessDel.onclick = delSession;
+    const sessRename = document.getElementById('sessRename');
+    if (sessRename) sessRename.onclick = renameSession;
     const send = () => {
       const text = (ta.value || '').trim();
       if (!text) return;
@@ -168,11 +171,15 @@
     try{ rows = ((await api('/api/agent/sessions')).sessions) || []; }
     catch(e){ /* 列表加载失败：仅保留当前会话占位 */ }
     sel.innerHTML = '';
+    const labelText = (r) => {
+      const t = (r.title || '').replace(/\s+/g, ' ').slice(0, 30) || r.session_id;
+      return `${t}（${r.n} 条 · ${fmtTime(r.last_at)}）`;
+    };
     const opts = rows.filter(r => r.session_id !== currentSession)
       .map(r => {
         const o = document.createElement('option');
         o.value = r.session_id;
-        o.text = `${r.session_id}（${r.n} 条 · ${fmtTime(r.last_at)}）`;
+        o.text = labelText(r);
         o.title = (r.last_content || '').slice(0, 80) || r.session_id;
         o.dataset.n = r.n;
         return o;
@@ -181,7 +188,7 @@
     if (cur){
       const o = document.createElement('option');
       o.value = cur.session_id;
-      o.text = `${cur.session_id}（${cur.n} 条 · ${fmtTime(cur.last_at)}）`;
+      o.text = labelText(cur);
       o.title = (cur.last_content || '').slice(0, 80) || cur.session_id;
       o.dataset.n = cur.n;
       opts.unshift(o); // 当前会话置顶
@@ -227,6 +234,23 @@
       newSession(); // 当前会话已删：落到新会话，消息区同时清空
     }catch(e){
       toastError('删除失败：' + (e.message || ''));
+    }
+  }
+  async function renameSession(){
+    // 重命名当前会话：后端存 agent_session_meta，列表展示优先于自动标题
+    const sel = document.getElementById('sessSel');
+    const cur = sel && sel.selectedOptions && sel.selectedOptions[0];
+    const curTitle = cur ? (cur.text || '').split('（')[0] : '';
+    const name = await promptDialog('重命名会话', curTitle,
+      '会话名称（留空恢复自动标题）');
+    if (name === null) return;
+    try{
+      await api('/api/agent/sessions/' + encodeURIComponent(currentSession)
+        + '/title', {method: 'PUT', body: JSON.stringify({title: name})});
+      toastSuccess(name ? '会话已重命名' : '已恢复自动标题');
+      refreshSessSel();
+    }catch(e){
+      toastError('重命名失败：' + (e.message || ''));
     }
   }
   function abortChat(){
@@ -635,6 +659,14 @@
       adviceList = data.advice || [];
     }catch(e){ adviceList = []; }
     renderAdviceList(box);
+    refreshAdviceBadge(); // 建议状态变化后同步导航角标
+  }
+  async function refreshAdviceBadge(){
+    if (!window.updateAdviceBadge) return;
+    try{
+      const data = await api('/api/agent/advice/badge');
+      window.updateAdviceBadge(data.pending || 0);
+    }catch(e){ /* 角标失败不影响主列表 */ }
   }
   function renderAdviceList(box){
     if (!box) return;

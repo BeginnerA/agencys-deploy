@@ -69,7 +69,7 @@ python webapp/app.py
 ## 三、Phase 1：只读智能运维助手
 
 - **对话**：登录用户在「智能助手」页与 LLM 多轮对话，回复**流式输出**（SSE 打字机效果，工具调用过程可见）；消息持久化到 `agent_messages`，可在 API/页面回溯（会话按用户隔离）。CLI/MCP 入口同样支持流式/批量两种形态。
-- **会话管理**：对话页支持多会话（下拉切换/新建/删除，`localStorage` 记住当前会话）；`float` 会话由全站右下角悬浮助手产生，也可在此管理。列表/删除仅 operator/admin（默认自己的会话；admin 可 `scope=all`/`user_id=` 跨用户管理，含 CLI 的 id=0 会话），消息回溯同样按用户隔离。
+- **会话管理**：对话页支持多会话（下拉切换/新建/重命名/删除，`localStorage` 记住当前会话）；`float` 会话由全站右下角悬浮助手产生，也可在此管理。会话标题自动取首条用户消息前 40 字，可手动重命名（存 `agent_session_meta`，空名恢复自动标题；删除会话同步清理）。列表/删除/重命名仅 operator/admin（默认自己的会话；admin 可 `scope=all`/`user_id=` 跨用户管理，含 CLI 的 id=0 会话），消息回溯同样按用户隔离。
 - **工具**：20 个只读工具 + 12 个写工具（operator/admin 可见），全部以 JSON 结果回给模型：
   - 只读：`list_projects / get_project / list_services / list_environments / env_servers / service_status / recent_tasks / task_detail / list_alerts / alert_detail / search_logs / release_window / canary_configs / cert_monitors / audit_logs / search_cases / case_detail / advice_list / pending_approvals / run_detail`
   - 写：`analyze_alert / precheck / ack_alert / plan_operation / case_save / case_update` + 平台配置管理与闭环：`manage_schedules`（定时计划 CRUD/启停/立即执行）、`manage_windows`（发布窗口 CRUD，仅 admin）、`manage_canary`（灰度策略 CRUD/设默认）、`canary_decision`（灰度运行中决策 continue/stop/rollback）、`set_alert_status`（告警 resolve/reopen）、`send_digest`（立即推送巡检日报）
@@ -139,7 +139,8 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | --- | --- | --- | --- |
 | POST | /agent/chat | 对话（批量，body: message, session_id；返回 reply/plan_run_id） | 登录用户 |
 | POST | /agent/chat/stream | 对话（SSE 流式，事件：text 正文增量 / tool 工具开始 / tool_result 工具结束 / done 收尾 / error 异常） | 登录用户 |
-| GET | /agent/sessions | 会话列表（mine：默认本人；admin 加 scope=all 看全部；含条数/归属/摘要） | operator/admin |
+| GET | /agent/sessions | 会话列表（mine：默认本人；admin 加 scope=all 看全部；含标题/条数/归属/摘要） | operator/admin |
+| PUT | /agent/sessions/<id>/title | 重命名会话（仅本人；空串恢复自动标题） | operator/admin |
 | DELETE | /agent/sessions/<id> | 删除整段会话（不可恢复；默认删自己的，admin 可 user_id= 指定） | operator/admin |
 | GET | /agent/sessions/<id>/messages | 会话消息回溯（默认仅本人；admin 可 user_id= 跨用户审计） | operator/admin |
 | GET | /agent/runs | 审批单列表（status 过滤） | 登录用户 |
@@ -147,6 +148,7 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | POST | /agent/runs/<id>/decision | 审批（action: approve/reject, force_window） | operator/admin |
 | POST | /agent/runs/<id>/to_case | 已完结审批单一键沉淀案例 | operator/admin |
 | GET | /agent/advice | 建议列表（scope/ref_id/status 过滤，status: pending/adopted/dismissed） | 登录用户 |
+| GET | /agent/advice/badge | 待处理建议计数（全局导航角标） | 登录用户 |
 | POST | /agent/advice/<id>/to_case | 建议沉淀为案例 | operator/admin |
 | POST | /agent/advice/<id>/to_run | 建议一键采纳（失败归因→回滚审批单；灰度→写决策，自动标 adopted） | operator/admin |
 | POST | /agent/advice/<id>/dismiss | 忽略待处理建议（仅 pending，可重开） | operator/admin |
@@ -175,7 +177,7 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | AGENT_MAX_RESULT_CHARS | — | 6000 | 工具结果截断长度（500-20000） |
 | — | agent_digest | enabled=0, cron="0 9 * * *", channels=[] | 巡检日报配置（JSON，Web 弹窗维护） |
 
-> 数据表：建议生命周期列（`agent_advice.status/status_at/status_by/action_ref`，存量库 `_migrate` 幂等补列）与发送历史表 `agent_digest_logs`（sent_at/ok_count/total_count/channels/detail/summary）已在 SCHEMA 与迁移中定义。
+> 数据表：建议生命周期列（`agent_advice.status/status_at/status_by/action_ref`，存量库 `_migrate` 幂等补列）、发送历史表 `agent_digest_logs`（sent_at/ok_count/total_count/channels/detail/summary）与会话重命名元数据 `agent_session_meta`（session_id+user_id 唯一，仅手动重命名时写入）已在 SCHEMA 与迁移中定义。
 
 ## 十、安全与边界
 

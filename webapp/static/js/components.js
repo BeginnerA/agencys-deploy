@@ -33,6 +33,38 @@ function confirmDialog(text, title){
   });
 }
 
+// 输入弹窗：resolve(输入串/ null)；Enter 提交，Esc 取消
+function promptDialog(title, value, placeholder){
+  return new Promise(resolve => {
+    const root = document.getElementById('modalRoot');
+    root.classList.remove('hidden');
+    root.innerHTML = `
+      <div class="modal-mask" id="pdMask">
+        <div class="modal-card">
+          <h3>${esc(title || '输入')}</h3>
+          <input type="text" id="pdInput" value="${esc(value || '')}"
+                 placeholder="${esc(placeholder || '')}" maxlength="60"
+                 style="width:100%;margin-bottom:20px">
+          <div style="display:flex;gap:10px;justify-content:flex-end">
+            <button class="btn" id="pdNo">取消</button>
+            <button class="btn primary" id="pdYes">确定</button>
+          </div>
+        </div>
+      </div>`;
+    const input = document.getElementById('pdInput');
+    const close = (v) => { root.classList.add('hidden'); root.innerHTML = ''; resolve(v); };
+    const submit = () => close((input.value || '').trim());
+    document.getElementById('pdNo').onclick = () => close(null);
+    document.getElementById('pdYes').onclick = submit;
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter'){ e.preventDefault(); submit(); }
+      if (e.key === 'Escape') close(null);
+    };
+    document.getElementById('pdMask').onclick = (e) => { if(e.target.id === 'pdMask') close(null); };
+    setTimeout(() => { input.focus(); input.select(); }, 40);
+  });
+}
+
 // 表单抽屉：{title, body, wide, onClose} → 返回容器元素；onClose 返回 Promise 时 await 后再销毁
 let drawerPrevClose = null; // 当前抽屉的 onClose（被新 openDrawer 覆盖时先触发，如停止日志流）
 function openDrawer(opts){

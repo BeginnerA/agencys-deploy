@@ -82,6 +82,7 @@ function renderSidebar(){
         <div class="nav-item ${r.path === activePath ? 'active' : ''}" data-path="${r.path}">
           <span class="nav-ico">${r.icon}</span><span class="nav-txt">${r.name}</span>
           ${r.path === 'alerts' ? '<span class="nav-badge hidden" id="alertBadge">0</span>' : ''}
+          ${r.path === 'agent' ? '<span class="nav-badge hidden" id="adviceBadge">0</span>' : ''}
         </div>`).join('')}
     </div>`).join('');
   sb.innerHTML = `
@@ -117,6 +118,13 @@ function renderBreadcrumb(){
 // 供 alerts 页更新角标
 window.updateAlertBadge = function(count){
   const badge = document.getElementById('alertBadge');
+  if (!badge) return;
+  if (count > 0){ badge.classList.remove('hidden'); badge.textContent = count > 99 ? '99+' : count; }
+  else badge.classList.add('hidden');
+};
+// 供 agent 页/全局轮询更新待处理建议角标
+window.updateAdviceBadge = function(count){
+  const badge = document.getElementById('adviceBadge');
   if (!badge) return;
   if (count > 0){ badge.classList.remove('hidden'); badge.textContent = count > 99 ? '99+' : count; }
   else badge.classList.add('hidden');

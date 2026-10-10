@@ -33,10 +33,11 @@ def _sse(obj: dict) -> str:
 
 
 def _session_rows(db_path: str, user_id: int = 0) -> list:
-    """会话聚合（按 session_id + created_by 分组，含归属/条数/最后活动摘要）
+    """会话聚合（按 session_id + created_by 分组，含归属/条数/标题/最后活动摘要）
 
     user_id=0 表示全部用户（admin scope=all 视角）；每组带 last_content
     供前端展示摘要，列表按最后活动倒序。
+    title：手动重命名（agent_session_meta）优先，否则回退首条用户消息前 40 字。
     """
     conn = dbm.get_conn(db_path)
     try:
@@ -45,6 +46,15 @@ def _session_rows(db_path: str, user_id: int = 0) -> list:
             " COALESCE((SELECT u.username FROM users u WHERE u.id = m.created_by)"
             ", '#0') AS owner,"
             " COUNT(*) AS n, MAX(m.created_at) AS last_at,"
+            " COALESCE("
+            "  (SELECT t.title FROM agent_session_meta t"
+            "   WHERE t.session_id = m.session_id AND t.user_id = m.created_by"
+            "     AND t.title != ''),"
+            "  (SELECT SUBSTR(m3.content, 1, 40) FROM agent_messages m3"
+            "   WHERE m3.session_id = m.session_id"
+            "    AND m3.created_by = m.created_by AND m3.role = 'user'"
+            "   ORDER BY m3.id ASC LIMIT 1),"
+            "  '') AS title,"
             " (SELECT m2.content FROM agent_messages m2"
             "  WHERE m2.session_id = m.session_id"
             "   AND m2.created_by = m.created_by"
@@ -252,6 +262,20 @@ def list_advice():
     rows = advisor_mod.list_advice(current_app.config["DB_PATH"], scope,
                                    ref_id, limit, status=status)
     return jsonify({"advice": rows})
+
+
+@agent_bp.route("/agent/advice/badge")
+@require_auth
+def advice_badge():
+    """待处理建议计数（全局导航角标，一条 COUNT 查询）"""
+    conn = dbm.get_conn(current_app.config["DB_PATH"])
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM agent_advice WHERE status='pending'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return jsonify({"pending": n})
 
 
 @agent_bp.route("/agent/advice/<int:advice_id>")
@@ -531,6 +555,10 @@ def delete_session(session_id):
         cur = conn.execute(
             "DELETE FROM agent_messages WHERE session_id=? AND created_by=?",
             (session_id[:64], uid))
+        # 同步清理重命名元数据（防孤儿行）
+        conn.execute(
+            "DELETE FROM agent_session_meta WHERE session_id=? AND user_id=?",
+            (session_id[:64], uid))
         conn.commit()
         deleted = cur.rowcount
     finally:
@@ -539,6 +567,32 @@ def delete_session(session_id):
           {"session_id": session_id[:64], "user_id": uid,
            "deleted": deleted})
     return jsonify({"ok": True, "deleted": deleted})
+
+
+@agent_bp.route("/agent/sessions/<session_id>/title", methods=["PUT"])
+@require_auth
+@require_role("admin", "operator")
+def rename_session(session_id):
+    """重命名会话（仅本人；title 空串视为清除重命名，回退自动标题）"""
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    title = _str(body, "title", maxlen=60).strip()
+    sid = session_id[:64]
+    uid = int(g.user.get("id") or 0)
+    db_path = current_app.config["DB_PATH"]
+    rows = dbm.list_records(db_path, "agent_session_meta",
+                            "session_id=? AND user_id=?", (sid, uid))
+    now = int(time.time())
+    if rows:
+        dbm.update_record(db_path, "agent_session_meta", rows[0]["id"],
+                          dict(title=title, updated_at=now))
+    else:
+        dbm.create_record(db_path, "agent_session_meta", dict(
+            session_id=sid, user_id=uid, title=title, updated_at=now))
+    audit("agent_session_rename", "session", 0,
+          {"session_id": sid, "title": title})
+    return jsonify({"ok": True, "title": title})
 
 
 # ---------- 巡检日报 ----------

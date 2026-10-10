@@ -18,4 +18,9 @@
     const data = await api('/api/alerts/badge').catch(() => null);
     if (data) updateAlertBadge(data.firing || 0);
   }, 15000);
+  // 全局待处理建议角标：15s 轮询（advisor 后台持续产出新建议）
+  poll(async () => {
+    const data = await api('/api/agent/advice/badge').catch(() => null);
+    if (data) updateAdviceBadge(data.pending || 0);
+  }, 15000);
 })();
