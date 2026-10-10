@@ -463,6 +463,78 @@ class TestTools(AgentBase):
         self.assertEqual(row["docker_images_mb"], 10.0)
         self.assertEqual(row["ssl_days"], 45.0)
 
+    def test_service_topology_queries(self):
+        from agent import tools as tools_mod
+        now = int(time.time())
+        # 两服务：auth 依赖 api（发布顺序 api 先）
+        api_id = dbm.create_record(self.db, "services", dict(
+            project_id=self.proj_id, name="api", image_name="api",
+            service_name="hqb-api", docker_context="", dockerfile="",
+            build_order="[]", nacos_groups="[]", dubbo_services="[]",
+            snailjob_group="", health_url="", health_port=0,
+            log_error_keywords="[]", clear_log_dir="", git_repo="", enabled=1))
+        dbm.create_record(self.db, "service_dependencies", dict(
+            project_id=self.proj_id, source_service="auth",
+            target_service="api", dep_type="manual", created_at=now))
+        # topology：nodes + edges
+        topo = json.loads(tools_mod.execute_tool(
+            "viewer", "service_topology",
+            {"metric": "topology", "project": "plat"}, self._ctx("viewer")))
+        self.assertEqual({n["name"] for n in topo["nodes"]}, {"auth", "api"})
+        self.assertEqual(topo["edges"],
+                         [{"source": "auth", "target": "api",
+                           "type": "manual"}])
+        # impact：auth 依赖 api → downstream=[api]
+        imp = json.loads(tools_mod.execute_tool(
+            "viewer", "service_topology",
+            {"metric": "impact", "project": "plat", "service": "auth"},
+            self._ctx("viewer")))
+        self.assertEqual([d["name"] for d in imp["downstream"]], ["api"])
+        self.assertEqual(imp["upstream"], [])
+        # impact 服务不存在 → 报错
+        miss = json.loads(tools_mod.execute_tool(
+            "viewer", "service_topology",
+            {"metric": "impact", "project": "plat", "service": "ghost"},
+            self._ctx("viewer")))
+        self.assertIn("error", miss)
+        # publish_order：被依赖的先发布
+        order = json.loads(tools_mod.execute_tool(
+            "viewer", "service_topology",
+            {"metric": "publish_order", "project": "plat"},
+            self._ctx("viewer")))
+        self.assertEqual(order["order"], ["api", "auth"])
+        self.assertFalse(order["has_cycle"])
+        # snapshots + compare：两次快照有版本差异
+        dbm.create_record(self.db, "deployment_snapshots", dict(
+            project_id=self.proj_id, env="prod", task_id=0, version="1.0.0",
+            image_versions={"auth": "1.0.0", "api": "1.0.0"},
+            deployed_at=now - 100))
+        dbm.create_record(self.db, "deployment_snapshots", dict(
+            project_id=self.proj_id, env="prod", task_id=0, version="1.1.0",
+            image_versions={"auth": "1.1.0", "api": "1.0.0"},
+            deployed_at=now))
+        snaps = json.loads(tools_mod.execute_tool(
+            "viewer", "service_topology",
+            {"metric": "snapshots", "project": "plat", "env": "prod"},
+            self._ctx("viewer")))
+        self.assertEqual(len(snaps["snapshots"]), 2)
+        cmp = json.loads(tools_mod.execute_tool(
+            "viewer", "service_topology",
+            {"metric": "compare", "project": "plat", "env": "prod"},
+            self._ctx("viewer")))
+        self.assertEqual(cmp["changes"],
+                         [{"service": "auth", "old": "1.0.0", "new": "1.1.0"}])
+        # compare 只给 old_id 不给 new_id → 报错
+        bad = json.loads(tools_mod.execute_tool(
+            "viewer", "service_topology",
+            {"metric": "compare", "old_id": 1}, self._ctx("viewer")))
+        self.assertIn("error", bad)
+        # metric 非法
+        bad2 = json.loads(tools_mod.execute_tool(
+            "viewer", "service_topology", {"metric": "graph"},
+            self._ctx("viewer")))
+        self.assertIn("error", bad2)
+
 
 class TestExecutor(AgentBase):
     def _plan(self, op="deploy", **kw):
@@ -979,12 +1051,13 @@ class TestAgentManageTools(AgentBase):
                   "manage_schedules", "manage_windows", "manage_canary",
                   "canary_decision", "set_alert_status",
                   "manage_alert_rules", "manage_silences",
-                  "manage_log_storage",
+                  "manage_log_storage", "manage_dependencies",
                   "decide_run"):
             self.assertNotIn(n, viewer_names)
             self.assertIn(n, admin_names)
         # 观测类 read 工具对 viewer 可见（含第十三档新增）
-        for n in ("search_logs", "logs_context", "monitor_metrics"):
+        for n in ("search_logs", "logs_context", "monitor_metrics",
+                  "service_topology"):
             self.assertIn(n, viewer_names)
             self.assertIn(n, admin_names)
 
@@ -1356,6 +1429,63 @@ class TestAgentManageTools(AgentBase):
         self.assertIsNotNone(entry)
         detail = json.loads(entry["detail"] or "{}")
         self.assertEqual(detail.get("deleted_entries"), 5)
+
+    def test_dependencies_tool_lifecycle(self):
+        # 夹具补第二服务（auth 依赖 api）
+        dbm.create_record(self.db, "services", dict(
+            project_id=self.proj_id, name="api", image_name="api",
+            service_name="hqb-api", docker_context="", dockerfile="",
+            build_order="[]", nacos_groups="[]", dubbo_services="[]",
+            snailjob_group="", health_url="", health_port=0,
+            log_error_keywords="[]", clear_log_dir="", git_repo="", enabled=1))
+        # viewer 拒绝（write 级过滤，与 Web 端 operator/admin 权限对齐）
+        denied = self._call("manage_dependencies",
+                            {"action": "list", "project": "plat"},
+                            role="viewer")
+        self.assertIn("error", denied)
+        # create 悬空拒绝（防幻觉，对话侧比 Web 更严）
+        ghost = self._call("manage_dependencies",
+                           {"action": "create", "project": "plat",
+                            "source": "ghost", "target": "auth"})
+        self.assertIn("不存在", ghost["error"])
+        # create 自依赖拒绝
+        self_dep = self._call("manage_dependencies",
+                              {"action": "create", "project": "plat",
+                               "source": "auth", "target": "auth"})
+        self.assertIn("自己", self_dep["error"])
+        # create 成功 + 审计
+        ok = self._call("manage_dependencies",
+                        {"action": "create", "project": "plat",
+                         "source": "auth", "target": "api"})
+        self.assertTrue(ok["ok"])
+        dep_id = ok["id"]
+        logs = dbm.list_audit_logs(self.db, 10)
+        entry = next((l for l in logs
+                      if l["action"] == "agent_add_dependency"), None)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["target_id"], dep_id)
+        # 重复创建 → UNIQUE 拒绝
+        dup = self._call("manage_dependencies",
+                         {"action": "create", "project": "plat",
+                          "source": "auth", "target": "api"})
+        self.assertIn("已存在", dup["error"])
+        # 环检测：api → auth 会成环（auth→api 已存在）
+        cycle = self._call("manage_dependencies",
+                           {"action": "create", "project": "plat",
+                            "source": "api", "target": "auth"})
+        self.assertIn("循环", cycle["error"])
+        # list 带记录 id（删除入口）
+        rows = self._call("manage_dependencies",
+                          {"action": "list", "project": "plat"})
+        self.assertEqual(len(rows["dependencies"]), 1)
+        self.assertEqual(rows["dependencies"][0]["id"], dep_id)
+        # delete + 再删不存在
+        dele = self._call("manage_dependencies",
+                          {"action": "delete", "dependency_id": dep_id})
+        self.assertTrue(dele["ok"])
+        again = self._call("manage_dependencies",
+                           {"action": "delete", "dependency_id": dep_id})
+        self.assertIn("不存在", again["error"])
 
     def test_clone_environment_copies_server_bindings(self):
         # 新项目 → clone plat/prod 环境（含服务器绑定，order 保持）

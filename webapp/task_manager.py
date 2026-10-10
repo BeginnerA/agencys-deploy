@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, Future
 
+from . import db as dbm
 from .db import update_task
 
 DEPLOY_ROOT = Path(__file__).resolve().parent.parent
@@ -102,6 +103,57 @@ def submit_task(db_path: str, task: dict, extra_args: list = None):
     _task_registry.setdefault(task["id"], fut)
 
 
+def _save_deploy_snapshot(db_path, task_id: int, log_file: str):
+    """部署成功后写环境快照（deployment_snapshots）：快照对比的数据生产点，
+    覆盖 Web/Agent/调度/webhook 全通道（此前仅测试写入，对比功能空转）。
+
+    image_versions 口径：优先解析子进程日志的自动版本行（流水线每服务一行
+    `[name] 自动版本: ... 新版本 X`，单服务无前缀行归属任务 name）；固定版本
+    模式单服务任务记 {任务 name: version}，流水线展开 stages 全部服务同版本。
+    restart 任务无版本变更不落快照。失败静默（快照绝不阻断任务终态回写）。
+    """
+    try:
+        task = dbm.get_task(db_path, task_id)  # 重取：auto_version 回填后的最新记录
+        if not task or task.get("type") == "restart":
+            return
+        version = task.get("version") or ""
+        image_versions = {}
+        content = ""
+        try:
+            with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except OSError:
+            pass
+        if content:
+            # 流水线自动版本：每服务一行带 [name] 前缀
+            for m in re.finditer(
+                    r"(?:^|\n)\[([\w.-]+)\]\s*自动版本:\s*当前线上\s+\S+\s*→\s*新版本\s+(\S+)",
+                    content):
+                image_versions[m.group(1)] = m.group(2)
+            # 单服务自动版本：行首无前缀，归属任务 name
+            m = re.search(
+                r"(?:^|\n)自动版本:\s*当前线上\s+\S+\s*→\s*新版本\s+(\S+)", content)
+            if m and task["name"] not in image_versions:
+                image_versions[task["name"]] = m.group(1)
+        if not image_versions and version:
+            if task["type"] == "pipeline":
+                pl = dbm.get_record(db_path, "pipelines", task.get("ref_id") or 0)
+                for stage in (pl.get("stages") if pl else None) or []:
+                    for svc in (stage.get("services") or []):
+                        sid = svc.get("service_id")
+                        rec = dbm.get_record(db_path, "services", sid) if sid else None
+                        if rec:
+                            image_versions[rec["name"]] = version
+            else:
+                image_versions[task["name"]] = version
+        dbm.create_record(db_path, "deployment_snapshots", dict(
+            project_id=task["project_id"], env=task.get("env") or "",
+            task_id=task_id, version=version,
+            image_versions=image_versions, deployed_at=int(time.time())))
+    except Exception:
+        pass
+
+
 def _run_task(db_path, task, extra_args):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"task_{task['id']}.log"
@@ -142,6 +194,8 @@ def _run_task(db_path, task, extra_args):
             _backfill_auto_versions(db_path, task["id"], str(log_file))
         update_task(db_path, task["id"], status="success" if rc == 0 else "failed",
                     finished_at=time.time())
+        if rc == 0:
+            _save_deploy_snapshot(db_path, task["id"], str(log_file))
     except Exception as exc:
         # 兜底：线程池异常无人取回，不处理会永久卡 pending/running 且无日志
         _task_registry.pop(task["id"], None)

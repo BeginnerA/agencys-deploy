@@ -294,3 +294,131 @@ class TestDispatch(unittest.TestCase):
 
 
 # ===== 后续任务追加的测试类锚点 =====
+
+
+class TestDeploySnapshot(unittest.TestCase):
+    """部署成功写 deployment_snapshots（快照对比的数据生产点）
+
+    覆盖：固定版本单服务 / 自动版本日志解析（单服务无前缀行 + 流水线每服务
+    前缀行）/ 失败与 restart 不落快照。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "test.db")
+        dbm.init_db(self.db)
+        now = int(time.time())
+        self.proj_id = dbm.create_record(self.db, "projects", dict(
+            name="p1", code="p1", description="", git_org="", created_at=now))
+        self.svc_id = _make_svc(self.db, self.proj_id)
+        self.svc_b = dbm.create_record(self.db, "services", dict(
+            project_id=self.proj_id, name="api", image_name="api",
+            service_name="hqb-api", docker_context="", dockerfile="",
+            build_order="[]", nacos_groups="[]", dubbo_services="[]",
+            snailjob_group="", health_url="", health_port=0,
+            log_error_keywords="[]", clear_log_dir="", git_repo="", enabled=1))
+
+    def _make_task(self, **over):
+        base = dict(type="project", ref_id=self.svc_id, name="auth", env="prod",
+                    version="1.0.0", previous_version="", action="deploy")
+        base.update(over)
+        return dbm.create_task(self.db, self.proj_id, base["type"], base["ref_id"],
+                                base["name"], base["env"], base["version"],
+                                base["previous_version"], 0,
+                                extra=base.get("extra", []), action=base["action"])
+
+    def _snapshots(self):
+        return dbm.list_records(self.db, "deployment_snapshots", "project_id=?",
+                                (self.proj_id,), "deployed_at")
+
+    def test_fixed_version_service_task(self):
+        task_id = self._make_task()
+        log = os.path.join(self.tmp, "task.log")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write("[platform] 执行命令: deploy.py ...\n全部服务器发布完成\n")
+        from webapp.task_manager import _save_deploy_snapshot
+        _save_deploy_snapshot(self.db, task_id, log)
+        snaps = self._snapshots()
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0]["version"], "1.0.0")
+        self.assertEqual(snaps[0]["image_versions"], {"auth": "1.0.0"})
+        self.assertEqual(snaps[0]["task_id"], task_id)
+        self.assertEqual(snaps[0]["env"], "prod")
+
+    def test_auto_version_from_log(self):
+        # auto 场景：任务建时 version 空，回填后为 1.0.1（日志无前缀行归属任务 name）
+        task_id = self._make_task(version="")
+        dbm.update_task(self.db, task_id, version="1.0.1", previous_version="1.0.0")
+        log = os.path.join(self.tmp, "task.log")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write("自动版本: 当前线上 1.0.0 → 新版本 1.0.1\n全部服务器发布完成\n")
+        from webapp.task_manager import _save_deploy_snapshot
+        _save_deploy_snapshot(self.db, task_id, log)
+        snaps = self._snapshots()
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0]["version"], "1.0.1")
+        self.assertEqual(snaps[0]["image_versions"], {"auth": "1.0.1"})
+
+    def test_pipeline_auto_versions(self):
+        # 流水线 auto：每服务一行 [name] 前缀；version 空则快照 version 空
+        pl_id = dbm.create_record(self.db, "pipelines", dict(
+            project_id=self.proj_id, name="pl1", build_first=1,
+            stages=[{"services": [{"service_id": self.svc_id},
+                                   {"service_id": self.svc_b}]}]))
+        task_id = self._make_task(type="pipeline", ref_id=pl_id, name="pl1",
+                                  version="")
+        log = os.path.join(self.tmp, "task.log")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write("[auth] 自动版本: 当前线上 1.0.0 → 新版本 1.0.2\n"
+                    "[api] 自动版本: 当前线上 2.0.0 → 新版本 2.0.1\n")
+        from webapp.task_manager import _save_deploy_snapshot
+        _save_deploy_snapshot(self.db, task_id, log)
+        snaps = self._snapshots()
+        self.assertEqual(len(snaps), 1)
+        self.assertEqual(snaps[0]["image_versions"],
+                         {"auth": "1.0.2", "api": "2.0.1"})
+
+    def test_pipeline_fixed_version_expands_stages(self):
+        # 流水线固定版本：展开 stages 全部服务同版本
+        pl_id = dbm.create_record(self.db, "pipelines", dict(
+            project_id=self.proj_id, name="pl1", build_first=1,
+            stages=[{"services": [{"service_id": self.svc_id},
+                                   {"service_id": self.svc_b}]}]))
+        task_id = self._make_task(type="pipeline", ref_id=pl_id, name="pl1",
+                                  version="3.0.0")
+        from webapp.task_manager import _save_deploy_snapshot
+        _save_deploy_snapshot(self.db, task_id, os.path.join(self.tmp, "none.log"))
+        snaps = self._snapshots()
+        self.assertEqual(snaps[0]["image_versions"],
+                         {"auth": "3.0.0", "api": "3.0.0"})
+
+    def test_run_task_success_writes_snapshot(self):
+        proc = mock.Mock()
+        proc.wait.return_value = 0
+        task_id = self._make_task()
+        task = dbm.get_task(self.db, task_id)
+        with mock.patch("webapp.task_manager.subprocess.Popen",
+                        return_value=proc), \
+             mock.patch("webapp.task_manager.update_task"):
+            from webapp.task_manager import _run_task
+            _run_task(self.db, task, [])
+        self.assertEqual(len(self._snapshots()), 1)
+
+    def test_run_task_failure_no_snapshot(self):
+        proc = mock.Mock()
+        proc.wait.return_value = 1
+        task_id = self._make_task()
+        task = dbm.get_task(self.db, task_id)
+        with mock.patch("webapp.task_manager.subprocess.Popen",
+                        return_value=proc), \
+             mock.patch("webapp.task_manager.update_task"):
+            from webapp.task_manager import _run_task
+            _run_task(self.db, task, [])
+        self.assertEqual(self._snapshots(), [])
+
+    def test_restart_no_snapshot(self):
+        task_id = self._make_task(type="restart", version="", action="restart")
+        log = os.path.join(self.tmp, "task.log")
+        from webapp.task_manager import _save_deploy_snapshot
+        _save_deploy_snapshot(self.db, task_id, log)
+        self.assertEqual(self._snapshots(), [])

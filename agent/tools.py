@@ -607,6 +607,164 @@ def _run_detail(ctx, run_id=None, **kw) -> dict:
     return {"run": run}
 
 
+def _service_topology(ctx, metric="topology", project=None, env="",
+                      service="", old_id=None, new_id=None, limit=20, **kw) -> dict:
+    """服务依赖拓扑与发布编排查询：topology（项目全图）/ impact（服务上下游）/ publish_order（发布顺序建议）/ snapshots（部署快照）/ compare（快照对比）"""
+    db = ctx.db_path
+    if metric not in ("topology", "impact", "publish_order",
+                      "snapshots", "compare"):
+        raise ToolError("metric 仅支持 topology/impact/publish_order/snapshots/compare")
+    if metric in ("topology", "publish_order", "snapshots") and not project:
+        raise ToolError(f"metric={metric} 需要项目 project")
+    if metric == "compare" and not (old_id and new_id) and not (project and env):
+        raise ToolError("compare 需要 project+env（最近两次快照）或 old_id+new_id")
+    if metric == "impact" and not (project and service):
+        raise ToolError("metric=impact 需要 project + service（服务名）")
+
+    if metric == "snapshots":
+        proj = _resolve_project(db, project or "")
+        if not proj:
+            raise ToolError(f"项目不存在: {project}")
+        cond, params = "project_id=?", (proj["id"],)
+        if env:
+            cond, params = "project_id=? AND env=?", (proj["id"], env)
+        rows = dbm.list_records(db, "deployment_snapshots", cond, params,
+                                "deployed_at DESC")
+        return {"project": proj["code"], "env": env or "全部",
+                "snapshots": [{"id": r["id"], "env": r.get("env", ""),
+                               "task_id": r.get("task_id", 0),
+                               "version": r.get("version", ""),
+                               "image_versions": r.get("image_versions") or {},
+                               "deployed_at": _fmt_ts(r.get("deployed_at"))}
+                              for r in rows[:max(1, min(limit, 50))]],
+                "hint": "快照由每次部署成功后自动写入；compare 可对比两次快照的服务版本差异"}
+
+    if metric == "compare":
+        if old_id and new_id:
+            try:
+                old_id, new_id = int(old_id), int(new_id)
+            except (TypeError, ValueError):
+                raise ToolError("old_id/new_id 必须为整数")
+            old = dbm.get_record(db, "deployment_snapshots", old_id)
+            new = dbm.get_record(db, "deployment_snapshots", new_id)
+            if not old or not new:
+                raise ToolError("指定的快照不存在")
+        else:
+            proj = _resolve_project(db, project or "")
+            if not proj:
+                raise ToolError(f"项目不存在: {project}")
+            rows = dbm.list_records(db, "deployment_snapshots",
+                                    "project_id=? AND env=?",
+                                    (proj["id"], env), "deployed_at DESC")
+            if len(rows) < 2:
+                raise ToolError("至少需要 2 个快照才能对比")
+            old, new = rows[1], rows[0]
+        old_v = old.get("image_versions") or {}
+        new_v = new.get("image_versions") or {}
+        changes = [{"service": k, "old": old_v.get(k, ""), "new": new_v.get(k, "")}
+                   for k in sorted(set(old_v) | set(new_v))
+                   if old_v.get(k, "") != new_v.get(k, "")]
+        return {"old": {"id": old["id"], "version": old.get("version", ""),
+                        "env": old.get("env", ""),
+                        "deployed_at": _fmt_ts(old.get("deployed_at"))},
+                "new": {"id": new["id"], "version": new.get("version", ""),
+                        "env": new.get("env", ""),
+                        "deployed_at": _fmt_ts(new.get("deployed_at"))},
+                "changes": changes,
+                "hint": "changes 为两次快照间服务镜像版本差异（含新增/移除服务）"}
+
+    # topology / impact / publish_order：均基于服务依赖图
+    proj = _resolve_project(db, project or "")
+    if not proj:
+        raise ToolError(f"项目不存在: {project}")
+    pid = proj["id"]
+    services = dbm.list_services(db, pid, enabled_only=True)
+    svc_names = {s["name"] for s in services}
+    deps = dbm.list_records(db, "service_dependencies", "project_id=?",
+                            (pid,), "id")
+
+    if metric == "topology":
+        edges, seen = [], set()
+        for d in deps:
+            key = (d["source_service"], d["target_service"])
+            if key not in seen:
+                edges.append({"source": d["source_service"],
+                              "target": d["target_service"],
+                              "type": d.get("dep_type", "manual")})
+                seen.add(key)
+        for svc in services:
+            dubbo = svc.get("dubbo_services") or []
+            if isinstance(dubbo, str):
+                try:
+                    dubbo = json.loads(dubbo)
+                except (ValueError, TypeError):
+                    dubbo = []
+            for d in dubbo if isinstance(dubbo, list) else []:
+                target = d if isinstance(d, str) else d.get("service", "")
+                if target and target in svc_names:
+                    key = (svc["name"], target)
+                    if key not in seen:
+                        edges.append({"source": svc["name"], "target": target,
+                                      "type": "dubbo"})
+                        seen.add(key)
+        return {"project": proj["code"],
+                "nodes": [{"name": s["name"],
+                           "service_name": s.get("service_name", "")}
+                          for s in services],
+                "edges": edges,
+                "hint": "edges 含手动依赖（manage_dependencies 维护）与 dubbo 自动检测；"
+                        "impact 查单服务上下游、publish_order 查建议发布顺序"}
+
+    if metric == "impact":
+        if service not in svc_names:
+            raise ToolError(f"服务不存在或不属于该项目: {service}")
+        upstream = [{"name": d["source_service"],
+                     "type": d.get("dep_type", "manual")}
+                    for d in deps if d["target_service"] == service]
+        downstream = [{"name": d["target_service"],
+                       "type": d.get("dep_type", "manual")}
+                      for d in deps if d["source_service"] == service]
+        adj_up, adj_down = {}, {}
+        for d in deps:
+            adj_up.setdefault(d["target_service"], []).append(d["source_service"])
+            adj_down.setdefault(d["source_service"], []).append(d["target_service"])
+        indirect_up = {uu for u in upstream for uu in adj_up.get(u["name"], [])
+                       if uu != service}
+        indirect_down = {dd for d in downstream for dd in adj_down.get(d["name"], [])
+                         if dd != service}
+        return {"project": proj["code"], "service": service,
+                "upstream": upstream, "downstream": downstream,
+                "indirect_upstream": sorted(indirect_up),
+                "indirect_downstream": sorted(indirect_down),
+                "hint": "upstream=谁依赖我（升级影响方）、downstream=我依赖谁；"
+                        "间接层为两跳；发布前评估对上下游的影响"}
+
+    # publish_order：Kahn 拓扑排序（被依赖的先发布）
+    in_degree = {n: 0 for n in svc_names}
+    adj = {n: [] for n in svc_names}
+    for d in deps:
+        src, tgt = d["source_service"], d["target_service"]
+        if src in in_degree and tgt in in_degree:
+            adj[tgt].append(src)
+            in_degree[src] += 1
+    queue = sorted(n for n in svc_names if in_degree[n] == 0)
+    order = []
+    while queue:
+        node = queue.pop(0)
+        order.append(node)
+        for nxt in sorted(adj.get(node, [])):
+            in_degree[nxt] -= 1
+            if in_degree[nxt] == 0:
+                queue.append(nxt)
+    remaining = [n for n in svc_names if n not in order]
+    has_cycle = bool(remaining)
+    if remaining:
+        order.extend(sorted(remaining))
+    return {"project": proj["code"], "order": order, "has_cycle": has_cycle,
+            "hint": "被依赖的服务先发布；has_cycle=true 时环上服务附在末尾"
+                    "（建议用 manage_dependencies 拆解循环依赖）"}
+
+
 # ---------- 工具实现（write：operator/admin，均落库留痕） ----------
 
 def _analyze_alert(ctx, alert_id=None, **kw) -> dict:
@@ -2441,6 +2599,101 @@ def _manage_log_storage(ctx, action="status", log_retention_days=None,
     raise ToolError("action 仅支持 status/settings/cleanup")
 
 
+# ---------- 服务依赖拓扑管理（operator/admin） ----------
+
+def _manage_dependencies(ctx, action=None, project=None, dependency_id=None,
+                          source="", target="", dep_type="manual", **kw) -> dict:
+    """服务依赖关系管理（与 Web 端拓扑页同等效力）：source 依赖 target
+    （发布顺序上 target 先发布）。create 含环检测；对话侧比 Web 更严：
+    服务名悬空直接拒绝（防幻觉死配置）。"""
+    db = ctx.db_path
+    if action not in ("list", "create", "delete"):
+        raise ToolError("action 仅支持 list/create/delete")
+    if action in ("list", "create") and not project:
+        raise ToolError("action=list/create 需要项目 project")
+
+    if action == "list":
+        proj = _resolve_project(db, project or "")
+        if not proj:
+            raise ToolError(f"项目不存在: {project}")
+        rows = dbm.list_records(db, "service_dependencies", "project_id=?",
+                                (proj["id"],), "id")
+        return {"project": proj["code"],
+                "dependencies": [{"id": d["id"], "source": d["source_service"],
+                                  "target": d["target_service"],
+                                  "type": d.get("dep_type", "manual")}
+                                 for d in rows],
+                "hint": "source 依赖 target（target 先发布）；"
+                        "service_topology metric=impact/publish_order 消费本图"}
+
+    if action == "create":
+        proj = _resolve_project(db, project or "")
+        if not proj:
+            raise ToolError(f"项目不存在: {project}")
+        source, target = str(source or "").strip(), str(target or "").strip()
+        if not source or not target:
+            raise ToolError("缺少 source/target（服务名）")
+        if dep_type not in ("manual", "dubbo"):
+            raise ToolError("dep_type 仅支持 manual/dubbo（默认 manual）")
+        svc_names = {s["name"] for s in
+                     dbm.list_services(db, proj["id"], enabled_only=True)}
+        for name in (source, target):
+            if name not in svc_names:
+                raise ToolError(f"服务不存在或不属于该项目: {name}（可用 "
+                                f"list_services 核对）")
+        if source == target:
+            raise ToolError("不能依赖自己")
+        # 环检测：若 target 已能沿依赖边到达 source，加边 source→target 即成环
+        deps = dbm.list_records(db, "service_dependencies", "project_id=?",
+                                (proj["id"],), "id")
+        adj = {}
+        for d in deps:
+            adj.setdefault(d["source_service"], []).append(d["target_service"])
+        visited, queue = set(), [target]
+        while queue:
+            curr = queue.pop(0)
+            if curr == source:
+                raise ToolError("添加此依赖会形成循环依赖"
+                                "（可先 delete 拆解既有环）")
+            if curr in visited:
+                continue
+            visited.add(curr)
+            queue.extend(n for n in adj.get(curr, []) if n not in visited)
+        try:
+            did = dbm.create_record(db, "service_dependencies", dict(
+                project_id=proj["id"], source_service=source,
+                target_service=target, dep_type=dep_type,
+                created_at=int(time.time())))
+        except Exception as e:
+            if "UNIQUE" in str(e):
+                raise ToolError("依赖关系已存在")
+            raise
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_add_dependency", "service_dependency", did,
+                         {"project": proj["code"], "source": source,
+                          "target": target, "dep_type": dep_type,
+                          "via": "agent"})
+        return {"ok": True, "id": did, "source": source, "target": target,
+                "hint": "已记录；service_topology metric=publish_order 可查新发布顺序"}
+
+    # delete
+    try:
+        dependency_id = int(dependency_id)
+    except (TypeError, ValueError):
+        raise ToolError("action=delete 需要 dependency_id（整数，可先 list 查询）")
+    rec = dbm.get_record(db, "service_dependencies", dependency_id)
+    if not rec:
+        raise ToolError(f"依赖不存在: #{dependency_id}")
+    dbm.delete_record(db, "service_dependencies", dependency_id)
+    dbm.create_audit(db, ctx.user_id, ctx.username,
+                     "agent_delete_dependency", "service_dependency",
+                     dependency_id,
+                     {"project": rec.get("project_id"),
+                      "source": rec.get("source_service"),
+                      "target": rec.get("target_service"), "via": "agent"})
+    return {"ok": True, "id": dependency_id}
+
+
 # ---------- 注册表 ----------
 
 def _spec(name, description, params, permission, fn):
@@ -2518,6 +2771,16 @@ def build_tools() -> list:
               {"limit": num_opt}, "read", _pending_approvals),
         _spec("run_detail", "查看审批单（计划/状态/审批人/任务关联）",
               {"run_id": num}, "read", _run_detail),
+        _spec("service_topology",
+              "服务依赖拓扑与发布编排查询：metric=topology（项目依赖全图，"
+              "含 dubbo 自动检测）/ impact（单服务上下游直接+间接影响，发布前"
+              "评估）/ publish_order（建议发布顺序，被依赖的先发布，含环检测）/"
+              " snapshots（部署快照列表，部署成功自动写入）/ compare（两次快照"
+              "间服务版本差异；project+env 对比最近两次或 old_id+new_id 手动指定）",
+              {"metric": str_req, "project": str_opt, "env": str_opt,
+               "service": str_opt, "old_id": num_opt, "new_id": num_opt,
+               "limit": num_opt},
+              "read", _service_topology),
         # ---- write（operator/admin）----
         _spec("analyze_alert", "对告警做归因分析并保存建议（含近期发布/日志/案例关联）",
               {"alert_id": num}, "write", _analyze_alert),
@@ -2695,6 +2958,16 @@ def build_tools() -> list:
               {"action": str_req, "log_retention_days": num_opt,
                "log_archive_days": num_opt},
               "write", _manage_log_storage),
+        _spec("manage_dependencies",
+              "管理服务依赖关系（operator/admin，与 Web 拓扑页同等效力）："
+              "source 依赖 target（发布顺序上 target 先发布）。action=list/"
+              "create/delete；create 含环检测（拒绝成环）且服务名必须在项目内"
+              "存在（悬空拒绝）；dep_type=manual/dubbo。配合 service_topology "
+              "metric=impact/publish_order 查询影响面与发布顺序",
+              {"action": str_req, "project": str_opt,
+               "dependency_id": num_opt, "source": str_opt, "target": str_opt,
+               "dep_type": str_opt},
+              "write", _manage_dependencies),
 _spec("send_digest",
               "立即聚合并推送一次巡检日报（服务健康/告警/近24h发布/待审审批单"
               "/定时计划）到已配置的通知渠道；渠道未配置时提示先配置",
