@@ -203,6 +203,53 @@ def _switch_to_db_config(args) -> None:
     common_mod.CONFIG_DIR_OVERRIDE = tmp
 
 
+# 分片并行上传的文件大小下限：小文件单流更快，不值得多开 channel
+_SFTP_PARALLEL_MIN_SIZE = 64 * 1024 * 1024
+
+
+class _ThrottledProgress:
+    """上传进度聚合与节流日志：线程安全，每 10% 或每 15 秒至多输出一行。
+
+    单流上传用 set(t) 直接设置累计值（SFTP put 回调语义）；
+    分片并行上传各线程调用 add(n) 累加本通道写入量。
+    """
+
+    def __init__(self, host: str, label: str, total: int, start_time: float = None):
+        self.host = host
+        self.label = label
+        self.total = total
+        self.start = start_time or time.time()
+        self._lock = threading.Lock()
+        self._transferred = 0
+        self._last_pct = 0
+        self._last_log = self.start
+
+    def set(self, transferred: int):
+        with self._lock:
+            self._transferred = transferred
+            self._maybe_log()
+
+    def add(self, n: int):
+        with self._lock:
+            self._transferred += n
+            self._maybe_log()
+
+    def _maybe_log(self):
+        now = time.time()
+        pct = int(self._transferred * 100 / self.total) if self.total else 0
+        # 每 10% 或每 15 秒输出一次进度（与历史日志格式保持一致）
+        if pct >= self._last_pct + 10 or now - self._last_log >= 15:
+            elapsed = now - self.start
+            speed = self._transferred / elapsed / (1024 * 1024) if elapsed > 0 else 0
+            remaining_mb = (self.total - self._transferred) / (1024 * 1024)
+            eta = remaining_mb / speed if speed > 0 else 0
+            log(f"[{self.host}] 上传进度 {self.label}: {pct}% "
+                f"({self._transferred // (1024 * 1024)}/{self.total // (1024 * 1024)} MB) "
+                f"速度 {speed:.1f} MB/s 预计剩余 {eta:.0f}s")
+            self._last_log = now
+            self._last_pct = pct
+
+
 class RemoteServer:
     def __init__(self, host: str, ssh_cfg: dict):
         self.host = host
@@ -219,43 +266,119 @@ class RemoteServer:
 
     def sftp(self) -> paramiko.SFTPClient:
         if self._sftp is None:
+            # 调大本端 channel 窗口（默认 2MB）：SFTP 下载（日志拉取、compose 同步）
+            # 在高延迟链路受窗口限制明显；上传方向流量控制由服务端窗口决定，
+            # 本端调优无害，大文件上传提速由 sftp_put_with_progress 分片并行承担
+            self.client().get_transport().default_window_size = paramiko.common.MAX_WINDOW_SIZE
             self._sftp = self.client().open_sftp()
             # SFTP 通道设置超时，避免大文件传输时无限挂起（transport 层超时）
             self._sftp.get_channel().settimeout(300)
         return self._sftp
 
-    def sftp_put_with_progress(self, local_path: str, remote_path: str, label: str = ""):
+    def sftp_put_with_progress(self, local_path: str, remote_path: str, label: str = "",
+                               streams: int = 1):
         """通过 SFTP 上传文件并输出进度日志，避免大文件传输时看起来像卡住。
 
         label: 日志中显示的文件描述（如镜像包名），为空时使用文件名。
+        streams: 并行上传通道数（>1 且文件不小于 _SFTP_PARALLEL_MIN_SIZE 时启用
+            分片并行：多个 SFTP channel 各写目标文件一段 offset 区间，突破单
+            channel 吞吐上限，高延迟/高带宽链路提速明显；1 = 传统单流上传）。
         """
         file_size = os.path.getsize(local_path)
         if not label:
             label = Path(local_path).name
-        # 根据文件大小决定进度日志间隔：至少每 10% 输出一次，且不超过每 30 秒一次
         size_mb = file_size / (1024 * 1024)
-        log(f"[{self.host}] 开始上传 {label}（{size_mb:.1f} MB）-> {remote_path}")
+        parallel = streams > 1 and file_size >= _SFTP_PARALLEL_MIN_SIZE
+        log(f"[{self.host}] 开始上传 {label}（{size_mb:.1f} MB）-> {remote_path}"
+            + (f"（{min(int(streams), 8)} 通道并行）" if parallel else ""))
         start_time = time.time()
-        last_log_time = [start_time]
-        last_pct = [0]
-
-        def _progress(transferred: int, total: int):
-            now = time.time()
-            pct = int(transferred * 100 / total) if total else 0
-            # 每 10% 或每 15 秒输出一次进度
-            if pct >= last_pct[0] + 10 or now - last_log_time[0] >= 15:
-                elapsed = now - start_time
-                speed = transferred / elapsed / (1024 * 1024) if elapsed > 0 else 0
-                remaining_mb = (total - transferred) / (1024 * 1024)
-                eta = remaining_mb / speed if speed > 0 else 0
-                log(f"[{self.host}] 上传进度 {label}: {pct}% ({transferred // (1024*1024)}/{total // (1024*1024)} MB) "
-                    f"速度 {speed:.1f} MB/s 预计剩余 {eta:.0f}s")
-                last_log_time[0] = now
-                last_pct[0] = pct
-
-        self.sftp().put(local_path, remote_path, callback=_progress)
+        progress = _ThrottledProgress(self.host, label, file_size, start_time)
+        if parallel:
+            self._sftp_put_parallel(local_path, remote_path, file_size, streams, progress)
+        else:
+            self.sftp().put(local_path, remote_path,
+                            callback=lambda sent, _total: progress.set(sent))
         elapsed = time.time() - start_time
         log(f"[{self.host}] 上传完成 {label}，耗时 {elapsed:.1f}s")
+
+    def _sftp_put_parallel(self, local_path: str, remote_path: str, file_size: int,
+                           streams: int, progress: _ThrottledProgress):
+        """分片并行上传：先写 .part 临时文件，全部完成后校验大小再改名落正式名。
+
+        每个通道用独立 SFTP channel/file handle 写各自的 offset 区间
+        （SFTP 写请求自带 offset，多 handle 并发写同一文件互不覆盖）；
+        任一通道失败则清理 .part 并抛异常，由调用方按原有失败语义处理
+        （预传输记录失败、滚动发布阶段自动重试）。
+        """
+        part = remote_path + ".part"
+        streams = max(1, min(int(streams), 8))  # 上限 8：OpenSSH MaxSessions 默认 10，给 exec 留余量
+        # 先经 sftp() 触发 transport 窗口调优，并清理上次失败可能残留的 .part
+        try:
+            self.sftp().remove(part)
+        except IOError:
+            pass
+        # 分片边界：前 n-1 片等长，末片收尾
+        base = file_size // streams
+        ranges = []
+        offset = 0
+        for i in range(streams):
+            end = file_size if i == streams - 1 else offset + base
+            ranges.append((offset, end))
+            offset = end
+        errors = []
+
+        def _upload_range(idx: int):
+            seg_start, seg_end = ranges[idx]
+            handle = None
+            try:
+                # 首通道 'wb' 创建并截断 .part；其余通道 'r+b' 不截断，各写各的区间
+                handle = self.client().open_sftp().open(part, "wb" if idx == 0 else "r+b")
+                handle.set_pipelined(True)  # 写请求流水线化，不逐个等响应
+                handle.seek(seg_start)
+                with open(local_path, "rb") as f:
+                    f.seek(seg_start)
+                    remaining = seg_end - seg_start
+                    while remaining > 0:
+                        chunk = f.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise RuntimeError(f"本地文件 {local_path} 读取提前结束")
+                        handle.write(chunk)
+                        remaining -= len(chunk)
+                        progress.add(len(chunk))
+            except Exception as exc:  # 各通道异常汇聚到主线程统一抛出
+                errors.append(exc)
+            finally:
+                if handle is not None:
+                    try:
+                        # pipelined 模式下服务端写错误在 close 回收响应时暴露
+                        handle.close()
+                    except Exception as exc:
+                        errors.append(exc)
+
+        threads = [threading.Thread(target=_upload_range, args=(i,),
+                                    name=f"sftp-put-{self.host}-{i}") for i in range(streams)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            self._remove_quietly(part)
+            raise RuntimeError(f"[{self.host}] 并行上传 {Path(part).name} 失败: {errors[0]}")
+        remote_size = self.sftp().stat(part).st_size
+        if remote_size != file_size:
+            self._remove_quietly(part)
+            raise RuntimeError(
+                f"[{self.host}] 并行上传校验失败: 远端 {remote_size} 字节 != 本地 {file_size} 字节")
+        # 落正式名：先清理同版本残留（同 tag 重传场景），目标必不存在，rename 原子生效
+        self._remove_quietly(remote_path)
+        self.sftp().rename(part, remote_path)
+
+    def _remove_quietly(self, remote_path: str):
+        """删除远端文件；不存在或失败均忽略（清理场景不应产生新错误）"""
+        try:
+            self.sftp().remove(remote_path)
+        except Exception:
+            pass
 
     def exec(self, cmd: str, timeout: int = 60, stdin_data: str = None) -> str:
         """远程执行命令；stdin_data 非空时写入子进程 stdin（密码等敏感数据不落命令行）"""
@@ -322,6 +445,9 @@ class RemoteServer:
 
 class Deployer:
     _save_lock = threading.Lock()  # 串行化本地 docker save，避免并行发布时重复导出同一镜像
+    # 直传模式传输优化默认值（类级：__init__ 按 deploy 配置覆盖；测试可绕过 __init__ 构造）
+    upload_streams = 4        # 镜像包并行上传通道数（1 = 传统单流上传）
+    image_compress_level = 6  # docker save 导出 gzip 压缩级别（1-9）
     def __init__(self, project: str, version: str, previous_version: str = None, config: dict = None, env: str = None, canary: bool = False):
         self.project = project
         self.version = version
@@ -352,6 +478,11 @@ class Deployer:
             if not self.dist_dir.is_absolute():
                 self.dist_dir = Path(__file__).resolve().parent / self.dist_dir
             self.remote_tmp_dir = deploy_cfg.get("remote_tmp_dir", "/tmp/platform-deploy")
+            # 并行上传通道数（1-8）与镜像包压缩级别（1-9）；0/空串等非法值回退类默认
+            cfg_streams = as_number(deploy_cfg.get("upload_streams"), self.upload_streams)
+            self.upload_streams = max(1, min(int(cfg_streams) or self.upload_streams, 8))
+            cfg_level = as_number(deploy_cfg.get("image_compress_level"), self.image_compress_level)
+            self.image_compress_level = max(1, min(int(cfg_level) or self.image_compress_level, 9))
         else:
             self.full_image = f"{self.registry_host}/{self.registry_namespace}/{self.image_name}:{self.version}"
             # 首次发版无回滚版本（previous_version 未指定）时 prev_image 置空，失败则跳过容器回滚
@@ -586,7 +717,7 @@ class Deployer:
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     )
                     try:
-                        with gzip.open(str(local_tar), "wb", compresslevel=6) as fout:
+                        with gzip.open(str(local_tar), "wb", compresslevel=self.image_compress_level) as fout:
                             while True:
                                 chunk = proc.stdout.read(1024 * 1024)
                                 if not chunk:
@@ -627,7 +758,8 @@ class Deployer:
         tar_name = f"{self.image_name}_{version}.tar.gz"
         log(f"[{server.host}] 上传镜像包 {tar_name} 到 {self.remote_tmp_dir} ...")
         server.exec(f"mkdir -p {self.remote_tmp_dir}", timeout=15)
-        server.sftp_put_with_progress(str(local_tar), f"{self.remote_tmp_dir}/{tar_name}", label=tar_name)
+        server.sftp_put_with_progress(str(local_tar), f"{self.remote_tmp_dir}/{tar_name}",
+                                      label=tar_name, streams=self.upload_streams)
         log(f"[{server.host}] docker load {tar_name} ...")
         server.exec(f"docker load -i {self.remote_tmp_dir}/{tar_name}", timeout=600)
         loaded_id = server.image_id(image)

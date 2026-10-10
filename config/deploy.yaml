@@ -50,6 +50,10 @@
 #   canary_wait         - 首台灰度观察等待时间（秒），0 表示不等待
 #   dist_dir            - 直传模式（registry.mode=direct）本地镜像 tar 导出目录（相对本项目目录）
 #   remote_tmp_dir      - 直传模式服务器上存放镜像 tar 的临时目录
+#   upload_streams      - 直传模式镜像包并行上传通道数（1-8，默认 4）。多通道分片上传
+#                         突破单 SSH 通道吞吐上限，高延迟链路提速明显；配 1 回退传统单流
+#   image_compress_level - 镜像包 gzip 压缩级别（1-9，默认 6）。调低打包更快、包体略大；
+#                         带宽紧张可调高减小传输量
 #
 # Git Tag 相关：
 #   git_tag_suffix      - （可选）发布成功打 Git Tag 时附加在版本号后的后缀，最终 tag =

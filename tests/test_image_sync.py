@@ -33,7 +33,7 @@ class FakeServer:
         self.exec_calls.append(cmd)
         return ""
 
-    def sftp_put_with_progress(self, local_path, remote_path, label=""):
+    def sftp_put_with_progress(self, local_path, remote_path, label="", streams=1):
         self.uploaded.append((local_path, remote_path))
 
     def close(self):
@@ -217,7 +217,7 @@ class TestPrefetchImages(unittest.TestCase):
     def test_failures_collected_not_raised(self):
         """单台传输失败：不抛异常，返回失败 host 列表"""
         class FailServer(FakeServer):
-            def sftp_put_with_progress(self, local_path, remote_path, label=""):
+            def sftp_put_with_progress(self, local_path, remote_path, label="", streams=1):
                 raise RuntimeError("sftp timeout")
 
         servers = [{"ip": "10.0.0.1"}, {"ip": "10.0.0.2"}]

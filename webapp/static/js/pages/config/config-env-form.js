@@ -45,6 +45,8 @@
       { key:'canary_wait', label:'首台灰度等待（秒）', type:'number', hint:'0 = 不等待' },
       { key:'dist_dir', label:'直传临时目录（本地）', placeholder:'direct 模式镜像 tar 导出目录' },
       { key:'remote_tmp_dir', label:'直传临时目录（服务器）', placeholder:'direct 模式服务器存放 tar 的目录' },
+      { key:'upload_streams', label:'并行上传通道数', type:'number', hint:'direct 模式镜像包分片并行上传通道数（1-8），留空默认 4；1 = 传统单流，高延迟链路提速明显' },
+      { key:'image_compress_level', label:'镜像包压缩级别', type:'number', hint:'direct 模式 gzip 压缩级别（1-9），留空默认 6；调低打包更快、包体略大，带宽紧张可调高' },
       { key:'git_tag_suffix', label:'Git Tag 后缀', placeholder:'如 test', hint:'发布成功打 Git Tag 时附加在版本号后，最终 tag = v{version}-{后缀}；留空则打 v{version}。测试/生产环境配不同后缀可在 Git 上区分（如 test 配 test，prod 留空）' },
     ],
   };
