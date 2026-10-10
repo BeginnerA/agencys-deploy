@@ -589,6 +589,419 @@ def _case_update(ctx, case_id=None, root_cause=None, action=None,
             "hint": "案例已更新，后续相似故障可被检索复用"}
 
 
+# ---------- 工具实现（write：平台配置管理与闭环动作，均落审计） ----------
+
+def _jsonish(v, what: str):
+    """LLM 可能传对象或 JSON 字符串，统一还原为对象/列表"""
+    if v is None or isinstance(v, (dict, list)):
+        return v
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except ValueError:
+            raise ToolError(f"{what} 必须为对象/数组或其 JSON 字符串")
+    raise ToolError(f"{what} 类型非法")
+
+
+def _validate_cron(cron_expr: str) -> int:
+    """校验 cron 表达式并返回下次执行时间戳（与路由/调度器同一校验口径）"""
+    try:
+        from croniter import croniter
+        from datetime import datetime
+        return int(croniter(cron_expr, datetime.now()).get_next())
+    except ImportError:
+        raise ToolError("服务端未安装 croniter，无法校验 cron 表达式")
+    except (ValueError, KeyError) as e:
+        raise ToolError(f"cron 表达式无效: {e}")
+
+
+def _validate_window_scope(scope) -> str:
+    """校验窗口 scope 结构（与 deploy_enhance_routes._validate_scope 对齐）"""
+    if not isinstance(scope, dict):
+        return "scope 格式错误"
+    if scope.get("type") not in ("all", "project", "env", "server", "service"):
+        return "scope type 非法"
+    if not isinstance(scope.get("ids"), list):
+        return "scope.ids 需为列表"
+    if "env_ids" in scope and not isinstance(scope["env_ids"], list):
+        return "scope.env_ids 需为列表"
+    return ""
+
+
+def _validate_canary_steps(steps) -> list:
+    """steps 结构校验与归一化（与 compute_canary_batches 消费口径对齐）"""
+    steps = _jsonish(steps, "steps")
+    if not isinstance(steps, list) or not steps:
+        raise ToolError("steps 必须为非空数组")
+    out = []
+    for st in steps:
+        if not isinstance(st, dict) or "batch" not in st or "servers" not in st:
+            raise ToolError("steps 每项需含 batch 与 servers 字段")
+        srv = st["servers"]
+        if srv != "all" and not isinstance(srv, int):
+            raise ToolError('steps.servers 需为整数或 "all"')
+        out.append({"batch": int(st["batch"]), "servers": srv,
+                    "observe_minutes": int(st.get("observe_minutes", 0)),
+                    "auto_advance": bool(st.get("auto_advance", False))})
+    return out
+
+
+def _schedule_out(s: dict) -> dict:
+    return {"id": s["id"], "name": s["name"], "type": s["type"],
+            "project_id": s["project_id"],
+            "ref_type": s.get("ref_type", "project"),
+            "ref_id": s.get("ref_id", 0),
+            "env": s.get("env", ""), "version": s.get("version", ""),
+            "previous_version": s.get("previous_version", ""),
+            "enabled": s.get("enabled", 1),
+            "schedule_at": _fmt_ts(s.get("schedule_at")),
+            "cron_expr": s.get("cron_expr", ""),
+            "next_run_at": _fmt_ts(s.get("next_run_at")),
+            "last_run_at": _fmt_ts(s.get("last_run_at"))}
+
+
+def _manage_schedules(ctx, action=None, schedule_id=None, project=None,
+                      name="", type="once", service="", env="", version="",
+                      previous_version="", schedule_at=0, cron_expr="",
+                      extra=None, **kw) -> dict:
+    """定时计划管理：list/create/update/delete/toggle；run 生成审批单"""
+    db = ctx.db_path
+    action = action or "list"
+    if action == "list":
+        proj = _resolve_project(db, project or "")
+        if proj:
+            rows = dbm.list_records(db, "deploy_schedules", "project_id=?",
+                                    (proj["id"],), "id DESC")
+        else:
+            rows = dbm.list_records(db, "deploy_schedules", "", (), "id DESC")
+        return {"schedules": [_schedule_out(s) for s in rows[:50]]}
+    if action == "create":
+        proj = _resolve_project(db, project or "")
+        if not proj:
+            raise ToolError("缺少项目 project（id/code/name）")
+        if not name.strip():
+            raise ToolError("缺少计划名称 name")
+        if type not in ("once", "cron"):
+            raise ToolError("type 必须为 once 或 cron")
+        ref_type, ref_id = "project", proj["id"]
+        if service:
+            svc = _find_service(db, proj["code"], service)
+            ref_type, ref_id = "service", svc["id"]
+        if type == "cron":
+            if not cron_expr:
+                raise ToolError("cron 类型必须提供 cron_expr")
+            next_run_at = _validate_cron(cron_expr)
+        else:
+            if not schedule_at:
+                raise ToolError("once 类型必须提供 schedule_at（Unix 秒时间戳）")
+            next_run_at = int(schedule_at)
+        sid = dbm.create_record(db, "deploy_schedules", dict(
+            project_id=proj["id"], type=type, name=name.strip(),
+            ref_type=ref_type, ref_id=ref_id, env=env or "",
+            version=version or "", previous_version=previous_version or "",
+            extra=json.dumps(extra, ensure_ascii=False) if extra else "[]",
+            schedule_at=int(schedule_at or 0), cron_expr=cron_expr or "",
+            enabled=1, last_run_at=0, next_run_at=next_run_at,
+            created_by=ctx.user_id, created_at=int(time.time())))
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_create_schedule", "deploy_schedules", sid,
+                         {"name": name, "type": type, "via": "agent"})
+        return {"id": sid, "enabled": True,
+                "next_run_at": _fmt_ts(next_run_at),
+                "hint": "计划已创建并启用，到点由调度器自动执行"}
+    sched = dbm.get_record(db, "deploy_schedules", int(schedule_id or 0)) \
+        if schedule_id else None
+    if not sched:
+        raise ToolError("缺少或不存在 schedule_id")
+    if action == "update":
+        fields = {}
+        if name:
+            fields["name"] = name.strip()
+        if env != "":
+            fields["env"] = env
+        if version != "":
+            fields["version"] = version
+        if previous_version != "":
+            fields["previous_version"] = previous_version
+        if cron_expr:
+            fields["cron_expr"] = cron_expr
+            # 同步重算 next_run_at，保证新表达式立即生效（与路由 update 对齐）
+            fields["next_run_at"] = _validate_cron(cron_expr)
+        if schedule_at:
+            fields["schedule_at"] = int(schedule_at)
+            fields["next_run_at"] = int(schedule_at)
+        if extra is not None:
+            fields["extra"] = json.dumps(extra, ensure_ascii=False)
+        if service:
+            svc = _find_service(db, "", service)
+            fields["ref_type"], fields["ref_id"] = "service", svc["id"]
+        if not fields:
+            raise ToolError("未提供任何要修改的字段")
+        dbm.update_record(db, "deploy_schedules", sched["id"], fields)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_update_schedule", "deploy_schedules",
+                         sched["id"], fields)
+        return {"ok": True, "updated": list(fields)}
+    if action == "delete":
+        dbm.delete_record(db, "deploy_schedules", sched["id"])
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_delete_schedule", "deploy_schedules",
+                         sched["id"], {"name": sched["name"], "via": "agent"})
+        return {"ok": True, "deleted": sched["name"]}
+    if action == "toggle":
+        new_enabled = 0 if sched["enabled"] else 1
+        dbm.update_record(db, "deploy_schedules", sched["id"],
+                          {"enabled": new_enabled})
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_toggle_schedule", "deploy_schedules",
+                         sched["id"], {"enabled": new_enabled, "via": "agent"})
+        return {"id": sched["id"], "enabled": bool(new_enabled)}
+    if action == "run":
+        try:
+            run = executor_mod.plan_schedule_run(
+                db, {"id": ctx.user_id, "username": ctx.username},
+                sched["id"], intent="Agent 手动执行定时计划")
+        except executor_mod.ExecutorError as e:
+            raise ToolError(str(e))
+        plan = run.get("plan") or {}
+        return {"run_id": run["id"], "status": run["status"],
+                "plan": {"op": plan.get("op"), "target": plan.get("target"),
+                         "env": plan.get("env"),
+                         "window_warning": plan.get("window_warning", False),
+                         "window_text": plan.get("window_text", ""),
+                         "steps": plan.get("steps", [])},
+                "hint": "已生成审批单，人工审批通过后才会执行"}
+    raise ToolError("action 仅支持 list/create/update/delete/toggle/run")
+
+
+def _manage_windows(ctx, action=None, window_id=None, name="",
+                    block_level="warn", start_at=0, end_at=0,
+                    repeat_yearly=False, scope=None, project=None, **kw) -> dict:
+    """发布窗口管理（仅 admin，与 Web 端权限一致）"""
+    db = ctx.db_path
+    if (ctx.role or "").lower() != "admin":
+        raise ToolError("发布窗口管理仅 admin 可操作（与 Web 端权限一致）")
+    action = action or "list"
+    if action == "list":
+        rows = dbm.list_records(db, "release_windows", "", (), "id DESC")
+        return {"windows": [
+            {"id": w["id"], "name": w["name"],
+             "project_id": w.get("project_id", 0),
+             "start": _fmt_ts(w.get("start_at")),
+             "end": _fmt_ts(w.get("end_at")),
+             "block_level": w.get("block_level"),
+             "repeat_yearly": w.get("repeat_yearly", 0),
+             "scope": w.get("scope") or {"type": "all", "ids": []}}
+            for w in rows[:50]]}
+    if action == "create":
+        if not name.strip():
+            raise ToolError("缺少窗口名称 name")
+        if block_level not in ("block", "warn"):
+            raise ToolError("block_level 必须为 block 或 warn")
+        if not start_at or not end_at:
+            raise ToolError("缺少 start_at / end_at（Unix 秒时间戳）")
+        scope = _jsonish(scope, "scope") or {"type": "all", "ids": []}
+        err = _validate_window_scope(scope)
+        if err:
+            raise ToolError(err)
+        proj = _resolve_project(db, project or "")
+        wid = dbm.create_record(db, "release_windows", dict(
+            project_id=proj["id"] if proj else 0, name=name.strip(),
+            start_at=int(start_at), end_at=int(end_at),
+            block_level=block_level, scope=scope,
+            repeat_yearly=1 if repeat_yearly else 0,
+            created_by=ctx.user_id, created_at=int(time.time())))
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_create_window", "release_windows", wid,
+                         {"name": name, "block_level": block_level,
+                          "via": "agent"})
+        return {"id": wid, "hint": "窗口已生效，命中项目的发布计划将受限"}
+    win = dbm.get_record(db, "release_windows", int(window_id or 0)) \
+        if window_id else None
+    if not win:
+        raise ToolError("缺少或不存在 window_id")
+    if action == "update":
+        fields = {}
+        if name:
+            fields["name"] = name.strip()
+        if block_level in ("block", "warn"):
+            fields["block_level"] = block_level
+        if start_at:
+            fields["start_at"] = int(start_at)
+        if end_at:
+            fields["end_at"] = int(end_at)
+        if kw.get("repeat_yearly") is not None:
+            fields["repeat_yearly"] = 1 if kw["repeat_yearly"] else 0
+        if scope is not None:
+            scope = _jsonish(scope, "scope")
+            err = _validate_window_scope(scope)
+            if err:
+                raise ToolError(err)
+            fields["scope"] = scope
+        if not fields:
+            raise ToolError("未提供任何要修改的字段")
+        dbm.update_record(db, "release_windows", win["id"], fields)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_update_window", "release_windows",
+                         win["id"], fields)
+        return {"ok": True, "updated": list(fields)}
+    if action == "delete":
+        dbm.delete_record(db, "release_windows", win["id"])
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_delete_window", "release_windows",
+                         win["id"], {"name": win["name"], "via": "agent"})
+        return {"ok": True, "deleted": win["name"]}
+    raise ToolError("action 仅支持 list/create/update/delete")
+
+
+def _manage_canary(ctx, action=None, config_id=None, project=None,
+                   name="", steps=None, is_default=None, **kw) -> dict:
+    """灰度策略管理：list/create/update/delete/set_default"""
+    db = ctx.db_path
+    action = action or "list"
+    if action == "list":
+        proj = _resolve_project(db, project or "")
+        if proj:
+            rows = dbm.list_records(db, "canary_configs", "project_id=?",
+                                    (proj["id"],), "id")
+        else:
+            rows = dbm.list_records(db, "canary_configs", "", (), "id")
+        return {"canary_configs": [
+            {"id": c["id"], "name": c["name"],
+             "project_id": c["project_id"],
+             "is_default": c.get("is_default", 0),
+             "steps": c.get("steps") or []} for c in rows]}
+    if action == "create":
+        proj = _resolve_project(db, project or "")
+        if not proj:
+            raise ToolError("缺少项目 project（id/code/name）")
+        if not name.strip():
+            raise ToolError("缺少策略名称 name")
+        norm_steps = _validate_canary_steps(steps)
+        conn = dbm.get_conn(db)
+        try:
+            if is_default:
+                conn.execute(
+                    "UPDATE canary_configs SET is_default=0 "
+                    "WHERE project_id=? AND is_default=1", (proj["id"],))
+                conn.commit()
+        finally:
+            conn.close()
+        cid = dbm.create_record(db, "canary_configs", dict(
+            project_id=proj["id"], name=name.strip(),
+            steps=json.dumps(norm_steps, ensure_ascii=False),
+            is_default=1 if is_default else 0, created_at=int(time.time())))
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_create_canary", "canary_configs", cid,
+                         {"name": name, "is_default": bool(is_default),
+                          "via": "agent"})
+        return {"id": cid, "is_default": bool(is_default)}
+    cfg = dbm.get_record(db, "canary_configs", int(config_id or 0)) \
+        if config_id else None
+    if not cfg:
+        raise ToolError("缺少或不存在 config_id")
+    if action in ("update", "set_default"):
+        fields = {}
+        if action == "set_default" or is_default:
+            fields["is_default"] = 1 if (action == "set_default" or is_default) else 0
+        if name:
+            fields["name"] = name.strip()
+        if steps is not None:
+            fields["steps"] = json.dumps(_validate_canary_steps(steps),
+                                         ensure_ascii=False)
+        if not fields:
+            raise ToolError("未提供任何要修改的字段")
+        if fields.get("is_default") == 1:
+            # 设为默认时先清除同项目其他默认策略，保证唯一（与路由语义对齐）
+            conn = dbm.get_conn(db)
+            try:
+                conn.execute(
+                    "UPDATE canary_configs SET is_default=0 "
+                    "WHERE project_id=? AND is_default=1 AND id<>?",
+                    (cfg["project_id"], cfg["id"]))
+                conn.commit()
+            finally:
+                conn.close()
+        dbm.update_record(db, "canary_configs", cfg["id"], fields)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         f"agent_{action}_canary", "canary_configs",
+                         cfg["id"], fields)
+        return {"ok": True, "updated": list(fields)}
+    if action == "delete":
+        dbm.delete_record(db, "canary_configs", cfg["id"])
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_delete_canary", "canary_configs", cfg["id"],
+                         {"name": cfg["name"], "via": "agent"})
+        return {"ok": True, "deleted": cfg["name"]}
+    raise ToolError("action 仅支持 list/create/update/delete/set_default")
+
+
+def _canary_decision(ctx, task_id=None, action=None, **kw) -> dict:
+    """灰度运行中决策（与 Web 端 POST /deploy/canary-decisions 同语义）"""
+    if action not in ("continue", "stop", "rollback"):
+        raise ToolError("action 必须为 continue/stop/rollback")
+    try:
+        task_id = int(task_id)
+    except (TypeError, ValueError):
+        raise ToolError("缺少 task_id（整数）")
+    from deploy import read_canary_decision, canary_decision_path
+    cur = read_canary_decision(task_id)
+    if cur.get("state") != "waiting":
+        raise ToolError(f"任务 #{task_id} 当前无等待中的灰度决策"
+                        f"（state={cur.get('state')}）")
+    path = canary_decision_path(task_id)
+    cur["state"] = action
+    cur["updated_at"] = int(time.time())
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False)
+    except OSError:
+        raise ToolError("决策文件写入失败（任务可能已结束）")
+    dbm.create_audit(ctx.db_path, ctx.user_id, ctx.username,
+                     "agent_canary_decision", "tasks", task_id,
+                     {"action": action, "via": "agent"})
+    return {"task_id": task_id, "action": action,
+            "hint": "决策已写入，发布子进程将在下轮轮询时读取"}
+
+
+def _set_alert_status(ctx, alert_id=None, action=None, note="", **kw) -> dict:
+    """告警闭环：resolve 解决 / reopen 重开（确认请用 ack_alert；与路由语义一致）"""
+    db = ctx.db_path
+    if action not in ("resolve", "reopen"):
+        raise ToolError("action 仅支持 resolve/reopen（确认请用 ack_alert）")
+    try:
+        alert_id = int(alert_id)
+    except (TypeError, ValueError):
+        raise ToolError("缺少 alert_id（整数）")
+    alert = dbm.get_record(db, "alerts", alert_id)
+    if not alert:
+        raise ToolError(f"告警不存在: #{alert_id}")
+    now = int(time.time())
+    if action == "resolve":
+        if alert["status"] == "resolved":
+            raise ToolError(f"告警 #{alert_id} 已是解决状态")
+        dbm.update_record(db, "alerts", alert_id, dict(
+            status="resolved", resolved_by=ctx.username,
+            resolved_at=now, resolved_type="manual"))
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_resolve_alert", "alerts", alert_id,
+                         {"subject": alert.get("subject"), "via": "agent",
+                          "note": note or ""})
+        return {"ok": True, "alert_id": alert_id, "status": "resolved",
+                "hint": "已标记解决；建议沉淀归因为案例供后续复用"}
+    if alert["status"] != "resolved":
+        raise ToolError("仅已解决告警可重新打开")
+    dbm.update_record(db, "alerts", alert_id, dict(
+        status="firing", resolved_by="", resolved_at=None,
+        resolved_type="", first_seen_at=now, last_seen_at=now,
+        notify_count=0, escalation_level=0))
+    dbm.create_audit(db, ctx.user_id, ctx.username,
+                     "agent_reopen_alert", "alerts", alert_id,
+                     {"subject": alert.get("subject"), "via": "agent",
+                      "note": note or ""})
+    return {"ok": True, "alert_id": alert_id, "status": "firing"}
+
+
 # ---------- 注册表 ----------
 
 def _spec(name, description, params, permission, fn):
@@ -677,6 +1090,48 @@ def build_tools() -> list:
                "result": str_opt, "lesson": str_opt, "title": str_opt,
                "tags": {"type": "array", "items": {"type": "string"}}},
               "write", _case_update),
+        _spec("manage_schedules",
+              "管理定时发布计划。action=list/create/update/delete/toggle/run；"
+              "create 需 project+name+type（once 需 schedule_at Unix 秒，"
+              "cron 需 cron_expr），service 可选指定服务级计划；"
+              "run 生成审批单需人工审批后才执行",
+              {"action": str_req, "project": str_opt, "schedule_id": num_opt,
+               "name": str_opt, "type": str_opt, "service": str_opt,
+               "env": str_opt, "version": str_opt,
+               "previous_version": str_opt, "schedule_at": num_opt,
+               "cron_expr": str_opt,
+               "extra": {"type": "array", "items": {"type": "string"}}},
+              "write", _manage_schedules),
+        _spec("manage_windows",
+              "管理发布窗口（仅 admin）。action=list/create/update/delete；"
+              "create 需 name+start_at+end_at（Unix 秒），"
+              "block_level=block（禁发）/warn（发布需确认），"
+              "scope 可选 {type: all/project/env/server/service, ids: []}，"
+              "repeat_yearly 表示每年重复",
+              {"action": str_req, "window_id": num_opt, "name": str_opt,
+               "block_level": str_opt, "start_at": num_opt,
+               "end_at": num_opt, "repeat_yearly": bool_opt,
+               "scope": {"type": "object"}, "project": str_opt},
+              "write", _manage_windows),
+        _spec("manage_canary",
+              "管理灰度策略。action=list/create/update/delete/set_default；"
+              "steps 形如 [{batch:1, servers:1, observe_minutes:10, "
+              "auto_advance:false}]（servers 可为 all）；"
+              "set_default 将该策略设为项目默认",
+              {"action": str_req, "project": str_opt, "config_id": num_opt,
+               "name": str_opt,
+               "steps": {"type": "array", "items": {"type": "object"}},
+               "is_default": bool_opt},
+              "write", _manage_canary),
+        _spec("canary_decision",
+              "对等待中的灰度任务提交决策：action=continue 继续/stop 停止/"
+              "rollback 回滚首台（需提供发布任务 task_id）",
+              {"task_id": num, "action": str_req}, "write", _canary_decision),
+        _spec("set_alert_status",
+              "告警闭环：action=resolve 标记解决/reopen 重开已解决告警"
+              "（确认告警请用 ack_alert）",
+              {"alert_id": num, "action": str_req, "note": str_opt},
+              "write", _set_alert_status),
     ]
 
 

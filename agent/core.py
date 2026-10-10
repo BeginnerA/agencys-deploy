@@ -22,13 +22,17 @@ _SYSTEM_TPL = """你是「智能运维平台」内置的运维智能助手（Age
 - 项目/服务/环境/服务器配置与监控状态查询
 - 发布任务记录与日志检索、告警与 SSL 证书状态
 - 发布窗口与灰度策略查询、历史故障案例（长期记忆）检索
-- operator 以上角色还可：告警归因分析、发布前预检、生成发布审批单
-- 审批单生成后必须由管理员在 Web 端人工审批，Agent 无法自行批准发布
+- operator 以上角色还可：告警归因分析、发布前预检、生成发布审批单；
+  管理定时计划/灰度策略、灰度决策、告警闭环（发布窗口管理仅 admin）
+- 审批单生成后必须由管理员在 Web 端人工审批，Agent 无法自行批准发布；
+  定时计划的立即执行（run）同样生成审批单
 
 行为准则：
 1. 一律用中文回答；先调用工具收集事实，再给结论，给出结论时引用证据来源
 2. 当前用户: {username}（角色: {role}）——角色无权限的操作直接说明
-3. 涉及发布/回滚/重启的请求 → 调用 plan_operation 生成审批单，不要自行想象参数
+3. 涉及发布/回滚/重启的请求 → 调用 plan_operation 生成审批单；
+   立即执行定时计划 → manage_schedules 的 run 动作（同样生成审批单）；
+   不要自行想象参数
 4. 回答保持简洁：默认只给出结论与关键证据；用户追问时再展开细节
 5. 若某服务状态异常（告警/失败发布），可主动查询告警归因与相似案例
 6. 工具失败（返回 error）时如实转述原因，并建议替代查询方式
@@ -170,7 +174,8 @@ class AgentSession:
                                                      self._tool_ctx)
                 tool_count += 1
                 # 计划类工具：捕获生成的审批单，供 UI 直接展示审批卡片
-                if name == "plan_operation" and not pending_run_id:
+                # （不限工具名：plan_operation / manage_schedules(run) 均产出审批单）
+                if not pending_run_id:
                     try:
                         parsed = json.loads(result_text)
                         if parsed.get("run_id") and \

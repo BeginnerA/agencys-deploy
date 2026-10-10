@@ -239,6 +239,76 @@ def plan_operation(db_path: str, user: dict, op: str, target: str = "",
     return get_run(db_path, run_id)
 
 
+def plan_schedule_run(db_path: str, user: dict, schedule_id: int,
+                      intent: str = "") -> dict:
+    """生成「定时计划立即执行」审批单（kind=schedule_run）
+
+    与 Web 端 run_schedule 等效，但 Agent 通道必须经人工审批；
+    block 窗口直接拒单，warn 窗口审批时需显式 force_window。"""
+    try:
+        schedule_id = int(schedule_id)
+    except (TypeError, ValueError):
+        raise ExecutorError("缺少 schedule_id（整数）")
+    sched = dbm.get_record(db_path, "deploy_schedules", schedule_id)
+    if not sched:
+        raise ExecutorError(f"定时计划不存在: #{schedule_id}")
+    warn, window_text = _window_warning(db_path, sched["project_id"])
+    # 任务名解析与 run_schedule 对齐：服务级计划显示服务名
+    target_name = sched["name"]
+    if sched.get("ref_type") == "service" and sched.get("ref_id"):
+        svc = dbm.get_record(db_path, "services", sched["ref_id"])
+        if svc:
+            target_name = svc["name"]
+    when = (_fmt_cron(sched.get("cron_expr")) if sched["type"] == "cron"
+            else _fmt_ts(sched.get("schedule_at")))
+    plan = {
+        "op": "schedule_run", "kind": "schedule",
+        "target": target_name,
+        "env": sched["env"], "version": sched["version"],
+        "previous_version": sched["previous_version"],
+        "flags": {},
+        "window_warning": warn, "window_text": window_text,
+        "steps": [
+            f"执行定时计划「{sched['name']}」(#{schedule_id}，{sched['type']}"
+            + (f"，计划时间 {when}" if when else "") + ")",
+            f"目标: {sched['ref_type']} ref_id={sched['ref_id']} 环境 {sched['env'] or '-'}",
+            "按计划参数创建发布任务并提交执行（与 Web 端手动执行一致）",
+        ],
+        "cli": f"POST /api/deploy/schedules/{schedule_id}/run（手动执行定时计划）",
+    }
+    run_id = dbm.create_record(db_path, "agent_runs", dict(
+        kind="schedule_run", project_id=sched["project_id"],
+        ref_type="deploy_schedules", ref_id=sched["id"],
+        name=sched["name"], env=sched["env"], version=sched["version"],
+        previous_version=sched["previous_version"],
+        intent=intent or "", plan=plan,
+        status="awaiting_approval",
+        created_by=int(user.get("id", 0)),
+        created_by_name=user.get("username", ""),
+        created_at=_now()))
+    return get_run(db_path, run_id)
+
+
+def _fmt_ts(ts) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+    except (TypeError, OSError, ValueError):
+        return ""
+
+
+def _fmt_cron(expr: str) -> str:
+    """cron 表达式附下次执行时间，便于审批人确认"""
+    if not expr:
+        return ""
+    try:
+        from croniter import croniter
+        from datetime import datetime
+        nxt = int(croniter(expr, datetime.now()).get_next())
+        return f"{expr}（下次 { _fmt_ts(nxt) }）"
+    except Exception:
+        return expr
+
+
 def get_run(db_path: str, run_id: int) -> dict:
     run = dbm.get_record(db_path, "agent_runs", run_id)
     if not run:
@@ -264,9 +334,38 @@ def list_runs(db_path: str, status: str = "", project_id: int = 0,
 
 
 def _submit_task(db_path: str, run: dict) -> int:
-    """按计划创建平台任务并提交执行（复用 deploy_routes.create_task 的参数语义）"""
+    """按计划创建平台任务并提交执行（复用 deploy_routes.create_task 的参数语义）
+
+    kind=schedule_run（定时计划立即执行）按调度器 _process_due_locked 同语义
+    创建任务：ref_type/ref_id/version 取计划原值，force_window 追加 --force-window。
+    """
     plan = run.get("plan") or {}
     flags = plan.get("flags") or {}
+    if run.get("ref_type") == "deploy_schedules":
+        sched = dbm.get_record(db_path, "deploy_schedules", run["ref_id"])
+        if not sched:
+            raise ExecutorError(f"定时计划不存在或已删除: #{run['ref_id']}")
+        try:
+            extra = json.loads(sched.get("extra") or "[]")
+        except (ValueError, TypeError):
+            extra = []
+        if not isinstance(extra, list):
+            extra = []
+        if run.get("force_window"):
+            extra.append("--force-window")
+        # ref_type=service 时，解析服务名作为任务名（与 run_schedule 对齐）
+        task_name = sched["name"]
+        if sched.get("ref_type") == "service" and sched.get("ref_id"):
+            svc = dbm.get_record(db_path, "services", sched["ref_id"])
+            if svc:
+                task_name = svc["name"]
+        task_id = dbm.create_task(
+            db_path, sched["project_id"], sched["ref_type"], sched["ref_id"],
+            task_name, sched["env"], sched["version"],
+            sched["previous_version"], run["created_by"], extra=extra)
+        task = dbm.get_task(db_path, task_id)
+        task_manager.submit_task(db_path, task, extra)
+        return task_id
     type_ = "pipeline" if run["ref_type"] == "pipelines" else \
         ("restart" if plan.get("op") == "restart" else "project")
     action = "rollback" if flags.get("rollback") else \

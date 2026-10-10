@@ -742,5 +742,159 @@ class TestMcpServer(AgentBase):
         self.assertEqual(payload["status"], "awaiting_approval")
 
 
+class TestAgentManageTools(AgentBase):
+    """配置管理工具接入：定时计划 / 发布窗口 / 灰度策略 / 灰度决策 / 告警闭环"""
+
+    def _ctx(self, role="admin"):
+        return type("Ctx", (), {"db_path": self.db, "user_id": 1,
+                                "username": "tester", "role": role})()
+
+    def _call(self, name, args, role="admin"):
+        from agent import tools as tools_mod
+        return json.loads(tools_mod.execute_tool(role, name, args,
+                                                 self._ctx(role)))
+
+    def test_new_tools_role_filtering(self):
+        from agent import tools as tools_mod
+        viewer_names = {t["name"] for t in tools_mod.visible_tools("viewer")}
+        admin_names = {t["name"] for t in tools_mod.visible_tools("admin")}
+        for n in ("manage_schedules", "manage_windows", "manage_canary",
+                  "canary_decision", "set_alert_status"):
+            self.assertNotIn(n, viewer_names)
+            self.assertIn(n, admin_names)
+
+    def test_schedules_lifecycle(self):
+        out = self._call("manage_schedules", {
+            "action": "create", "project": "plat", "name": "夜间发布",
+            "type": "once", "env": "prod", "version": "1.2.0",
+            "previous_version": "1.1.0",
+            "schedule_at": int(time.time()) + 3600})
+        self.assertIn("id", out)
+        sid = out["id"]
+        rows = self._call("manage_schedules", {"action": "list",
+                                               "project": "plat"})
+        self.assertEqual(len(rows["schedules"]), 1)
+        self.assertEqual(rows["schedules"][0]["enabled"], 1)
+        # cron 计划与表达式校验
+        out2 = self._call("manage_schedules", {
+            "action": "create", "project": "plat", "name": "每日发布窗口",
+            "type": "cron", "cron_expr": "0 3 * * *", "env": "test",
+            "version": "1.2.1"})
+        self.assertIn("id", out2)
+        bad = self._call("manage_schedules", {
+            "action": "create", "project": "plat", "name": "坏表达式",
+            "type": "cron", "cron_expr": "not-a-cron"})
+        self.assertIn("error", bad)
+        upd = self._call("manage_schedules", {
+            "action": "update", "schedule_id": sid, "name": "夜间发布v2"})
+        self.assertTrue(upd["ok"])
+        tog = self._call("manage_schedules", {"action": "toggle",
+                                              "schedule_id": sid})
+        self.assertFalse(tog["enabled"])
+        dele = self._call("manage_schedules", {"action": "delete",
+                                               "schedule_id": sid})
+        self.assertTrue(dele["ok"])
+
+    def test_schedule_run_requires_approval_then_executes(self):
+        out = self._call("manage_schedules", {
+            "action": "create", "project": "plat", "name": "手动执行计划",
+            "type": "once", "service": "auth", "env": "prod",
+            "version": "1.2.0", "previous_version": "1.1.0",
+            "schedule_at": int(time.time()) + 60})
+        sid = out["id"]
+        run_out = self._call("manage_schedules", {"action": "run",
+                                                  "schedule_id": sid})
+        self.assertEqual(run_out["status"], "awaiting_approval")
+        run_id = run_out["run_id"]
+        rec = dbm.get_record(self.db, "agent_runs", run_id)
+        self.assertEqual(rec["kind"], "schedule_run")
+        self.assertEqual(rec["ref_type"], "deploy_schedules")
+        # 审批通过 → 复用平台任务通道（mock 子进程提交）
+        with mock.patch("agent.executor.task_manager.submit_task") as sub:
+            from agent.executor import decide_run
+            r2 = decide_run(self.db, run_id, USER, action="approve")
+        self.assertEqual(r2["status"], "executing")
+        sub.assert_called_once()
+        task = dbm.get_task(self.db, r2["task_id"])
+        self.assertEqual(task["type"], "service")   # 计划的 ref_type
+        self.assertEqual(task["name"], "auth")       # 服务级计划用服务名
+
+    def test_windows_admin_only_and_lifecycle(self):
+        denied = self._call("manage_windows", {"action": "list"},
+                            role="operator")
+        self.assertIn("error", denied)
+        now = int(time.time())
+        out = self._call("manage_windows", {
+            "action": "create", "name": "春节封网", "block_level": "block",
+            "start_at": now + 3600, "end_at": now + 7200,
+            "scope": {"type": "project", "ids": [self.proj_id]}})
+        self.assertIn("id", out)
+        wid = out["id"]
+        rows = self._call("manage_windows", {"action": "list"})
+        self.assertEqual(rows["windows"][0]["name"], "春节封网")
+        upd = self._call("manage_windows", {
+            "action": "update", "window_id": wid,
+            "block_level": "warn", "repeat_yearly": True})
+        self.assertTrue(upd["ok"])
+        bad_scope = self._call("manage_windows", {
+            "action": "create", "name": "坏scope", "start_at": now,
+            "end_at": now + 60, "scope": {"type": "ghost", "ids": []}})
+        self.assertIn("error", bad_scope)
+        dele = self._call("manage_windows", {"action": "delete",
+                                             "window_id": wid})
+        self.assertTrue(dele["ok"])
+
+    def test_canary_default_uniqueness(self):
+        steps = [{"batch": 1, "servers": 1, "observe_minutes": 5}]
+        c1 = self._call("manage_canary", {
+            "action": "create", "project": "plat", "name": "默认策略",
+            "steps": steps, "is_default": True})
+        c2 = self._call("manage_canary", {
+            "action": "create", "project": "plat", "name": "备用策略",
+            "steps": steps})
+        # set_default 切换后，同项目仅剩一个默认
+        self._call("manage_canary", {"action": "set_default",
+                                     "config_id": c2["id"]})
+        rows = self._call("manage_canary", {"action": "list",
+                                            "project": "plat"})
+        defaults = [c for c in rows["canary_configs"] if c["is_default"]]
+        self.assertEqual(len(defaults), 1)
+        self.assertEqual(defaults[0]["id"], c2["id"])
+        bad_steps = self._call("manage_canary", {
+            "action": "create", "project": "plat", "name": "坏steps",
+            "steps": [{"servers": 1}]})
+        self.assertIn("error", bad_steps)
+        dele = self._call("manage_canary", {"action": "delete",
+                                            "config_id": c1["id"]})
+        self.assertTrue(dele["ok"])
+
+    def test_canary_decision_requires_waiting(self):
+        out = self._call("canary_decision", {"task_id": 999,
+                                             "action": "continue"})
+        self.assertIn("error", out)
+
+    def test_alert_resolve_reopen(self):
+        now = int(time.time())
+        alert_id = dbm.create_record(self.db, "alerts", dict(
+            rule_id=0, fingerprint="fp-1", status="firing", severity="P1",
+            subject="auth 502", description="", target_info="{}",
+            first_seen_at=now, last_seen_at=now))
+        out = self._call("set_alert_status", {
+            "action": "resolve", "alert_id": alert_id})
+        self.assertEqual(out["status"], "resolved")
+        rec = dbm.get_record(self.db, "alerts", alert_id)
+        self.assertEqual(rec["resolved_by"], "tester")
+        # 重复解决被拒
+        dup = self._call("set_alert_status", {
+            "action": "resolve", "alert_id": alert_id})
+        self.assertIn("error", dup)
+        # reopen 回 firing
+        reo = self._call("set_alert_status", {
+            "action": "reopen", "alert_id": alert_id})
+        self.assertEqual(reo["status"], "firing")
+        rec2 = dbm.get_record(self.db, "alerts", alert_id)
+        self.assertEqual(rec2["status"], "firing")
+
+
 if __name__ == "__main__":
     unittest.main()

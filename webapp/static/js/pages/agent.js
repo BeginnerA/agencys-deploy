@@ -30,7 +30,7 @@
   const SCOPE_LABEL = {
     canary:'灰度决策', task_failed:'失败归因', alert:'告警归因', precheck:'发布预检'
   };
-  const OP_LABEL = {deploy:'发布', rollback:'回滚', restart:'重启'};
+  const OP_LABEL = {deploy:'发布', rollback:'回滚', restart:'重启', schedule_run:'定时发布'};
   const CHAT_SUG = [
     'pay 服务现在状态如何？',
     '最近 1 小时有没有任务失败？',

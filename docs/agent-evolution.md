@@ -17,7 +17,7 @@
 agent/
 ├── config.py      LLM 网关配置（环境变量 > platform_settings 表 > 默认值）
 ├── llm.py         OpenAI 兼容 function-calling 客户端（零第三方依赖，requests 直连）
-├── tools.py       26 个运维工具注册表（read/write 两级权限）
+├── tools.py       31 个运维工具注册表（read/write 两级权限）
 ├── core.py        对话编排（ReAct 循环：模型思考 → 调工具 → 收敛；批量/SSE 流式双通道）
 ├── advisor.py     Phase 2 决策引擎：灰度建议 / 失败归因 / 告警归因 / 预检 / 案例沉淀
 ├── executor.py    Phase 3 发布执行：计划生成 / 审批状态机 / 任务提交 / 后台同步
@@ -69,9 +69,9 @@ python webapp/app.py
 
 - **对话**：登录用户在「智能助手」页与 LLM 多轮对话，回复**流式输出**（SSE 打字机效果，工具调用过程可见）；消息持久化到 `agent_messages`，可在 API/页面回溯（会话按用户隔离）。CLI/MCP 入口同样支持流式/批量两种形态。
 - **会话管理**：对话页支持多会话（下拉切换/新建/删除，`localStorage` 记住当前会话）；`float` 会话由全站右下角悬浮助手产生，也可在此管理。列表/删除仅 operator/admin（默认自己的会话；admin 可 `scope=all`/`user_id=` 跨用户管理，含 CLI 的 id=0 会话），消息回溯同样按用户隔离。
-- **工具**：20 个只读工具 + 6 个写工具（operator/admin 可见），全部以 JSON 结果回给模型：
+- **工具**：20 个只读工具 + 11 个写工具（operator/admin 可见），全部以 JSON 结果回给模型：
   - 只读：`list_projects / get_project / list_services / list_environments / env_servers / service_status / recent_tasks / task_detail / list_alerts / alert_detail / search_logs / release_window / canary_configs / cert_monitors / audit_logs / search_cases / case_detail / advice_list / pending_approvals / run_detail`
-  - 写：`analyze_alert / precheck / ack_alert / plan_operation / case_save / case_update`
+  - 写：`analyze_alert / precheck / ack_alert / plan_operation / case_save / case_update` + 平台配置管理与闭环：`manage_schedules`（定时计划 CRUD/启停/立即执行）、`manage_windows`（发布窗口 CRUD，仅 admin）、`manage_canary`（灰度策略 CRUD/设默认）、`canary_decision`（灰度运行中决策 continue/stop/rollback）、`set_alert_status`（告警 resolve/reopen）
 - **循环**：最多 8 轮工具调用（`AGENT_MAX_TOOL_ROUNDS`）；工具结果超长自动截断（`AGENT_MAX_RESULT_CHARS`）；第 8 轮仍未收敛则输出当前事实总结。
 - **角色注入**：系统提示按角色分级——viewer 只见只读工具；`plan_operation` 等写工具仅 operator/admin 可用，且在服务端二次校验。
 
@@ -101,6 +101,7 @@ python webapp/app.py
 ```
 
 - **计划生成**：`plan_operation(op=deploy/rollback/restart, target=服务或流水线名, env, version, previous_version, canary/skip_build/auto_version/no_git_tag)` 校验目标存在、版本格式、与平台一致的回滚语义（rollback 时 version=回滚目标），产出可预览的 CLI 命令行，绝不直接执行。
+- **定时计划立即执行**：`manage_schedules(action=run)` 生成 `kind=schedule_run` 审批单（与 Web 端 run_schedule 等效但必经人工审批）；block 窗口拒单、warn 窗口审批需显式 force_window，通过后按调度器同语义创建任务并后台同步终态。
 - **审批单状态机**：`awaiting_approval → executing → success / failed`（或 `rejected`）。重复审批 409；viewer 无审批权（403）。
 - **发布窗口联动**：计划生成时检测窗口——block 直接拒单；warn 记 `window_warning`，审批时必须显式勾选「已确认窗口风险」才放行（`force_window`），放行后任务携带 `--force-window`。
 - **可观测与审计**：审批人 / 时间 / 意见、任务 id、执行摘要全部落库；「审批单」页签可直接看到任务终态与日志摘要；操作进 `audit_logs`。
@@ -158,6 +159,6 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 
 1. **人工审批不可绕过**：任何写操作工具只生成审批单，执行必经 `decision=approve`。
 2. **密钥保护**：api_key 仅环境变量 / DB 读取，不落日志、不出现在工具输出与配置查询响应。
-3. **权限分层**：viewer 全链路只读（工具、API、前端按钮三级过滤）。
+3. **权限分层**：viewer 全链路只读（工具、API、前端按钮三级过滤）；发布窗口管理仅 admin（与 Web 端一致）。
 4. **降级可用**：未配置 LLM 时批量对话返回 400 带配置提示、流式对话返回 SSE `error` 事件（均含 hint）；建议引擎自动降级纯规则（记录 model=rule-based）。
 5. **防御性编码**：全部外部输入长度/类型约束；SQL 仅经白名单表名/列名或参数化查询。
