@@ -17,13 +17,14 @@
 agent/
 ├── config.py      LLM 网关配置（环境变量 > platform_settings 表 > 默认值）
 ├── llm.py         OpenAI 兼容 function-calling 客户端（零第三方依赖，requests 直连）
-├── tools.py       31 个运维工具注册表（read/write 两级权限）
+├── tools.py       32 个运维工具注册表（read/write 两级权限）
 ├── core.py        对话编排（ReAct 循环：模型思考 → 调工具 → 收敛；批量/SSE 流式双通道）
 ├── advisor.py     Phase 2 决策引擎：灰度建议 / 失败归因 / 告警归因 / 预检 / 案例沉淀
 ├── executor.py    Phase 3 发布执行：计划生成 / 审批状态机 / 任务提交 / 后台同步
 ├── memory.py      Phase 4 长期记忆：故障案例 CRUD + 字符 bigram 相似检索
-├── scheduler.py   后台建议调度（daemon 线程，默认 30s 一轮）
-├── routes.py      Web API（/api/agent/*，20 条，RBAC 对齐平台）
+├── digest.py      周期巡检日报：健康/告警/发布聚合 → 通知渠道定时推送
+├── scheduler.py   后台建议调度（daemon 线程，默认 30s 一轮；顺带检查日报到点）
+├── routes.py      Web API（/api/agent/*，26 条，RBAC 对齐平台）
 ├── cli.py         终端对话入口（交互式 / --once 单轮）
 └── mcp_server.py  MCP stdio server（JSON-RPC 2.0，零依赖）
 ```
@@ -69,9 +70,9 @@ python webapp/app.py
 
 - **对话**：登录用户在「智能助手」页与 LLM 多轮对话，回复**流式输出**（SSE 打字机效果，工具调用过程可见）；消息持久化到 `agent_messages`，可在 API/页面回溯（会话按用户隔离）。CLI/MCP 入口同样支持流式/批量两种形态。
 - **会话管理**：对话页支持多会话（下拉切换/新建/删除，`localStorage` 记住当前会话）；`float` 会话由全站右下角悬浮助手产生，也可在此管理。列表/删除仅 operator/admin（默认自己的会话；admin 可 `scope=all`/`user_id=` 跨用户管理，含 CLI 的 id=0 会话），消息回溯同样按用户隔离。
-- **工具**：20 个只读工具 + 11 个写工具（operator/admin 可见），全部以 JSON 结果回给模型：
+- **工具**：20 个只读工具 + 12 个写工具（operator/admin 可见），全部以 JSON 结果回给模型：
   - 只读：`list_projects / get_project / list_services / list_environments / env_servers / service_status / recent_tasks / task_detail / list_alerts / alert_detail / search_logs / release_window / canary_configs / cert_monitors / audit_logs / search_cases / case_detail / advice_list / pending_approvals / run_detail`
-  - 写：`analyze_alert / precheck / ack_alert / plan_operation / case_save / case_update` + 平台配置管理与闭环：`manage_schedules`（定时计划 CRUD/启停/立即执行）、`manage_windows`（发布窗口 CRUD，仅 admin）、`manage_canary`（灰度策略 CRUD/设默认）、`canary_decision`（灰度运行中决策 continue/stop/rollback）、`set_alert_status`（告警 resolve/reopen）
+  - 写：`analyze_alert / precheck / ack_alert / plan_operation / case_save / case_update` + 平台配置管理与闭环：`manage_schedules`（定时计划 CRUD/启停/立即执行）、`manage_windows`（发布窗口 CRUD，仅 admin）、`manage_canary`（灰度策略 CRUD/设默认）、`canary_decision`（灰度运行中决策 continue/stop/rollback）、`set_alert_status`（告警 resolve/reopen）、`send_digest`（立即推送巡检日报）
 - **循环**：最多 8 轮工具调用（`AGENT_MAX_TOOL_ROUNDS`）；工具结果超长自动截断（`AGENT_MAX_RESULT_CHARS`）；第 8 轮仍未收敛则输出当前事实总结。
 - **角色注入**：系统提示按角色分级——viewer 只见只读工具；`plan_operation` 等写工具仅 operator/admin 可用，且在服务端二次校验。
 
@@ -102,6 +103,7 @@ python webapp/app.py
 
 - **计划生成**：`plan_operation(op=deploy/rollback/restart, target=服务或流水线名, env, version, previous_version, canary/skip_build/auto_version/no_git_tag)` 校验目标存在、版本格式、与平台一致的回滚语义（rollback 时 version=回滚目标），产出可预览的 CLI 命令行，绝不直接执行。
 - **定时计划立即执行**：`manage_schedules(action=run)` 生成 `kind=schedule_run` 审批单（与 Web 端 run_schedule 等效但必经人工审批）；block 窗口拒单、warn 窗口审批需显式 force_window，通过后按调度器同语义创建任务并后台同步终态。
+- **建议一键采纳**：失败归因建议（有回滚版本）→ `POST /api/agent/advice/<id>/to_run` 自动生成回滚审批单（参数从 evidence.task 推导，与手动建单同一安全链路）；灰度决策建议 → 直接写决策文件（仅当任务仍在 waiting，否则 409 提示）；告警归因/预检建议无可执行动作，明确拒绝。已完结审批单可 `POST /api/agent/runs/<id>/to_case` 一键沉淀案例（含关联归因建议），Web 端建议卡片/审批单详情均有对应按钮。
 - **审批单状态机**：`awaiting_approval → executing → success / failed`（或 `rejected`）。重复审批 409；viewer 无审批权（403）。
 - **发布窗口联动**：计划生成时检测窗口——block 直接拒单；warn 记 `window_warning`，审批时必须显式勾选「已确认窗口风险」才放行（`force_window`），放行后任务携带 `--force-window`。
 - **可观测与审计**：审批人 / 时间 / 意见、任务 id、执行摘要全部落库；「审批单」页签可直接看到任务终态与日志摘要；操作进 `audit_logs`。
@@ -122,7 +124,14 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 - 检索用字符 bigram Jaccard 相似度 + service 过滤，命中案例会作为证据带入下一次建议（归因 → 记忆 → 归因的飞轮）。
 - 案例与建议均按 RBAC：viewer 只读，operator 可建/改案例，admin 可删除。
 
-## 七、HTTP API 一览（前缀 /api，JWT Bearer）
+## 七、周期巡检日报
+
+- **聚合内容**（全部来自平台既有事实源，单次聚合毫秒级）：服务健康统计（监控缓存，异常服务逐个列出）、未解决告警（按 P0/P1 优先，Top 5 明细）、近 24h 发布任务（成功/失败计数 + 失败清单）、待审审批单数、启用中定时计划与 24h 内 upcoming。
+- **发送**：复用告警六渠道（`alert_channels.send_custom`，同一套配置检查与重试，**不写 alert_events**——日报不是告警）。
+- **调度**：挂在建议调度线程同一循环，每轮检查 cron 是否到点（48h 补发窗口：重启跨日不漏发、停机超 2 天不补发）；多实例用 `scheduler_locks` 独立锁名 `agent_digest` 互斥，拿锁后双检防重复发送。
+- **配置**：`platform_settings` 键 `agent_digest`（JSON：enabled/cron/channels/title/last_sent_at/last_result）；Web 端「智能助手 → 📤 巡检日报」弹窗维护（仅 admin），支持内联预览与手动立即发送；对话工具 `send_digest` 亦可立即推送。
+
+## 八、HTTP API 一览（前缀 /api，JWT Bearer）
 
 | 方法 | 路径 | 说明 | 权限 |
 | --- | --- | --- | --- |
@@ -134,9 +143,14 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | GET | /agent/runs | 审批单列表（status 过滤） | 登录用户 |
 | GET | /agent/runs/<id> | 审批单详情 | 登录用户 |
 | POST | /agent/runs/<id>/decision | 审批（action: approve/reject, force_window） | operator/admin |
+| POST | /agent/runs/<id>/to_case | 已完结审批单一键沉淀案例 | operator/admin |
 | GET | /agent/advice | 建议列表（scope/ref_id 过滤） | 登录用户 |
 | POST | /agent/advice/<id>/to_case | 建议沉淀为案例 | operator/admin |
+| POST | /agent/advice/<id>/to_run | 建议一键采纳（失败归因→回滚审批单；灰度→写决策） | operator/admin |
 | DELETE | /agent/advice/<id> | 删除建议 | admin |
+| GET/POST | /agent/digest/config | 巡检日报配置查看 / 保存（enabled/cron/channels/title） | admin |
+| GET | /agent/digest/preview | 预览当前日报文本（不发送） | operator/admin |
+| POST | /agent/digest/send | 手动立即发送一次日报 | operator/admin |
 | POST | /agent/analyze/alert/<id> | 手动告警归因 | operator/admin |
 | POST | /agent/precheck | 发布预检（target/env/version） | operator/admin |
 | GET/POST | /agent/cases | 案例列表 / 新建 | 新建需 operator/admin |
@@ -145,7 +159,7 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | POST | /agent/config | 保存网关配置（base_url/api_key/model） | admin |
 | GET | /deploy/canary-decisions/<task_id> | 既有灰度接口，waiting 时附加 advice 建议 | 登录用户 |
 
-## 八、配置项
+## 九、配置项
 
 | 环境变量 | platform_settings 键 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -154,8 +168,9 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | AGENT_LLM_MODEL | agent_llm_model | "" | 模型名，留空由服务端决定 |
 | AGENT_MAX_TOOL_ROUNDS | — | 8 | 单轮对话最大工具调用次数（1-20） |
 | AGENT_MAX_RESULT_CHARS | — | 6000 | 工具结果截断长度（500-20000） |
+| — | agent_digest | enabled=0, cron="0 9 * * *", channels=[] | 巡检日报配置（JSON，Web 弹窗维护） |
 
-## 九、安全与边界
+## 十、安全与边界
 
 1. **人工审批不可绕过**：任何写操作工具只生成审批单，执行必经 `decision=approve`。
 2. **密钥保护**：api_key 仅环境变量 / DB 读取，不落日志、不出现在工具输出与配置查询响应。

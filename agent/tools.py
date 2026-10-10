@@ -964,6 +964,19 @@ def _canary_decision(ctx, task_id=None, action=None, **kw) -> dict:
             "hint": "决策已写入，发布子进程将在下轮轮询时读取"}
 
 
+def _send_digest(ctx, **kw) -> dict:
+    """立即发送一次巡检日报（与 Web 端 POST /agent/digest/send 同语义）"""
+    from . import digest as digest_mod
+    try:
+        res = digest_mod.build_and_send(ctx.db_path)
+    except ValueError as e:
+        raise ToolError(str(e))
+    return {"summary": res["summary"],
+            "results": [list(r) for r in res["results"]],
+            "text": res["text"],
+            "hint": "日报已推送；周期自动推送需管理员在 Web 端开启日报配置"}
+
+
 def _set_alert_status(ctx, alert_id=None, action=None, note="", **kw) -> dict:
     """告警闭环：resolve 解决 / reopen 重开（确认请用 ack_alert；与路由语义一致）"""
     db = ctx.db_path
@@ -1132,6 +1145,10 @@ def build_tools() -> list:
               "（确认告警请用 ack_alert）",
               {"alert_id": num, "action": str_req, "note": str_opt},
               "write", _set_alert_status),
+_spec("send_digest",
+              "立即聚合并推送一次巡检日报（服务健康/告警/近24h发布/待审审批单"
+              "/定时计划）到已配置的通知渠道；渠道未配置时提示先配置",
+              {}, "write", _send_digest),
     ]
 
 

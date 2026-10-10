@@ -16,6 +16,7 @@ from webapp import db as dbm
 from webapp.auth import audit, require_auth, require_role
 from . import config as agent_config
 from . import core as core_mod
+from . import digest as digest_mod
 from . import llm as llm_mod
 from . import advisor as advisor_mod
 from . import executor as executor_mod
@@ -220,6 +221,21 @@ def run_decision(run_id):
     return jsonify({"run": run})
 
 
+@agent_bp.route("/agent/runs/<int:run_id>/to_case", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def run_to_case(run_id):
+    """已完结审批单一键沉淀为案例草稿（含关联失败归因建议）"""
+    try:
+        case_id = executor_mod.build_case_from_run(
+            current_app.config["DB_PATH"], run_id,
+            user={"id": g.user["id"], "username": g.user["username"]})
+    except executor_mod.ExecutorError as e:
+        return jsonify({"error": str(e)}), 409
+    audit("agent_run_to_case", "agent_run", run_id, {"case_id": case_id})
+    return jsonify({"case_id": case_id}), 201
+
+
 # ---------- 建议（Phase 2） ----------
 
 @agent_bp.route("/agent/advice")
@@ -270,6 +286,24 @@ def advice_to_case(advice_id):
     audit("agent_advice_to_case", "agent_advice", advice_id,
           {"case_id": case_id})
     return jsonify({"case_id": case_id}), 201
+
+
+@agent_bp.route("/agent/advice/<int:advice_id>/to_run", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def advice_to_run(advice_id):
+    """建议一键采纳：失败归因→回滚审批单；灰度建议→写决策文件"""
+    db_path = current_app.config["DB_PATH"]
+    try:
+        res = executor_mod.advice_to_action(
+            db_path, advice_id,
+            {"id": g.user["id"], "username": g.user["username"]})
+    except executor_mod.ExecutorError as e:
+        return jsonify({"error": str(e)}), 409
+    audit("agent_advice_to_run", "agent_advice", advice_id,
+          {"action": res.get("action"), "run_id": res.get("run_id", 0),
+           "task_id": res.get("task_id", 0)})
+    return jsonify(res), 201
 
 
 # ---------- 案例（Phase 4 记忆） ----------
@@ -468,6 +502,70 @@ def delete_session(session_id):
           {"session_id": session_id[:64], "user_id": uid,
            "deleted": deleted})
     return jsonify({"ok": True, "deleted": deleted})
+
+
+# ---------- 巡检日报 ----------
+
+@agent_bp.route("/agent/digest/config")
+@require_auth
+@require_role("admin")
+def digest_config_view():
+    """查看日报配置（含上次发送结果）"""
+    return jsonify({"config": digest_mod.get_digest_config(
+        current_app.config["DB_PATH"])})
+
+
+@agent_bp.route("/agent/digest/config", methods=["POST"])
+@require_auth
+@require_role("admin")
+def digest_config_update():
+    """更新日报配置（开关/cron/渠道/标题，未传字段保留原值）"""
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    try:
+        cfg = digest_mod.save_digest_config(
+            current_app.config["DB_PATH"],
+            enabled=(int(bool(body["enabled"])) if "enabled" in body else None),
+            cron=_str(body, "cron", maxlen=100) or None,
+            channels=(body["channels"] if isinstance(body.get("channels"),
+                                                     list) else None),
+            title=(_str(body, "title", maxlen=40) or None)
+            if "title" in body else None)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:  # cron 校验等（ToolError/ImportError）
+        return jsonify({"error": f"配置非法: {e}"}), 400
+    audit("agent_digest_config", "setting", 0,
+          {"enabled": cfg.get("enabled"), "cron": cfg.get("cron"),
+           "channels": cfg.get("channels")})
+    return jsonify({"config": cfg})
+
+
+@agent_bp.route("/agent/digest/preview")
+@require_auth
+@require_role("admin", "operator")
+def digest_preview():
+    """预览当前巡检日报文本（不发送，供配置页核对内容）"""
+    db_path = current_app.config["DB_PATH"]
+    cfg = digest_mod.get_digest_config(db_path)
+    snap = digest_mod.collect_snapshot(db_path)
+    return jsonify({"text": digest_mod.render_text(
+        snap, cfg.get("title") or "巡检日报")})
+
+
+@agent_bp.route("/agent/digest/send", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def digest_send():
+    """手动立即发送一次巡检日报（结果回写 last_sent_at）"""
+    try:
+        res = digest_mod.build_and_send(current_app.config["DB_PATH"])
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    audit("agent_digest_send", "setting", 0, {"summary": res["summary"]})
+    return jsonify({"text": res["text"], "results": res["results"],
+                    "summary": res["summary"]})
 
 
 # ---------- 手动触发建议（供前端按钮/测试） ----------

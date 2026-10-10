@@ -380,6 +380,101 @@ class AgentApiBase(unittest.TestCase):
                                 json={"target": "ghost", "env": "prod"})
         self.assertEqual(resp.status_code, 404)
 
+    # ---------- 建议一键采纳 / 审批单沉淀案例 ----------
+
+    def test_advice_to_run_creates_rollback(self):
+        tid = self._make_task(version="1.1.0", status="failed")
+        from agent import advisor as adv
+        aid = adv.save_advice(
+            self.db_path, "task_failed", tid,
+            "任务失败归因：auth prod 1.1.0", "## 建议动作\n回滚",
+            evidence={"task": {"id": tid, "name": "auth", "env": "prod",
+                               "version": "1.1.0",
+                               "previous_version": "1.0.0"}},
+            model="rule-based", actor={"id": 0, "username": "advisor"})
+        # viewer 无采纳权限
+        resp = self.client.post(f"/api/agent/advice/{aid}/to_run",
+                                headers=self.viewer_headers)
+        self.assertEqual(resp.status_code, 403)
+        # admin 采纳 → 201 + 回滚审批单
+        resp = self.client.post(f"/api/agent/advice/{aid}/to_run",
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 201)
+        data = resp.get_json()
+        self.assertEqual(data["action"], "run")
+        run = dbm.get_record(self.db_path, "agent_runs", data["run_id"])
+        self.assertEqual(run["status"], "awaiting_approval")
+        self.assertEqual(run["version"], "1.0.0")
+        # 不存在的建议 → 409
+        resp = self.client.post("/api/agent/advice/99999/to_run",
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 409)
+
+    def test_run_to_case_endpoint(self):
+        run = self._plan_run()
+        dbm.update_record(self.db_path, "agent_runs", run["id"],
+                          dict(status="failed", summary="构建失败"))
+        # viewer 无权限
+        resp = self.client.post(f"/api/agent/runs/{run['id']}/to_case",
+                                headers=self.viewer_headers)
+        self.assertEqual(resp.status_code, 403)
+        resp = self.client.post(f"/api/agent/runs/{run['id']}/to_case",
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 201)
+        case_id = resp.get_json()["case_id"]
+        case = dbm.get_record(self.db_path, "agent_cases", case_id)
+        self.assertEqual(case["source"], "agent_run")
+        # 未完结的审批单不可沉淀 → 409
+        run2 = self._plan_run()
+        resp = self.client.post(f"/api/agent/runs/{run2['id']}/to_case",
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 409)
+
+    # ---------- 巡检日报 ----------
+
+    def test_digest_config_permissions_and_flow(self):
+        # viewer/operator 均不能读写配置
+        resp = self.client.get("/api/agent/digest/config",
+                               headers=self.viewer_headers)
+        self.assertEqual(resp.status_code, 403)
+        # admin 默认配置
+        resp = self.client.get("/api/agent/digest/config", headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        cfg = resp.get_json()["config"]
+        self.assertEqual(cfg["enabled"], 0)
+        self.assertEqual(cfg["channels"], [])
+        # 保存（非法渠道 → 400）
+        resp = self.client.post("/api/agent/digest/config",
+                                headers=self.headers,
+                                json={"channels": ["nope"]})
+        self.assertEqual(resp.status_code, 400)
+        resp = self.client.post("/api/agent/digest/config",
+                                headers=self.headers,
+                                json={"enabled": True, "cron": "30 8 * * *",
+                                      "channels": ["wecom"], "title": "早报"})
+        self.assertEqual(resp.status_code, 200)
+        cfg = resp.get_json()["config"]
+        self.assertEqual(cfg["enabled"], 1)
+        self.assertEqual(cfg["cron"], "30 8 * * *")
+        self.assertEqual(cfg["channels"], ["wecom"])
+        # 非法 cron → 400
+        resp = self.client.post("/api/agent/digest/config",
+                                headers=self.headers,
+                                json={"cron": "bad"})
+        self.assertEqual(resp.status_code, 400)
+        # 预览（operator 可用）
+        resp = self.client.get("/api/agent/digest/preview",
+                               headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("早报", resp.get_json()["text"])
+        # 手动发送（mock 渠道发送；operator 可用）
+        with mock.patch("webapp.alert_channels.send_custom",
+                        return_value=[("wecom", True, "ok")]):
+            resp = self.client.post("/api/agent/digest/send",
+                                    headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("1/1", resp.get_json()["summary"])
+
     # ---------- 案例 CRUD ----------
 
     def test_cases_crud_permissions(self):

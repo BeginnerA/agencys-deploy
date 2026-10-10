@@ -896,5 +896,217 @@ class TestAgentManageTools(AgentBase):
         self.assertEqual(rec2["status"], "firing")
 
 
+class TestAgentAdviceAction(AgentBase):
+    """建议一键采纳：失败归因→回滚审批单 / 灰度建议→决策文件"""
+
+    def _save_advice(self, scope, evidence, title="测试建议"):
+        from agent import advisor
+        aid = advisor.save_advice(
+            self.db, scope, int(evidence.get("task", {}).get("id", 0)),
+            title, "## 建议动作\n回滚", evidence=evidence, model="rule-based",
+            actor={"id": 0, "username": "advisor"})
+        return aid
+
+    def test_task_failed_with_prev_creates_rollback_run(self):
+        task_id = self.make_task(version="1.1.0", previous_version="1.0.0",
+                                 status="failed")
+        aid = self._save_advice("task_failed", {
+            "task": {"id": task_id, "name": "auth", "env": "prod",
+                     "version": "1.1.0", "previous_version": "1.0.0"}})
+        from agent import executor
+        res = executor.advice_to_action(
+            self.db, aid, {"id": 1, "username": "tester"})
+        self.assertEqual(res["action"], "run")
+        self.assertGreater(res["run_id"], 0)
+        run = dbm.get_record(self.db, "agent_runs", res["run_id"])
+        self.assertEqual(run["status"], "awaiting_approval")
+        self.assertEqual(run["name"], "auth")
+        self.assertEqual(run["env"], "prod")
+        self.assertEqual(run["version"], "1.0.0")  # 回滚目标版本
+        self.assertIn("失败归因建议", run["intent"])
+
+    def test_task_failed_without_prev_rejected(self):
+        task_id = self.make_task(version="1.1.0", previous_version="",
+                                 status="failed")
+        aid = self._save_advice("task_failed", {
+            "task": {"id": task_id, "name": "auth", "env": "prod",
+                     "version": "1.1.0", "previous_version": ""}})
+        from agent import executor
+        with self.assertRaises(executor.ExecutorError):
+            executor.advice_to_action(self.db, aid,
+                                      {"id": 1, "username": "tester"})
+
+    def test_canary_writes_decision_file(self):
+        task_id = self.make_task(version="1.2.0", status="running")
+        dec_file = os.path.join(self.tmp, "canary_decision_1.json")
+        aid = self._save_advice("canary", {
+            "task": {"id": task_id, "name": "auth", "env": "prod",
+                     "version": "1.2.0"}, "decision": "rollback"})
+        from agent import executor
+        with mock.patch("deploy.read_canary_decision",
+                        return_value={"task_id": task_id, "state": "waiting"}), \
+                mock.patch("deploy.canary_decision_path",
+                           return_value=dec_file):
+            res = executor.advice_to_action(
+                self.db, aid, {"id": 1, "username": "tester"})
+        self.assertEqual(res["action"], "canary")
+        self.assertEqual(res["decision"], "rollback")
+        with open(dec_file, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["state"], "rollback")
+
+    def test_canary_not_waiting_rejected(self):
+        task_id = self.make_task(version="1.2.0", status="success")
+        aid = self._save_advice("canary", {
+            "task": {"id": task_id, "name": "auth", "env": "prod",
+                     "version": "1.2.0"}, "decision": "continue"})
+        from agent import executor
+        with mock.patch("deploy.read_canary_decision",
+                        return_value={"task_id": task_id, "state": "none"}):
+            with self.assertRaises(executor.ExecutorError):
+                executor.advice_to_action(self.db, aid,
+                                          {"id": 1, "username": "tester"})
+
+    def test_scope_without_action_rejected(self):
+        from agent import executor
+        aid = self._save_advice("alert", {"target": {"service": "auth"}})
+        with self.assertRaises(executor.ExecutorError):
+            executor.advice_to_action(self.db, aid,
+                                      {"id": 1, "username": "tester"})
+        # 不存在建议
+        with self.assertRaises(executor.ExecutorError):
+            executor.advice_to_action(self.db, 99999,
+                                      {"id": 1, "username": "tester"})
+
+
+class TestAgentDigest(AgentBase):
+    """巡检日报：配置读写 / 到点判断 / 聚合 / 渲染 / 发送"""
+
+    def test_config_default_and_save(self):
+        from agent import digest
+        cfg = digest.get_digest_config(self.db)
+        self.assertEqual(cfg["enabled"], 0)
+        self.assertEqual(cfg["cron"], "0 9 * * *")
+        self.assertEqual(cfg["channels"], [])
+        # 保存后读取一致
+        cfg = digest.save_digest_config(self.db, enabled=1,
+                                        cron="30 8 * * 1-5",
+                                        channels=["wecom", "feishu"])
+        self.assertEqual(cfg["enabled"], 1)
+        cfg2 = digest.get_digest_config(self.db)
+        self.assertEqual(cfg2["channels"], ["wecom", "feishu"])
+        self.assertEqual(cfg2["cron"], "30 8 * * 1-5")
+        # 重复保存（update 路径）
+        digest.save_digest_config(self.db, enabled=0)
+        self.assertEqual(digest.get_digest_config(self.db)["enabled"], 0)
+        # 非法渠道/非法 cron 报错
+        with self.assertRaises(ValueError):
+            digest.save_digest_config(self.db, channels=["sms_twilio"])
+        with self.assertRaises(Exception):
+            digest.save_digest_config(self.db, cron="not-a-cron")
+
+    def test_due_ts_window(self):
+        from agent import digest
+        from datetime import datetime
+        # 10:00 时今天 09:00 是最近应发时刻（在 48h 窗口内且已过）
+        now = int(datetime(2026, 10, 10, 10, 0).timestamp())
+        due = digest._due_ts("0 9 * * *", now)
+        self.assertLess(due, now)
+        self.assertGreater(now - due, 0)
+        self.assertLess(now - due, digest._DUE_WINDOW)
+        # 刚过 09:00 也能算出同一 due（窗口内向后找第一个触发点）
+        now2 = int(datetime(2026, 10, 10, 9, 1).timestamp())
+        self.assertEqual(digest._due_ts("0 9 * * *", now2), due)
+
+    def test_check_and_send_disabled(self):
+        from agent import digest
+        res = digest.check_and_send(self.db)
+        self.assertFalse(res["sent"])
+        self.assertEqual(res["reason"], "disabled")
+
+    def test_build_and_send_requires_channels(self):
+        from agent import digest
+        with self.assertRaises(ValueError):
+            digest.build_and_send(self.db)
+
+    def test_build_and_send_and_check_due(self):
+        from agent import digest
+        digest.save_digest_config(self.db, enabled=1,
+                                  cron="* * * * *",  # 每分钟：永远 due
+                                  channels=["wecom"])
+        sent = []
+        with mock.patch("webapp.alert_channels.send_custom",
+                        side_effect=lambda db, text, ch, subject="s": (
+                            sent.append((text, ch)) or [("wecom", True, "ok")])):
+            res = digest.check_and_send(self.db)
+        self.assertTrue(res["sent"])
+        self.assertEqual(len(sent), 1)
+        text, chans = sent[0]
+        self.assertIn("巡检日报", text)
+        self.assertEqual(chans, ["wecom"])
+        # last_sent_at 已回写：下一轮不再发
+        with mock.patch("webapp.alert_channels.send_custom") as m:
+            res2 = digest.check_and_send(self.db)
+        self.assertFalse(res2["sent"])
+        m.assert_not_called()
+
+    def test_collect_snapshot_and_render(self):
+        from agent import digest
+        now = int(time.time())
+        # 造数据：一条未解决告警 + 一失败一成功任务 + 一待审审批单 + 一计划
+        dbm.create_record(self.db, "alerts", dict(
+            rule_id=0, fingerprint="fp-1", status="firing", severity="P1",
+            subject="auth 连接超时", description="",
+            target_info='{"service": "auth", "env": "prod"}',
+            first_seen_at=now, last_seen_at=now))
+        self.make_task(version="1.1.0", status="failed", finished_at=now)
+        self.make_task(version="1.0.9", status="success", finished_at=now)
+        dbm.create_record(self.db, "agent_runs", dict(
+            kind="operation", project_id=self.proj_id, ref_type="services",
+            ref_id=self.svc_id, name="auth", env="prod", version="1.2.0",
+            plan="{}", status="awaiting_approval",
+            created_by=1, created_at=now))
+        dbm.create_record(self.db, "deploy_schedules", dict(
+            project_id=self.proj_id, type="cron", name="每日构建",
+            ref_type="project", ref_id=self.proj_id, env="prod",
+            version="", previous_version="", extra="[]",
+            schedule_at=0, cron_expr="0 3 * * *",
+            enabled=1, last_run_at=0, next_run_at=now + 3600,
+            created_by=1, created_at=now))
+        snap = digest.collect_snapshot(self.db, now=now)
+        self.assertTrue(snap["alerts"]["ok"])
+        self.assertEqual(snap["alerts"]["total"], 1)
+        self.assertEqual(snap["deploys"]["failed"], 1)
+        self.assertEqual(snap["deploys"]["success"], 1)
+        self.assertEqual(snap["approvals"]["pending"], 1)
+        self.assertEqual(snap["schedules"]["enabled"], 1)
+        text = digest.render_text(snap)
+        self.assertIn("巡检日报", text)
+        self.assertIn("auth 连接超时", text)
+        self.assertIn("失败 1", text)
+        self.assertIn("待审审批单 1 张", text)
+        self.assertIn("每日构建", text)
+
+    def test_send_digest_tool(self):
+        from agent import tools as tools_mod
+        from agent import digest as digest_mod
+        ctx = type("Ctx", (), {"db_path": self.db, "user_id": 1,
+                              "username": "tester", "role": "admin"})()
+        # 未配置渠道 → 错误信息（execute_tool 统一转 error dict）
+        out = json.loads(tools_mod.execute_tool(
+            "admin", "send_digest", {}, ctx))
+        self.assertIn("error", out)
+        digest_mod.save_digest_config(self.db, channels=["wecom"])
+        with mock.patch("webapp.alert_channels.send_custom",
+                        return_value=[("wecom", True, "ok")]):
+            out = json.loads(tools_mod.execute_tool(
+                "admin", "send_digest", {}, ctx))
+        self.assertIn("summary", out)
+        self.assertIn("巡检日报", out["text"])
+        # 工具表注册：viewer 不可见
+        names = {t["name"] for t in tools_mod.visible_tools("viewer")}
+        self.assertNotIn("send_digest", names)
+
+
 if __name__ == "__main__":
     unittest.main()

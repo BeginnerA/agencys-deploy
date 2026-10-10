@@ -251,6 +251,45 @@ def test_channel(db_path: str, channel: str) -> tuple:
         return False, str(e)[:200]
 
 
+def send_custom(db_path: str, text: str, channels: list,
+                subject: str = "平台通知") -> list:
+    """按渠道发送自定义文本（巡检日报等非告警场景），不写 alert_events。
+
+    与 send_alert 同一套配置检查与重试逻辑；email 渠道用 subject 做邮件主题。
+    返回 [(channel, ok, detail), ...]；任何异常不外抛（调用方为后台任务）。
+    """
+    pseudo = {"id": 0, "severity": "INFO", "subject": subject,
+              "description": "", "target_info": {},
+              "first_seen_at": int(time.time())}
+    results = []
+    for channel in channels:
+        func_name = _CHANNEL_FUNCS.get(channel)
+        if not func_name:
+            continue
+        ok, detail = False, ""
+        try:
+            cfg = get_channel_config(db_path, channel)
+            missing = [k for k in _REQUIRED.get(channel, ()) if not cfg.get(k)]
+            if missing:
+                detail = "渠道未配置: " + ",".join(missing)
+            else:
+                body = f"【{subject}】\n{text}" if channel == "email" else text
+                for attempt in range(RETRIES + 1):
+                    try:
+                        getattr(sys.modules[__name__], func_name)(
+                            cfg, body, pseudo)
+                        ok, detail = True, "ok"
+                        break
+                    except Exception as e:
+                        detail = str(e)[:200]
+                        if attempt < RETRIES:
+                            time.sleep(2 ** attempt)
+        except Exception as e:
+            detail = str(e)[:200]
+        results.append((channel, ok, detail))
+    return results
+
+
 def send_alert(db_path: str, alert: dict, channels: list) -> list:
     """按渠道发送告警通知（失败重试 2 次指数退避），结果写 alert_events。
 

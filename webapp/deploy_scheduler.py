@@ -17,10 +17,12 @@ def _lock_owner() -> str:
     return f"{socket.gethostname()}:{os.getpid()}"
 
 
-def try_acquire_scheduler_lock(db_path: str, ttl: int = _LOCK_TTL) -> bool:
+def try_acquire_scheduler_lock(db_path: str, ttl: int = _LOCK_TTL,
+                               lock_name: str = _SCHEDULER_LOCK) -> bool:
     """获取调度执行租约锁（SQLite 事务串行化，多进程安全）。
 
-    锁记录带过期时间：持有进程崩溃时残留锁在 TTL 后自动失效。"""
+    锁记录带过期时间：持有进程崩溃时残留锁在 TTL 后自动失效。
+    lock_name 可为不同后台任务取独立锁（如 agent_digest），互不阻塞。"""
     from . import db as dbm
     owner = _lock_owner()
     conn = dbm.get_conn(db_path)
@@ -29,7 +31,7 @@ def try_acquire_scheduler_lock(db_path: str, ttl: int = _LOCK_TTL) -> bool:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT expires_at FROM scheduler_locks WHERE name=?",
-            (_SCHEDULER_LOCK,)
+            (lock_name,)
         ).fetchone()
         if row and row["expires_at"] > now:
             return False  # 其他实例持有中
@@ -38,7 +40,7 @@ def try_acquire_scheduler_lock(db_path: str, ttl: int = _LOCK_TTL) -> bool:
             "VALUES (?, ?, ?, ?) "
             "ON CONFLICT(name) DO UPDATE SET owner=excluded.owner, "
             "acquired_at=excluded.acquired_at, expires_at=excluded.expires_at",
-            (_SCHEDULER_LOCK, owner, now, now + ttl)
+            (lock_name, owner, now, now + ttl)
         )
         conn.commit()
         return True
@@ -46,14 +48,15 @@ def try_acquire_scheduler_lock(db_path: str, ttl: int = _LOCK_TTL) -> bool:
         conn.close()
 
 
-def release_scheduler_lock(db_path: str):
+def release_scheduler_lock(db_path: str,
+                           lock_name: str = _SCHEDULER_LOCK):
     """释放本实例持有的调度锁（仅删除 owner 匹配的记录，防误删他人锁）"""
     from . import db as dbm
     conn = dbm.get_conn(db_path)
     try:
         conn.execute(
             "DELETE FROM scheduler_locks WHERE name=? AND owner=?",
-            (_SCHEDULER_LOCK, _lock_owner())
+            (lock_name, _lock_owner())
         )
         conn.commit()
     finally:

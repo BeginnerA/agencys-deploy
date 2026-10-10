@@ -525,6 +525,70 @@ def build_case_from_run(db_path: str, run_id: int, user: dict = None) -> int:
         username=(user or {}).get("username", ""))
 
 
+def advice_to_action(db_path: str, advice_id: int, user: dict) -> dict:
+    """建议一键采纳：task_failed → 回滚审批单；canary → 灰度决策文件
+
+    参数从建议 evidence 推导（task.name/env/previous_version、decision），
+    与手动执行同一安全链路（审批单/决策文件协议），Agent 层零旁路。
+    返回 {"action": "run"|"canary", ...}；无可执行动作时抛 ExecutorError。
+    """
+    advice = dbm.get_record(db_path, "agent_advice", advice_id)
+    if not advice:
+        raise ExecutorError(f"建议不存在: #{advice_id}")
+    ev = advice.get("evidence") or {}
+    if isinstance(ev, str):
+        try:
+            ev = json.loads(ev)
+        except (json.JSONDecodeError, TypeError):
+            ev = {}
+    task = ev.get("task") or {}
+    if advice["scope"] == "task_failed":
+        prev = task.get("previous_version") or ""
+        if not prev:
+            raise ExecutorError(
+                "该建议为首次发布失败（无回滚版本），无可执行的自动动作，"
+                "请按建议人工排查后重新发布")
+        run = plan_operation(
+            db_path, user, op="rollback", target=task.get("name") or "",
+            env=task.get("env") or "", version=prev,
+            intent=f"采纳失败归因建议 #{advice_id}: {advice.get('title', '')}")
+        return {"action": "run", "run_id": run["id"],
+                "name": run["name"], "env": run.get("env"),
+                "version": run.get("version"),
+                "hint": "已生成回滚审批单，请在审批单列表确认执行"}
+    if advice["scope"] == "canary":
+        decision = ev.get("decision") or ""
+        if decision not in ("continue", "stop", "rollback"):
+            raise ExecutorError(f"建议中无可识别的灰度决策: {decision or '空'}")
+        task_id = int(task.get("id") or 0)
+        if not task_id:
+            raise ExecutorError("建议证据缺少任务 ID，无法写入灰度决策")
+        from deploy import read_canary_decision, canary_decision_path
+        cur = read_canary_decision(task_id)
+        if cur.get("state") != "waiting":
+            raise ExecutorError(
+                f"任务 #{task_id} 当前无等待中的灰度决策（state={cur.get('state')}），"
+                "决策可能已被处理或任务已结束")
+        path = canary_decision_path(task_id)
+        cur["state"] = decision
+        cur["updated_at"] = _now()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cur, f, ensure_ascii=False)
+        except OSError as e:
+            raise ExecutorError(f"决策文件写入失败: {e}") from e
+        dbm.create_audit(db_path, int(user.get("id", 0)),
+                         user.get("username", ""),
+                         "agent_advice_to_canary", "tasks", task_id,
+                         {"decision": decision, "advice_id": advice_id,
+                          "via": "agent"})
+        return {"action": "canary", "task_id": task_id,
+                "decision": decision,
+                "hint": f"决策 {decision} 已写入，发布子进程将在下轮轮询时读取"}
+    raise ExecutorError(
+        f"「{advice['scope']}」类建议无可执行动作（仅失败归因/灰度决策建议可采纳）")
+
+
 def serialize_public(run: dict) -> dict:
     """对外输出审批单（剥离内部字段；plan JSON 已反序列化由 dbm 保证）"""
     return run

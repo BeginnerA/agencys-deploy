@@ -65,6 +65,7 @@
         <button class="tab-btn ${currentTab==='advice'?'active':''}" data-tab="advice">🤖 决策建议</button>
         <button class="tab-btn ${currentTab==='cases'?'active':''}" data-tab="cases">📚 故障案例库</button>
         <span class="spacer"></span>
+        ${role === 'admin' ? '<button class="btn sm ghost" id="digestChip">📤 巡检日报</button>' : ''}
         <span class="gw-state" id="gwChip" title="查看/配置 LLM 网关"></span>
       </div>
       <div id="tabContent"></div>`;
@@ -73,6 +74,8 @@
     });
     const chip = document.getElementById('gwChip');
     if (chip) chip.onclick = () => openGwModal();
+    const dg = document.getElementById('digestChip');
+    if (dg) dg.onclick = openDigestModal;
     switchTab(currentTab);
   }
 
@@ -561,8 +564,22 @@
           <div class="row"><b>创建人</b>${esc(run.created_by_name || '-')} @ ${fmtTime(run.created_at)}</div>
           ${run.decided_by_name ? `<div class="row"><b>审批人</b>${esc(run.decided_by_name)} @ ${fmtTime(run.decided_at)}
             ${run.decision_note ? '（' + esc(run.decision_note) + '）' : ''}</div>` : ''}
-        </div>`
+        </div>`,
+      footer: (canManage && (run.status === 'failed' || run.status === 'success'))
+        ? `<button class="btn" id="runCaseCancel">关闭</button>
+           <button class="btn primary" id="runToCase">📥 沉淀为案例</button>`
+        : ''
     });
+    const cc = document.getElementById('runCaseCancel');
+    if (cc) cc.onclick = () => { document.getElementById('drawerRoot').classList.add('hidden'); };
+    const tc = document.getElementById('runToCase');
+    if (tc) tc.onclick = async () => {
+      try{
+        const data = await api(`/api/agent/runs/${id}/to_case`, {method:'POST'});
+        toastSuccess('已生成案例草稿 #' + data.case_id + '，可在故障案例库查看');
+        document.getElementById('drawerRoot').classList.add('hidden');
+      }catch(e){ toastError('沉淀失败：' + (e.message || '')); }
+    };
   }
 
   // ==================== 决策建议 Tab ====================
@@ -616,6 +633,9 @@
     const scopeIco = {canary:'🐤', task_failed:'🧯', alert:'🚨', precheck:'🛡️'};
     box.innerHTML = adviceList.map(a => {
       const actions = [];
+      if (canManage && adoptable(a)){
+        actions.push(`<button class="btn sm primary" data-adopt="${a.id}">⚡ 采纳执行</button>`);
+      }
       if (canManage){
         actions.push(`<button class="btn sm" data-to="${a.id}">📥 沉淀案例</button>`);
       }
@@ -643,6 +663,20 @@
     box.querySelectorAll('[data-open]').forEach(item => {
       item.onclick = () => openAdviceDetail(Number(item.dataset.open));
     });
+    box.querySelectorAll('[data-adopt]').forEach(b => {
+      b.onclick = async (ev) => {
+        ev.stopPropagation();
+        try{
+          const data = await api(`/api/agent/advice/${b.dataset.adopt}/to_run`, {method:'POST'});
+          if (data.action === 'run'){
+            toastSuccess(`已生成回滚审批单 #${data.run_id}，请在发布审批单页确认执行`);
+          }else{
+            toastSuccess(`任务 #${data.task_id} 灰度决策「${data.decision}」已写入`);
+          }
+          loadAdvice();
+        }catch(e){ toastError('采纳失败：' + (e.message || '')); }
+      };
+    });
     box.querySelectorAll('[data-to]').forEach(b => {
       b.onclick = async (ev) => {
         ev.stopPropagation();
@@ -664,6 +698,18 @@
         }catch(e){ toastError('删除失败：' + (e.message || '')); }
       };
     });
+  }
+  function parseEvidence(a){
+    let ev = a.evidence;
+    if (typeof ev === 'string'){ try { ev = JSON.parse(ev); }catch(e){ return {}; } }
+    return (ev && typeof ev === 'object') ? ev : {};
+  }
+  // 建议是否可一键采纳：失败归因（有回滚版本）或灰度决策建议
+  function adoptable(a){
+    const ev = parseEvidence(a);
+    if (a.scope === 'task_failed') return !!(ev.task || {}).previous_version;
+    if (a.scope === 'canary') return !!(ev.decision && (ev.task || {}).id);
+    return false;
   }
   function openAdviceDetail(id){
     const a = adviceList.find(x => x.id === id);
@@ -948,6 +994,83 @@
         renderGwChip();
       }catch(e){ toastError('保存失败：' + (e.message || '')); }
     };
+  }
+
+  function openDigestModal(){
+    openDrawer({
+      title: '巡检日报订阅',
+      body: '<div class="muted" style="padding:20px;text-align:center">加载中…</div>',
+      footer: role === 'admin'
+        ? `<button class="btn" id="dgCancel">关闭</button>
+           <button class="btn" id="dgPreview">👁 预览内容</button>
+           <button class="btn primary" id="dgSave">保存配置</button>`
+        : `<button class="btn" id="dgCancel">关闭</button>`
+    });
+    const cancel = document.getElementById('dgCancel');
+    if (cancel) cancel.onclick = () => { document.getElementById('drawerRoot').classList.add('hidden'); };
+    const closeIt = () => document.getElementById('drawerRoot').classList.add('hidden');
+    (async () => {
+      let cfg = {};
+      try{ cfg = (await api('/api/agent/digest/config')).config || {}; }
+      catch(e){ toastError('日报配置读取失败：' + (e.message || '')); }
+      const chans = ['email','wecom','webhook','sms_aliyun','feishu','dingtalk'];
+      const sel = cfg.channels || [];
+      const bc = document.querySelector('#drawerRoot .drawer-body')
+        || document.getElementById('drawerRoot');
+      if (bc) bc.innerHTML = `
+        <div class="muted" style="font-size:var(--fs-12);line-height:1.8;margin-bottom:10px">
+          定时聚合服务健康 / 未解决告警 / 近 24h 发布 / 待审审批单 / 定时计划，
+          推送到已配置的通知渠道。发送失败的原因会显示在下方。
+        </div>
+        ${role === 'admin' ? `
+        <div class="field"><label>启用定时推送</label>
+          <select id="dgEnabled">
+            <option value="0" ${cfg.enabled ? '' : 'selected'}>关闭</option>
+            <option value="1" ${cfg.enabled ? 'selected' : ''}>开启</option>
+          </select></div>
+        <div class="field"><label>推送时间（cron 表达式，默认每天 09:00）</label>
+          <input type="text" id="dgCron" value="${esc(cfg.cron || '0 9 * * *')}" placeholder="0 9 * * *"></div>
+        <div class="field"><label>日报标题</label>
+          <input type="text" id="dgTitle" value="${esc(cfg.title || '巡检日报')}" maxlength="40"></div>
+        <div class="field"><label>通知渠道（可多选；渠道配置在告警通知页维护）</label>
+          <div style="display:flex;gap:14px;flex-wrap:wrap">
+            ${chans.map(c => `<label style="display:flex;align-items:center;gap:4px">
+              <input type="checkbox" value="${c}" ${sel.includes(c) ? 'checked' : ''}>${c}</label>`).join('')}
+          </div></div>`
+        : '<div class="muted">仅管理员可修改配置；可点击预览查看当前日报内容。</div>'}
+        ${cfg.last_sent_at ? `<div class="plan-detail" style="margin-top:10px">
+          <div class="row"><b>上次发送</b>${fmtTime(cfg.last_sent_at)}</div>
+          <div class="row"><b>结果</b>${esc(cfg.last_result || '-')}</div></div>` : ''}
+        <div id="dgPreviewBox" class="plan-detail" style="margin-top:12px"></div>`;
+      const pv = document.getElementById('dgPreview');
+      if (pv) pv.onclick = async () => {
+        const box = document.getElementById('dgPreviewBox');
+        try{
+          const data = await api('/api/agent/digest/preview');
+          if (box) box.innerHTML = `
+            <div class="row"><b>预览（不发送）</b></div>
+            <pre style="white-space:pre-wrap;font-size:12px;line-height:1.7;margin:6px 0 0">${esc(data.text || '')}</pre>`;
+        }catch(e){ toastError('预览失败：' + (e.message || '')); }
+      };
+      const save = document.getElementById('dgSave');
+      if (save) save.onclick = async () => {
+        const chansSel = Array.from(
+          document.querySelectorAll('#drawerRoot input[type=checkbox]:checked'))
+          .map(x => x.value);
+        const body = {
+          enabled: (document.getElementById('dgEnabled') || {}).value === '1',
+          cron: (document.getElementById('dgCron') || {}).value || '',
+          title: (document.getElementById('dgTitle') || {}).value || '',
+          channels: chansSel
+        };
+        if (body.enabled && !chansSel.length){ toastError('请至少选择一个通知渠道'); return; }
+        try{
+          await api('/api/agent/digest/config', {method:'POST', body: JSON.stringify(body)});
+          toastSuccess('日报配置已保存');
+          closeIt();
+        }catch(e){ toastError('保存失败：' + (e.message || '')); }
+      };
+    })();
   }
 
   // ==================== 模块导出 ====================
