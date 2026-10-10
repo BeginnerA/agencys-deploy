@@ -1,7 +1,7 @@
 """周期巡检日报：聚合平台健康面 → 纯文本日报 → 现成通知渠道推送
 
 设计原则：
-    1. 数据全部来自平台既有事实源（监控缓存/告警表/任务表/审批单/定时计划），
+    1. 数据全部来自平台既有事实源（监控缓存/告警表/任务表/审批单/定时计划/到期监控），
        不做额外探测，单次聚合毫秒级，可挂在建议调度线程里每轮顺带检查；
     2. 发送复用 alert_channels 六渠道，走 send_custom（不写 alert_events，
        日报不是告警）；渠道未配置时结果里带原因，配置页可直接排查；
@@ -93,6 +93,7 @@ def collect_snapshot(db_path: str, now: int = None) -> dict:
         "deploys": _deploys(db_path, now),
         "approvals": _approvals(db_path),
         "schedules": _schedules(db_path, now),
+        "expiring": _expiring(db_path),
     }
 
 
@@ -167,6 +168,48 @@ def _schedules(db_path: str, now: int) -> dict:
     return {"enabled": len(rows), "upcoming": upcoming, "ok": True}
 
 
+def _expiring(db_path: str) -> dict:
+    """临近到期的监控项（证书/域名/订阅等）：与告警引擎同口径
+
+    阈值判定复用 webapp.alert_engine.AlertEngine（阶梯取最宽档，
+    否则逐项 warn_days>0 优先、回退全局 default_warn_days），保证
+    不会出现「日报说无到期、告警却已触发」的口径分叉。
+    """
+    try:
+        import json
+        from webapp.alert_engine import AlertEngine
+        cfg_rows = dbm.list_records(db_path, "platform_settings", "key=?",
+                                    ("custom_monitor_config",))
+        cfg = {}
+        if cfg_rows and cfg_rows[0].get("value"):
+            try:
+                cfg = json.loads(cfg_rows[0]["value"])
+            except (ValueError, TypeError):
+                cfg = {}
+        default_warn = cfg.get("default_warn_days", 30)
+        monitors = dbm.list_records(db_path, "custom_monitors", "enabled=1",
+                                    (), "days_left")
+        items = []
+        for m in monitors:
+            days_left = m.get("days_left")
+            if days_left is None:
+                continue
+            tiered = AlertEngine._parse_tiered(m.get("tiered_thresholds"))
+            if tiered:
+                threshold = max(t[0] for t in tiered)  # 最宽档：进入任一阶梯即提醒
+            else:
+                warn_days = m.get("warn_days") or 0
+                threshold = warn_days if warn_days > 0 else default_warn
+            if days_left <= threshold:
+                items.append({"name": m["name"], "type": m.get("type") or "",
+                              "target": m.get("target") or "",
+                              "days_left": days_left})
+        items.sort(key=lambda x: x["days_left"])
+        return {"ok": True, "count": len(items), "items": items[:10]}
+    except Exception:
+        return {"ok": False}
+
+
 # ---------- 文本渲染 ----------
 
 def _fmt_ts(ts) -> str:
@@ -228,6 +271,21 @@ def render_text(snap: dict, title: str = "巡检日报") -> str:
                      f"启用中定时计划 {sc.get('enabled', 0)} 个")
         for u in sc.get("upcoming") or []:
             lines.append(f"  🕐 {u['name']} → {_fmt_ts(u['next_run_at'])}")
+
+    ex = snap.get("expiring") or {}
+    if ex.get("ok"):
+        if ex.get("count"):
+            lines.append(f"—— 到期提醒：临近到期 {ex['count']} 项")
+            for it in ex.get("items") or []:
+                dl = it.get("days_left")
+                dl_txt = (f"{int(dl)} 天" if isinstance(dl, (int, float))
+                          and dl >= 0 else "—")
+                tag = "❗已到期" if isinstance(dl, (int, float)) and dl <= 0 \
+                    else f"剩 {dl_txt}"
+                lines.append(f"  ⏳ {it['name']}（{it.get('type') or ''} "
+                             f"{it.get('target') or ''}）{tag}")
+        else:
+            lines.append("—— 到期提醒：无临近到期项 ✅")
     return "\n".join(lines)
 
 

@@ -2104,6 +2104,42 @@ class TestAgentDigest(AgentBase):
         self.assertIn("待审审批单 1 张", text)
         self.assertIn("每日构建", text)
 
+    def test_expiring_aggregation_and_render(self):
+        from agent import digest
+        now = int(time.time())
+        # 四条到期监控：阶梯命中 / 超阈值排除 / 全局默认命中 / 已到期
+        mk = lambda **kw: dbm.create_record(self.db, "custom_monitors", dict(
+            type=kw.get("type", "ssl"), name=kw["name"],
+            target=kw.get("target", "a.com"), days_left=kw["days_left"],
+            warn_days=kw.get("warn_days", 0),
+            tiered_thresholds=kw.get("tiered", ""), enabled=1,
+            created_at=now, updated_at=now))
+        mk(name="阶梯命中", type="ssl", days_left=5,
+           tiered='{"30":"P3","7":"P1"}')      # 最宽档 30，5<=30 入选
+        mk(name="超阈排除", type="domain", days_left=20, warn_days=7)  # 20>7 不入选
+        mk(name="默认命中", type="license", days_left=25)   # warn 0→默认 30，25<=30 入选
+        mk(name="已到日期", type="cloud_renewal", days_left=0, warn_days=3)  # 入选
+        snap = digest.collect_snapshot(self.db, now=now)
+        ex = snap["expiring"]
+        self.assertTrue(ex["ok"])
+        self.assertEqual(ex["count"], 3)
+        names = [it["name"] for it in ex["items"]]
+        self.assertNotIn("超阈排除", names)
+        # 按剩余天数升序：已到期(0) 排首
+        self.assertEqual(ex["items"][0]["name"], "已到日期")
+        text = digest.render_text(snap)
+        self.assertIn("到期提醒：临近到期 3 项", text)
+        self.assertIn("阶梯命中", text)
+        self.assertIn("已到期", text)
+        self.assertNotIn("超阈排除", text)
+
+    def test_expiring_degrades_on_error(self):
+        from agent import digest
+        # 无监控项时返回 ok且 count 0，渲染带✅（不因空数据报错）
+        ex = digest._expiring(self.db)
+        self.assertTrue(ex["ok"])
+        self.assertEqual(ex["count"], 0)
+
     def test_send_digest_tool(self):
         from agent import tools as tools_mod
         from agent import digest as digest_mod

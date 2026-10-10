@@ -22,7 +22,7 @@ agent/
 ├── advisor.py     Phase 2 决策引擎：灰度建议 / 失败归因 / 告警归因 / 预检 / 案例沉淀
 ├── executor.py    Phase 3 发布执行：计划生成 / 审批状态机 / 任务提交 / 后台同步
 ├── memory.py      Phase 4 长期记忆：故障案例 CRUD + 字符 bigram 相似检索
-├── digest.py      周期巡检日报：健康/告警/发布聚合 → 通知渠道定时推送
+├── digest.py      周期巡检日报：健康/告警/发布/到期聚合 → 通知渠道定时推送
 ├── scheduler.py   后台建议调度（daemon 线程，默认 30s 一轮；顺带检查日报到点）
 ├── routes.py      Web API（/api/agent/*，29 条，RBAC 对齐平台）
 ├── cli.py         终端对话入口（交互式 / --once 单轮）
@@ -114,6 +114,8 @@ python webapp/app.py
 
 **运维辅助对话化**：三个高频小动作收入对话。`manage_servers` 新增 action=test（仅 admin，与 Web `/servers/test` 同等效力）：按 host 或 server_id 定位已注册服务器，服务器级 ssh 凭据优先、缺省回退首个绑定环境 ssh 段、再回退 root:22，复用 `webapp.monitor._ssh_exec`（惰性 import）执行 `echo ok` 探连通与耗时（失败返回 ok=False 属正常结果而非工具错，仅探测成功才写审计 `agent_test_server`）——接入绑定后验连通、故障排查场景常用。`refresh_monitor`（operator/admin，与 Web `/monitor/refresh` 同等效力）：`get_monitor().refresh()` 立即触发一轮采集，数据过时或刚改完配置想看最新状态时先刷一轮（采集器未启动则拒绝）。`manage_config_backup`（仅 admin，与 Web `/config/export|import` 同等效力）：action=export 把 DB 配置全量导出为 YAML 到 `data/export/config/`（单项目兼容名可直接复制为 config/，多项目按 code 加后缀）；action=import 从项目 `config/` 目录逐文件回灌 DB（逐文件结果见 results，文件不存在也计入失败项）；复用 `webapp.exporter.export_all`/`webapp.importer.import_from_config`（与 Web 同一实现），根目录从 tools.py 位置推导与 config_routes 同源；审计 `agent_export_config`/`agent_import_config`（via:agent）。
 
+**新能力回灌日报**：到期监控体系建成后，巡检日报原本只聚合健康/告警/发布/审批/计划五块，从未纳入到期——新能力与旧聚合面存在口径断点。`digest._expiring` 补齐第六块：复用 `AlertEngine._parse_tiered` 与告警引擎同口径判定（阶梯取最宽档、否则逐项 warn_days>0 优先、回退全局 default_warn_days），将临近到期项按剩余天数升序写进日报（已到期标❗）；单点异常降级为该节不可用不阻断整报，口径一致确保不会「日报说无到期、告警却已触发」。工具面未变（`send_digest` 已存），仅描述补到期。
+
 - **计划生成**：`plan_operation(op=deploy/rollback/restart, target=服务或流水线名, env, version, previous_version, canary/skip_build/auto_version/no_git_tag)` 校验目标存在、版本格式、与平台一致的回滚语义（rollback 时 version=回滚目标），产出可预览的 CLI 命令行，绝不直接执行。
 - **定时计划立即执行**：`manage_schedules(action=run)` 生成 `kind=schedule_run` 审批单（与 Web 端 run_schedule 等效但必经人工审批）；block 窗口拒单、warn 窗口审批需显式 force_window，通过后按调度器同语义创建任务并后台同步终态。
 - **建议一键采纳**：失败归因建议（有回滚版本）→ `POST /api/agent/advice/<id>/to_run` 自动生成回滚审批单（参数从 evidence.task 推导，与手动建单同一安全链路）；灰度决策建议 → 直接写决策文件（仅当任务仍在 waiting，否则 409 提示）；告警归因/预检建议无可执行动作，明确拒绝。已完结审批单可 `POST /api/agent/runs/<id>/to_case` 一键沉淀案例（含关联归因建议），Web 端建议卡片/审批单详情均有对应按钮。
@@ -142,7 +144,7 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 
 ## 七、周期巡检日报
 
-- **聚合内容**（全部来自平台既有事实源，单次聚合毫秒级）：服务健康统计（监控缓存，异常服务逐个列出）、未解决告警（按 P0/P1 优先，Top 5 明细）、近 24h 发布任务（成功/失败计数 + 失败清单）、待审审批单数、启用中定时计划与 24h 内 upcoming。
+- **聚合内容**（全部来自平台既有事实源，单次聚合毫秒级）：服务健康统计（监控缓存，异常服务逐个列出）、未解决告警（按 P0/P1 优先，Top 5 明细）、近 24h 发布任务（成功/失败计数 + 失败清单）、待审审批单数、启用中定时计划与 24h 内 upcoming、临近到期监控项（证书/域名/订阅等，与告警引擎同口径复用 `AlertEngine._parse_tiered` 判定阶梯/单阈值，按剩余天数升序列出）。
 - **发送**：复用告警六渠道（`alert_channels.send_custom`，同一套配置检查与重试，**不写 alert_events**——日报不是告警）。
 - **调度**：挂在建议调度线程同一循环，每轮检查 cron 是否到点（48h 补发窗口：重启跨日不漏发、停机超 2 天不补发）；多实例用 `scheduler_locks` 独立锁名 `agent_digest` 互斥，拿锁后双检防重复发送。
 - **配置**：`platform_settings` 键 `agent_digest`（JSON：enabled/cron/channels/title/last_sent_at/last_result）；Web 端「智能助手 → 📤 巡检日报」弹窗维护（仅 admin），支持内联预览与手动立即发送；对话工具 `send_digest` 亦可立即推送。

@@ -3414,7 +3414,7 @@ _spec("manage_config_backup",
               {"action": str_req}, "write", _manage_config_backup),
 _spec("send_digest",
               "立即聚合并推送一次巡检日报（服务健康/告警/近24h发布/待审审批单"
-              "/定时计划）到已配置的通知渠道；渠道未配置时提示先配置",
+              "/定时计划/临近到期监控）到已配置的通知渠道；渠道未配置时提示先配置",
               {}, "write", _send_digest),
     ]
 
