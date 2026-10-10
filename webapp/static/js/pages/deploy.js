@@ -1,6 +1,7 @@
 // pages/deploy.js — 发布中心（任务列表 + 新建 + 详情日志流 + 终止）
 (function(){
-  let timer = null;      // 列表 5s 轮询
+  let liveOffs = [];   // 列表实时绑定（事件驱动；通道降级时按 15s 兜底轮询）
+  function clearLiveOffs(){ liveOffs.forEach(off => { try{ off(); }catch(e){} }); liveOffs = []; }
   let logTimer = null;   // 当前日志流的停止函数（destroy 兜底；流自身在关抽屉/终态时自停）
   let statusFilter = 'all';
   let projFilter = 'all'; // all / 项目 id
@@ -138,9 +139,11 @@
     if (!logBox) return null;
     let offset = 0;
     let interval = null;
+    let liveOff = null;        // 任务状态事件绑定（终态即时收尾，不等下一轮轮询）
     let buf = '';            // 累积待渲染文本，rAF 统一刷入 DOM
     let flushing = false;    // 防止多个 rAF 回调堆叠
-    const stop = () => { if (interval){ clearInterval(interval); interval = null; } };
+    const stop = () => { if (interval){ clearInterval(interval); interval = null; }
+                         if (liveOff){ liveOff(); liveOff = null; } };
     // 批量 DOM 写入：每帧最多一次 textContent 赋值 + scrollTop，避免高频重排
     function flushDOM(){
       if (!buf || !logBox) { flushing = false; return; }
@@ -212,6 +215,9 @@
     };
     tick();
     if (['running','pending'].includes(task.status)){
+      // 任务日志文件由发布子进程直接写入（跨进程，后端无法埋点）→ 2s 增量轮询必须保留；
+      // 但状态流转是进程内事件，绑 tasks 让终态收尾与徽标刷新即时生效（降级时 2s 兜底）
+      liveOff = liveBind('tasks', () => { tick(); }, 2000);
       interval = setInterval(tick, 2000);
     }
     return stop;
@@ -279,8 +285,7 @@
     render: async function(root){
       destroyed = false;
       lastSig = null; // 重置签名：确保重渲染后首次 loadTasks 必定执行 renderTable
-      if (timer) clearInterval(timer); // 项目筛选重渲染时先清理旧轮询
-      timer = null;
+      clearLiveOffs();   // 项目筛选重渲染时先解绑旧通道绑定
       const statuses = [['all','全部'],['running','运行中'],['pending','等待中'],['success','成功'],['failed','失败']];
       const subTabs = `
         <div class="sub-tabs" style="display:flex;gap:4px;margin-bottom:12px">
@@ -338,11 +343,13 @@
         envSel.onchange = () => { envFilter = envSel.value; renderTable(); };
       }
       await loadTasks().catch(() => {});
-      if (destroyed) return []; // destroy 后在途续体不再创建轮询
-      timer = setInterval(loadTasks, 5000);
-      return [timer];
+      if (destroyed) return []; // destroy 后在途续体不再建绑定
+      // 任务列表靠事件驱动：create_task / update_task 都经 db 漏斗推 tasks 事件
+      // （含排队项新建、状态流转、调度器与 Agent 通道），降级时回 15s 轮询
+      liveOffs = [liveBind('tasks', () => loadTasks().catch(() => {}), 15000)];
+      return [];
     },
-    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; lastSig = null; if (logTimer){ logTimer(); logTimer = null; } },
+    destroy: function(){ destroyed = true; clearLiveOffs(); lastSig = null; if (logTimer){ logTimer(); logTimer = null; } },
   };
   // 跨页复用：dashboard 最近发布 / layout 全局搜索 → 任务日志抽屉（无路由依赖）
   window.deployPage = { openTaskDetailSafe: function(id){ return openTaskDetail(id, true); } };

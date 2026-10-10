@@ -213,7 +213,7 @@ class TestStreamRoute(unittest.TestCase):
 
 
 class TestProducerHooks(unittest.TestCase):
-    """生产者埋点：任务/告警状态漏斗 + 建议落库 + 引擎新建告警"""
+    """生产者埋点：任务/告警/审批单/建议状态漏斗 + 引擎新建告警 + 采集轮次"""
 
     def setUp(self):
         events.reset()
@@ -298,6 +298,69 @@ class TestProducerHooks(unittest.TestCase):
         self.assertEqual(ev["topic"], "monitor")
         self.assertEqual(ev["data"]["envs"], 0)
         self.assertEqual(ev["data"]["round"], 1)
+        events.unsubscribe(sub)
+
+    def test_create_task_publishes_created_event(self):
+        # 排队项新建也是列表变化源：Web/CLI/Agent/调度/webhook 全经 db.create_task
+        sub = events.subscribe(["tasks"])
+        tid = self._create_task()
+        ev = events.next_event(sub, timeout=0.5)
+        self.assertEqual(ev["topic"], "tasks")
+        self.assertEqual(ev["data"], {"task_id": tid, "status": "pending",
+                                      "event": "created"})
+        events.unsubscribe(sub)
+
+    def test_agent_runs_status_publishes_agent_topic(self):
+        # 审批单执行态回写全部走 update_record("agent_runs")（executor 六处 + Web 审批）：
+        # 靠表→主题映射一处收口，不逐处埋点
+        run_id = dbm.create_record(self.db, "agent_runs", dict(
+            kind="operation", name="svc", env="prod",
+            created_at=int(time.time())))
+        sub = events.subscribe(["agent"])
+        dbm.update_record(self.db, "agent_runs", run_id, {"status": "executing"})
+        ev = events.next_event(sub, timeout=0.5)
+        self.assertEqual(ev["data"]["table"], "agent_runs")
+        self.assertEqual(ev["data"]["status"], "executing")
+        dbm.update_record(self.db, "agent_runs", run_id, {"summary": "done"})
+        self.assertIsNone(events.next_event(sub, timeout=0.05))   # 非状态字段不推
+        events.unsubscribe(sub)
+
+    def test_advice_status_change_publishes_agent_topic(self):
+        from agent import advisor
+        aid = advisor.save_advice(self.db, "service", 5, "标题", "正文")
+        sub = events.subscribe(["agent"])
+        dbm.update_record(self.db, "agent_advice", aid, {"status": "dismissed"})
+        ev = events.next_event(sub, timeout=0.5)
+        self.assertEqual(ev["topic"], "agent")
+        self.assertEqual(ev["data"]["table"], "agent_advice")
+        self.assertEqual(ev["data"]["id"], aid)
+        events.unsubscribe(sub)
+
+    def test_tasks_table_not_in_status_topic_map(self):
+        # tasks 由 update_task 专属漏斗发事件；若 update_record 也发则同一变更双发，
+        # 前端会重复重取（映射表必须显式登记，不能因同名字段隐式扩大事件面）
+        tid = self._create_task()
+        sub = events.subscribe(["tasks"])
+        dbm.update_record(self.db, "tasks", tid, {"status": "running"})
+        self.assertIsNone(events.next_event(sub, timeout=0.05))
+        events.unsubscribe(sub)
+
+    def test_log_collector_round_publishs_logs_event(self):
+        # 服务采集日志：每轮只发一帧（携带本轮新行数与涉及服务），无增量不发
+        from webapp.log_collector import LogCollector
+        col = LogCollector(self.db, str(Path(self.db).parent / "logs"),
+                           interval=10)
+        sub = events.subscribe(["logs"])
+        col._publish_round_event()
+        self.assertIsNone(events.next_event(sub, timeout=0.05))
+        out = ("2026-01-01T00:00:00.000000Z line one\n"
+               "2026-01-01T00:00:01.000000Z line two\n")
+        col._collect_container_output("prod", 1, "h1", "svc-a", out, "")
+        col._publish_round_event()
+        ev = events.next_event(sub, timeout=0.5)
+        self.assertEqual(ev["topic"], "logs")
+        self.assertEqual(ev["data"]["new_entries"], 2)
+        self.assertIn("prod/svc-a", ev["data"]["services"])
         events.unsubscribe(sub)
 
 

@@ -1,10 +1,11 @@
 // pages/deploy_schedules.js — 定时发布计划管理
 (function(){
-  let timer = null;
+  let liveOffs = [];   // 计划列表实时绑定（事件驱动；降级时按 20s 兜底轮询）
+  function clearLiveOffs(){ liveOffs.forEach(off => { try{ off(); }catch(e){} }); liveOffs = []; }
   let destroyed = false;
   let schedules = [];
   let projects = [];
-  let lastSig = null; // 10s 轮询数据签名：无变化时跳过表格全量重建
+  let lastSig = null; // 刷新数据签名：无变化时跳过表格全量重建
 
   async function loadData(){
     projects = await api('/api/projects').catch(() => []);
@@ -194,9 +195,12 @@
       const nb = document.getElementById('newSchedBtn');
       if (nb) nb.onclick = openCreateForm;
       renderTable();
-      timer = setInterval(refresh, 10000);
-      return [timer];
+      clearLiveOffs();
+      // 计划列表的变化源头：调度器到点触发会创建任务（tasks 事件）并回写 last_run 字段；
+      // CRUD 都由本页主动重拉。计划数据低频，降级时 20s 兜底
+      liveOffs = [liveBind('tasks', () => refresh().catch(() => {}), 20000)];
+      return [];
     },
-    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; lastSig = null; }
+    destroy: function(){ destroyed = true; clearLiveOffs(); lastSig = null; }
   };
 })();

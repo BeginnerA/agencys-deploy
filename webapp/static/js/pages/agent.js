@@ -1,7 +1,17 @@
 // pages/agent.js — 智能助手（对话 / 审批单 / 决策建议 / 故障案例 / 网关配置）
 // 消费后端 /api/agent/* API；角色：viewer=只读对话；operator/admin=审批/建议/案例
 (function(){
-  let timer = null;
+  let liveOffs = [];   // 列表页实时绑定（事件驱动；降级时按 15s 兜底轮询）
+  function clearLiveOffs(){ liveOffs.forEach(off => { try{ off(); }catch(e){} }); liveOffs = []; }
+
+  // 当前页签刷新（后台 advisor 建议与审批单执行态会持续变化）；
+  // 案例页无事件源，靠同一绑定的兜底轮询兼顾
+  function refreshLiveTab(){
+    if (destroyed || document.hidden) return;
+    if (currentTab === 'runs') loadRuns();
+    else if (currentTab === 'advice') loadAdvice();
+    else if (currentTab === 'cases') loadCases();
+  }
   let destroyed = false;
   let chatAbort = null;    // 流式对话 AbortController（切页时中止）
   let pendingTools = [];   // 流式对话中未收尾的工具行（tool → tool_result）
@@ -1291,21 +1301,16 @@
     render: async function(root){
       destroyed = false;
       renderPage();
-      if (timer) clearInterval(timer);
-      // 列表页 15s 自动刷新（后台 advisor 建议/执行态会持续变化）
-      timer = setInterval(() => {
-        if (destroyed) return;
-        if (currentTab === 'runs' && !document.hidden) loadRuns();
-        else if (currentTab === 'advice' && !document.hidden) loadAdvice();
-        else if (currentTab === 'cases' && !document.hidden) loadCases();
-      }, 15000);
-      return [timer];
+      clearLiveOffs();
+      // 事件源：agent（新建议 + agent_runs/agent_advice 状态流转）与
+      // tasks（审批单关联的发布任务状态）；通道降级时回 15s 轮询（与旧口径一致）
+      liveOffs = [liveBind(['agent', 'tasks'], refreshLiveTab, 15000)];
+      return [];
     },
     destroy: function(){
       destroyed = true;
       abortChat();
-      if (timer) clearInterval(timer);
-      timer = null;
+      clearLiveOffs();
     }
   };
 })();

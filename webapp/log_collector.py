@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import db as dbm
+from . import events
 from .alert_engine import get_engine
 
 # docker logs 时间戳解析正则（含可选纳秒/微秒部分）
@@ -121,6 +122,10 @@ class LogCollector:
         self._thread = None
         self._lock = threading.Lock()
         self._fail_counts = {}
+        # 本轮新索引日志计数/涉及服务（多线程写入经 _lock 汇总），
+        # 轮末有增量才推一次 logs 事件（前端服务日志抽屉靠它去抖取尾部）
+        self._round_entries = 0
+        self._round_services = set()
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -161,6 +166,9 @@ class LogCollector:
         """
         if not self.ssh_func:
             return
+        with self._lock:
+            self._round_entries = 0
+            self._round_services = set()
         # 本轮启用的日志关键词规则（每轮加载一次，供所有容器复用）
         self._current_kw_rules = self._load_log_keyword_rules()
         conn = dbm.get_conn(self.db_path)
@@ -219,6 +227,18 @@ class LogCollector:
                 except Exception:
                     pass
         self._current_kw_rules = None
+        self._publish_round_event()
+
+    def _publish_round_event(self):
+        """轮末单帧发布（而非每容器一帧）：采集周期本身就是 30s 量级，
+        细粒度推送只会让已绑 logs 的页面反复重取；本轮无新行则不推"""
+        with self._lock:
+            new_entries = self._round_entries
+            services = sorted(self._round_services)
+        if new_entries > 0:
+            events.publish("logs", {"new_entries": new_entries,
+                                    "services": services[:10],
+                                    "services_total": len(services)})
 
     def _collect_host(self, job: dict):
         """采集单台主机：一次 SSH 单通道批量拉取所有容器增量日志
@@ -412,6 +432,9 @@ class LogCollector:
             self._scan_keywords_in_entries(entries, env_name, env_id, rowids)
             self._update_scan_state(env_name, host, container, service,
                                     last_line_ts or "", line_offset, today)
+            with self._lock:
+                self._round_entries += len(entries)
+                self._round_services.add(f"{env_name}/{service}")
 
     def _append_to_file(self, file_path: str, lines: list):
         """追加日志行到文件（自动创建目录）"""

@@ -719,6 +719,12 @@ def create_record(db_path: str, table: str, fields: dict) -> int:
         conn.close()
 
 
+# 状态流转 → 实时主题映射：凡经 update_record 写 status 且前端需即时感知的表都在此登记。
+# 单一漏斗的目的在于：Web route / Agent 工具 / 后台引擎 / 调度器四类写通道共用
+# 同一处埋点，既不会漏埋（如在 5 个 route 处理器各自 publish）也不会双发。
+_STATUS_TOPICS = {"alerts": "alerts", "agent_runs": "agent", "agent_advice": "agent"}
+
+
 def update_record(db_path: str, table: str, record_id: int, fields: dict) -> bool:
     _check_table(table)
     fields = _serialize(table, fields)
@@ -733,12 +739,12 @@ def update_record(db_path: str, table: str, record_id: int, fields: dict) -> boo
         ok = cur.rowcount > 0
     finally:
         conn.close()
-    # alerts 状态流转的唯一漏斗：route 层手工 ack/resolve/reopen、批量操作、
-    # 引擎自动恢复都经此处，一处埋点全覆盖；只在 status 变化时推，
-    # 避开同指纹重复命中每轮刷 last_seen_at 的事件风暴
-    if ok and table == "alerts" and "status" in fields:
-        events.publish("alerts", {"alert_id": record_id,
-                                  "status": fields["status"]})
+    # 状态变更事件（见 _STATUS_TOPICS）：只在 status 字段写入且确实更新成功时推，
+    # 避开同指纹告警每轮只刷 last_seen_at 造成的事件风暴
+    topic = _STATUS_TOPICS.get(table)
+    if ok and topic and "status" in fields:
+        events.publish(topic, {"table": table, "id": record_id,
+                               "status": fields["status"]})
     return ok
 
 
@@ -919,7 +925,12 @@ def create_task(db_path: str, project_id: int, type_: str, ref_id: int, name: st
                   env=env, version=version, previous_version=previous_version,
                   extra=extra or [], action=action, status="pending",
                   created_by=created_by)
-    return create_record(db_path, "tasks", fields)
+    task_id = create_record(db_path, "tasks", fields)
+    # 新建任务也推 events：列表页靠它即时看到排队项（状态流转只覆盖已有任务）；
+    # 全部创建入口（Web/CLI/Agent/调度/webhook）均经本函数，一处即收口
+    events.publish("tasks", {"task_id": task_id, "status": "pending",
+                             "event": "created"})
+    return task_id
 
 
 def update_task(db_path: str, task_id: int, **fields) -> bool:

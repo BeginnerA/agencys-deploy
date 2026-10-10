@@ -11,7 +11,7 @@ function renderTopbar(){
       <div class="drop-panel" id="searchDrop"></div>
     </div>
     <button class="tb-btn" id="refreshBtn" title="手动刷新监控">⟳</button>
-    <button class="tb-btn" id="liveChip" title="实时通道状态"><span class="dot gray"></span>连接中</button>
+    <button class="live-chip gray" id="liveChip" title="实时通道状态" aria-label="实时通道状态"><span class="dot gray"></span>连接中</button>
     <div class="user-chip" id="userChip">
       <div class="user-avatar">${esc((u.username || '?').slice(0,1).toUpperCase())}</div>
       <div class="user-meta"><div class="u-name">${esc(u.username || '未知')}</div>
@@ -129,20 +129,60 @@ function renderMarquee(latest){
   document.getElementById('mqClose').onclick = () => { bar.classList.add('hidden'); bar.dataset.closed = '1'; };
 }
 
-// 实时通道指示灯：把「数据新不新鲜」从用户无从得知变成一眼可见
-// 复用 .tb-btn 外壳与 .dot 状态色（ok/warn/gray），不引入新视觉语系
+// 实时通道指示灯：胶囊芯片承载 状态点+文字，宽度自适应不再受 .tb-btn 32px 方壳挤压；
+// 点击展开通道详情小面板（状态/最近事件/订阅主题/手动重连），定位范式同 #userMenu
 function renderLiveChip(){
   const el = document.getElementById('liveChip');
   if (!el || typeof liveOnState !== 'function') return;
-  const MAP = {online: ['dot ok', '实时'], connecting: ['dot warn', '连接中'],
-               degraded: ['dot gray', '降级轮询'], init: ['dot gray', '连接中']};
+  const MAP = {online: ['ok', 'dot ok', '实时'], connecting: ['warn', 'dot warn', '连接中'],
+               degraded: ['gray', 'dot gray', '降级轮询'], init: ['gray', 'dot gray', '连接中']};
   const paint = (s) => {
     const m = MAP[s] || MAP.init;
+    el.className = 'live-chip ' + m[0];
+    el.innerHTML = `<span class="${m[1]}"></span>${m[2]}`;
     const last = liveLastEvent();
-    el.innerHTML = `<span class="${m[0]}"></span>${m[1]}`;
     el.title = '实时通道：' + s + '\n'
       + (last ? '最近事件 ' + new Date(last).toLocaleTimeString()
                 : '尚未收到事件（当前靠兜底轮询驱动）');
+    syncLiveMenu(s);
   };
   liveOnState(paint);
+  el.onclick = (e) => { e.stopPropagation(); toggleLiveMenu(); };
+  document.addEventListener('click', (e) => {
+    const menu = document.getElementById('liveMenu');
+    if (menu && menu.style.display === 'block' && !el.contains(e.target) && !menu.contains(e.target))
+      menu.style.display = 'none';
+  });
 }
+let _liveMenuEl = null;
+function toggleLiveMenu(){
+  const el = document.getElementById('liveChip');
+  if (!el) return;
+  const menu = _liveMenuEl || (_liveMenuEl = Object.assign(document.createElement('div'), {id: 'liveMenu'}));
+  if (!menu.parentNode) document.body.appendChild(menu);
+  if (menu.style.display === 'block'){ menu.style.display = 'none'; return; }
+  syncLiveMenu(typeof liveState === 'function' ? liveState() : 'init', true);
+  const r = el.getBoundingClientRect();
+  menu.style.top = (r.bottom + 6) + 'px';
+  menu.style.right = (window.innerWidth - r.right) + 'px';
+  menu.style.display = 'block';
+}
+// 面板内容随状态/事件实时刷新（开着时不点重连也能看到「最近事件」跳动）；force 为打开时强制填充
+function syncLiveMenu(s, force){
+  const menu = document.getElementById('liveMenu');
+  if (!menu || (menu.style.display !== 'block' && !force)) return;
+  const last = liveLastEvent();
+  const topics = typeof liveTopics === 'function' ? liveTopics().join(' / ') : '-';
+  menu.innerHTML = `
+    <div class="lm-row"><span>通道状态</span><b>${NAME_LIVE[s] || s}</b></div>
+    <div class="lm-row"><span>最近事件</span><b>${last ? new Date(last).toLocaleTimeString() : '暂无（兜底轮询驱动）'}</b></div>
+    <div class="lm-row"><span>订阅主题</span><b>${topics}</b></div>
+    <button class="lm-btn" id="liveReconnect">↻ 立即重连</button>`;
+  document.getElementById('liveReconnect').onclick = (e) => {
+    e.stopPropagation();
+    if (typeof liveStop === 'function') liveStop();
+    if (typeof liveStart === 'function') liveStart();
+    toastSuccess('正在重连实时通道...');
+  };
+}
+const NAME_LIVE = {online: '实时在线', connecting: '连接中', degraded: '降级轮询', init: '初始化'};

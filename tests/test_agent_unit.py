@@ -1656,7 +1656,9 @@ class TestAgentManageTools(AgentBase):
                                return_value={"subscribers": 2,
                                              "published": 9, "dropped": 1}), \
              mock.patch("webapp.monitor.get_monitor", return_value=None), \
-             mock.patch("webapp.alert_engine.get_engine", return_value=None):
+             mock.patch("webapp.alert_engine.get_engine", return_value=None), \
+             mock.patch("webapp.log_collector.get_collector",
+                        return_value=type("_Col", (), {"interval": 30})()):
             out = self._call("live_status", {})
         self.assertTrue(out["ok"])
         self.assertEqual(out["subscribers"], 2)
@@ -1666,7 +1668,11 @@ class TestAgentManageTools(AgentBase):
         self.assertIsNone(out["monitor_interval"])
         self.assertFalse(out["alert_engine_running"])
         self.assertIn("alerts", out["topics"])
-        # 采集器在跑时上报周期
+        # logs 主题（服务采集日志）与它的生产者状态：logs 事件只盖采集日志
+        self.assertIn("logs", out["topics"])
+        self.assertTrue(out["log_collector_running"])
+        self.assertEqual(out["log_collect_interval"], 30)
+        # 监控探测在跑时上报其探测周期
         class _Mon:
             _interval = 45
         with mock.patch.object(events, "stats",

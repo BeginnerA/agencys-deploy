@@ -1,6 +1,9 @@
 // pages/logs.js — 日志中心（任务日志/审计日志/服务日志三 Tab + 项目/环境筛选 + 日志追尾）
 (function(){
-  let timer = null;       // 追尾定时器
+  let timer = null;       // 追尾定时器（任务日志文件由发布子进程直写、跨进程不可
+                           // 埋点，因此正文仍靠 3s 增量轮询，logs 主题不覆盖它）
+  let liveOffs = [];      // 任务列表实时绑定（新建/状态流转即时重拉下拉选项）
+  function clearLiveOffs(){ liveOffs.forEach(off => { try{ off(); }catch(e){} }); liveOffs = []; }
   let tab = 'task';       // task / audit / service（audit 仅 admin）
   let projFilter = 'all'; // all / 项目 id
   let envFilter = 'all';  // all / 环境名（仅选中项目时生效）
@@ -539,8 +542,14 @@
         renderTab();
       });
       await renderTab();
+      // 任务下拉靠 tasks 事件即时反映新建/状态流转（日志正文仍靠上面的追尾轮询）；
+      // 通道降级时 30s 兜底重拉
+      clearLiveOffs();
+      liveOffs = [liveBind('tasks', () => {
+        if (tab === 'task') loadTaskList().catch(() => {});
+      }, 30000)];
       return [];
     },
-    destroy: function(){ destroyed = true; stopTail(); },
+    destroy: function(){ destroyed = true; stopTail(); clearLiveOffs(); },
   };
 })();

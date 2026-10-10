@@ -1,14 +1,15 @@
 // pages/devices.js — 设备总览（项目/环境切换 + 服务卡片墙 + 发布抽屉 + 服务器列表）
 (function(){
   let state = { projects: [], currentProject: null, envs: [], currentEnv: null };
-  let timer = null;
+  let liveOffs = [];        // 卡片墙实时绑定（事件驱动；降级时按兜底轮询）
+  function clearLiveOffs(){ liveOffs.forEach(off => { try{ off(); }catch(e){} }); liveOffs = []; }
   let monitorCache = null;
   let tasksCache = [];
   let reqSeq = 0; // 丢弃过期响应（快速切换项目/环境时防乱序覆盖）
-  let lastSig = null; // 3s 轮询数据签名：无变化时跳过卡片墙/服务器表全量重建
+  let lastSig = null; // 刷新签名：无变化时跳过卡片墙/服务器表全量重建
   let destroyed = false; // 路由切换后丢弃 in-flight 响应，防覆盖新页面/泄漏轮询
-  // 服务日志抽屉轮询状态
-  let svcLogTimer = null;
+  // 服务日志抽屉取数状态（logs 事件驱动 + 降级兜底轮询）
+  let svcLogLive = null;
   let svcLogLastId = 0;
   let svcLogFilter = 'all';   // all / error / warn / info
   let svcLogLines = 100;
@@ -313,7 +314,7 @@
 
   // ---- 服务日志抽屉（1Panel 风格，轮询 /api/logs/tail，5s 增量追加）----
   function stopSvcLogPolling(){
-    if (svcLogTimer){ clearInterval(svcLogTimer); svcLogTimer = null; }
+    if (svcLogLive){ svcLogLive(); svcLogLive = null; }
   }
   function openServiceLogDrawer(svcName){
     stopSvcLogPolling();
@@ -344,7 +345,9 @@
     document.getElementById('svcLogShowTsCb').onchange = (e) => { svcLogShowTs = e.target.checked; renderLogLines(svcName); };
     document.getElementById('svcLogClear').onclick = () => { if (box) { box.innerHTML = '<span style="color:#8b949e">（已清空）</span>'; svcLogLastId = 0; } };
     pollServiceLogs(svcName);
-    svcLogTimer = setInterval(() => pollServiceLogs(svcName), 5000);
+    // 服务日志源于采集器（默认 30s 一轮），logs 事件就是「本轮有新行」信号；
+    // 通道降级时回 15s 兜底轮询（原 5s 轮询比采集周期还快，大部分时间在空转）
+    svcLogLive = liveBind('logs', () => pollServiceLogs(svcName), 15000);
   }
   async function pollServiceLogs(svcName){
     try {
@@ -402,9 +405,9 @@
       try{ await loadProjects(); }
       catch(e){ root.innerHTML = errorState('设备数据加载失败：' + e.message, 'navigate'); return []; }
       if (destroyed) return [];
-      return timer ? [timer] : [];
+      return [];
     },
-    destroy: function(){ destroyed = true; if (timer) clearInterval(timer); timer = null; lastSig = null; stopSvcLogPolling(); },
+    destroy: function(){ destroyed = true; clearLiveOffs(); lastSig = null; stopSvcLogPolling(); },
   };
 
   async function render(){
@@ -430,8 +433,9 @@
     root.querySelectorAll('.chip[data-env]').forEach(c => c.onclick = () => switchEnv(c.dataset.env));
     await loadData().catch(() => {});
     if (destroyed) return;
-    // 3s 轮询卡片状态（发布中任务状态变化）
-    if (timer) clearInterval(timer);
-    timer = setInterval(async () => { try{ await loadData(); }catch(e){} }, 3000);
+    // 卡片墙：监控采集轮次（monitor）与任务创建/状态流转（tasks）都会改变卡片，
+    // 一个绑定吃两个事件源（避免绑两条重复重取）；降级时 10s 兜底轮询
+    clearLiveOffs();
+    liveOffs = [liveBind(['monitor', 'tasks'], () => loadData().catch(() => {}), 10000)];
   }
 })();

@@ -26,7 +26,9 @@ from ..auth import require_auth
 stream_bp = Blueprint("stream", __name__)
 
 # 已知主题（与生产者埋点一一对应）：未知主题直接忽略，避免前端拼错参数收不到东西
-KNOWN_TOPICS = ("monitor", "alerts", "tasks", "agent")
+# logs = 采集器本轮有新日志行（服务日志抽屉取尾部）；任务日志文件由发布子进程直接
+# 写入（跨进程不可埋点），仍靠页面轮询追尾，不在本主题覆盖范围内
+KNOWN_TOPICS = ("monitor", "alerts", "tasks", "agent", "logs")
 HEARTBEAT_SECONDS = 15.0      # 空闲发注释帧保活，防代理判定连接死掉
 MAX_LIFETIME_SECONDS = 1800   # 单流最长 30 分钟，到期收尾由前端自动重连
 # 已断开的客户端要等到下一次写帧（事件或心跳）才因 BrokenPipe 退出生成器并退订，

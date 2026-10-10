@@ -10,13 +10,15 @@
 // 为什么用 fetch + ReadableStream 而不是 EventSource：需要携带 Authorization 头
 // （EventSource 不能自定义请求头，与本平台 JWT 认证不兼容），与 agent-stream.js 同一范式。
 (function(){
-  const TOPICS = ['monitor', 'alerts', 'tasks', 'agent'];
+  const TOPICS = ['monitor', 'alerts', 'tasks', 'agent', 'logs'];
   const COALESCE_MS = 400;          // 同绑定短时间多事件合并窗口
   const BACKOFF_MAX_MS = 30000;     // 重连退避上限
+  const CAP_BACKOFF_MS = 30000;     // 服务端拒接（订阅已满）时的退避下限，防形成重连风暴
   const FALLBACK_WHEN_HIDDEN_MS = 60000;  // 页面隐藏时兜底轮询降频（省请求，回前台立即重连）
 
   let state = 'init';               // init | connecting | online | degraded
   let ctrl = null, retryTimer = null, attempt = 0, started = false;
+  let capped = false;               // 上一轮被服务端拒接（收不到 hello）
   let lastEventTs = 0;
   const binds = {};                 // id -> {topic, fn, fallbackMs, timer, lastRun, trail, dead}
   const watchers = [];              // 状态变化订阅（顶栏指示灯用）
@@ -81,7 +83,7 @@
     Object.keys(binds).forEach(k => {
       const b = binds[k];
       if (!b || b.dead) return;
-      if (topic === 'resync' || b.topic === topic) run(b);
+      if (topic === 'resync' || b.topics.indexOf(topic) >= 0) run(b);
     });
   }
 
@@ -93,6 +95,10 @@
     let frame = null;
     try{ frame = JSON.parse(raw); }catch(e){ return; }
     if (!frame || typeof frame.type !== 'string') return;
+    // 只有真正收到 hello 才算通道打开（复位退避）：仅凭 HTTP 200 复位会让
+    // 「服务端拒接但返回 200 + error 帧」变成 1s 一次的紧循环重连（实测风暴）
+    if (frame.type === 'hello'){ capped = false; attempt = 0; return; }
+    if (frame.type === 'error'){ capped = true; throw new Error('stream_capped'); }
     if (frame.type === 'event') dispatch(frame.topic);
     else if (frame.type === 'bye') throw new Error('stream_closed');  // 交给外层重连
   }
@@ -100,7 +106,8 @@
   function scheduleReconnect(){
     if (retryTimer || started === false) return;
     if (document.hidden) return;             // 隐藏时不重连，回前台由 visibilitychange 触发
-    const delay = Math.min(BACKOFF_MAX_MS, 1000 * Math.pow(2, attempt));
+    let delay = Math.min(BACKOFF_MAX_MS, 1000 * Math.pow(2, attempt));
+    if (capped) delay = Math.max(delay, CAP_BACKOFF_MS);   // 服务端满：慢下来而不是每秒戳一次
     attempt += 1;
     retryTimer = setTimeout(() => { retryTimer = null; connect(); }, delay);
   }
@@ -119,7 +126,7 @@
       if (!resp.ok || !resp.body){          // 503 订阅已满 / 网关异常：退回轮询
         setState('degraded'); scheduleReconnect(); return;
       }
-      setState('online'); attempt = 0;
+      setState('online');
       const reader = resp.body.getReader(), dec = new TextDecoder();
       let buf = '';
       for(;;){
@@ -150,14 +157,20 @@
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (started) connectWithAbort();        // 回前台立即重连，进后台释放流
+    if (!started) return;
+    // 已在线且前台可见时不重建流（避免可见性抖动把旧流 abort 掉造成重复订阅）
+    if (!document.hidden && state === 'online') return;
+    connectWithAbort();
   });
 
   // ---- 对外 API ----
-  // liveBind(topic, fn, fallbackMs) → off()；fn 返回 false 视为自动解绑
+  // liveBind(topic | topics[], fn, fallbackMs) → off()；fn 返回 false 视为自动解绑
+  // 多主题台共用一个刷新函数（如设备页靠 monitor+tasks 两个事件源）时绑一次即可，
+  // 避免绑多条而重复重取（合并窗口只在单绑定内生效）
   window.liveBind = function(topic, fn, fallbackMs){
     const id = ++bindSeq;
-    binds[id] = {id, topic, fn, fallbackMs: fallbackMs || 30000,
+    const topics = (Array.isArray(topic) ? topic : [topic]).filter(Boolean);
+    binds[id] = {id, topics, fn, fallbackMs: fallbackMs || 30000,
                  timer: null, lastRun: 0, trail: null, dead: false};
     if (!started) window.liveStart();
     else syncFallback();
@@ -176,6 +189,8 @@
   };
   window.liveState = function(){ return state; };
   window.liveLastEvent = function(){ return lastEventTs; };
+  // 顶栏详情面板展示订阅主题用（返回副本，防外部改到内部数组）
+  window.liveTopics = function(){ return TOPICS.slice(); };
   window.liveOnState = function(w){
     if (typeof w === 'function'){ watchers.push(w); try{ w(state); }catch(e){} }
     return () => { const i = watchers.indexOf(w); if (i >= 0) watchers.splice(i, 1); };

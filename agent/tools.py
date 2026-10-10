@@ -3114,9 +3114,11 @@ def _live_status(ctx, **kw) -> dict:
     from webapp import events
     from webapp.monitor import get_monitor
     from webapp.alert_engine import get_engine
+    from webapp.log_collector import get_collector
     from webapp.routes.stream_routes import KNOWN_TOPICS
     st = events.stats()
     mon = get_monitor()
+    col = get_collector()
     return {
         "ok": True,
         "subscribers": st["subscribers"],
@@ -3126,6 +3128,9 @@ def _live_status(ctx, **kw) -> dict:
         "monitor_running": mon is not None,
         "monitor_interval": getattr(mon, "_interval", None),
         "alert_engine_running": get_engine() is not None,
+        # logs 主题的 producer：采集器不在跑就不会有新日志事件
+        "log_collector_running": col is not None,
+        "log_collect_interval": getattr(col, "interval", None),
         "hint": ("subscribers=0 且 monitor_running=true 说明页面未建流（前端已退回"
                  "降级轮询，数据仍会刷新只是变慢）；dropped 持续增长说明有客户端"
                  "消费不过来，前端会收到 resync 自行全量重取，无需人工处理；"
@@ -3442,7 +3447,9 @@ _spec("send_digest",
               {}, "write", _send_digest),
 _spec("live_status",
               "实时推送通道体检（只读）：当前 SSE 订阅者数、累计发布/丢弃事件数、"
-              "已开主题，以及监控采集器/告警引擎这两个生产者是否在跑；用于回答"
+              "已开主题（monitor/alerts/tasks/agent/logs），以及监控采集器、告警"
+              "引擎、日志采集器三个生产者是否在跑（logs 事件只盖服务采集日志，"
+              "发布任务的日志文件由子进程直写、仍靠页面轮询）；用于回答"
               "「界面数据为什么不即时/实时通道是否正常」",
               {}, "read", _live_status),
     ]
