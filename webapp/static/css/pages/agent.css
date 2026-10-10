@@ -57,10 +57,14 @@
 .chat-input textarea:focus{border-color:var(--primary);box-shadow:var(--shadow-glow)}
 .chat-input .send-btn{align-self:flex-end;height:44px}
 
-/* ---------- 列表类 Tab（审批单/建议） ---------- */
-.agent-list-panel{padding:0;overflow:hidden}
-.list-toolbar{display:flex;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);
+/* ---------- 列表类 Tab（审批单/建议/案例） ---------- */
+/* 面板限高（口径与 .chat-wrap 同源）：数据多时列表内部滚动，面板外内容（如决策建议 Tab 的快捷工具）常驻可见 */
+.agent-list-panel{padding:0;overflow:hidden;display:flex;flex-direction:column;
+  max-height:calc(100vh - 210px)}
+.list-toolbar{display:flex;flex-shrink:0;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);
   flex-wrap:wrap}
+.agent-list-body{flex:1;min-height:120px;overflow-y:auto}
+.agent-list-body.pad{padding:14px}
 .list-toolbar input[type="text"],.list-toolbar select{background:var(--bg-panel-2);
   border:1px solid var(--border);color:var(--text-1);border-radius:var(--r-card);
   padding:6px 10px;font-size:var(--fs-12);outline:none;width:220px}

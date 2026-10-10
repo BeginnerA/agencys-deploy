@@ -484,7 +484,7 @@
           <span style="flex:1"></span>
           <button class="btn sm ghost" id="runsRefresh">刷新</button>
         </div>
-        <div id="runsList"></div>
+        <div id="runsList" class="agent-list-body"></div>
       </div>`);
     document.querySelectorAll('[data-status]').forEach(c => {
       c.onclick = () => { runStatus = c.dataset.status; loadRuns(); };
@@ -505,6 +505,7 @@
   }
   function renderRunsList(box){
     if (!box) return;
+    const keepScroll = box.scrollTop; // 15s 轮询重渲染后恢复内部滚动位置
     if (!runs.length){
       box.innerHTML = `<div class="agent-list-panel panel"><div class="panel">${emptyState('📝', '暂无审批单（可在对话中让助手生成发布计划）')}</div></div>`;
       return;
@@ -544,6 +545,7 @@
     box.querySelectorAll('[data-open]').forEach(item => {
       item.onclick = () => openRunDetail(Number(item.dataset.open));
     });
+    box.scrollTop = keepScroll;
   }
   function getRun(id){ return runs.find(r => r.id === id) || null; }
   async function onRunDecision(id, act){
@@ -665,7 +667,7 @@
           <button class="btn sm ghost" id="adviceRefresh">刷新</button>
         </div>
         <div class="list-toolbar" style="border-top:none;padding-top:0">${stChips}</div>
-        <div id="adviceList"></div>
+        <div id="adviceList" class="agent-list-body"></div>
       </div>
       <div class="field" style="display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap">
         <b style="color:var(--text-2)">快捷工具：</b>
@@ -708,6 +710,7 @@
   }
   function renderAdviceList(box){
     if (!box) return;
+    const keepScroll = box.scrollTop; // 15s 轮询重渲染后恢复内部滚动位置
     if (!adviceList.length){
       box.innerHTML = `<div class="panel">${emptyState('🤖', '暂无建议（后台调度会自动分析灰度 / 失败任务 / 告警）')}</div>`;
       return;
@@ -812,6 +815,7 @@
         }catch(e){ toastError('操作失败：' + (e.message || '')); }
       };
     });
+    box.scrollTop = keepScroll;
   }
   function parseEvidence(a){
     let ev = a.evidence;
@@ -940,7 +944,7 @@
           <span style="flex:1"></span>
           ${canManage ? '<button class="btn sm primary" id="caseNew">＋ 新案例</button>' : ''}
         </div>
-        <div style="padding:14px" id="caseGrid"></div>
+        <div id="caseGrid" class="agent-list-body pad"></div>
       </div>`);
     const search = () => {
       caseKw = (document.getElementById('caseKw') || {}).value || '';
@@ -967,6 +971,7 @@
   }
   function renderCases(box){
     if (!box) return;
+    const keepScroll = box.scrollTop; // 15s 轮询重渲染后恢复内部滚动位置
     if (!cases.length){
       box.innerHTML = emptyState('📚', '暂无故障案例。可在「决策建议」中将 AI 建议一键沉淀为案例');
       return;
@@ -986,6 +991,7 @@
     box.querySelectorAll('[data-open]').forEach(card => {
       card.onclick = () => openCaseDetail(Number(card.dataset.open));
     });
+    box.scrollTop = keepScroll;
   }
   function getCase(id){ return cases.find(c => c.id === id) || null; }
   function openCaseDetail(id, caseObj){
