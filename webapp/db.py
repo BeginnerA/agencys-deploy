@@ -438,6 +438,7 @@ CREATE TABLE IF NOT EXISTS agent_session_meta (
     session_id TEXT NOT NULL,
     user_id INTEGER NOT NULL DEFAULT 0,
     title TEXT DEFAULT '',
+    pinned INTEGER DEFAULT 0,
     updated_at INTEGER NOT NULL,
     UNIQUE(session_id, user_id)
 );
@@ -572,6 +573,10 @@ def _migrate(conn):
             else:
                 s = json.dumps({"type": "all", "ids": []})
             conn.execute("UPDATE release_windows SET scope=? WHERE id=?", (s, row["id"]))
+    # agent_session_meta 补 pinned 列（会话置顶；存量库幂等加列）
+    asm_cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_session_meta)")}
+    if "pinned" not in asm_cols:
+        conn.execute("ALTER TABLE agent_session_meta ADD COLUMN pinned INTEGER DEFAULT 0")
     # custom_monitors 补列（owner / renewal_status / tiered_thresholds / probe_fail_count / cert_fingerprint / san_domains）
     cm_cols = {r["name"] for r in conn.execute("PRAGMA table_info(custom_monitors)")}
     if "owner" not in cm_cols:

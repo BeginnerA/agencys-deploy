@@ -305,6 +305,98 @@ class AgentApiBase(unittest.TestCase):
         rows = dbm.list_records(self.db_path, "agent_session_meta",
                                 "session_id=? AND user_id=?", ("sA", 1))
         self.assertEqual(rows, [])
+
+    def test_session_pin_and_search(self):
+        # 两个会话：sA 较旧、sB 较新（默认按最后活动倒序：sB 在前）
+        t0 = int(time.time())
+        self._msg("sA", "user", "订单服务告警排查", user_id=1, ts=t0)
+        self._msg("sA", "assistant", "已定位根因", user_id=1, ts=t0 + 1)
+        self._msg("sB", "user", "灰度发布计划", user_id=1, ts=t0 + 10)
+        r = self.client.get("/api/agent/sessions", headers=self.headers)
+        sess = r.get_json()["sessions"]
+        self.assertEqual([s["session_id"] for s in sess], ["sB", "sA"])
+        self.assertEqual(sess[0]["pinned"], 0)
+        # viewer 无权置顶
+        r = self.client.put("/api/agent/sessions/sA/pin",
+                            headers=self.viewer_headers, json={"pinned": True})
+        self.assertEqual(r.status_code, 403)
+        # 置顶 sA：排序优先于最近活动（sA 反超 sB）
+        r = self.client.put("/api/agent/sessions/sA/pin",
+                            headers=self.headers, json={"pinned": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["pinned"])
+        r = self.client.get("/api/agent/sessions", headers=self.headers)
+        sess = r.get_json()["sessions"]
+        self.assertEqual([s["session_id"] for s in sess], ["sA", "sB"])
+        self.assertEqual(sess[0]["pinned"], 1)
+        self.assertEqual(sess[1]["pinned"], 0)
+        # 非布尔 pinned → 400
+        r = self.client.put("/api/agent/sessions/sA/pin",
+                            headers=self.headers, json={"pinned": "yes"})
+        self.assertEqual(r.status_code, 400)
+        # 取消置顶：恢复活动序
+        r = self.client.put("/api/agent/sessions/sA/pin",
+                            headers=self.headers, json={"pinned": False})
+        r = self.client.get("/api/agent/sessions", headers=self.headers)
+        self.assertEqual(
+            [s["session_id"] for s in r.get_json()["sessions"]], ["sB", "sA"])
+        # 会话搜索：按标题（自动标题含关键词）命中 sA
+        r = self.client.get("/api/agent/sessions?q=告警",
+                            headers=self.headers)
+        self.assertEqual(
+            [s["session_id"] for s in r.get_json()["sessions"]], ["sA"])
+        # 按最后消息内容命中 sB
+        r = self.client.get("/api/agent/sessions?q=灰度",
+                            headers=self.headers)
+        self.assertEqual(
+            [s["session_id"] for s in r.get_json()["sessions"]], ["sB"])
+        # 按手动标题命中（重命名后 title 覆盖自动标题）
+        self.client.put("/api/agent/sessions/sB/title",
+                        headers=self.headers, json={"title": "发布窗口讨论"})
+        r = self.client.get("/api/agent/sessions?q=窗口",
+                            headers=self.headers)
+        self.assertEqual(
+            [s["session_id"] for s in r.get_json()["sessions"]], ["sB"])
+        # 无命中 → 空列表
+        r = self.client.get("/api/agent/sessions?q=不存在的关键词xyz",
+                            headers=self.headers)
+        self.assertEqual(r.get_json()["sessions"], [])
+        # 删除会话同步清理置顶元数据（防孤儿行，含 pinned）
+        self.client.put("/api/agent/sessions/sA/pin",
+                        headers=self.headers, json={"pinned": True})
+        self.client.delete("/api/agent/sessions/sA", headers=self.headers)
+        rows = dbm.list_records(self.db_path, "agent_session_meta",
+                                "session_id=? AND user_id=?", ("sA", 1))
+        self.assertEqual(rows, [])
+
+    def test_session_meta_pinned_migration(self):
+        # 存量库无 pinned 列 → _migrate 幂等补列（老库升级路径）
+        old_db = os.path.join(self.tmp, "old.db")
+        conn = dbm.get_conn(old_db)
+        try:
+            conn.execute(
+                "CREATE TABLE agent_session_meta ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " session_id TEXT NOT NULL, user_id INTEGER NOT NULL DEFAULT 0,"
+                " title TEXT DEFAULT '', updated_at INTEGER NOT NULL,"
+                " UNIQUE(session_id, user_id))")
+            conn.execute(
+                "INSERT INTO agent_session_meta"
+                " (session_id, user_id, title, updated_at)"
+                " VALUES ('sOld', 1, '老库会话', 1)")
+            conn.commit()
+        finally:
+            conn.close()
+        dbm.init_db(old_db)  # 幂等：补列 + 既有数据保留
+        cols = {r["name"] for r in dbm.get_conn(old_db).execute(
+            "PRAGMA table_info(agent_session_meta)").fetchall()}
+        self.assertIn("pinned", cols)
+        rows = dbm.list_records(old_db, "agent_session_meta",
+                                "session_id=?", ("sOld",))
+        self.assertEqual(rows[0]["title"], "老库会话")
+        self.assertEqual(rows[0]["pinned"], 0)
+
+    def test_advice_badge_counts(self):
         # 待处理建议角标：登录用户可查，计数随状态流转变化
         from agent import advisor as adv
         a1 = adv.save_advice(self.db_path, "alert", 0, "t1", "b", actor={})

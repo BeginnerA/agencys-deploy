@@ -19,6 +19,9 @@
   let currentSession = canManage
     ? (localStorage.getItem('agentCurSession') || 'web')
     : 'web';
+  let sessPinned = false;   // 当前会话置顶态（refreshSessSel 同步）
+  let sessSearchKw = '';    // 会话搜索词（防抖后置入下拉请求）
+  let sessSearchTimer = null; // 搜索防抖定时器（独立于页面轮询 timer）
 
   const RUN_LABEL = {
     awaiting_approval: {label:'待审批', cls:'pending', ico:'📝'},
@@ -101,8 +104,12 @@
       <div class="chat-wrap">
         ${canManage ? `
         <div class="chat-sessbar">
+          <input type="text" id="sessSearch" class="sess-search"
+                 placeholder="🔍 搜索会话" value="${esc(sessSearchKw)}"
+                 title="按标题或最后消息搜索会话">
           <select id="sessSel" class="filter-sel sess-sel"
-                  title="切换历史会话（含悬浮助手会话）"></select>
+                  title="切换历史会话（含悬浮助手会话；📌 为置顶）"></select>
+          <button class="btn sm ghost" id="sessPin" title="置顶/取消置顶当前会话">📌</button>
           <button class="btn sm ghost" id="sessRename" title="重命名当前会话">✏️</button>
           <button class="btn sm ghost" id="sessNew" title="新建会话（从空历史开始）">＋ 新建</button>
           <button class="btn sm ghost" id="sessDel" title="删除当前会话全部消息（不可恢复）">🗑 删除</button>
@@ -128,6 +135,19 @@
     if (sessDel) sessDel.onclick = delSession;
     const sessRename = document.getElementById('sessRename');
     if (sessRename) sessRename.onclick = renameSession;
+    const sessPin = document.getElementById('sessPin');
+    if (sessPin) sessPin.onclick = pinSession;
+    const sessSearch = document.getElementById('sessSearch');
+    if (sessSearch){
+      // 搜索词变更 300ms 防抖后重拉会话列表（含空串恢复全量）
+      sessSearch.oninput = () => {
+        if (sessSearchTimer) clearTimeout(sessSearchTimer);
+        sessSearchTimer = setTimeout(() => {
+          sessSearchKw = (sessSearch.value || '').trim();
+          refreshSessSel(sessSearchKw);
+        }, 300);
+      };
+    }
     const send = () => {
       const text = (ta.value || '').trim();
       if (!text) return;
@@ -163,17 +183,18 @@
       s.onclick = () => sendChat(s.dataset.sug);
     });
   }
-  async function refreshSessSel(){
-    // 会话下拉 = 当前用户全部会话；新会话（无消息）不在列表时补占位 option
+  async function refreshSessSel(q){
+    // 会话下拉 = 当前用户全部会话（q 非空时后端按标题/最后消息过滤）；
+    // 新会话（无消息）不在列表时补占位 option
     const sel = document.getElementById('sessSel');
     if (!sel) return;
     let rows = [];
-    try{ rows = ((await api('/api/agent/sessions')).sessions) || []; }
+    try{ rows = ((await api('/api/agent/sessions' + (q ? '?q=' + encodeURIComponent(q) : ''))).sessions) || []; }
     catch(e){ /* 列表加载失败：仅保留当前会话占位 */ }
     sel.innerHTML = '';
     const labelText = (r) => {
       const t = (r.title || '').replace(/\s+/g, ' ').slice(0, 30) || r.session_id;
-      return `${t}（${r.n} 条 · ${fmtTime(r.last_at)}）`;
+      return `${r.pinned ? '📌 ' : ''}${t}（${r.n} 条 · ${fmtTime(r.last_at)}）`;
     };
     const opts = rows.filter(r => r.session_id !== currentSession)
       .map(r => {
@@ -186,6 +207,7 @@
       });
     const cur = rows.find(r => r.session_id === currentSession);
     if (cur){
+      sessPinned = !!cur.pinned;
       const o = document.createElement('option');
       o.value = cur.session_id;
       o.text = labelText(cur);
@@ -193,6 +215,7 @@
       o.dataset.n = cur.n;
       opts.unshift(o); // 当前会话置顶
     }else{
+      sessPinned = false; // 新会话无 meta 记录
       const o = document.createElement('option');
       o.value = currentSession;
       o.text = currentSession + '（新会话，暂无消息）';
@@ -201,6 +224,8 @@
     }
     opts.forEach(o => sel.appendChild(o));
     sel.value = currentSession;
+    const pinBtn = document.getElementById('sessPin');
+    if (pinBtn) pinBtn.classList.toggle('active', sessPinned);
   }
   function switchSession(sid){
     if (!sid || sid === currentSession) return;
@@ -248,9 +273,22 @@
       await api('/api/agent/sessions/' + encodeURIComponent(currentSession)
         + '/title', {method: 'PUT', body: JSON.stringify({title: name})});
       toastSuccess(name ? '会话已重命名' : '已恢复自动标题');
-      refreshSessSel();
+      refreshSessSel(sessSearchKw);
     }catch(e){
       toastError('重命名失败：' + (e.message || ''));
+    }
+  }
+  async function pinSession(){
+    // 置顶/取消置顶当前会话：列表排序优先于最近活动（仅本人）
+    try{
+      const r = await api('/api/agent/sessions/' + encodeURIComponent(currentSession)
+        + '/pin', {method: 'PUT',
+                   body: JSON.stringify({pinned: !sessPinned})});
+      sessPinned = !!r.pinned;
+      toastSuccess(sessPinned ? '会话已置顶' : '已取消置顶');
+      refreshSessSel(sessSearchKw);
+    }catch(e){
+      toastError('置顶失败：' + (e.message || ''));
     }
   }
   function abortChat(){
@@ -1277,6 +1315,8 @@
       abortChat();
       if (timer) clearInterval(timer);
       timer = null;
+      if (sessSearchTimer) clearTimeout(sessSearchTimer);
+      sessSearchTimer = null;
     }
   };
 })();

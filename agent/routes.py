@@ -32,11 +32,12 @@ def _sse(obj: dict) -> str:
     return "data: " + json.dumps(obj, ensure_ascii=False) + "\n\n"
 
 
-def _session_rows(db_path: str, user_id: int = 0) -> list:
-    """会话聚合（按 session_id + created_by 分组，含归属/条数/标题/最后活动摘要）
+def _session_rows(db_path: str, user_id: int = 0, q: str = "") -> list:
+    """会话聚合（按 session_id + created_by 分组，含归属/条数/标题/置顶/最后活动摘要）
 
     user_id=0 表示全部用户（admin scope=all 视角）；每组带 last_content
-    供前端展示摘要，列表按最后活动倒序。
+    供前端展示摘要；q 非空时按标题/最后消息模糊过滤（HAVING 别名匹配）。
+    排序：置顶优先，其后按最后活动倒序。
     title：手动重命名（agent_session_meta）优先，否则回退首条用户消息前 40 字。
     """
     conn = dbm.get_conn(db_path)
@@ -46,6 +47,9 @@ def _session_rows(db_path: str, user_id: int = 0) -> list:
             " COALESCE((SELECT u.username FROM users u WHERE u.id = m.created_by)"
             ", '#0') AS owner,"
             " COUNT(*) AS n, MAX(m.created_at) AS last_at,"
+            " COALESCE((SELECT t.pinned FROM agent_session_meta t"
+            "   WHERE t.session_id = m.session_id AND t.user_id = m.created_by)"
+            "  , 0) AS pinned,"
             " COALESCE("
             "  (SELECT t.title FROM agent_session_meta t"
             "   WHERE t.session_id = m.session_id AND t.user_id = m.created_by"
@@ -64,8 +68,12 @@ def _session_rows(db_path: str, user_id: int = 0) -> list:
         if user_id:
             sql += " WHERE m.created_by = ?"
             params = (user_id,)
-        sql += (" GROUP BY m.session_id, m.created_by"
-                " ORDER BY last_at DESC, m.session_id LIMIT 200")
+        sql += " GROUP BY m.session_id, m.created_by"
+        if q:
+            # 标题（含自动标题）与最后一条消息模糊匹配；SQLite HAVING 可引用输出列别名
+            sql += " HAVING (title LIKE ? OR last_content LIKE ?)"
+            params += (f"%{q}%", f"%{q}%")
+        sql += (" ORDER BY pinned DESC, last_at DESC, m.session_id LIMIT 200")
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
     finally:
         conn.close()
@@ -516,12 +524,16 @@ def config_update():
 @require_auth
 @require_role("admin", "operator")
 def list_sessions():
-    """会话列表：operator 仅自己创建的；admin 加 scope=all 可看全部（含 CLI）"""
+    """会话列表：operator 仅自己创建的；admin 加 scope=all 可看全部（含 CLI）
+
+    q 参数：按标题/最后消息模糊过滤（会话搜索）。
+    """
     user = g.user or {}
     scope_all = request.args.get("scope") == "all" and \
         (user.get("role") == "admin")
+    q = (request.args.get("q") or "").strip()[:60]
     rows = _session_rows(current_app.config["DB_PATH"],
-                         0 if scope_all else int(user.get("id") or 0))
+                         0 if scope_all else int(user.get("id") or 0), q=q)
     return jsonify({"sessions": rows})
 
 
@@ -596,6 +608,35 @@ def rename_session(session_id):
     audit("agent_session_rename", "session", 0,
           {"session_id": sid, "title": title})
     return jsonify({"ok": True, "title": title})
+
+
+@agent_bp.route("/agent/sessions/<session_id>/pin", methods=["PUT"])
+@require_auth
+@require_role("admin", "operator")
+def pin_session(session_id):
+    """置顶/取消置顶会话（仅本人；置顶在列表排序中优先于最近活动）"""
+    body = _json_body()
+    if body is None:
+        return jsonify({"error": "请求体必须为 JSON 对象"}), 400
+    pinned = body.get("pinned", True)
+    if not isinstance(pinned, bool):
+        return jsonify({"error": "pinned 必须为布尔值"}), 400
+    sid = session_id[:64]
+    uid = int(g.user.get("id") or 0)
+    db_path = current_app.config["DB_PATH"]
+    rows = dbm.list_records(db_path, "agent_session_meta",
+                            "session_id=? AND user_id=?", (sid, uid))
+    now = int(time.time())
+    if rows:
+        dbm.update_record(db_path, "agent_session_meta", rows[0]["id"],
+                          dict(pinned=1 if pinned else 0, updated_at=now))
+    else:
+        dbm.create_record(db_path, "agent_session_meta", dict(
+            session_id=sid, user_id=uid, title="", pinned=1 if pinned else 0,
+            updated_at=now))
+    audit("agent_session_pin", "session", 0,
+          {"session_id": sid, "pinned": pinned})
+    return jsonify({"ok": True, "pinned": pinned})
 
 
 # ---------- 巡检日报 ----------

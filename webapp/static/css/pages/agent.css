@@ -10,13 +10,15 @@
 /* ---------- 对话 Tab ---------- */
 .chat-wrap{display:flex;flex-direction:column;height:calc(100vh - 210px);min-height:420px;
   background:var(--bg-panel);border:1px solid var(--border);border-radius:var(--r-panel);overflow:hidden}
-/* 会话管理条（多会话切换 / 新建 / 删除） */
+/* 会话管理条（多会话切换 / 搜索 / 置顶 / 新建 / 删除） */
 .chat-sessbar{display:flex;align-items:center;gap:8px;padding:8px 12px;
   border-bottom:1px solid var(--border);background:var(--bg-panel-2)}
-.chat-sessbar .sess-sel{width:340px}
+.chat-sessbar .sess-search{width:170px;padding:3px 10px;font-size:var(--fs-12)}
+.chat-sessbar .sess-sel{width:300px;flex-shrink:1;min-width:160px}
 .chat-sessbar .btn{padding:3px 12px;font-size:var(--fs-12)}
 .chat-sessbar .btn:hover{color:var(--danger);border-color:var(--danger)}
 .chat-sessbar #sessNew:hover{color:var(--primary);border-color:var(--primary)}
+.chat-sessbar #sessPin:hover,.chat-sessbar #sessPin.active{color:var(--warning,#e6a700);border-color:var(--warning,#e6a700)}
 .chat-msgs{flex:1;overflow-y:auto;padding:16px 18px;display:flex;flex-direction:column;gap:12px}
 .chat-empty{margin:auto;text-align:center;color:var(--text-3);font-size:var(--fs-13);line-height:2}
 .chat-empty .big{font-size:30px;display:block;margin-bottom:6px}
