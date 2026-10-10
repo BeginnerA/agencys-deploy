@@ -26,7 +26,13 @@
     if (state === next) return;
     state = next;
     syncFallback();
-    watchers.forEach(w => { try{ w(next); }catch(e){ /* 指示灯异常不影响通道 */ } });
+    notify();
+  }
+
+  // 订阅者（顶栏指示灯）重算：状态变化与事件到达都要通知，
+  // 否则指示灯 title 里的「最近事件时间」会停在首次渲染的文案上
+  function notify(){
+    watchers.forEach(w => { try{ w(state); }catch(e){ /* 指示灯异常不影响通道 */ } });
   }
 
   // ---- 绑定调度：在线靠事件，离线靠各自节奏的轮询 ----
@@ -71,6 +77,7 @@
 
   function dispatch(topic){
     lastEventTs = Date.now();
+    notify();
     Object.keys(binds).forEach(k => {
       const b = binds[k];
       if (!b || b.dead) return;
