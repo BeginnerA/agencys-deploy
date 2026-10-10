@@ -556,7 +556,42 @@ def _plan_operation(ctx, op=None, target=None, env=None, version="",
                      "cli": plan.get("cli", ""),
                      "window_warning": plan.get("window_warning", False),
                      "window_text": plan.get("window_text", "")},
-            "hint": "审批单已生成，等待人工审批（Web 端操作，Agent 无法自行批准）"}
+            "hint": "审批单已生成，等待人工审批（Web 审批单页或对话中明确指示 decide_run）"}
+
+
+def _decide_run(ctx, run_id=None, action=None, note="", force_window=None,
+                **kw) -> dict:
+    """审批发布审批单（与 Web 端审批同等效力，决策者身份与审计一致）
+
+    安全语义：仅当用户明确表达「批准/驳回某审批单」时调用；
+    run_id 必须先经 pending_approvals / run_detail 核对，不得凭记忆猜测。
+    """
+    if action not in ("approve", "reject"):
+        raise ToolError("action 仅支持 approve/reject")
+    try:
+        run_id = int(run_id)
+    except (TypeError, ValueError):
+        raise ToolError("缺少 run_id（整数，可用 pending_approvals 查询待审清单）")
+    try:
+        run = executor_mod.decide_run(
+            ctx.db_path, run_id,
+            {"id": ctx.user_id, "username": ctx.username},
+            action=action, note=(note or "")[:500],
+            force_window=bool(force_window))
+    except executor_mod.ExecutorError as e:
+        raise ToolError(str(e))
+    dbm.create_audit(ctx.db_path, ctx.user_id, ctx.username,
+                     "agent_" + action, "agent_run", run_id,
+                     {"name": run.get("name"), "env": run.get("env"),
+                      "version": run.get("version"),
+                      "note": (note or "")[:500],
+                      "force_window": bool(force_window), "via": "agent"})
+    hint = ("已驳回，审批单关闭" if action == "reject" else
+            "已批准，任务已提交执行；终态由后台同步，可用 run_detail 查询")
+    return {"run_id": run_id, "status": run["status"],
+            "task_id": run.get("task_id") or 0,
+            "decided_by": run.get("decided_by_name", ""),
+            "hint": hint}
 
 
 def _case_save(ctx, advice_id=None, **kw) -> dict:
@@ -1851,12 +1886,21 @@ def build_tools() -> list:
               {"alert_id": num, "note": str_opt}, "write", _ack_alert),
         _spec("plan_operation",
               "生成发布操作审批单：op=deploy/rollback/restart，target=服务或流水线名；"
-              "生成后必须由人工在 Web 审批才执行",
+              "生成后需人工审批（Web 审批单页或用户明确指示 decide_run）才执行",
               {"op": str_req, "target": str_req, "env": str_req,
                "version": str_opt, "previous_version": str_opt,
                "canary": bool_opt, "skip_build": bool_opt,
                "auto_version": bool_opt, "no_git_tag": bool_opt,
                "intent": str_opt}, "write", _plan_operation),
+        _spec("decide_run",
+              "审批发布审批单（与 Web 端同等效力，决策者身份落审计）。"
+              "仅当用户明确表达批准/驳回某一审批单时调用；先用 "
+              "pending_approvals/run_detail 核对 run_id 与内容，不得凭记忆猜测；"
+              "action=approve/reject；approve 即提交任务执行；"
+              "审批单含发布窗口告警时必须用户已确认风险并显式 force_window=true；"
+              "note 为决策备注（会落审计）",
+              {"run_id": num, "action": str_req, "note": str_opt,
+               "force_window": bool_opt}, "write", _decide_run),
         _spec("case_save", "把一条 AI 建议（告警归因/失败归因）沉淀为案例草稿",
               {"advice_id": num}, "write", _case_save),
         _spec("case_update", "补全/修正案例内容（title/symptom/service/env/version/root_cause/action/result/lesson/tags）",

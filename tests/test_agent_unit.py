@@ -777,6 +777,85 @@ class TestMcpServer(AgentBase):
         self.assertEqual(payload["status"], "awaiting_approval")
 
 
+class TestAgentDecideTool(AgentBase):
+    """对话审批工具 decide_run：与 Web 端审批同等效力（含审计与安全校验）"""
+
+    def _ctx(self, role="admin"):
+        return type("Ctx", (), {"db_path": self.db, "user_id": 1,
+                                "username": "tester", "role": role})()
+
+    def _call(self, name, args, role="admin"):
+        from agent import tools as tools_mod
+        return json.loads(tools_mod.execute_tool(role, name, args,
+                                                 self._ctx(role)))
+
+    def _new_run(self):
+        return self._call("plan_operation",
+                          {"op": "deploy", "target": "auth", "env": "prod",
+                           "version": "1.2.0"})
+
+    def test_decide_run_role_and_args(self):
+        from agent import tools as tools_mod
+        viewer_names = {t["name"] for t in tools_mod.visible_tools("viewer")}
+        admin_names = {t["name"] for t in tools_mod.visible_tools("admin")}
+        self.assertNotIn("decide_run", viewer_names)
+        self.assertIn("decide_run", admin_names)
+        # viewer 调用被拒（与 Web 端 operator/admin 审批权限对齐）
+        denied = self._call("decide_run", {"run_id": 1, "action": "approve"},
+                            role="viewer")
+        self.assertIn("error", denied)
+        # 非法 action / 缺 run_id / 不存在的审批单
+        self.assertIn("error", self._call("decide_run",
+                                          {"run_id": 1, "action": "later"}))
+        self.assertIn("error", self._call("decide_run",
+                                          {"action": "approve"}))
+        self.assertIn("error", self._call("decide_run",
+                                          {"run_id": 999, "action": "approve"}))
+
+    def test_decide_run_approve_and_audit(self):
+        created = self._new_run()
+        run_id = created["run_id"]
+        self.assertEqual(created["status"], "awaiting_approval")
+        # mock 任务提交与看护线程：工具层只验证审批流转，不真发任务
+        with mock.patch("agent.executor.task_manager.submit_task"), \
+                mock.patch("agent.executor._watch_run"):
+            resp = self._call("decide_run",
+                              {"run_id": run_id, "action": "approve",
+                               "note": "对话内批准"})
+        self.assertNotIn("error", resp)
+        self.assertEqual(resp["status"], "executing")
+        self.assertGreater(resp["task_id"], 0)
+        self.assertIn("已批准", resp["hint"])
+        # 审计落库（via=agent 与 Web 端区分）
+        logs = dbm.list_audit_logs(self.db, 10)
+        entry = next((l for l in logs if l["action"] == "agent_approve"
+                      and l["target_id"] == run_id), None)
+        self.assertIsNotNone(entry)
+        detail = json.loads(entry["detail"] or "{}")
+        self.assertEqual(detail.get("via"), "agent")
+        # 已进入执行态不可再审
+        with mock.patch("agent.executor.task_manager.submit_task"), \
+                mock.patch("agent.executor._watch_run"):
+            resp2 = self._call("decide_run",
+                               {"run_id": run_id, "action": "reject"})
+        self.assertIn("error", resp2)
+
+    def test_decide_run_reject(self):
+        created = self._new_run()
+        resp = self._call("decide_run",
+                          {"run_id": created["run_id"], "action": "reject",
+                           "note": "需求取消"})
+        self.assertNotIn("error", resp)
+        self.assertEqual(resp["status"], "rejected")
+        self.assertEqual(resp["task_id"], 0)
+        self.assertIn("已驳回", resp["hint"])
+        logs = dbm.list_audit_logs(self.db, 10)
+        entry = next((l for l in logs if l["action"] == "agent_reject"
+                      and l["target_id"] == created["run_id"]), None)
+        self.assertIsNotNone(entry)
+
+
+
 class TestAgentManageTools(AgentBase):
     """配置管理工具接入：定时计划 / 发布窗口 / 灰度策略 / 灰度决策 / 告警闭环"""
 
