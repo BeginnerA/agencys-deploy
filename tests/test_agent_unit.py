@@ -486,7 +486,9 @@ class TestExecutor(AgentBase):
     def test_sync_executing_runs(self):
         from agent.executor import decide_run, sync_executing_runs
         run = self._plan()
-        with mock.patch("agent.executor.task_manager.submit_task"):
+        # mock _watch_run：避免审批后台线程首轮查库抢先回写（毫秒级竞态）
+        with mock.patch("agent.executor.task_manager.submit_task"), \
+                mock.patch("agent.executor._watch_run"):
             r2 = decide_run(self.db, run["id"], USER, action="approve")
         task = dbm.get_task(self.db, r2["task_id"])
         dbm.update_task(self.db, task["id"], status="success",
@@ -793,6 +795,7 @@ class TestAgentManageTools(AgentBase):
         admin_names = {t["name"] for t in tools_mod.visible_tools("admin")}
         for n in ("manage_projects", "manage_services",
                   "manage_environments", "manage_servers",
+                  "manage_pipelines",
                   "manage_schedules", "manage_windows", "manage_canary",
                   "canary_decision", "set_alert_status"):
             self.assertNotIn(n, viewer_names)
@@ -939,6 +942,74 @@ class TestAgentManageTools(AgentBase):
             "action": "delete", "environment_id": eid})
         self.assertTrue(dele["ok"])
         dbm.delete_record(self.db, "servers", sid9)  # 清理夹具外数据
+
+    def test_pipelines_tool_lifecycle(self):
+        # viewer 拒绝
+        denied = self._call("manage_pipelines",
+                            {"action": "list", "project": "plat"},
+                            role="viewer")
+        self.assertIn("error", denied)
+        # 夹具外再注册一个服务（多 stage 需要）
+        self._call("manage_services", {
+            "action": "create", "project": "plat", "name": "user-api",
+            "image_name": "user", "service_name": "hqb-user"})
+        # create：扁平数组 = 单 stage 多服务
+        out = self._call("manage_pipelines", {
+            "action": "create", "project": "plat", "name": "全量发布",
+            "stages": ["auth", "user-api"]})
+        self.assertIn("id", out)
+        plid = out["id"]
+        self.assertEqual(out["stage_count"], 1)
+        self.assertEqual(out["service_count"], 2)
+        self.assertTrue(out["build_first"])  # 缺省 true
+        rec = dbm.get_record(self.db, "pipelines", plid)
+        # 落库为 Web 原生形态（服务名 → service_id，单 stage 两服务）
+        self.assertEqual(len(rec["stages"]), 1)
+        self.assertEqual(rec["stages"][0]["services"][0]["service_id"],
+                         self.svc_id)
+        self.assertEqual(len(rec["stages"][0]["services"]), 2)
+        # 悬空引用拒绝（创建侧拒绝，与 Web _check_pipeline_stages 一致）
+        ghost = self._call("manage_pipelines", {
+            "action": "create", "project": "plat", "name": "坏流水线",
+            "stages": ["ghost"]})
+        self.assertIn("error", ghost)
+        # 重复名拒绝
+        dup = self._call("manage_pipelines", {
+            "action": "create", "project": "plat", "name": "全量发布",
+            "stages": ["auth"]})
+        self.assertIn("error", dup)
+        # update：嵌套数组 = 多 stage 顺序 + build_first=False
+        upd = self._call("manage_pipelines", {
+            "action": "update", "pipeline_id": plid,
+            "stages": [["auth"], ["user-api"]], "build_first": False})
+        self.assertTrue(upd["ok"])
+        rec = dbm.get_record(self.db, "pipelines", plid)
+        self.assertEqual(len(rec["stages"]), 2)
+        self.assertEqual(rec["build_first"], 0)
+        # list：stages 展开服务名（service_id → name）
+        rows = self._call("manage_pipelines", {"action": "list",
+                                                "project": "plat"})
+        pls = {p["name"]: p for p in rows["pipelines"]}
+        self.assertEqual(pls["全量发布"]["stages"], [["auth"], ["user-api"]])
+        # 原生对象形态（对齐 Web）也可直接传入
+        native = self._call("manage_pipelines", {
+            "action": "create", "project": "plat", "name": "原生形态",
+            "stages": [{"services": [{"service_id": self.svc_id}]}]})
+        self.assertIn("id", native)
+        # plan_operation 以流水线名为目标（kind 自动识别 → pipelines）
+        from agent import executor as executor_mod
+        run = executor_mod.plan_operation(
+            self.db, USER, op="deploy", target="全量发布",
+            project_code="plat", env="prod", version="1.0.0")
+        self.assertEqual(run["status"], "awaiting_approval")
+        rec_run = dbm.get_record(self.db, "agent_runs", run["id"])
+        self.assertEqual(rec_run["ref_type"], "pipelines")
+        self.assertEqual(rec_run["kind"], "operation")
+        # delete
+        dele = self._call("manage_pipelines",
+                          {"action": "delete", "pipeline_id": plid})
+        self.assertTrue(dele["ok"])
+        self.assertIsNone(dbm.get_record(self.db, "pipelines", plid))
 
     def test_clone_environment_copies_server_bindings(self):
         # 新项目 → clone plat/prod 环境（含服务器绑定，order 保持）

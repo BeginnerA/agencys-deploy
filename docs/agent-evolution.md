@@ -17,7 +17,7 @@
 agent/
 ├── config.py      LLM 网关配置（环境变量 > platform_settings 表 > 默认值）
 ├── llm.py         OpenAI 兼容 function-calling 客户端（零第三方依赖，requests 直连）
-├── tools.py       36 个运维工具注册表（read/write 两级权限）
+├── tools.py       37 个运维工具注册表（read/write 两级权限）
 ├── core.py        对话编排（ReAct 循环：模型思考 → 调工具 → 收敛；批量/SSE 流式双通道）
 ├── advisor.py     Phase 2 决策引擎：灰度建议 / 失败归因 / 告警归因 / 预检 / 案例沉淀
 ├── executor.py    Phase 3 发布执行：计划生成 / 审批状态机 / 任务提交 / 后台同步
@@ -70,10 +70,10 @@ python webapp/app.py
 
 - **对话**：登录用户在「智能助手」页与 LLM 多轮对话，回复**流式输出**（SSE 打字机效果，工具调用过程可见）；消息持久化到 `agent_messages`，可在 API/页面回溯（会话按用户隔离）。CLI/MCP 入口同样支持流式/批量两种形态。
 - **会话管理**：对话页支持多会话（下拉切换/新建/重命名/删除，`localStorage` 记住当前会话）；`float` 会话由全站右下角悬浮助手产生，也可在此管理。会话标题自动取首条用户消息前 40 字，可手动重命名（存 `agent_session_meta`，空名恢复自动标题；删除会话同步清理）。列表/删除/重命名仅 operator/admin（默认自己的会话；admin 可 `scope=all`/`user_id=` 跨用户管理，含 CLI 的 id=0 会话），消息回溯同样按用户隔离。
-- **工具**：20 个只读工具 + 16 个写工具（operator/admin 可见），全部以 JSON 结果回给模型：
+- **工具**：20 个只读工具 + 17 个写工具（operator/admin 可见），全部以 JSON 结果回给模型：
   - 只读：`list_projects / get_project / list_services / list_environments / env_servers / service_status / recent_tasks / task_detail / list_alerts / alert_detail / search_logs / release_window / canary_configs / cert_monitors / audit_logs / search_cases / case_detail / advice_list / pending_approvals / run_detail`
-  - 写：`analyze_alert / precheck / ack_alert / plan_operation / case_save / case_update` + 平台配置管理与闭环：`manage_projects`（项目 CRUD，仅 admin）、`manage_services`（服务注册 CRUD，仅 admin；git_repo 支持远程 URL）、`manage_environments`（环境 CRUD + 跨项目 clone 含服务器绑定，仅 admin；ssh 口令输出脱敏）、`manage_servers`（服务器注册/绑定/解绑，仅 admin；bind 为 upsert，口令入参不回显）、`manage_schedules`（定时计划 CRUD/启停/立即执行）、`manage_windows`（发布窗口 CRUD，仅 admin）、`manage_canary`（灰度策略 CRUD/设默认）、`canary_decision`（灰度运行中决策 continue/stop/rollback）、`set_alert_status`（告警 resolve/reopen）、`send_digest`（立即推送巡检日报）
-- **对话式项目接入端到端**：对话中给 git 地址与目标服务器即可走通「建项目 → 注册服务 → 建环境 → 绑定服务器 → 生成发布审批单」全链：`manage_projects` 建项目（code 白名单/唯一校验与 Web 一致）→ `manage_services` 注册服务（`git_repo` 填 http(s) 远程 URL 时**首次构建自动 clone** 到 `deploy.project_root` 下同名目录，clone 失败阻断构建、URL 内嵌凭证日志脱敏；本地形态拒../../../盘符防穿越）→ `manage_environments` 建环境（新项目无环境时 `plan_operation` 会拒单；**clone 动作从既有项目复制环境六配置块 + 服务器绑定**，多项目共享基础设施场景一键接入）→ `manage_servers` 绑定目标服务器（bind upsert：未注册先注册再绑定，幂等）→ `plan_operation` 生成审批单，人工审批后构建部署。均仅 admin，动作全落审计（`agent_create_project` 等）。
+  - 写：`analyze_alert / precheck / ack_alert / plan_operation / case_save / case_update` + 平台配置管理与闭环：`manage_projects`（项目 CRUD，仅 admin）、`manage_services`（服务注册 CRUD，仅 admin；git_repo 支持远程 URL）、`manage_environments`（环境 CRUD + 跨项目 clone 含服务器绑定，仅 admin；ssh 口令输出脱敏）、`manage_servers`（服务器注册/绑定/解绑，仅 admin；bind 为 upsert，口令入参不回显）、`manage_pipelines`（发布流水线 CRUD，仅 admin；stages 双形态——服务名数组/嵌套数组/原生对象，悬空引用创建侧拒绝）、`manage_schedules`（定时计划 CRUD/启停/立即执行）、`manage_windows`（发布窗口 CRUD，仅 admin）、`manage_canary`（灰度策略 CRUD/设默认）、`canary_decision`（灰度运行中决策 continue/stop/rollback）、`set_alert_status`（告警 resolve/reopen）、`send_digest`（立即推送巡检日报）
+- **对话式项目接入端到端**：对话中给 git 地址与目标服务器即可走通「建项目 → 注册服务 → 建环境 → 绑定服务器 → 生成发布审批单」全链：`manage_projects` 建项目（code 白名单/唯一校验与 Web 一致）→ `manage_services` 注册服务（`git_repo` 填 http(s) 远程 URL 时**首次构建自动 clone** 到 `deploy.project_root` 下同名目录，clone 失败阻断构建、URL 内嵌凭证日志脱敏；本地形态拒../../../盘符防穿越）→ `manage_environments` 建环境（新项目无环境时 `plan_operation` 会拒单；**clone 动作从既有项目复制环境六配置块 + 服务器绑定**，多项目共享基础设施场景一键接入）→ `manage_servers` 绑定目标服务器（bind upsert：未注册先注册再绑定，幂等）→ `plan_operation` 生成审批单，人工审批后构建部署。多服务分阶段发布用 `manage_pipelines` 编排（stages 用服务名数组，落库为 Web 原生 service_id 形态；`plan_operation` target 填流水线名即可整链发布，build_first=true 先统一构建全部镜像再逐 stage 发布）。均仅 admin，动作全落审计（`agent_create_project` 等）。
 - **循环**：最多 8 轮工具调用（`AGENT_MAX_TOOL_ROUNDS`）；工具结果超长自动截断（`AGENT_MAX_RESULT_CHARS`）；第 8 轮仍未收敛则输出当前事实总结。
 - **角色注入**：系统提示按角色分级——viewer 只见只读工具；`plan_operation` 等写工具仅 operator/admin 可用，且在服务端二次校验。
 

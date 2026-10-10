@@ -1532,6 +1532,169 @@ def _manage_servers(ctx, action=None, host="", server_id=None,
     raise ToolError("action 仅支持 list/create/bind/unbind/update")
 
 
+def _pipeline_stages_in(db: str, project_id: int, stages):
+    """stages 双形态解析 → 原生 Web 形态 [{services: [{service_id}]}]
+
+    - 字符串数组 ["a", "b"] = 单 stage 内多服务并行
+    - 嵌套数组 [["a", "b"], ["c"]] = 多 stage 顺序发布
+    - 对象数组 [{"services": [{"service_id": 1}]}] = 原生形态（对齐 Web）
+    服务名在项目内唯一（UNIQUE(project_id, name)），名字解析无歧义；
+    与 Web 端 _check_pipeline_stages 同校验：悬空引用创建侧拒绝。
+    """
+    if isinstance(stages, str):
+        try:
+            stages = json.loads(stages)
+        except (TypeError, ValueError):
+            raise ToolError("stages 必须为数组（服务名数组或 stage 数组）")
+    if not isinstance(stages, list) or not stages:
+        raise ToolError("stages 必须为非空数组（如 [\"order-svc\"] 或 [[\"a\"], [\"b\"]])")
+    if all(isinstance(s, str) for s in stages):
+        stages = [stages]  # 扁平服务名数组 → 单 stage 多服务
+    svc_by_name = {s["name"]: s for s in dbm.list_services(db, project_id)}
+    svc_by_id = {s["id"]: s for s in svc_by_name.values()}
+    out = []
+    for stage in stages:
+        if isinstance(stage, str):
+            stage = [stage]  # 混形态容错：单元素字符串
+        if isinstance(stage, list):
+            items = stage
+        elif isinstance(stage, dict):
+            items = stage.get("services", [])
+            if not isinstance(items, list):
+                raise ToolError("stage.services 必须为数组")
+        else:
+            raise ToolError("stage 必须为服务名数组或对象")
+        ids = []
+        for it in items:
+            if isinstance(it, str):
+                rec = svc_by_name.get(it)
+                if not rec:
+                    raise ToolError(f"stages 引用了不存在的服务: {it}")
+                ids.append(rec["id"])
+            elif isinstance(it, dict) and isinstance(it.get("service_id"), int) \
+                    and not isinstance(it.get("service_id"), bool):
+                rec = svc_by_id.get(it["service_id"])
+                if not rec:
+                    raise ToolError(
+                        f"stages 引用了不存在的服务 (service_id={it['service_id']})")
+                ids.append(rec["id"])
+            else:
+                raise ToolError("stage.services 元素必须为服务名或 {service_id}")
+        if not ids:
+            raise ToolError("每个 stage 至少包含一个服务")
+        out.append({"services": [{"service_id": i} for i in ids]})
+    return out
+
+
+def _pipeline_out(db: str, pl: dict, svc_map: dict) -> dict:
+    """流水线输出：stages 展开服务名（service_id → name，便于阅读）"""
+    stages = pl.get("stages") or []
+    if isinstance(stages, str):
+        try:
+            stages = json.loads(stages)
+        except (TypeError, ValueError):
+            stages = []
+    out_stages = []
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        names = []
+        for svc in stage.get("services", []) or []:
+            if isinstance(svc, dict):
+                sid = svc.get("service_id")
+                rec = svc_map.get(sid)
+                names.append(rec["name"] if rec else f"#{sid}")
+        if names:
+            out_stages.append(names)
+    return {"id": pl["id"], "name": pl["name"],
+            "build_first": bool(pl.get("build_first")),
+            "stages": out_stages,
+            "service_count": sum(len(s) for s in out_stages)}
+
+
+def _manage_pipelines(ctx, action=None, project=None, pipeline_id=None,
+                       name="", stages=None, build_first=None, **kw) -> dict:
+    """流水线管理（仅 admin，与 Web 端一致）：list/create/update/delete
+
+    流水线是多服务分阶段发布的编排：plan_operation 可直接以流水线名为
+    目标（kind 自动识别）；调度与单服务发布不依赖流水线。
+    """
+    db = ctx.db_path
+    _require_admin(ctx, "流水线管理")
+    action = action or "list"
+    if action == "list":
+        proj = _resolve_project(db, project or "")
+        if not proj:
+            raise ToolError("缺少项目 project（id/code/name）")
+        svc_map = {s["id"]: s for s in dbm.list_services(db, proj["id"])}
+        rows = dbm.list_pipelines(db, proj["id"])
+        return {"project": proj["code"],
+                "pipelines": [_pipeline_out(db, pl, svc_map) for pl in rows]}
+    if action == "create":
+        proj = _resolve_project(db, project or "")
+        if not proj:
+            raise ToolError("缺少项目 project（id/code/name）")
+        name = (name or "").strip()
+        if not name:
+            raise ToolError("缺少流水线名 name")
+        if stages is None:
+            raise ToolError("缺少 stages（服务名数组或 stage 数组）")
+        for pl in dbm.list_pipelines(db, proj["id"]):
+            if pl["name"] == name:
+                raise ToolError(f"项目内流水线名已存在: {name}")
+        norm_stages = _pipeline_stages_in(db, proj["id"], stages)
+        plid = dbm.create_record(db, "pipelines", dict(
+            project_id=proj["id"], name=name,
+            build_first=1 if build_first is None or build_first else 0,
+            stages=norm_stages))
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_create_pipeline", "pipelines", plid,
+                         {"name": name, "via": "agent"})
+        svc_n = sum(len(s.get("services", [])) for s in norm_stages)
+        return {"id": plid, "name": name,
+                "stage_count": len(norm_stages), "service_count": svc_n,
+                "build_first": build_first is None or bool(build_first),
+                "hint": "流水线已创建；发布走 plan_operation target=流水线名"
+                        "（stages 逐阶段发布，build_first 先统一构建）"}
+    # update/delete：按 pipeline_id 定位
+    try:
+        plid = int(pipeline_id)
+    except (TypeError, ValueError):
+        raise ToolError("缺少 pipeline_id（整数）")
+    rec = dbm.get_record(db, "pipelines", plid)
+    if not rec:
+        raise ToolError(f"流水线不存在: #{plid}")
+    if action == "update":
+        fields = {}
+        if name:
+            n = name.strip()
+            if not n:
+                raise ToolError("name 不能为空")
+            for pl in dbm.list_pipelines(db, rec["project_id"]):
+                if pl["name"] == n and pl["id"] != rec["id"]:
+                    raise ToolError(f"项目内流水线名已存在: {n}")
+            fields["name"] = n
+        if stages is not None:
+            fields["stages"] = _pipeline_stages_in(db, rec["project_id"], stages)
+        if build_first is not None:
+            fields["build_first"] = 1 if build_first else 0
+        if not fields:
+            raise ToolError("未提供任何要修改的字段（name/stages/build_first）")
+        dbm.update_record(db, "pipelines", plid, fields)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_update_pipeline", "pipelines", plid,
+                         {"name": rec["name"], "updated": list(fields)})
+        return {"ok": True, "updated": list(fields)}
+    if action == "delete":
+        # 对齐 Web：无额外引用保护（调度仅引用 project/service，不引用流水线）
+        dbm.delete_record(db, "pipelines", plid)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_delete_pipeline", "pipelines", plid,
+                         {"name": rec["name"], "via": "agent"})
+        return {"ok": True, "deleted": rec["name"]}
+    raise ToolError("action 仅支持 list/create/update/delete")
+
+
 def _canary_decision(ctx, task_id=None, action=None, **kw) -> dict:
     """灰度运行中决策（与 Web 端 POST /deploy/canary-decisions 同语义）"""
     if action not in ("continue", "stop", "rollback"):
@@ -1756,6 +1919,17 @@ def build_tools() -> list:
                "ssh_password": str_opt, "ssh_key_file": str_opt,
                "nacos_ip": str_opt, "remark": str_opt, "enabled": bool_opt},
               "write", _manage_servers),
+        _spec("manage_pipelines",
+              "发布流水线编排（仅 admin）。action=list/create/update/delete；"
+              "create 需 project+name+stages；stages 三种形态：服务名数组"
+              "[\"a\",\"b\"]（单 stage 并行）、嵌套数组[[\"a\"],[\"b\"]]"
+              "（多 stage 顺序）、对象[{\"services\":[{\"service_id\":1}]}]；"
+              "多服务分阶段发布用流水线，发布走 plan_operation target=流水线名；"
+              "build_first=true 先统一构建全部镜像再逐 stage 发布",
+              {"action": str_req, "project": str_opt,
+               "pipeline_id": num_opt, "name": str_opt,
+               "stages": {"type": "array"}, "build_first": bool_opt},
+              "write", _manage_pipelines),
         _spec("manage_schedules",
               "管理定时发布计划。action=list/create/update/delete/toggle/run；"
               "create 需 project+name+type（once 需 schedule_at Unix 秒，"
