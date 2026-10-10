@@ -1052,7 +1052,8 @@ class TestAgentManageTools(AgentBase):
                   "canary_decision", "set_alert_status",
                   "manage_alert_rules", "manage_silences",
                   "manage_log_storage", "manage_dependencies",
-                  "manage_monitors",
+                  "manage_monitors", "refresh_monitor",
+                  "manage_config_backup",
                   "decide_run"):
             self.assertNotIn(n, viewer_names)
             self.assertIn(n, admin_names)
@@ -1575,6 +1576,74 @@ class TestAgentManageTools(AgentBase):
         self.assertTrue(dele["ok"])
         self.assertIsNone(
             dbm.get_record(self.db, "custom_monitors", dom_id))
+
+    def test_servers_test_action(self):
+        import webapp.monitor as monitor_mod
+        # 定位不存在 → 报错（先 list 查询引导）
+        ghost = self._call("manage_servers",
+                           {"action": "test", "host": "10.9.9.9"})
+        self.assertIn("不存在", ghost["error"])
+        # 缺 host/server_id → 报错
+        noarg = self._call("manage_servers", {"action": "test"})
+        self.assertIn("host", noarg["error"])
+        # 夹具服务器 10.0.0.1（ssh_user=root）：mock _ssh_exec 成功
+        with mock.patch.object(monitor_mod, "_ssh_exec",
+                               return_value="ok"):
+            r = self._call("manage_servers",
+                           {"action": "test", "host": "10.0.0.1"})
+        self.assertTrue(r["ok"])
+        self.assertIn("连接成功", r["message"])
+        # 探测抛异常 → ok=False（连接失败是正常结果而非工具错）
+        with mock.patch.object(monitor_mod, "_ssh_exec",
+                               side_effect=Exception("Connection refused")):
+            r2 = self._call("manage_servers",
+                            {"action": "test", "host": "10.0.0.1"})
+        self.assertFalse(r2["ok"])
+        self.assertIn("连接失败", r2["message"])
+        # 成功探测才写审计
+        logs = dbm.list_audit_logs(self.db, 20)
+        self.assertIn("agent_test_server", {l["action"] for l in logs})
+
+    def test_refresh_and_config_backup_tools(self):
+        # refresh_monitor：采集器未启动→报错；启动→ok（mock get_monitor）
+        with mock.patch("webapp.monitor.get_monitor", return_value=None):
+            r = self._call("refresh_monitor", {})
+        self.assertIn("未启动", r["error"])
+        fake_mon = mock.Mock()
+        with mock.patch("webapp.monitor.get_monitor",
+                        return_value=fake_mon):
+            r = self._call("refresh_monitor", {})
+        self.assertTrue(r["ok"])
+        fake_mon.refresh.assert_called_once()
+        # manage_config_backup：operator 被函数内 _require_admin 拒（仅 admin）
+        denied = self._call("manage_config_backup", {"action": "export"},
+                            role="operator")
+        self.assertIn("admin", denied["error"])
+        # viewer 完全不可见（write 级）
+        vdeny = self._call("manage_config_backup", {"action": "export"},
+                           role="viewer")
+        self.assertIn("error", vdeny)
+        # admin export（mock export_all 防真实写盘）
+        import webapp.exporter as exporter_mod
+        with mock.patch.object(exporter_mod, "export_all",
+                               return_value=["projects.yaml",
+                                             "deploy.yaml"]):
+            out = self._call("manage_config_backup", {"action": "export"})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["count"], 2)
+        logs = dbm.list_audit_logs(self.db, 20)
+        self.assertIn("agent_export_config", {l["action"] for l in logs})
+        # admin import（mock import_from_config）
+        import webapp.importer as importer_mod
+        with mock.patch.object(importer_mod, "import_from_config",
+                               return_value={"projects.yaml":
+                                             (True, "创建项目 1")}):
+            out = self._call("manage_config_backup", {"action": "import"})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["imported"], 1)
+        # 非法 action
+        bad = self._call("manage_config_backup", {"action": "backup"})
+        self.assertIn("export/import", bad["error"])
 
     def test_clone_environment_copies_server_bindings(self):
         # 新项目 → clone plat/prod 环境（含服务器绑定，order 保持）

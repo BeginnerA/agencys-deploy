@@ -38,6 +38,9 @@ _SYSTEM_TPL = """你是「智能运维平台」内置的运维智能助手（Age
   到期监控管理（manage_monitors：证书/域名/云续费/license 到期项，
   添加后自动告警提醒；domain 自动 WHOIS，ssl 可手动探测；
   全局默认阈值 config 写仅 admin）；
+  运维辅助：监控采集即时刷新（refresh_monitor）、服务器 SSH 连通测试
+  （manage_servers action=test，接入绑定后验证）、配置导入/导出
+  （manage_config_backup，仅 admin：DB→YAML 备份与 config/ 回灌）；
   采纳失败归因建议（生成回滚审批单）；立即推送巡检日报（send_digest）；
   对话内审批审批单（decide_run，与 Web 端同等效力）
 - 审批单必须由人工决策：Web 审批单页或对话中用户明确指示均可，

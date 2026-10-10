@@ -1822,6 +1822,50 @@ def _manage_servers(ctx, action=None, host="", server_id=None,
                          env_obj["id"], {"server_id": sid, "via": "agent"})
         return {"ok": True, "server_id": sid,
                 "environment": env_obj["name"]}
+    if action == "test":
+        # SSH 连通测试（与 Web /servers/test 同等效力）：仅测已存配置，
+        # 服务器级凭据优先、缺省回退首个绑定环境 ssh 段、再回退 root:22
+        if server_id:
+            rec = dbm.get_record(db, "servers", int(server_id))
+        elif host:
+            rows = dbm.list_records(db, "servers", "host=?",
+                                    (host.strip(),))
+            rec = rows[0] if rows else None
+        else:
+            raise ToolError("action=test 需要 host 或 server_id")
+        if not rec:
+            raise ToolError("服务器不存在（可先 list 查询）")
+        from webapp.monitor import _ssh_exec
+        ssh = {}
+        for k_src, k_dst in (("ssh_user", "user"),
+                             ("ssh_password", "password"),
+                             ("ssh_key_file", "key_file")):
+            if rec.get(k_src):
+                ssh[k_dst] = rec[k_src]
+        port = rec.get("ssh_port") or 0
+        if not ssh.get("user"):
+            envs = dbm.list_server_envs(db, rec["id"])
+            if envs:
+                env_ssh = envs[0].get("ssh") or {}
+                for k in ("user", "password", "key_file", "port"):
+                    if k not in ssh and env_ssh.get(k):
+                        ssh[k] = env_ssh[k]
+        port = port or ssh.get("port") or 22
+        user = ssh.get("user") or "root"
+        h = rec["host"]
+        t0 = time.time()
+        try:
+            _ssh_exec(h, int(port), ssh, "echo ok", timeout=8)
+        except Exception as e:
+            ms = int((time.time() - t0) * 1000)
+            return {"ok": False,
+                    "message": f"连接失败（{ms}ms）：{str(e)[:200]}"}
+        ms = int((time.time() - t0) * 1000)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_test_server", "servers", rec["id"],
+                         {"host": h, "via": "agent"})
+        return {"ok": True,
+                "message": f"连接成功（{user}@{h}:{port}，耗时 {ms}ms）"}
     # update：按 server_id 改覆盖字段
     rec = dbm.get_record(db, "servers", int(server_id or 0)) \
         if server_id else None
@@ -1854,7 +1898,7 @@ def _manage_servers(ctx, action=None, host="", server_id=None,
                          {"host": rec["host"], "updated": list(fields)})
         # 口令不回显：审计与返回均不含敏感值
         return {"ok": True, "updated": [k for k in fields if k != "ssh_password"]}
-    raise ToolError("action 仅支持 list/create/bind/unbind/update")
+    raise ToolError("action 仅支持 list/create/bind/unbind/test/update")
 
 
 def _pipeline_stages_in(db: str, project_id: int, stages):
@@ -3013,6 +3057,58 @@ def _manage_monitors(ctx, action=None, monitor_id=None, type="", name="",
     return {"ok": True, "id": monitor_id}
 
 
+# ---------- 监控刷新（operator/admin） ----------
+
+def _refresh_monitor(ctx, **kw) -> dict:
+    """立即触发一轮监控采集刷新（与 Web /monitor/refresh 同等效力）：
+    数据可能过时时先刷一轮再查 service_status/monitor_metrics。"""
+    from webapp.monitor import get_monitor
+    mon = get_monitor()
+    if not mon:
+        raise ToolError("监控采集器未启动（刷新不可用）")
+    mon.refresh()
+    return {"ok": True,
+            "hint": "已触发一轮采集刷新；稍后用 service_status/"
+                    "monitor_metrics 查最新数据"}
+
+
+# ---------- 配置导入导出（仅 admin） ----------
+
+def _manage_config_backup(ctx, action=None, **kw) -> dict:
+    """平台配置导入/导出（与 Web /config/export|import 同等效力，仅 admin）：
+    export 把 DB 配置全量导出为 YAML；import 从 config/ 目录回灌 DB。"""
+    _require_admin(ctx, "配置导入导出")
+    db = ctx.db_path
+    from pathlib import Path
+    root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if action == "export":
+        from webapp.exporter import export_all
+        target = root / "data" / "export" / "config"
+        written = export_all(db, target)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_export_config", "config", 0,
+                         {"files": written, "via": "agent"})
+        return {"ok": True, "files": written, "dir": str(target),
+                "count": len(written),
+                "hint": "已导出到 data/export/config/（单项目时兼容名可直接"
+                        "复制为 config/；多项目按 code 加后缀）"}
+    if action == "import":
+        from webapp.importer import import_from_config
+        config_dir = root / "config"
+        results = import_from_config(db, config_dir)
+        summary = {k: {"ok": ok, "message": msg}
+                   for k, (ok, msg) in results.items()}
+        ok_n = sum(1 for v in summary.values() if v["ok"])
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_import_config", "config", 0,
+                         {"results": summary, "via": "agent"})
+        return {"ok": True, "results": summary,
+                "imported": ok_n, "total": len(summary),
+                "hint": "从 config/ 目录回灌（逐文件结果见 results；"
+                        "文件不存在也计入失败项）"}
+    raise ToolError("action 仅支持 export/import")
+
+
 # ---------- 注册表 ----------
 
 def _spec(name, description, params, permission, fn):
@@ -3177,9 +3273,11 @@ def build_tools() -> list:
                "source_project": str_opt, "source_env": str_opt},
               "write", _manage_environments),
         _spec("manage_servers",
-              "服务器管理（仅 admin）。action=list/create/bind/unbind/update；"
-              "bind 为 upsert：host 未注册时按参数先注册再绑定到"
+              "服务器管理（仅 admin）。action=list/create/bind/unbind/"
+              "test/update；bind 为 upsert：host 未注册时按参数先注册再绑定到"
               "project+environment（幂等）；发布目标即环境绑定清单；"
+              "test 为 SSH 连通测试（按 host 或 server_id 定位已注册服务器，"
+              "服务器级凭据优先、缺省回退首个绑定环境 ssh）；"
               "ssh_port/ssh_user/ssh_password/ssh_key_file 不传则继承环境级配置",
               {"action": str_req, "host": str_opt, "server_id": num_opt,
                "project": str_opt, "environment": str_opt,
@@ -3303,6 +3401,17 @@ _spec("manage_monitors",
                "default_severity": str_opt, "default_channels": str_opt,
                "ssl_check_interval": num_opt},
               "write", _manage_monitors),
+_spec("refresh_monitor",
+              "立即触发一轮监控采集刷新（operator/admin，与 Web /monitor/"
+              "refresh 同等效力）：觉得数据过时、刚改完配置想看最新状态时先刷"
+              "一轮，稍后配合 service_status/monitor_metrics 查看",
+              {}, "write", _refresh_monitor),
+_spec("manage_config_backup",
+              "平台配置导入/导出（仅 admin，与 Web /config/export|import "
+              "同等效力）：action=export 把 DB 配置全量导出为 YAML 到 "
+              "data/export/config/（备份/迁移）；action=import 从 config/ 目录"
+              "逐文件回灌 DB（逐文件结果见 results）",
+              {"action": str_req}, "write", _manage_config_backup),
 _spec("send_digest",
               "立即聚合并推送一次巡检日报（服务健康/告警/近24h发布/待审审批单"
               "/定时计划）到已配置的通知渠道；渠道未配置时提示先配置",
