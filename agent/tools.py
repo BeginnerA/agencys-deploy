@@ -3109,6 +3109,30 @@ def _manage_config_backup(ctx, action=None, **kw) -> dict:
     raise ToolError("action 仅支持 export/import")
 
 
+def _live_status(ctx, **kw) -> dict:
+    """实时通道体检：SSE 订阅数 / 事件量 / 慢消费者丢弃 + 生产者线程在否"""
+    from webapp import events
+    from webapp.monitor import get_monitor
+    from webapp.alert_engine import get_engine
+    from webapp.routes.stream_routes import KNOWN_TOPICS
+    st = events.stats()
+    mon = get_monitor()
+    return {
+        "ok": True,
+        "subscribers": st["subscribers"],
+        "published": st["published"],
+        "dropped": st["dropped"],
+        "topics": list(KNOWN_TOPICS),
+        "monitor_running": mon is not None,
+        "monitor_interval": getattr(mon, "_interval", None),
+        "alert_engine_running": get_engine() is not None,
+        "hint": ("subscribers=0 且 monitor_running=true 说明页面未建流（前端已退回"
+                 "降级轮询，数据仍会刷新只是变慢）；dropped 持续增长说明有客户端"
+                 "消费不过来，前端会收到 resync 自行全量重取，无需人工处理；"
+                 "本统计为当前服务进程内口径（单进程部署即全局）"),
+    }
+
+
 # ---------- 注册表 ----------
 
 def _spec(name, description, params, permission, fn):
@@ -3416,6 +3440,11 @@ _spec("send_digest",
               "立即聚合并推送一次巡检日报（服务健康/告警/近24h发布/待审审批单"
               "/定时计划/临近到期监控）到已配置的通知渠道；渠道未配置时提示先配置",
               {}, "write", _send_digest),
+_spec("live_status",
+              "实时推送通道体检（只读）：当前 SSE 订阅者数、累计发布/丢弃事件数、"
+              "已开主题，以及监控采集器/告警引擎这两个生产者是否在跑；用于回答"
+              "「界面数据为什么不即时/实时通道是否正常」",
+              {}, "read", _live_status),
     ]
 
 

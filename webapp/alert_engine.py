@@ -18,6 +18,7 @@ from collections import deque
 from concurrent.futures import wait
 
 from . import db as dbm
+from . import events
 from .alert_channels import send_alert_async
 
 SEVERITY_ORDER = ("P0", "P1", "P2", "P3")
@@ -707,6 +708,10 @@ class AlertEngine:
             self._notify(alert, rule["channels"])
             dbm.update_record(self._db_path, "alerts", alert_id,
                               {"notify_count": 1})
+        # 仅新建告警推事件：同指纹重复命中每轮都会发生，推了会变成事件风暴
+        events.publish("alerts", {"action": "fired", "alert_id": alert_id,
+                                  "severity": rule.get("severity", "P2"),
+                                  "subject": subject})
         return alert_id
 
     # ---------- 异步通知 ----------
@@ -934,6 +939,7 @@ class AlertEngine:
         return False
 
     def _resolve(self, alert: dict, rtype: str, by: str = ""):
+        # 恢复事件不在此推：db.update_record 的 alerts 状态漏斗已覆盖（避免双发）
         dbm.update_record(self._db_path, "alerts", alert["id"], dict(
             status="resolved", resolved_by=by, resolved_at=int(time.time()),
             resolved_type=rtype))

@@ -11,6 +11,7 @@ function renderTopbar(){
       <div class="drop-panel" id="searchDrop"></div>
     </div>
     <button class="tb-btn" id="refreshBtn" title="手动刷新监控">⟳</button>
+    <button class="tb-btn" id="liveChip" title="实时通道状态"><span class="dot gray"></span>连接中</button>
     <div class="user-chip" id="userChip">
       <div class="user-avatar">${esc((u.username || '?').slice(0,1).toUpperCase())}</div>
       <div class="user-meta"><div class="u-name">${esc(u.username || '未知')}</div>
@@ -26,6 +27,7 @@ function renderTopbar(){
     try{ await api('/api/monitor/refresh', {method:'POST'}); toastSuccess('监控探测已刷新'); }
     catch(e){ toastError(e.message); }
   };
+  renderLiveChip();
   // 用户菜单
   const chip = document.getElementById('userChip');
   const menu = document.getElementById('userMenu');
@@ -125,4 +127,22 @@ function renderMarquee(latest){
     : `<span class="mq-label">最近发布</span><span class="mq-text">等待发布事件...</span>
        <button class="mq-close" id="mqClose">✕</button>`;
   document.getElementById('mqClose').onclick = () => { bar.classList.add('hidden'); bar.dataset.closed = '1'; };
+}
+
+// 实时通道指示灯：把「数据新不新鲜」从用户无从得知变成一眼可见
+// 复用 .tb-btn 外壳与 .dot 状态色（ok/warn/gray），不引入新视觉语系
+function renderLiveChip(){
+  const el = document.getElementById('liveChip');
+  if (!el || typeof liveOnState !== 'function') return;
+  const MAP = {online: ['dot ok', '实时'], connecting: ['dot warn', '连接中'],
+               degraded: ['dot gray', '降级轮询'], init: ['dot gray', '连接中']};
+  const paint = (s) => {
+    const m = MAP[s] || MAP.init;
+    const last = liveLastEvent();
+    el.innerHTML = `<span class="${m[0]}"></span>${m[1]}`;
+    el.title = '实时通道：' + s + '\n'
+      + (last ? '最近事件 ' + new Date(last).toLocaleTimeString()
+                : '尚未收到事件（当前靠兜底轮询驱动）');
+  };
+  liveOnState(paint);
 }

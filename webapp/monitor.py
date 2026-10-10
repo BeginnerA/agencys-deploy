@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 from . import db as dbm
+from . import events
 
 # Nacos accessToken 缓存：{base_url: (token, expire_ts)}，避免每服务每轮重复登录
 _NACOS_TOKEN_CACHE = {}
@@ -694,6 +695,8 @@ class MonitorScheduler:
                     continue
                 tasks.append((proj, env))
         self._probe_envs(tasks)
+        # 采集完成即推一轮信号（事件只带计数不带业务数据，前端自行重取 overview）
+        events.publish("monitor", {"round": self._round, "envs": len(tasks)})
 
     def _probe_envs(self, env_tasks: list):
         """两阶段探测：跨环境主机去重（主机只探一次）→ 环境级结果组装并发
@@ -1102,6 +1105,8 @@ class MonitorScheduler:
                 if env.get("monitor_enabled"):
                     tasks.append((proj, env))
         self._probe_envs(tasks)
+        events.publish("monitor", {"round": self._round, "envs": len(tasks),
+                                   "manual": True})
 
 
 _monitor = None

@@ -1645,6 +1645,38 @@ class TestAgentManageTools(AgentBase):
         bad = self._call("manage_config_backup", {"action": "backup"})
         self.assertIn("export/import", bad["error"])
 
+    def test_live_status_tool(self):
+        # 只读工具：全角色可见，结果来自事件总线 stats + 生产者单例
+        from agent import tools as tools_mod
+        from webapp import events
+        for role in ("viewer", "operator", "admin"):
+            names = {t["name"] for t in tools_mod.visible_tools(role)}
+            self.assertIn("live_status", names)
+        with mock.patch.object(events, "stats",
+                               return_value={"subscribers": 2,
+                                             "published": 9, "dropped": 1}), \
+             mock.patch("webapp.monitor.get_monitor", return_value=None), \
+             mock.patch("webapp.alert_engine.get_engine", return_value=None):
+            out = self._call("live_status", {})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["subscribers"], 2)
+        self.assertEqual(out["published"], 9)
+        self.assertEqual(out["dropped"], 1)
+        self.assertFalse(out["monitor_running"])
+        self.assertIsNone(out["monitor_interval"])
+        self.assertFalse(out["alert_engine_running"])
+        self.assertIn("alerts", out["topics"])
+        # 采集器在跑时上报周期
+        class _Mon:
+            _interval = 45
+        with mock.patch.object(events, "stats",
+                               return_value={"subscribers": 0,
+                                             "published": 0, "dropped": 0}), \
+             mock.patch("webapp.monitor.get_monitor", return_value=_Mon()):
+            out2 = self._call("live_status", {})
+        self.assertTrue(out2["monitor_running"])
+        self.assertEqual(out2["monitor_interval"], 45)
+
     def test_clone_environment_copies_server_bindings(self):
         # 新项目 → clone plat/prod 环境（含服务器绑定，order 保持）
         proj = self._call("manage_projects", {

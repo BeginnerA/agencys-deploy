@@ -1,12 +1,12 @@
 // pages/dashboard.js — 监控大屏（KPI/雷达/机房/趋势/服务器/最近发布）
 (function(){
   let charts = {};      // ECharts 实例
-  let dataTimer = null; // 大屏数据轮询
+  let liveOffs = [];  // 实时绑定取消器（事件驱动为主、降级轮询兜底）
   let overview = null;  // dashboard/overview 缓存
   let trendMode = 7;
   let destroyed = false; // 路由切换后丢弃 in-flight 响应，防覆盖新页面/泄漏轮询
   let monReqSeq = 0;     // loadMonitor 请求序号，防竞态：只渲染最新请求的响应
-  let lastSig = null;    // 上次渲染数据签名：5s 轮询数据无变化时跳过全量重建
+  let lastSig = null;    // 上次渲染数据签名：刷新后数据无变化时跳过全量重建
 
   // ---- KPI 条（规格 §6.1）----
   function kpiRow(o){
@@ -117,22 +117,26 @@
       };
       await load();
       if (destroyed) return [];
-      dataTimer = setInterval(load, 5000);
-      return [dataTimer];
+      // 事件驱动刷新：监控采集轮次/任务状态/告警变更任一事件到达即重取，
+      // 实时通道离线时退回 15s 轮询（原固定 5s 盲轮询：多数轮次无新数据）
+      liveOffs = [liveBind('monitor', load, 15000),
+                  liveBind('tasks', load, 15000),
+                  liveBind('alerts', load, 15000)];
+      return [];
     },
     destroy: function(){
       destroyed = true;
       lastSig = null; // 重置签名缓存，重进页面时强制首屏渲染
       Object.values(charts).forEach(c => { try{ c.dispose(); }catch(e){} });
       charts = {};
-      if (dataTimer) clearInterval(dataTimer);
-      dataTimer = null;
+      liveOffs.forEach(off => { try{ off(); }catch(e){} });
+      liveOffs = [];
     },
   };
 
   function renderAll(mon){
     if (destroyed) return;
-    // 5s 轮询无变化时跳过全量重建（echarts dispose/重建 + innerHTML 是主要开销）
+    // 事件驱动刷新无变化时跳过全量重建（echarts dispose/重建 + innerHTML 是主要开销）
     const sig = JSON.stringify({o: overview, m: mon});
     if (lastSig === sig) return;
     lastSig = sig;

@@ -17,7 +17,7 @@
 agent/
 ├── config.py      LLM 网关配置（环境变量 > platform_settings 表 > 默认值）
 ├── llm.py         OpenAI 兼容 function-calling 客户端（零第三方依赖，requests 直连）
-├── tools.py       48 个运维工具注册表（read/write 两级权限）
+├── tools.py       49 个运维工具注册表（read/write 两级权限）
 ├── core.py        对话编排（ReAct 循环：模型思考 → 调工具 → 收敛；批量/SSE 流式双通道）
 ├── advisor.py     Phase 2 决策引擎：灰度建议 / 失败归因 / 告警归因 / 预检 / 案例沉淀
 ├── executor.py    Phase 3 发布执行：计划生成 / 审批状态机 / 任务提交 / 后台同步
@@ -70,8 +70,8 @@ python webapp/app.py
 
 - **对话**：登录用户在「智能助手」页与 LLM 多轮对话，回复**流式输出**（SSE 打字机效果，工具调用过程可见）；消息持久化到 `agent_messages`，可在 API/页面回溯（会话按用户隔离）。CLI/MCP 入口同样支持流式/批量两种形态。
 - **会话管理**：对话页支持多会话（下拉切换/新建/重命名/置顶/删除/搜索，`localStorage` 记住当前会话）；`float` 会话由全站右下角悬浮助手产生，也可在此管理。会话标题自动取首条用户消息前 40 字，可手动重命名（存 `agent_session_meta`，空名恢复自动标题）；置顶（pinned，同表存列）在列表排序中优先于最近活动，仅本人可操作；搜索（`q` 参数）按标题/最后消息模糊过滤，前端搜索框 300ms 防抖触发；删除会话同步清理元数据（防孤儿行）。列表/删除/重命名/置顶仅 operator/admin（默认自己的会话；admin 可 `scope=all`/`user_id=` 跨用户管理，含 CLI 的 id=0 会话），消息回溯同样按用户隔离。
-- **工具**：23 个只读工具 + 25 个写工具（写工具 operator/admin 可见），全部以 JSON 结果回给模型：
-  - 只读：`list_projects / get_project / list_services / list_environments / env_servers / service_status / monitor_metrics / service_topology / recent_tasks / task_detail / list_alerts / alert_detail / search_logs / logs_context / release_window / canary_configs / cert_monitors / audit_logs / search_cases / case_detail / advice_list / pending_approvals / run_detail`
+- **工具**：24 个只读工具 + 25 个写工具（写工具 operator/admin 可见），全部以 JSON 结果回给模型：
+  - 只读：`list_projects / get_project / list_services / list_environments / env_servers / service_status / monitor_metrics / service_topology / recent_tasks / task_detail / list_alerts / alert_detail / search_logs / logs_context / release_window / canary_configs / cert_monitors / audit_logs / search_cases / case_detail / advice_list / pending_approvals / run_detail / live_status`
   - 写：`analyze_alert / precheck / ack_alert / plan_operation / decide_run / case_save / case_update` + 平台配置管理与闭环：`manage_projects`（项目 CRUD，仅 admin）、`manage_services`（服务注册 CRUD，仅 admin；git_repo 支持远程 URL）、`manage_environments`（环境 CRUD + 跨项目 clone 含服务器绑定，仅 admin；ssh 口令输出脱敏）、`manage_servers`（服务器注册/绑定/解绑，仅 admin；bind 为 upsert，口令入参不回显；test 为 SSH 连通测试，服务器级/环境级凭据回退）、`manage_pipelines`（发布流水线 CRUD，仅 admin；stages 双形态——服务名数组/嵌套数组/原生对象，悬空引用创建侧拒绝）、`manage_schedules`（定时计划 CRUD/启停/立即执行）、`manage_windows`（发布窗口 CRUD，仅 admin）、`manage_canary`（灰度策略 CRUD/设默认）、`canary_decision`（灰度运行中决策 continue/stop/rollback）、`set_alert_status`（告警 resolve/reopen）、`manage_alert_rules`（告警规则 CRUD/启停；校验镜像 Web 端含跨字段约束，update 合并复校验，scope.ids 悬空拒绝）、`manage_silences`（告警静默窗口 CRUD；one_time epoch / recurring HH:MM+weekdays，scope 悬空拒绝）、`manage_log_storage`（日志存储治理，仅 admin：status 存储概况/settings 保留期 1~365/cleanup 手动清理与每日自动维护同一逻辑）、`manage_dependencies`（服务依赖关系 CRUD，operator/admin；create 含环检测、服务名悬空拒绝，配合 service_topology 查影响面与发布顺序）、`manage_monitors`（到期监控管理，operator/admin：证书/域名/云续费/license/自定义到期项 CRUD/启停；domain 创建自动 WHOIS，check 手动探测（ssl 探测证书/domain 刷新 WHOIS），whois 临时查询域名到期，config 全局默认阈值写仅 admin）、`refresh_monitor`（立即触发一轮监控采集刷新，operator/admin）、`manage_config_backup`（仅 admin：action=export 将 DB 配置全量导出为 YAML / action=import 从 config/ 目录逐文件回灌）、`send_digest`（立即推送巡检日报）
 - **对话式项目接入端到端**：对话中给 git 地址与目标服务器即可走通「建项目 → 注册服务 → 建环境 → 绑定服务器 → 生成发布审批单」全链：`manage_projects` 建项目（code 白名单/唯一校验与 Web 一致）→ `manage_services` 注册服务（`git_repo` 填 http(s) 远程 URL 时**首次构建自动 clone** 到 `deploy.project_root` 下同名目录，clone 失败阻断构建、URL 内嵌凭证日志脱敏；本地形态拒../../../盘符防穿越）→ `manage_environments` 建环境（新项目无环境时 `plan_operation` 会拒单；**clone 动作从既有项目复制环境六配置块 + 服务器绑定**，多项目共享基础设施场景一键接入）→ `manage_servers` 绑定目标服务器（bind upsert：未注册先注册再绑定，幂等）→ `plan_operation` 生成审批单，审批（Web 审批单页或对话中 `decide_run`）后构建部署。多服务分阶段发布用 `manage_pipelines` 编排（stages 用服务名数组，落库为 Web 原生 service_id 形态；`plan_operation` target 填流水线名即可整链发布，build_first=true 先统一构建全部镜像再逐 stage 发布）。均仅 admin，动作全落审计（`agent_create_project` 等）。
 - **循环**：最多 8 轮工具调用（`AGENT_MAX_TOOL_ROUNDS`）；工具结果超长自动截断（`AGENT_MAX_RESULT_CHARS`）；第 8 轮仍未收敛则输出当前事实总结。
@@ -115,6 +115,14 @@ python webapp/app.py
 **运维辅助对话化**：三个高频小动作收入对话。`manage_servers` 新增 action=test（仅 admin，与 Web `/servers/test` 同等效力）：按 host 或 server_id 定位已注册服务器，服务器级 ssh 凭据优先、缺省回退首个绑定环境 ssh 段、再回退 root:22，复用 `webapp.monitor._ssh_exec`（惰性 import）执行 `echo ok` 探连通与耗时（失败返回 ok=False 属正常结果而非工具错，仅探测成功才写审计 `agent_test_server`）——接入绑定后验连通、故障排查场景常用。`refresh_monitor`（operator/admin，与 Web `/monitor/refresh` 同等效力）：`get_monitor().refresh()` 立即触发一轮采集，数据过时或刚改完配置想看最新状态时先刷一轮（采集器未启动则拒绝）。`manage_config_backup`（仅 admin，与 Web `/config/export|import` 同等效力）：action=export 把 DB 配置全量导出为 YAML 到 `data/export/config/`（单项目兼容名可直接复制为 config/，多项目按 code 加后缀）；action=import 从项目 `config/` 目录逐文件回灌 DB（逐文件结果见 results，文件不存在也计入失败项）；复用 `webapp.exporter.export_all`/`webapp.importer.import_from_config`（与 Web 同一实现），根目录从 tools.py 位置推导与 config_routes 同源；审计 `agent_export_config`/`agent_import_config`（via:agent）。
 
 **新能力回灌日报**：到期监控体系建成后，巡检日报原本只聚合健康/告警/发布/审批/计划五块，从未纳入到期——新能力与旧聚合面存在口径断点。`digest._expiring` 补齐第六块：复用 `AlertEngine._parse_tiered` 与告警引擎同口径判定（阶梯取最宽档、否则逐项 warn_days>0 优先、回退全局 default_warn_days），将临近到期项按剩余天数升序写进日报（已到期标❗）；单点异常降级为该节不可用不阻断整报，口径一致确保不会「日报说无到期、告警却已触发」。工具面未变（`send_digest` 已存），仅描述补到期。
+
+**前端实时通道立项**：平台页面的数据新鲜度原本全靠盲轮询——全量盘点得 7 处独立 `setInterval`（dashboard 5s、devices 3s/5s、deploy 2s/5s、alerts 15s、agent 15s、schedules 10s、logs 3s 追尾）加 app.js 三处全局角标轮询，既浪费请求又有最长一个周期的延迟。立项采用 **SSE 而非 WebSocket**：需求本质是 server→browser 的单向「有新数据了，去重取」通知，SSE 零新依赖（requirements 只有 Flask，不引入 flask-socketio/gevent）、不改运行模型（`app.run(threaded=True)` 单进程多线程，Dockerfile CMD 同源），跨进程收不到事件的风险由前端兜底轮询承接；浏览器侧沿用平台既有 SSE 消费范式（`fetch` + ReadableStream 逐行解析 `data:` 帧——EventSource 无法携带 Authorization 头，与 JWT 认证不兼容）。
+
+- **事件总线**（`webapp/events.py`，进程内）：`subscribe(topics)`/`publish(topic, data)`/`next_event(sub, timeout)`；每订阅者一条 `maxsize=100` 有界队列，写满只置 `gap` 标记并计 `dropped`、**绝不抛错影响业务**（`publish` 内部全吞异常返回 False）；队列曾溢出且当前排空时补一帧 `{"topic":"resync"}` 提示前端全量重取；全局单调 `seq` 便于排障；订阅者上限 64，超限拒接新连接。事件只作**信号**、不带业务数据契约，客户端收到后仍走原有 REST 取数，避免为推送另立一份易漂移的数据结构。
+- **生产者埋点取「唯一漏斗」**：任务状态只在 `db.update_task`（`status` 变化才推）推、告警状态只在 `db.update_record`（`table=='alerts'` 且含 `status`）推——后者一处即覆盖 route 层手工 ack/resolve/reopen/批量与引擎自动恢复，比在 5 个处理点重复埋点更不易漏、也不会双发；`monitor._cycle/refresh` 推 `{round, envs}`；`alert_engine._fire` 只在**新建告警**分支推（同指纹每轮重复命中不推，防事件风暴）；`advisor.save_advice` 推 `agent`。
+- **前端双态调度**（`webapp/static/js/live.js`）：`liveBind(topic, fn, fallbackMs) → off()`。通道 online 时靠事件驱动（同绑定 400ms 合并，沿用轮询性能口径）并清掉兜底定时器；connecting/degraded 时按各自 `fallbackMs` 退回轮询——**任何时刻都存在取数路径，不存在「既不推也不轮」的死角**；页面 hidden 释放长连接并降频至 ≥60s、回前台立即重连；指数退避重连（1s→30s 上限）；沿用既有 `poll()` 的「回调返回 false 即自动解绑」契约（异步回调返回 Promise 需先解包再判）。本档先接 dashboard / alerts / 全局角标跑马灯三处，deploy / devices / agent / schedules / logs 五处留待后续收敛。
+- **通道可视**：顶栏加通道指示灯（实时 / 连接中 / 降级轮询），复用既有 `.dot.ok/warn/gray` 与 `.tb-btn` 原语不引入新视觉语系，title 显示最近事件时间；`GET /api/stream?topics=` 订阅须在**生成器体内**发生（视图里订阅会在「客户端一帧未读即断开」时因生成器从未启动、`finally` 不执行而泄漏订阅者），超限改发 `error` 帧并立即收尾；死连接要等下一次写帧（事件或 15s 心跳）才因 BrokenPipe 退出生成器，回收窗口上界即心跳周期。
+- **Agent 侧**：新增只读工具 `live_status`（三级角色全可见）返回订阅数/累计发布/丢弃数/主题与 monitor、alert_engine 是否在跑，用于回答「数据为什么不即时更新」。
 
 - **计划生成**：`plan_operation(op=deploy/rollback/restart, target=服务或流水线名, env, version, previous_version, canary/skip_build/auto_version/no_git_tag)` 校验目标存在、版本格式、与平台一致的回滚语义（rollback 时 version=回滚目标），产出可预览的 CLI 命令行，绝不直接执行。
 - **定时计划立即执行**：`manage_schedules(action=run)` 生成 `kind=schedule_run` 审批单（与 Web 端 run_schedule 等效但必经人工审批）；block 窗口拒单、warn 窗口审批需显式 force_window，通过后按调度器同语义创建任务并后台同步终态。
@@ -184,6 +192,7 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | GET | /agent/config | 网关配置状态（**不回显 api_key**） | admin |
 | POST | /agent/config | 保存网关配置（base_url/api_key/model） | admin |
 | GET | /deploy/canary-decisions/<task_id> | 既有灰度接口，waiting 时附加 advice 建议 | 登录用户 |
+| GET | /stream | 页面实时通道（SSE，`text/event-stream`）；topics=monitor/alerts/tasks/agent 过滤，15s 心跳，带 `X-Accel-Buffering: no` | 登录用户 |
 
 ## 九、配置项
 

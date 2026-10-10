@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from webapp import db as dbm
+from webapp import events
 
 from . import llm as llm_mod
 from . import memory as memory_mod
@@ -55,13 +56,17 @@ def save_advice(db_path: str, scope: str, ref_id: int, title: str,
                 body: str, evidence: dict = None, model: str = "",
                 actor: dict = None) -> int:
     actor = actor or {}
-    return dbm.create_record(db_path, "agent_advice", dict(
+    advice_id = dbm.create_record(db_path, "agent_advice", dict(
         scope=scope, ref_id=int(ref_id or 0), title=title, body=body,
         evidence=evidence or {}, model=model,
         created_at=int(time.time()),
         created_by=int(actor.get("id", 0)),
         created_by_name=actor.get("username", ""),
         status="pending"))
+    # 后台 advisor 持续产出新建议，前端角标/列表靠本事件即时跟进（代替 15s 盲轮询）
+    events.publish("agent", {"action": "advice_new", "advice_id": advice_id,
+                             "scope": scope})
+    return advice_id
 
 
 def latest_advice(db_path: str, scope: str, ref_id: int, ttl: int = _ADVICE_TTL):

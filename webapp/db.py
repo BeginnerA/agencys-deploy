@@ -4,6 +4,8 @@ import re
 import sqlite3
 import time
 
+from . import events
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -728,9 +730,16 @@ def update_record(db_path: str, table: str, record_id: int, fields: dict) -> boo
         cur = conn.execute(f"UPDATE {table} SET {sets} WHERE id=?",
                            tuple(fields.values()) + (record_id,))
         conn.commit()
-        return cur.rowcount > 0
+        ok = cur.rowcount > 0
     finally:
         conn.close()
+    # alerts 状态流转的唯一漏斗：route 层手工 ack/resolve/reopen、批量操作、
+    # 引擎自动恢复都经此处，一处埋点全覆盖；只在 status 变化时推，
+    # 避开同指纹重复命中每轮刷 last_seen_at 的事件风暴
+    if ok and table == "alerts" and "status" in fields:
+        events.publish("alerts", {"alert_id": record_id,
+                                  "status": fields["status"]})
+    return ok
 
 
 # ---------- 删除保护 ----------
@@ -916,8 +925,13 @@ def create_task(db_path: str, project_id: int, type_: str, ref_id: int, name: st
 def update_task(db_path: str, task_id: int, **fields) -> bool:
     """白名单字段更新；返回是否更新成功"""
     allowed = {"status", "log_file", "started_at", "finished_at", "version", "previous_version"}
-    return update_record(db_path, "tasks", task_id, {k: v for k, v in fields.items()
-                                                      if k in allowed})
+    ok = update_record(db_path, "tasks", task_id, {k: v for k, v in fields.items()
+                                                   if k in allowed})
+    if ok and "status" in fields:
+        # 任务状态流转是发布/重启进度的唯一信号源（所有写路径都过本函数），
+        # 只推状态变更不推日志追加，避开高频写放大
+        events.publish("tasks", {"task_id": task_id, "status": fields["status"]})
+    return ok
 
 
 def list_tasks(db_path: str, project_id: int = None, limit: int = 100) -> list:

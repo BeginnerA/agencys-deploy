@@ -1,6 +1,6 @@
 // pages/alerts.js — 告警中心（告警列表 Tab + 规则管理 Tab + 静默窗口 Tab + 历史统计 Tab + 到期监控 Tab，消费后端 /api/alerts API）
 (function(){
-  let timer = null;
+  let liveOffs = [];   // 实时绑定取消器（事件驱动为主，降级轮询兜底）
   let destroyed = false;
   let searchTimer = null;
   let currentTab = 'alerts';  // Tab 切换：alerts | rules | silences | stats | monitors
@@ -2137,13 +2137,15 @@
       destroyed = false;
       await loadProjectsForFilter();
       renderPage();
-      // 统一启动定时刷新（先清理旧 timer，避免重复 setInterval 泄漏）：
-      // 告警列表 / 到期监控 tab 每 15s 自动刷新，剩余天数随当前时间实时递减
-      if (timer) clearInterval(timer);
-      timer = setInterval(() => {
+      // 统一刷新入口（事件驱动为主，实时通道离线时退回 15s 轮询）：
+      // 告警列表 / 到期监控 tab；剩余天数仍随时钟递减，靠到期监控轮次事件与兜底轮询兼顾
+      const refreshTab = () => {
         if (currentTab === 'alerts') { loadAlerts(); loadAlertCounts(); }
         else if (currentTab === 'monitors') { loadMonitors(); }
-      }, 15000);
+      };
+      liveOffs.forEach(off => { try{ off(); }catch(e){} });
+      liveOffs = [liveBind('alerts', refreshTab, 15000),
+                  liveBind('monitor', refreshTab, 15000)];
       if (currentTab === 'alerts') {
         await Promise.all([loadAlertCounts(), loadAlerts()]);
         if (destroyed) return [];
@@ -2156,13 +2158,13 @@
       } else if (currentTab === 'monitors') {
         loadMonitors();
       }
-      return [timer];
+      return [];
     },
     destroy: function(){
       destroyed = true;
-      if (timer) clearInterval(timer);
+      liveOffs.forEach(off => { try{ off(); }catch(e){} });
+      liveOffs = [];
       if (searchTimer) clearTimeout(searchTimer);
-      timer = null;
       searchTimer = null;
       // 清理历史统计图表
       if (statsResizeHandler) { window.removeEventListener('resize', statsResizeHandler); statsResizeHandler = null; }
