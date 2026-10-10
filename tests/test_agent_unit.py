@@ -924,6 +924,11 @@ class TestAgentAdviceAction(AgentBase):
         self.assertEqual(run["env"], "prod")
         self.assertEqual(run["version"], "1.0.0")  # 回滚目标版本
         self.assertIn("失败归因建议", run["intent"])
+        # 采纳后建议自动标 adopted（终态，带产出关联）
+        adv = dbm.get_record(self.db, "agent_advice", aid)
+        self.assertEqual(adv["status"], "adopted")
+        self.assertEqual(adv["action_ref"], f"agent_run:{res['run_id']}")
+        self.assertEqual(adv["status_by"], "tester")
 
     def test_task_failed_without_prev_rejected(self):
         task_id = self.make_task(version="1.1.0", previous_version="",
@@ -954,6 +959,10 @@ class TestAgentAdviceAction(AgentBase):
         with open(dec_file, encoding="utf-8") as f:
             data = json.load(f)
         self.assertEqual(data["state"], "rollback")
+        # 采纳后建议自动标 adopted
+        adv = dbm.get_record(self.db, "agent_advice", aid)
+        self.assertEqual(adv["status"], "adopted")
+        self.assertEqual(adv["action_ref"], f"task:{task_id}")
 
     def test_canary_not_waiting_rejected(self):
         task_id = self.make_task(version="1.2.0", status="success")
@@ -979,8 +988,95 @@ class TestAgentAdviceAction(AgentBase):
                                       {"id": 1, "username": "tester"})
 
 
+class TestAdviceLifecycle(AgentBase):
+    """建议生命周期：默认 pending / 状态流转 / 过滤 / 工具参数"""
+
+    def test_save_default_pending(self):
+        from agent import advisor
+        aid = advisor.save_advice(
+            self.db, "alert", 0, "告警归因", "## 分析", evidence={},
+            model="rule-based", actor={"id": 0, "username": "advisor"})
+        rec = dbm.get_record(self.db, "agent_advice", aid)
+        self.assertEqual(rec["status"], "pending")
+        self.assertIsNone(rec["status_at"])
+
+    def test_status_flow_and_terminal(self):
+        from agent import advisor
+        aid = advisor.save_advice(
+            self.db, "alert", 0, "告警归因", "## 分析", evidence={},
+            actor={"id": 0, "username": "advisor"})
+        user = {"id": 1, "username": "op"}
+        # pending → dismissed → reopen → adopted（终态）
+        advisor.set_advice_status(self.db, aid, "dismissed", user)
+        self.assertEqual(dbm.get_record(
+            self.db, "agent_advice", aid)["status"], "dismissed")
+        advisor.set_advice_status(self.db, aid, "pending", user)
+        self.assertEqual(dbm.get_record(
+            self.db, "agent_advice", aid)["status"], "pending")
+        advisor.set_advice_status(self.db, aid, "adopted", user,
+                                  action_ref="agent_run:9")
+        rec = dbm.get_record(self.db, "agent_advice", aid)
+        self.assertEqual(rec["status"], "adopted")
+        self.assertEqual(rec["action_ref"], "agent_run:9")
+        self.assertEqual(rec["status_by"], "op")
+        self.assertGreater(rec["status_at"], 0)
+        # adopted 终态：忽略/重开/再采纳均拒绝
+        for target in ("dismissed", "pending", "adopted"):
+            with self.assertRaises(ValueError):
+                advisor.set_advice_status(self.db, aid, target, user)
+
+    def test_invalid_transitions_and_missing(self):
+        from agent import advisor
+        aid = advisor.save_advice(
+            self.db, "alert", 0, "告警归因", "## 分析", evidence={},
+            actor={"id": 0, "username": "advisor"})
+        user = {"id": 1, "username": "op"}
+        # 非法状态值 / 不存在建议
+        with self.assertRaises(ValueError):
+            advisor.set_advice_status(self.db, aid, "closed", user)
+        with self.assertRaises(ValueError):
+            advisor.set_advice_status(self.db, 99999, "dismissed", user)
+        # pending 不能重开（仅 dismissed 可）
+        with self.assertRaises(ValueError):
+            advisor.set_advice_status(self.db, aid, "pending", user)
+
+    def test_list_filter_by_status(self):
+        from agent import advisor
+        a1 = advisor.save_advice(
+            self.db, "alert", 0, "告警归因一", "x", actor={})
+        a2 = advisor.save_advice(
+            self.db, "alert", 0, "告警归因二", "x", actor={})
+        advisor.set_advice_status(self.db, a2, "dismissed",
+                                  {"id": 1, "username": "op"})
+        pend = advisor.list_advice(self.db, status="pending")
+        self.assertEqual([r["id"] for r in pend], [a1])
+        dism = advisor.list_advice(self.db, status="dismissed")
+        self.assertEqual([r["id"] for r in dism], [a2])
+        self.assertEqual(len(advisor.list_advice(self.db)), 2)
+
+    def test_advice_list_tool_status_param(self):
+        from agent import tools as tools_mod
+        from agent import advisor as advisor_mod
+        ctx = type("Ctx", (), {"db_path": self.db, "user_id": 1,
+                              "username": "tester", "role": "admin"})()
+        a1 = advisor_mod.save_advice(
+            self.db, "alert", 0, "告警归因", "x", actor={})
+        advisor_mod.set_advice_status(self.db, a1, "adopted",
+                                      {"id": 1, "username": "op"},
+                                      action_ref="task:5")
+        out = json.loads(tools_mod.execute_tool(
+            "admin", "advice_list", {"status": "adopted"}, ctx))
+        self.assertEqual(len(out["advice"]), 1)
+        self.assertEqual(out["advice"][0]["status"], "adopted")
+        self.assertEqual(out["advice"][0]["action_ref"], "task:5")
+        # 非法 status → error dict
+        out = json.loads(tools_mod.execute_tool(
+            "admin", "advice_list", {"status": "bad"}, ctx))
+        self.assertIn("error", out)
+
+
 class TestAgentDigest(AgentBase):
-    """巡检日报：配置读写 / 到点判断 / 聚合 / 渲染 / 发送"""
+    """巡检日报：配置读写 / 到点判断 / 聚合 / 渲染 / 发送 / 历史"""
 
     def test_config_default_and_save(self):
         from agent import digest
@@ -1106,6 +1202,31 @@ class TestAgentDigest(AgentBase):
         # 工具表注册：viewer 不可见
         names = {t["name"] for t in tools_mod.visible_tools("viewer")}
         self.assertNotIn("send_digest", names)
+
+    def test_build_and_send_writes_history_log(self):
+        from agent import digest
+        digest.save_digest_config(self.db, channels=["wecom", "feishu"])
+        # 全部成功
+        with mock.patch("webapp.alert_channels.send_custom",
+                        return_value=[("wecom", True, "ok"),
+                                      ("feishu", True, "ok")]):
+            digest.build_and_send(self.db)
+        rows = dbm.list_records(self.db, "agent_digest_logs", order="id DESC")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ok_count"], 2)
+        self.assertEqual(rows[0]["total_count"], 2)
+        self.assertIn("2/2 渠道成功", rows[0]["summary"])
+        self.assertIn("wecom", rows[0]["channels"])
+        # 部分失败也落历史（第二次发送）
+        with mock.patch("webapp.alert_channels.send_custom",
+                        return_value=[("wecom", False, "timeout"),
+                                      ("feishu", True, "ok")]):
+            digest.build_and_send(self.db)
+        rows = dbm.list_records(self.db, "agent_digest_logs", order="id DESC")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["ok_count"], 1)
+        self.assertEqual(rows[0]["total_count"], 2)
+        self.assertIn("timeout", rows[0]["detail"])
 
 
 if __name__ == "__main__":

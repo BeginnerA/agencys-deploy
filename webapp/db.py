@@ -395,7 +395,11 @@ CREATE TABLE IF NOT EXISTS agent_advice (
     model TEXT DEFAULT '',
     created_at INTEGER NOT NULL,
     created_by INTEGER DEFAULT 0,
-    created_by_name TEXT DEFAULT ''
+    created_by_name TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    status_at INTEGER,
+    status_by TEXT DEFAULT '',
+    action_ref TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_agent_advice_ref
     ON agent_advice(scope, ref_id, id);
@@ -420,6 +424,15 @@ CREATE TABLE IF NOT EXISTS agent_cases (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_cases_svc
     ON agent_cases(service, created_at);
+CREATE TABLE IF NOT EXISTS agent_digest_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sent_at INTEGER NOT NULL,
+    ok_count INTEGER NOT NULL DEFAULT 0,
+    total_count INTEGER NOT NULL DEFAULT 0,
+    channels TEXT DEFAULT '',
+    detail TEXT DEFAULT '',
+    summary TEXT DEFAULT ''
+);
 """
 
 # JSON 字段（读写时自动序列化/反序列化）
@@ -455,7 +468,7 @@ TABLES = frozenset(("projects", "services", "environments", "servers",
                     "response_time_history", "monitor_snapshots",
                     "custom_monitors", "renewal_logs",
                     "agent_runs", "agent_messages", "agent_advice",
-                    "agent_cases"))
+                    "agent_cases", "agent_digest_logs"))
 
 
 def _check_table(table: str):
@@ -577,6 +590,30 @@ def _migrate(conn):
     lsc_cols = {r["name"] for r in conn.execute("PRAGMA table_info(log_scan_state)")}
     if "file_date" not in lsc_cols:
         conn.execute("ALTER TABLE log_scan_state ADD COLUMN file_date TEXT DEFAULT ''")
+    # agent_advice 补生命周期列（pending/adopted/dismissed 状态机，采纳关联对象）
+    adv_cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_advice)")}
+    if "status" not in adv_cols:
+        conn.execute("ALTER TABLE agent_advice ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+    if "status_at" not in adv_cols:
+        conn.execute("ALTER TABLE agent_advice ADD COLUMN status_at INTEGER")
+    if "status_by" not in adv_cols:
+        conn.execute("ALTER TABLE agent_advice ADD COLUMN status_by TEXT DEFAULT ''")
+    if "action_ref" not in adv_cols:
+        conn.execute("ALTER TABLE agent_advice ADD COLUMN action_ref TEXT DEFAULT ''")
+    # agent_digest_logs 表（新建库已在 SCHEMA 创建，存量库需补建）
+    dlog_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='agent_digest_logs'"
+    ).fetchone()
+    if not dlog_exists:
+        conn.execute("""CREATE TABLE agent_digest_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sent_at INTEGER NOT NULL,
+            ok_count INTEGER NOT NULL DEFAULT 0,
+            total_count INTEGER NOT NULL DEFAULT 0,
+            channels TEXT DEFAULT '',
+            detail TEXT DEFAULT '',
+            summary TEXT DEFAULT ''
+        )""")
 
 
 def _serialize(table: str, fields: dict) -> dict:

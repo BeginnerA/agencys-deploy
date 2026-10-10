@@ -10,7 +10,7 @@
   // ---- 页面状态 ----
   let gw = null;             // GET /api/agent/config 缓存
   let runs = [], runStatus = 'all';
-  let adviceList = [], adviceScope = '';
+  let adviceList = [], adviceScope = '', adviceStatus = 'pending';
   let cases = [], caseKw = '', caseSvc = '';
 
   const role = currentUser().role || 'viewer';
@@ -583,10 +583,18 @@
   }
 
   // ==================== 决策建议 Tab ====================
+  const ADVICE_STATUS_LABEL = {
+    pending: {label:'待处理', cls:'tag-warn'},
+    adopted: {label:'已采纳', cls:'tag-ok'},
+    dismissed: {label:'已忽略', cls:'tag-info'}
+  };
   function renderAdviceTab(){
     const chips = ['', ...Object.keys(SCOPE_LABEL)].map(s => `
       <button class="chip ${adviceScope===s?'active':''}" data-scope="${s}">
         ${s === '' ? '全部' : SCOPE_LABEL[s]}</button>`).join('');
+    const stChips = ['', ...Object.keys(ADVICE_STATUS_LABEL)].map(s => `
+      <button class="chip ${adviceStatus===s?'active':''}" data-astatus="${s}">
+        ${s === '' ? '全部状态' : ADVICE_STATUS_LABEL[s].label}</button>`).join('');
     setPanel(`
       <div class="agent-list-panel panel">
         <div class="list-toolbar">
@@ -594,6 +602,7 @@
           <span style="flex:1"></span>
           <button class="btn sm ghost" id="adviceRefresh">刷新</button>
         </div>
+        <div class="list-toolbar" style="border-top:none;padding-top:0">${stChips}</div>
         <div id="adviceList"></div>
       </div>
       <div class="field" style="display:flex;gap:8px;margin-top:12px;align-items:center;flex-wrap:wrap">
@@ -607,6 +616,9 @@
     document.querySelectorAll('[data-scope]').forEach(c => {
       c.onclick = () => { adviceScope = c.dataset.scope; loadAdvice(); };
     });
+    document.querySelectorAll('[data-astatus]').forEach(c => {
+      c.onclick = () => { adviceStatus = c.dataset.astatus; loadAdvice(); };
+    });
     const rf = document.getElementById('adviceRefresh');
     if (rf) rf.onclick = loadAdvice;
     const preGo = document.getElementById('preGo');
@@ -619,7 +631,7 @@
     if (!box) return;
     box.innerHTML = skeletonHTML(3);
     try{
-      const data = await api('/api/agent/advice' + qs({scope: adviceScope, limit: 100}));
+      const data = await api('/api/agent/advice' + qs({scope: adviceScope, status: adviceStatus, limit: 100}));
       adviceList = data.advice || [];
     }catch(e){ adviceList = []; }
     renderAdviceList(box);
@@ -632,22 +644,33 @@
     }
     const scopeIco = {canary:'🐤', task_failed:'🧯', alert:'🚨', precheck:'🛡️'};
     box.innerHTML = adviceList.map(a => {
+      const st = ADVICE_STATUS_LABEL[a.status] || ADVICE_STATUS_LABEL.pending;
       const actions = [];
-      if (canManage && adoptable(a)){
+      if (canManage && a.status === 'pending' && adoptable(a)){
         actions.push(`<button class="btn sm primary" data-adopt="${a.id}">⚡ 采纳执行</button>`);
       }
       if (canManage){
         actions.push(`<button class="btn sm" data-to="${a.id}">📥 沉淀案例</button>`);
       }
+      if (canManage && a.status === 'pending'){
+        actions.push(`<button class="btn sm" data-dismiss="${a.id}">忽略</button>`);
+      }
+      if (canManage && a.status === 'dismissed'){
+        actions.push(`<button class="btn sm" data-reopen="${a.id}">恢复</button>`);
+      }
       if (role === 'admin'){
         actions.push(`<button class="btn sm danger" data-del="${a.id}">删除</button>`);
       }
+      const stBadge = a.status === 'pending' ? ''
+        : `<span class="tag ${st.cls}">${st.label}</span>`;
+      const refHtml = a.action_ref ? `<span>📎 ${esc(a.action_ref)}</span>` : '';
       return `
         <div class="agent-item" data-open="${a.id}">
           <div class="run-status-ico">${scopeIco[a.scope] || '💡'}</div>
           <div class="ai-main">
             <div class="ai-title">${esc(a.title || '建议')}
               <span class="tag tag-info">${SCOPE_LABEL[a.scope] || esc(a.scope)}</span>
+              ${stBadge}
               ${a.model ? `<span class="muted" style="font-size:var(--fs-11)">${esc(a.model)}</span>` : ''}
             </div>
             <div class="ai-body">${esc(a.body || '')}</div>
@@ -655,6 +678,7 @@
               <span>🕐 ${fmtTime(a.created_at)}</span>
               <span>👤 ${esc(a.created_by_name || 'advisor')}</span>
               <span>🔗 ref #${a.ref_id}</span>
+              ${refHtml}
             </div>
           </div>
           <div class="ai-actions">${actions.join('')}</div>
@@ -698,6 +722,26 @@
         }catch(e){ toastError('删除失败：' + (e.message || '')); }
       };
     });
+    box.querySelectorAll('[data-dismiss]').forEach(b => {
+      b.onclick = async (ev) => {
+        ev.stopPropagation();
+        try{
+          await api(`/api/agent/advice/${b.dataset.dismiss}/dismiss`, {method:'POST'});
+          toastSuccess('已忽略该建议');
+          loadAdvice();
+        }catch(e){ toastError('操作失败：' + (e.message || '')); }
+      };
+    });
+    box.querySelectorAll('[data-reopen]').forEach(b => {
+      b.onclick = async (ev) => {
+        ev.stopPropagation();
+        try{
+          await api(`/api/agent/advice/${b.dataset.reopen}/reopen`, {method:'POST'});
+          toastSuccess('已重开该建议');
+          loadAdvice();
+        }catch(e){ toastError('操作失败：' + (e.message || '')); }
+      };
+    });
   }
   function parseEvidence(a){
     let ev = a.evidence;
@@ -719,6 +763,11 @@
       const ev = typeof a.evidence === 'string' ? JSON.parse(a.evidence) : a.evidence;
       if (ev) evHtml = `<div class="row"><b>证据</b><code style="font-size:11px">${esc(JSON.stringify(ev, null, 2))}</code></div>`;
     }catch(e){}
+    const st = ADVICE_STATUS_LABEL[a.status] || ADVICE_STATUS_LABEL.pending;
+    const statusHtml = a.status === 'pending'
+      ? `<span class="tag ${st.cls}">${st.label}</span>`
+      : `<span class="tag ${st.cls}">${st.label}</span>` +
+        (a.status_by ? ` <span class="muted" style="font-size:var(--fs-11)">${esc(a.status_by)} @ ${fmtTime(a.status_at)}</span>` : '');
     openDrawer({
       title: '决策建议 #' + id,
       wide: true,
@@ -726,11 +775,30 @@
         <div class="plan-detail">
           <div class="row"><b>标题</b>${esc(a.title || '-')}</div>
           <div class="row"><b>类型</b>${SCOPE_LABEL[a.scope] || esc(a.scope)}（ref #${a.ref_id}）</div>
+          <div class="row"><b>状态</b>${statusHtml}</div>
+          ${a.action_ref ? `<div class="row"><b>采纳产出</b><code>${esc(a.action_ref)}</code></div>` : ''}
           <div class="row"><b>内容</b><span style="white-space:pre-line">${esc(a.body || '-')}</span></div>
           ${evHtml}
           <div class="row"><b>产出</b>${esc(a.model || '规则引擎')} · ${esc(a.created_by_name || 'advisor')} @ ${fmtTime(a.created_at)}</div>
+          ${canManage ? `<div class="row"><b>关联案例</b><span id="advCaseBox" class="muted">加载中…</span></div>` : ''}
         </div>`
     });
+    if (canManage){
+      (async () => {
+        try{
+          const data = await api('/api/agent/cases' + qs({advice_id: id, limit: 20}));
+          const box = document.getElementById('advCaseBox');
+          if (!box) return;
+          const cs = data.cases || [];
+          box.innerHTML = cs.length
+            ? cs.map(c => `<span class="tag tag-info" style="margin-right:4px">#${c.id} ${esc(c.title || '')}</span>`).join('')
+            : '无（可点击列表中「沉淀案例」生成）';
+        }catch(e){
+          const box = document.getElementById('advCaseBox');
+          if (box) box.textContent = '读取失败';
+        }
+      })();
+    }
   }
   async function runPrecheck(){
     const target = (document.getElementById('preTarget') || {}).value || '';
@@ -1041,6 +1109,8 @@
         ${cfg.last_sent_at ? `<div class="plan-detail" style="margin-top:10px">
           <div class="row"><b>上次发送</b>${fmtTime(cfg.last_sent_at)}</div>
           <div class="row"><b>结果</b>${esc(cfg.last_result || '-')}</div></div>` : ''}
+        ${canManage ? `<div id="dgLogsBox" class="plan-detail" style="margin-top:12px">
+          <div class="row"><b>发送历史</b><span class="muted">加载中…</span></div></div>` : ''}
         <div id="dgPreviewBox" class="plan-detail" style="margin-top:12px"></div>`;
       const pv = document.getElementById('dgPreview');
       if (pv) pv.onclick = async () => {
@@ -1052,6 +1122,25 @@
             <pre style="white-space:pre-wrap;font-size:12px;line-height:1.7;margin:6px 0 0">${esc(data.text || '')}</pre>`;
         }catch(e){ toastError('预览失败：' + (e.message || '')); }
       };
+      if (canManage){
+        (async () => {
+          const box = document.getElementById('dgLogsBox');
+          if (!box) return;
+          try{
+            const data = await api('/api/agent/digest/logs' + qs({limit: 10}));
+            const logs = data.logs || [];
+            box.innerHTML = logs.length
+              ? `<div class="row"><b>发送历史（最近 ${logs.length} 次）</b></div>` + logs.map(l => `
+                <div class="row" style="font-size:var(--fs-12)">
+                  <span>${l.ok_count === l.total_count ? '✅' : '⚠️'} ${fmtTime(l.sent_at)}</span>
+                  <span class="muted">${esc(l.summary || '')}</span>
+                </div>`).join('')
+              : '<div class="row"><b>发送历史</b><span class="muted">暂无记录</span></div>';
+          }catch(e){
+            box.innerHTML = '<div class="row"><b>发送历史</b><span class="muted">读取失败</span></div>';
+          }
+        })();
+      }
       const save = document.getElementById('dgSave');
       if (save) save.onclick = async () => {
         const chansSel = Array.from(

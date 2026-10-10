@@ -47,6 +47,10 @@ _ADVICE_TTL = 6 * 3600  # 同 scope+ref 的建议 6 小时内不重复生成（�
 
 # ---------- 建议存取 ----------
 
+# 建议生命周期状态：pending 待处理 / adopted 已采纳（自动标记，不可逆转）/
+# dismissed 已忽略（仅 pending 可忽略，可重开回 pending）
+ADVICE_STATUSES = ("pending", "adopted", "dismissed")
+
 def save_advice(db_path: str, scope: str, ref_id: int, title: str,
                 body: str, evidence: dict = None, model: str = "",
                 actor: dict = None) -> int:
@@ -56,7 +60,8 @@ def save_advice(db_path: str, scope: str, ref_id: int, title: str,
         evidence=evidence or {}, model=model,
         created_at=int(time.time()),
         created_by=int(actor.get("id", 0)),
-        created_by_name=actor.get("username", "")))
+        created_by_name=actor.get("username", ""),
+        status="pending"))
 
 
 def latest_advice(db_path: str, scope: str, ref_id: int, ttl: int = _ADVICE_TTL):
@@ -74,7 +79,7 @@ def latest_advice(db_path: str, scope: str, ref_id: int, ttl: int = _ADVICE_TTL)
 
 
 def list_advice(db_path: str, scope: str = "", ref_id: int = 0,
-                limit: int = 30) -> list:
+                limit: int = 30, status: str = "") -> list:
     conds, params = [], []
     if scope:
         conds.append("scope=?")
@@ -82,10 +87,43 @@ def list_advice(db_path: str, scope: str = "", ref_id: int = 0,
     if ref_id:
         conds.append("ref_id=?")
         params.append(int(ref_id))
+    if status:
+        conds.append("status=?")
+        params.append(status)
     where = " AND ".join(conds)
     rows = dbm.list_records(db_path, "agent_advice", where, tuple(params),
                             "id DESC")
     return rows[:max(1, min(limit, 100))]
+
+
+def set_advice_status(db_path: str, advice_id: int, status: str,
+                      actor: dict = None, action_ref: str = "") -> dict:
+    """流转建议状态：pending→adopted（采纳自动标记）/ pending→dismissed（人工忽略）
+    / dismissed→pending（重开）。adopted 为终态不可再流转。
+
+    返回 {"ok": True, "status": ...}；建议不存在抛 ValueError，
+    非法状态或非法流转抛 ValueError（路由层转 4xx）。
+    """
+    if status not in ADVICE_STATUSES:
+        raise ValueError(f"非法建议状态: {status}")
+    advice = dbm.get_record(db_path, "agent_advice", advice_id)
+    if not advice:
+        raise ValueError(f"建议不存在: #{advice_id}")
+    cur = advice.get("status") or "pending"
+    if cur == "adopted":
+        raise ValueError("该建议已采纳，状态不可再变更")
+    if status == "adopted" and cur != "pending":
+        raise ValueError("仅待处理建议可标记为已采纳")
+    if status == "dismissed" and cur != "pending":
+        raise ValueError("仅待处理建议可忽略")
+    if status == "pending" and cur != "dismissed":
+        raise ValueError("仅已忽略建议可重开")
+    fields = {"status": status, "status_at": int(time.time()),
+              "status_by": (actor or {}).get("username", "")}
+    if action_ref:
+        fields["action_ref"] = action_ref
+    dbm.update_record(db_path, "agent_advice", advice_id, fields)
+    return {"ok": True, "status": status}
 
 
 def delete_advice(db_path: str, advice_id: int) -> bool:

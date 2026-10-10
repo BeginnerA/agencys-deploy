@@ -430,16 +430,21 @@ def _case_detail(ctx, case_id=None, **kw) -> dict:
     return {"case": case}
 
 
-def _advice_list(ctx, scope="", ref_id=0, limit=10, **kw) -> dict:
+def _advice_list(ctx, scope="", ref_id=0, limit=10, status="", **kw) -> dict:
     if scope not in ("", "canary", "task_failed", "alert", "precheck"):
         raise ToolError("scope 仅支持 canary/task_failed/alert/precheck")
+    if status and status not in advisor_mod.ADVICE_STATUSES:
+        raise ToolError("status 仅支持 pending/adopted/dismissed")
     rows = advisor_mod.list_advice(ctx.db_path, scope=scope,
                                    ref_id=int(ref_id or 0),
-                                   limit=max(1, min(limit, 50)))
+                                   limit=max(1, min(limit, 50)),
+                                   status=status)
     return {"advice": [{"id": a["id"], "scope": a["scope"],
                         "ref_id": a["ref_id"], "title": a["title"],
                         "body": (a.get("body") or "")[:600],
                         "model": a.get("model", ""),
+                        "status": a.get("status", "pending"),
+                        "action_ref": a.get("action_ref", ""),
                         "created_at": _fmt_ts(a.get("created_at")),
                         "created_by_name": a.get("created_by_name", "")}
                        for a in rows]}
@@ -1073,8 +1078,10 @@ def build_tools() -> list:
               "read", _search_cases),
         _spec("case_detail", "查看案例详情",
               {"case_id": num}, "read", _case_detail),
-        _spec("advice_list", "查看 AI 建议列表（scope: canary/task_failed/alert/precheck）",
-              {"scope": str_opt, "ref_id": num_opt, "limit": num_opt},
+        _spec("advice_list", "查看 AI 建议列表（scope: canary/task_failed/alert/precheck；"
+              "status: pending 待处理/adopted 已采纳/dismissed 已忽略，默认全部）",
+              {"scope": str_opt, "ref_id": num_opt, "limit": num_opt,
+               "status": str_opt},
               "read", _advice_list),
         _spec("pending_approvals", "查看待审批的 Agent 发布计划（人工审批入口）",
               {"limit": num_opt}, "read", _pending_approvals),

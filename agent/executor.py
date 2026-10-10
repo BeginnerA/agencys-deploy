@@ -532,6 +532,7 @@ def advice_to_action(db_path: str, advice_id: int, user: dict) -> dict:
     与手动执行同一安全链路（审批单/决策文件协议），Agent 层零旁路。
     返回 {"action": "run"|"canary", ...}；无可执行动作时抛 ExecutorError。
     """
+    from . import advisor
     advice = dbm.get_record(db_path, "agent_advice", advice_id)
     if not advice:
         raise ExecutorError(f"建议不存在: #{advice_id}")
@@ -552,6 +553,8 @@ def advice_to_action(db_path: str, advice_id: int, user: dict) -> dict:
             db_path, user, op="rollback", target=task.get("name") or "",
             env=task.get("env") or "", version=prev,
             intent=f"采纳失败归因建议 #{advice_id}: {advice.get('title', '')}")
+        advisor.set_advice_status(db_path, advice_id, "adopted", user,
+                                      action_ref=f"agent_run:{run['id']}")
         return {"action": "run", "run_id": run["id"],
                 "name": run["name"], "env": run.get("env"),
                 "version": run.get("version"),
@@ -582,6 +585,8 @@ def advice_to_action(db_path: str, advice_id: int, user: dict) -> dict:
                          "agent_advice_to_canary", "tasks", task_id,
                          {"decision": decision, "advice_id": advice_id,
                           "via": "agent"})
+        advisor.set_advice_status(db_path, advice_id, "adopted", user,
+                                      action_ref=f"task:{task_id}")
         return {"action": "canary", "task_id": task_id,
                 "decision": decision,
                 "hint": f"决策 {decision} 已写入，发布子进程将在下轮轮询时读取"}

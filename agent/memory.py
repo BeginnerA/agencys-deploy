@@ -48,12 +48,18 @@ def get_case(db_path: str, case_id: int):
     return dbm.get_record(db_path, "agent_cases", case_id)
 
 
-def list_cases(db_path: str, service: str = "", limit: int = 50) -> list:
+def list_cases(db_path: str, service: str = "", limit: int = 50,
+               advice_id: int = 0) -> list:
+    conds, params = [], []
     if service:
-        rows = dbm.list_records(db_path, "agent_cases", "service=?",
-                                (service,), "id DESC")
-    else:
-        rows = dbm.list_records(db_path, "agent_cases", order="id DESC")
+        conds.append("service=?")
+        params.append(service)
+    if advice_id:
+        conds.append("advice_id=?")
+        params.append(int(advice_id))
+    where = " AND ".join(conds)
+    rows = dbm.list_records(db_path, "agent_cases", where, tuple(params),
+                            "id DESC")
     return rows[:max(1, min(limit, 200))]
 
 

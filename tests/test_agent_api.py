@@ -474,6 +474,69 @@ class AgentApiBase(unittest.TestCase):
                                     headers=self.headers)
         self.assertEqual(resp.status_code, 200)
         self.assertIn("1/1", resp.get_json()["summary"])
+        # 发送历史落表且可查（operator 可用，viewer 403）
+        resp = self.client.get("/api/agent/digest/logs",
+                               headers=self.viewer_headers)
+        self.assertEqual(resp.status_code, 403)
+        resp = self.client.get("/api/agent/digest/logs",
+                               headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        logs = resp.get_json()["logs"]
+        self.assertGreaterEqual(len(logs), 1)
+        self.assertEqual(logs[0]["ok_count"], 1)
+        self.assertEqual(logs[0]["total_count"], 1)
+        self.assertEqual(logs[0]["channels"], "wecom")
+
+    # ---------- 建议生命周期 ----------
+
+    def test_advice_lifecycle_endpoints(self):
+        from agent import advisor as adv
+        aid = adv.save_advice(
+            self.db_path, "alert", 0, "告警归因：auth P1", "## 分析",
+            evidence={"target": {"service": "auth"}},
+            model="rule-based", actor={"id": 0, "username": "advisor"})
+        # viewer 无忽略权限
+        resp = self.client.post(f"/api/agent/advice/{aid}/dismiss",
+                                headers=self.viewer_headers)
+        self.assertEqual(resp.status_code, 403)
+        # admin 忽略 → 重开 → 过滤查询
+        resp = self.client.post(f"/api/agent/advice/{aid}/dismiss",
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.get("/api/agent/advice?status=dismissed",
+                               headers=self.headers)
+        self.assertIn(aid, [a["id"] for a in resp.get_json()["advice"]])
+        resp = self.client.get("/api/agent/advice?status=pending",
+                               headers=self.headers)
+        self.assertNotIn(aid, [a["id"] for a in resp.get_json()["advice"]])
+        # 非法 status → 400
+        resp = self.client.get("/api/agent/advice?status=bad",
+                               headers=self.headers)
+        self.assertEqual(resp.status_code, 400)
+        # 已忽略不能重复忽略 → 409；重开 → 回到待处理
+        resp = self.client.post(f"/api/agent/advice/{aid}/dismiss",
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 409)
+        resp = self.client.post(f"/api/agent/advice/{aid}/reopen",
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        rec = dbm.get_record(self.db_path, "agent_advice", aid)
+        self.assertEqual(rec["status"], "pending")
+        # 采纳后建议自动标 adopted，且不可再忽略
+        tid = self._make_task(version="1.1.0", status="failed")
+        dbm.update_record(self.db_path, "agent_advice", aid, dict(
+            scope="task_failed", ref_id=tid,
+            evidence='{"task": {"id": %d, "name": "auth", "env": "prod", '
+                     '"version": "1.1.0", "previous_version": "1.0.0"}}' % tid))
+        resp = self.client.post(f"/api/agent/advice/{aid}/to_run",
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 201)
+        rec = dbm.get_record(self.db_path, "agent_advice", aid)
+        self.assertEqual(rec["status"], "adopted")
+        self.assertTrue(rec["action_ref"].startswith("agent_run:"))
+        resp = self.client.post(f"/api/agent/advice/{aid}/dismiss",
+                                headers=self.headers)
+        self.assertEqual(resp.status_code, 409)
 
     # ---------- 案例 CRUD ----------
 

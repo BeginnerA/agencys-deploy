@@ -24,7 +24,7 @@ agent/
 ├── memory.py      Phase 4 长期记忆：故障案例 CRUD + 字符 bigram 相似检索
 ├── digest.py      周期巡检日报：健康/告警/发布聚合 → 通知渠道定时推送
 ├── scheduler.py   后台建议调度（daemon 线程，默认 30s 一轮；顺带检查日报到点）
-├── routes.py      Web API（/api/agent/*，26 条，RBAC 对齐平台）
+├── routes.py      Web API（/api/agent/*，29 条，RBAC 对齐平台）
 ├── cli.py         终端对话入口（交互式 / --once 单轮）
 └── mcp_server.py  MCP stdio server（JSON-RPC 2.0，零依赖）
 ```
@@ -104,6 +104,7 @@ python webapp/app.py
 - **计划生成**：`plan_operation(op=deploy/rollback/restart, target=服务或流水线名, env, version, previous_version, canary/skip_build/auto_version/no_git_tag)` 校验目标存在、版本格式、与平台一致的回滚语义（rollback 时 version=回滚目标），产出可预览的 CLI 命令行，绝不直接执行。
 - **定时计划立即执行**：`manage_schedules(action=run)` 生成 `kind=schedule_run` 审批单（与 Web 端 run_schedule 等效但必经人工审批）；block 窗口拒单、warn 窗口审批需显式 force_window，通过后按调度器同语义创建任务并后台同步终态。
 - **建议一键采纳**：失败归因建议（有回滚版本）→ `POST /api/agent/advice/<id>/to_run` 自动生成回滚审批单（参数从 evidence.task 推导，与手动建单同一安全链路）；灰度决策建议 → 直接写决策文件（仅当任务仍在 waiting，否则 409 提示）；告警归因/预检建议无可执行动作，明确拒绝。已完结审批单可 `POST /api/agent/runs/<id>/to_case` 一键沉淀案例（含关联归因建议），Web 端建议卡片/审批单详情均有对应按钮。
+- **建议生命周期**：`agent_advice.status` 三态——`pending` 待处理 → `adopted` 已采纳（to_run 成功自动标记，终态，带 `action_ref` 关联审批单/任务）/ `dismissed` 已忽略（人工，可重开回 pending）。前端建议列表按状态过滤（默认待处理），已处理建议不再堆积；建议详情展示状态、操作人与关联案例反查。
 - **审批单状态机**：`awaiting_approval → executing → success / failed`（或 `rejected`）。重复审批 409；viewer 无审批权（403）。
 - **发布窗口联动**：计划生成时检测窗口——block 直接拒单；warn 记 `window_warning`，审批时必须显式勾选「已确认窗口风险」才放行（`force_window`），放行后任务携带 `--force-window`。
 - **可观测与审计**：审批人 / 时间 / 意见、任务 id、执行摘要全部落库；「审批单」页签可直接看到任务终态与日志摘要；操作进 `audit_logs`。
@@ -130,6 +131,7 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 - **发送**：复用告警六渠道（`alert_channels.send_custom`，同一套配置检查与重试，**不写 alert_events**——日报不是告警）。
 - **调度**：挂在建议调度线程同一循环，每轮检查 cron 是否到点（48h 补发窗口：重启跨日不漏发、停机超 2 天不补发）；多实例用 `scheduler_locks` 独立锁名 `agent_digest` 互斥，拿锁后双检防重复发送。
 - **配置**：`platform_settings` 键 `agent_digest`（JSON：enabled/cron/channels/title/last_sent_at/last_result）；Web 端「智能助手 → 📤 巡检日报」弹窗维护（仅 admin），支持内联预览与手动立即发送；对话工具 `send_digest` 亦可立即推送。
+- **发送历史**：每次实际发送落一条 `agent_digest_logs`（成功失败都记，含 ok/total 渠道数与逐渠道明细），Web 弹窗展示最近 10 次结果；`GET /api/agent/digest/logs` 可追溯，失败排查不再依赖单点 last_result。
 
 ## 八、HTTP API 一览（前缀 /api，JWT Bearer）
 
@@ -144,13 +146,16 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | GET | /agent/runs/<id> | 审批单详情 | 登录用户 |
 | POST | /agent/runs/<id>/decision | 审批（action: approve/reject, force_window） | operator/admin |
 | POST | /agent/runs/<id>/to_case | 已完结审批单一键沉淀案例 | operator/admin |
-| GET | /agent/advice | 建议列表（scope/ref_id 过滤） | 登录用户 |
+| GET | /agent/advice | 建议列表（scope/ref_id/status 过滤，status: pending/adopted/dismissed） | 登录用户 |
 | POST | /agent/advice/<id>/to_case | 建议沉淀为案例 | operator/admin |
-| POST | /agent/advice/<id>/to_run | 建议一键采纳（失败归因→回滚审批单；灰度→写决策） | operator/admin |
+| POST | /agent/advice/<id>/to_run | 建议一键采纳（失败归因→回滚审批单；灰度→写决策，自动标 adopted） | operator/admin |
+| POST | /agent/advice/<id>/dismiss | 忽略待处理建议（仅 pending，可重开） | operator/admin |
+| POST | /agent/advice/<id>/reopen | 重开已忽略建议（回 pending） | operator/admin |
 | DELETE | /agent/advice/<id> | 删除建议 | admin |
 | GET/POST | /agent/digest/config | 巡检日报配置查看 / 保存（enabled/cron/channels/title） | admin |
 | GET | /agent/digest/preview | 预览当前日报文本（不发送） | operator/admin |
 | POST | /agent/digest/send | 手动立即发送一次日报 | operator/admin |
+| GET | /agent/digest/logs | 日报发送历史（最近 N 条） | operator/admin |
 | POST | /agent/analyze/alert/<id> | 手动告警归因 | operator/admin |
 | POST | /agent/precheck | 发布预检（target/env/version） | operator/admin |
 | GET/POST | /agent/cases | 案例列表 / 新建 | 新建需 operator/admin |
@@ -169,6 +174,8 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | AGENT_MAX_TOOL_ROUNDS | — | 8 | 单轮对话最大工具调用次数（1-20） |
 | AGENT_MAX_RESULT_CHARS | — | 6000 | 工具结果截断长度（500-20000） |
 | — | agent_digest | enabled=0, cron="0 9 * * *", channels=[] | 巡检日报配置（JSON，Web 弹窗维护） |
+
+> 数据表：建议生命周期列（`agent_advice.status/status_at/status_by/action_ref`，存量库 `_migrate` 幂等补列）与发送历史表 `agent_digest_logs`（sent_at/ok_count/total_count/channels/detail/summary）已在 SCHEMA 与迁移中定义。
 
 ## 十、安全与边界
 

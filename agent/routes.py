@@ -244,10 +244,13 @@ def list_advice():
     scope = request.args.get("scope", "")
     if scope and not _SAFE_SCOPE.match(scope):
         return jsonify({"error": "scope 非法"}), 400
+    status = request.args.get("status", "")
+    if status and status not in advisor_mod.ADVICE_STATUSES:
+        return jsonify({"error": "status 非法"}), 400
     ref_id = request.args.get("ref_id", 0, type=int)
     limit = max(1, min(request.args.get("limit", 30, type=int), 100))
     rows = advisor_mod.list_advice(current_app.config["DB_PATH"], scope,
-                                   ref_id, limit)
+                                   ref_id, limit, status=status)
     return jsonify({"advice": rows})
 
 
@@ -292,7 +295,7 @@ def advice_to_case(advice_id):
 @require_auth
 @require_role("admin", "operator")
 def advice_to_run(advice_id):
-    """建议一键采纳：失败归因→回滚审批单；灰度建议→写决策文件"""
+    """建议一键采纳：失败归因→回滚审批单；灰度建议→写决策文件（自动标 adopted）"""
     db_path = current_app.config["DB_PATH"]
     try:
         res = executor_mod.advice_to_action(
@@ -306,6 +309,36 @@ def advice_to_run(advice_id):
     return jsonify(res), 201
 
 
+@agent_bp.route("/agent/advice/<int:advice_id>/dismiss", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def advice_dismiss(advice_id):
+    """忽略待处理建议（仅 pending 可忽略）"""
+    try:
+        advisor_mod.set_advice_status(
+            current_app.config["DB_PATH"], advice_id, "dismissed",
+            actor={"id": g.user["id"], "username": g.user["username"]})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    audit("agent_advice_dismiss", "agent_advice", advice_id)
+    return jsonify({"ok": True})
+
+
+@agent_bp.route("/agent/advice/<int:advice_id>/reopen", methods=["POST"])
+@require_auth
+@require_role("admin", "operator")
+def advice_reopen(advice_id):
+    """重开已忽略的建议（回到待处理）"""
+    try:
+        advisor_mod.set_advice_status(
+            current_app.config["DB_PATH"], advice_id, "pending",
+            actor={"id": g.user["id"], "username": g.user["username"]})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 409
+    audit("agent_advice_reopen", "agent_advice", advice_id)
+    return jsonify({"ok": True})
+
+
 # ---------- 案例（Phase 4 记忆） ----------
 
 @agent_bp.route("/agent/cases")
@@ -313,13 +346,17 @@ def advice_to_run(advice_id):
 def list_cases():
     keyword = request.args.get("keyword", "")
     service = request.args.get("service", "")
+    advice_id = request.args.get("advice_id", 0, type=int)
     limit = max(1, min(request.args.get("limit", 50, type=int), 200))
     db = current_app.config["DB_PATH"]
     if keyword:
         rows = memory_mod.search_cases(db, keyword=keyword,
                                        service=service or None, limit=limit)
+        if advice_id:
+            rows = [c for c in rows if c.get("advice_id") == advice_id]
     else:
-        rows = memory_mod.list_cases(db, service=service, limit=limit)
+        rows = memory_mod.list_cases(db, service=service, limit=limit,
+                                     advice_id=advice_id)
     return jsonify({"cases": rows})
 
 
@@ -552,6 +589,17 @@ def digest_preview():
     snap = digest_mod.collect_snapshot(db_path)
     return jsonify({"text": digest_mod.render_text(
         snap, cfg.get("title") or "巡检日报")})
+
+
+@agent_bp.route("/agent/digest/logs")
+@require_auth
+@require_role("admin", "operator")
+def digest_logs():
+    """巡检日报发送历史（最近 N 条，供追溯与失败排查）"""
+    limit = max(1, min(request.args.get("limit", 20, type=int), 100))
+    rows = dbm.list_records(current_app.config["DB_PATH"],
+                            "agent_digest_logs", order="id DESC")
+    return jsonify({"logs": rows[:limit]})
 
 
 @agent_bp.route("/agent/digest/send", methods=["POST"])

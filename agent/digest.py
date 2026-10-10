@@ -6,9 +6,12 @@
     2. 发送复用 alert_channels 六渠道，走 send_custom（不写 alert_events，
        日报不是告警）；渠道未配置时结果里带原因，配置页可直接排查；
     3. 多实例互斥复用 scheduler_locks 租约锁（独立锁名 agent_digest），
-       cron 到点判断用 48h 补发窗口：服务重启跨日不漏发，停机超 2 天不补发。
+       cron 到点判断用 48h 补发窗口：服务重启跨日不漏发，停机超 2 天不补发；
+    4. 每次实际发送落一条 agent_digest_logs 历史（成功失败都记），
+       供配置页追溯与失败排查。
 """
 import json
+import sys
 import time
 
 from webapp import db as dbm
@@ -239,6 +242,20 @@ def _due_ts(cron_expr: str, now: int) -> int:
     return int(nxt.timestamp())
 
 
+def _log_send(db_path: str, results: list, summary: str) -> None:
+    """发送结果落历史表；写失败仅告警不阻断（历史缺失不影响发送主流程）"""
+    try:
+        dbm.create_record(db_path, "agent_digest_logs", dict(
+            sent_at=int(time.time()),
+            ok_count=sum(1 for _, ok, _ in results if ok),
+            total_count=len(results),
+            channels=",".join(c for c, _, _ in results),
+            detail="; ".join(f"{c}={'ok' if ok else d}" for c, ok, d in results),
+            summary=summary))
+    except Exception as e:
+        print(f"[agent-digest] 发送历史写入失败: {e!r}", file=sys.stderr)
+
+
 def build_and_send(db_path: str) -> dict:
     """立即聚合并发送一次日报（手动触发/测试用）；返回发送结果与文本"""
     from webapp.alert_channels import send_custom
@@ -255,6 +272,7 @@ def build_and_send(db_path: str) -> dict:
         f"{ok_n}/{len(results)} 渠道成功: "
         + "; ".join(f"{c}={'ok' if ok else detail}" for c, ok, detail in results))
     _write_back(db_path, cfg)
+    _log_send(db_path, results, cfg["last_result"])
     return {"text": text, "results": results,
             "summary": cfg["last_result"]}
 
