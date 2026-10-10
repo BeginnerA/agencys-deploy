@@ -1220,7 +1220,8 @@
       let cfg = {};
       try{ cfg = (await api('/api/agent/digest/config')).config || {}; }
       catch(e){ toastError('日报配置读取失败：' + (e.message || '')); }
-      const chans = ['email','wecom','webhook','sms_aliyun','feishu','dingtalk'];
+      const chans = [['email','邮件'],['wecom','企微'],['webhook','Webhook'],
+        ['sms_aliyun','阿里云短信'],['feishu','飞书'],['dingtalk','钉钉']]; // 与告警页 CHANNELS / alert_channels.CHANNELS 同源
       const sel = cfg.channels || [];
       const bc = document.querySelector('#drawerRoot .drawer-body')
         || document.getElementById('drawerRoot');
@@ -1239,10 +1240,10 @@
           <input type="text" id="dgCron" value="${esc(cfg.cron || '0 9 * * *')}" placeholder="0 9 * * *"></div>
         <div class="field"><label>日报标题</label>
           <input type="text" id="dgTitle" value="${esc(cfg.title || '巡检日报')}" maxlength="40"></div>
-        <div class="field"><label>通知渠道（可多选；渠道配置在告警通知页维护）</label>
-          <div style="display:flex;gap:14px;flex-wrap:wrap">
-            ${chans.map(c => `<label style="display:flex;align-items:center;gap:4px">
-              <input type="checkbox" value="${c}" ${sel.includes(c) ? 'checked' : ''}>${c}</label>`).join('')}
+        <div class="field full"><label>通知渠道（可多选；渠道配置在告警通知页维护）</label>
+          <div class="rule-ch-box">
+            ${chans.map(([k, v]) => `<label class="rule-ch-cb">
+              <input type="checkbox" value="${k}" ${sel.includes(k) ? 'checked' : ''}> ${v}</label>`).join('')}
           </div></div>`
         : '<div class="muted">仅管理员可修改配置；可点击预览查看当前日报内容。</div>'}
         ${cfg.last_sent_at ? `<div class="plan-detail" style="margin-top:10px">
