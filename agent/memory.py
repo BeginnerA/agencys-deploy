@@ -49,7 +49,7 @@ def get_case(db_path: str, case_id: int):
 
 
 def list_cases(db_path: str, service: str = "", limit: int = 50,
-               advice_id: int = 0) -> list:
+               advice_id: int = 0, tag: str = "") -> list:
     conds, params = [], []
     if service:
         conds.append("service=?")
@@ -57,6 +57,9 @@ def list_cases(db_path: str, service: str = "", limit: int = 50,
     if advice_id:
         conds.append("advice_id=?")
         params.append(int(advice_id))
+    if tag:
+        conds.append("tags LIKE ?")
+        params.append(f'%"{tag}"%')
     where = " AND ".join(conds)
     rows = dbm.list_records(db_path, "agent_cases", where, tuple(params),
                             "id DESC")
@@ -73,9 +76,14 @@ def delete_case(db_path: str, case_id: int) -> bool:
 
 
 def search_cases(db_path: str, keyword: str = "", service: str = "",
-                 limit: int = 5) -> list:
-    """相似案例召回：返回按相关度降序的案例列表（含 score 字段）"""
-    candidates = list_cases(db_path, service=service, limit=200)
+                 limit: int = 5, exclude_id: int = 0, tag: str = "") -> list:
+    """相似案例召回：返回按相关度降序的案例列表（含 score 字段）
+
+    exclude_id 用于案例详情页的"相似案例"推荐，排除案例自身。
+    """
+    candidates = list_cases(db_path, service=service, limit=200, tag=tag)
+    if exclude_id:
+        candidates = [c for c in candidates if c["id"] != int(exclude_id)]
     if not keyword:
         return [dict(c, score=1.0) for c in candidates[:limit]]
     qgrams = _bigrams(keyword)

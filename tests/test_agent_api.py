@@ -631,6 +631,27 @@ class AgentApiBase(unittest.TestCase):
                                headers=self.headers)
         self.assertEqual(resp.status_code, 404)
 
+    def test_cases_tag_filter_and_exclude(self):
+        self.client.post("/api/agent/cases", headers=self.headers,
+                         json={"title": "磁盘写满导致发布失败", "service": "auth",
+                               "symptom": "df 100%", "tags": ["磁盘", "OOM"]})
+        self.client.post("/api/agent/cases", headers=self.headers,
+                         json={"title": "连接池耗尽", "service": "order",
+                               "symptom": "timeout", "tags": ["mysql"]})
+        # tag 过滤（JSON 字段参数化 LIKE）
+        resp = self.client.get("/api/agent/cases?tag=磁盘",
+                               headers=self.headers)
+        cases = resp.get_json()["cases"]
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]["title"], "磁盘写满导致发布失败")
+        # 相似召回排除自身（详情页"相似案例"）
+        cid = cases[0]["id"]
+        resp = self.client.get(
+            f"/api/agent/cases?keyword=磁盘&exclude_id={cid}",
+            headers=self.headers)
+        self.assertNotIn(cid,
+                         [c["id"] for c in resp.get_json()["cases"]])
+
     # ---------- 网关配置 ----------
 
     def test_config_view_and_update(self):

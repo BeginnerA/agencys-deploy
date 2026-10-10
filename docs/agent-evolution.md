@@ -122,7 +122,8 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 ### 故障案例库（长期记忆）
 
 - 告警归因 / 失败归因生成建议后可「一键沉淀为案例」（`POST /api/agent/advice/<id>/to_case`，对话工具 `case_save` 亦可）；案例可补全 `root_cause / action / result / lesson / tags`。
-- 检索用字符 bigram Jaccard 相似度 + service 过滤，命中案例会作为证据带入下一次建议（归因 → 记忆 → 归因的飞轮）。
+- 检索用字符 bigram Jaccard 相似度 + service/tag 过滤，命中案例会作为证据带入下一次建议（归因 → 记忆 → 归因的飞轮）。
+- 案例检索与溯源：列表支持 `tag` 参数过滤（JSON tags 参数化 LIKE）；详情页附「相似案例」推荐（`search_cases` 新增 `exclude_id` 排除自身，点击跳转）；来源三态标识（manual 手工 / advice 建议沉淀 / agent_run 执行沉淀）在列表卡片与详情展示，详情页标签可点击发起过滤。
 - 案例与建议均按 RBAC：viewer 只读，operator 可建/改案例，admin 可删除。
 
 ## 七、周期巡检日报
@@ -160,7 +161,7 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | GET | /agent/digest/logs | 日报发送历史（最近 N 条） | operator/admin |
 | POST | /agent/analyze/alert/<id> | 手动告警归因 | operator/admin |
 | POST | /agent/precheck | 发布预检（target/env/version） | operator/admin |
-| GET/POST | /agent/cases | 案例列表 / 新建 | 新建需 operator/admin |
+| GET/POST | /agent/cases | 案例列表（keyword/service/tag/advice_id/exclude_id 过滤）/ 新建 | 新建需 operator/admin |
 | GET/PUT/DELETE | /agent/cases/<id> | 案例详情 / 修改 / 删除（删除 admin） | 按列 |
 | GET | /agent/config | 网关配置状态（**不回显 api_key**） | admin |
 | POST | /agent/config | 保存网关配置（base_url/api_key/model） | admin |

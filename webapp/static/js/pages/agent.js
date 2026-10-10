@@ -11,7 +11,7 @@
   let gw = null;             // GET /api/agent/config 缓存
   let runs = [], runStatus = 'all';
   let adviceList = [], adviceScope = '', adviceStatus = 'pending';
-  let cases = [], caseKw = '', caseSvc = '';
+  let cases = [], caseKw = '', caseSvc = '', caseTag = '';
 
   const role = currentUser().role || 'viewer';
   const canManage = ['admin','operator'].includes(role);
@@ -878,12 +878,14 @@
   }
 
   // ==================== 故障案例 Tab ====================
+  const CASE_SRC_LABEL = { manual: '✍️ 手工', advice: '📥 建议沉淀', agent_run: '🤖 执行沉淀' };
   function renderCasesTab(){
     setPanel(`
       <div class="agent-list-panel panel">
         <div class="list-toolbar">
           <input type="text" id="caseKw" placeholder="搜索症状 / 根因 / 教训关键字" value="${esc(caseKw)}">
           <input type="text" id="caseSvc" placeholder="服务名（可空）" value="${esc(caseSvc)}" style="width:140px">
+          <input type="text" id="caseTag" placeholder="标签（可空）" value="${esc(caseTag)}" style="width:120px">
           <button class="btn sm" id="caseSearch">搜索</button>
           <span style="flex:1"></span>
           ${canManage ? '<button class="btn sm primary" id="caseNew">＋ 新案例</button>' : ''}
@@ -893,6 +895,7 @@
     const search = () => {
       caseKw = (document.getElementById('caseKw') || {}).value || '';
       caseSvc = (document.getElementById('caseSvc') || {}).value || '';
+      caseTag = (document.getElementById('caseTag') || {}).value || '';
       loadCases();
     };
     const sb = document.getElementById('caseSearch');
@@ -907,7 +910,7 @@
     if (!box) return;
     box.innerHTML = skeletonHTML(4);
     try{
-      const data = await api('/api/agent/cases' + qs({keyword: caseKw, service: caseSvc, limit: 100}));
+      const data = await api('/api/agent/cases' + qs({keyword: caseKw, service: caseSvc, tag: caseTag, limit: 100}));
       cases = data.cases || [];
     }catch(e){ cases = []; }
     renderCases(box);
@@ -924,6 +927,7 @@
         <div class="cc-body">${esc(c.symptom || c.root_cause || c.lesson || '')}</div>
         <div class="cc-foot">
           <span class="tag tag-${c.result === 'resolved' || c.result === '成功' ? 'ok' : 'warn'}">${esc(c.result || '待验证')}</span>
+          ${c.source ? `<span>${CASE_SRC_LABEL[c.source] || esc(c.source)}</span>` : ''}
           ${c.service ? `<span>🔧 ${esc(c.service)}</span>` : ''}
           ${c.env ? `<span>🌐 ${esc(c.env)}</span>` : ''}
           <span style="margin-left:auto">🕐 ${fmtTime(c.updated_at || c.created_at)}</span>
@@ -934,10 +938,11 @@
     });
   }
   function getCase(id){ return cases.find(c => c.id === id) || null; }
-  function openCaseDetail(id){
-    const c = getCase(id);
+  function openCaseDetail(id, caseObj){
+    const c = caseObj || getCase(id);
     if (!c) return;
-    const tags = (c.tags || []).map(t => `<span class="tag tag-info">${esc(t)}</span>`).join(' ');
+    const tags = (c.tags || []).map(t =>
+      `<span class="tag tag-info" data-tag="${esc(t)}" style="cursor:pointer" title="按该标签过滤案例">${esc(t)}</span>`).join(' ');
     openDrawer({
       title: `故障案例 #${id}`,
       wide: true,
@@ -954,13 +959,50 @@
           <div class="row"><b>根因</b><span style="white-space:pre-line">${esc(c.root_cause || '-')}</span></div>
           <div class="row"><b>处置</b><span style="white-space:pre-line">${esc(c.action || '-')}</span></div>
           <div class="row"><b>教训</b><span style="white-space:pre-line">${esc(c.lesson || '-')}</span></div>
-          ${c.source ? `<div class="row"><b>来源</b>${esc(c.source)} ${c.advice_id ? `（建议 #${c.advice_id}）` : ''}</div>` : ''}
+          ${c.source ? `<div class="row"><b>来源</b>${CASE_SRC_LABEL[c.source] || esc(c.source)}${c.advice_id ? `（建议 #${c.advice_id}）` : ''}</div>` : ''}
           <div class="row"><b>维护</b>${esc(c.created_by_name || '-')} @ ${fmtTime(c.created_at)}</div>
         </div>
-        <div style="margin-top:10px">${tags}</div>`,
+        ${tags ? `<div style="margin-top:10px">${tags}</div>` : ''}
+        <div style="margin-top:14px">
+          <b style="font-size:var(--fs-13)">🔗 相似案例</b>
+          <div id="simBox" class="muted" style="margin-top:6px;font-size:var(--fs-12)">加载中…</div>
+        </div>`,
       footer: (canManage ? `<button class="btn sm primary" id="caseEdit">编辑</button>` : '') +
         (role === 'admin' ? `<button class="btn sm danger" id="caseDel">删除</button>` : '')
     });
+    document.querySelectorAll('#drawerRoot [data-tag]').forEach(el => {
+      el.onclick = () => {
+        caseTag = el.dataset.tag;
+        document.getElementById('drawerRoot').classList.add('hidden');
+        switchTab('cases');
+      };
+    });
+    const simBox = document.getElementById('simBox');
+    if (simBox){
+      api('/api/agent/cases' + qs({
+        keyword: ((c.title || '') + ' ' + (c.symptom || '')).slice(0, 80),
+        exclude_id: c.id, limit: 5})).then(data => {
+        const box = document.getElementById('simBox');
+        if (!box) return;   // 抽屉已关闭/切换
+        const sims = (data.cases || []).filter(s => s.id !== c.id);
+        if (!sims.length){ box.textContent = '暂无相似案例'; return; }
+        box.classList.remove('muted');
+        box.innerHTML = sims.map(s => `
+          <div data-sim="${s.id}" style="cursor:pointer;padding:6px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px">
+            <b style="color:var(--text-1)">${esc(s.title)}</b>
+            <span class="muted" style="margin-left:8px">相关度 ${(Math.min(1, s.score || 0) * 100).toFixed(0)}%</span>
+          </div>`).join('');
+        box.querySelectorAll('[data-sim]').forEach(el => {
+          el.onclick = () => {
+            const s = sims.find(x => x.id === Number(el.dataset.sim));
+            if (s) openCaseDetail(s.id, s);
+          };
+        });
+      }).catch(() => {
+        const box = document.getElementById('simBox');
+        if (box) box.textContent = '相似案例加载失败';
+      });
+    }
     const eb = document.getElementById('caseEdit');
     if (eb) eb.onclick = () => { openCaseForm(c); };
     const db2 = document.getElementById('caseDel');

@@ -142,6 +142,20 @@ class TestMemory(AgentBase):
         self.assertEqual(len(list_cases(self.db, service="order")), 1)
         self.assertEqual(len(search_cases(self.db, service="order")), 1)
 
+    def test_list_by_tag_and_search_exclude(self):
+        self._mk("磁盘写满", "df 100%", service="auth", tags=["磁盘", "OOM"])
+        self._mk("连接池耗尽", "timeout", service="order", tags=["mysql"])
+        from agent.memory import list_cases, search_cases
+        self.assertEqual(len(list_cases(self.db, tag="磁盘")), 1)
+        self.assertEqual(list_cases(self.db, tag="磁盘")[0]["title"], "磁盘写满")
+        self.assertEqual(len(list_cases(self.db, tag="不存在的标签")), 0)
+        # 相似召回排除自身（详情页"相似案例"推荐）
+        rows = search_cases(self.db, keyword="磁盘", exclude_id=1, limit=5)
+        self.assertNotIn(1, [r["id"] for r in rows])
+        # 无关键字时同样排除自身
+        rows2 = search_cases(self.db, exclude_id=1, limit=5)
+        self.assertEqual([r["id"] for r in rows2], [2])
+
 
 class TestLlmGateway(AgentBase):
     def test_chat_requires_config(self):

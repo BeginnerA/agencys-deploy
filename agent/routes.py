@@ -371,16 +371,19 @@ def list_cases():
     keyword = request.args.get("keyword", "")
     service = request.args.get("service", "")
     advice_id = request.args.get("advice_id", 0, type=int)
+    tag = request.args.get("tag", "").strip()
+    exclude_id = request.args.get("exclude_id", 0, type=int)
     limit = max(1, min(request.args.get("limit", 50, type=int), 200))
     db = current_app.config["DB_PATH"]
     if keyword:
         rows = memory_mod.search_cases(db, keyword=keyword,
-                                       service=service or None, limit=limit)
+                                       service=service or None, limit=limit,
+                                       exclude_id=exclude_id, tag=tag)
         if advice_id:
             rows = [c for c in rows if c.get("advice_id") == advice_id]
     else:
         rows = memory_mod.list_cases(db, service=service, limit=limit,
-                                     advice_id=advice_id)
+                                     advice_id=advice_id, tag=tag)
     return jsonify({"cases": rows})
 
 
