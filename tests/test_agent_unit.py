@@ -876,7 +876,9 @@ class TestAgentManageTools(AgentBase):
                   "manage_environments", "manage_servers",
                   "manage_pipelines",
                   "manage_schedules", "manage_windows", "manage_canary",
-                  "canary_decision", "set_alert_status"):
+                  "canary_decision", "set_alert_status",
+                  "manage_alert_rules", "manage_silences",
+                  "decide_run"):
             self.assertNotIn(n, viewer_names)
             self.assertIn(n, admin_names)
 
@@ -1089,6 +1091,108 @@ class TestAgentManageTools(AgentBase):
                           {"action": "delete", "pipeline_id": plid})
         self.assertTrue(dele["ok"])
         self.assertIsNone(dbm.get_record(self.db, "pipelines", plid))
+
+    def test_alert_rules_tool_lifecycle(self):
+        # viewer 拒绝（write 级过滤，与 Web 端 operator/admin 权限对齐）
+        denied = self._call("manage_alert_rules", {"action": "list"},
+                            role="viewer")
+        self.assertIn("error", denied)
+        # create：scope 悬空拒绝（对话防幻觉）
+        ghost = self._call("manage_alert_rules", {
+            "action": "create", "name": "CPU", "metric_type": "metric",
+            "metric": "cpu", "threshold": 80,
+            "scope": {"type": "env", "ids": [999]}})
+        self.assertIn("error", ghost)
+        # create：metric 与 metric_type 跨字段失配拒绝
+        mismatch = self._call("manage_alert_rules", {
+            "action": "create", "name": "CPU", "metric_type": "status",
+            "metric": "cpu", "threshold": 80})
+        self.assertIn("error", mismatch)
+        # create：环境作用域规则（id 真实存在）
+        ok = self._call("manage_alert_rules", {
+            "action": "create", "name": "CPU 过高", "metric_type": "metric",
+            "metric": "cpu", "compare": ">", "threshold": 80,
+            "duration_seconds": 300,
+            "scope": {"type": "env", "ids": [self.env_id]},
+            "severity": "P2", "channels": ["wecom"]})
+        rid = ok["id"]
+        # update：局部更新 threshold，未提交字段保持原值
+        up = self._call("manage_alert_rules", {
+            "action": "update", "rule_id": rid, "threshold": 90})
+        self.assertTrue(up["ok"])
+        rec = dbm.get_record(self.db, "alert_rules", rid)
+        self.assertEqual(rec["threshold"], 90.0)
+        self.assertEqual(rec["metric"], "cpu")
+        self.assertEqual(rec["channels"], ["wecom"])
+        # update：合并复校验拦截跨字段失配（metric=cpu 与 status 冲突）
+        cross = self._call("manage_alert_rules", {
+            "action": "update", "rule_id": rid, "metric_type": "status"})
+        self.assertIn("error", cross)
+        # toggle / list / delete
+        tg = self._call("manage_alert_rules", {
+            "action": "toggle", "rule_id": rid})
+        self.assertFalse(tg["enabled"])
+        ls = self._call("manage_alert_rules", {"action": "list"})
+        rule = next(r for r in ls["rules"] if r["id"] == rid)
+        self.assertEqual(rule["scope"]["ids"], [self.env_id])
+        self.assertFalse(rule["enabled"])
+        dele = self._call("manage_alert_rules", {
+            "action": "delete", "rule_id": rid})
+        self.assertTrue(dele["ok"])
+        self.assertIsNone(dbm.get_record(self.db, "alert_rules", rid))
+
+    def test_silences_tool_lifecycle(self):
+        # viewer 拒绝
+        denied = self._call("manage_silences", {"action": "list"},
+                            role="viewer")
+        self.assertIn("error", denied)
+        now = int(time.time())
+        # create：scope 悬空拒绝（rules 引用不存在的规则 id）
+        ghost = self._call("manage_silences", {
+            "action": "create", "name": "发版静默", "type": "one_time",
+            "start_at": now, "end_at": now + 7200,
+            "scope": {"rules": [999], "envs": [], "servers": []}})
+        self.assertIn("error", ghost)
+        # create：one_time 环境与服务器作用域（id 真实存在）
+        ok = self._call("manage_silences", {
+            "action": "create", "name": "发版静默", "type": "one_time",
+            "start_at": now, "end_at": now + 7200,
+            "scope": {"rules": [], "envs": [self.env_id],
+                      "servers": [self.server_id]}})
+        wid = ok["id"]
+        # create：recurring 需 HH:MM 格式
+        bad = self._call("manage_silences", {
+            "action": "create", "name": "夜间", "type": "recurring",
+            "start_at": "25:00", "end_at": "08:00"})
+        self.assertIn("error", bad)
+        # update：局部更新 enabled，未提交字段保持原值
+        up = self._call("manage_silences", {
+            "action": "update", "silence_id": wid, "enabled": False})
+        self.assertTrue(up["ok"])
+        rec = dbm.get_record(self.db, "silence_windows", wid)
+        self.assertEqual(rec["enabled"], 0)
+        self.assertEqual(rec["scope"]["envs"], [self.env_id])
+        # 引擎闭环：按 id 配置的环境/服务器作用域对 target 名字生效
+        # （回归验证静默作用域 id→名翻译修复）
+        from webapp.alert_engine import AlertEngine
+        rule_id = dbm.create_record(self.db, "alert_rules", dict(
+            name="r", metric_type="metric", metric="cpu", compare=">",
+            threshold=80, duration_seconds=0,
+            scope={"type": "all", "ids": []}, severity="P2", channels=[],
+            escalation_interval=30, enabled=1, remark="",
+            created_at=1, updated_at=1))
+        rule = dbm.get_record(self.db, "alert_rules", rule_id)
+        dbm.update_record(self.db, "silence_windows", wid, {"enabled": 1})
+        engine = AlertEngine(self.db, interval=30)
+        self.assertTrue(engine._silenced(
+            rule, {"env": "prod", "host": "10.0.0.1"}))
+        self.assertFalse(engine._silenced(
+            rule, {"env": "test", "host": "1.1.1.1"}))
+        # delete
+        dele = self._call("manage_silences", {
+            "action": "delete", "silence_id": wid})
+        self.assertTrue(dele["ok"])
+        self.assertIsNone(dbm.get_record(self.db, "silence_windows", wid))
 
     def test_clone_environment_copies_server_bindings(self):
         # 新项目 → clone plat/prod 环境（含服务器绑定，order 保持）

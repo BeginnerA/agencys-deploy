@@ -1809,6 +1809,375 @@ def _set_alert_status(ctx, alert_id=None, action=None, note="", **kw) -> dict:
     return {"ok": True, "alert_id": alert_id, "status": "firing"}
 
 
+# ---------- 告警规则与静默窗口管理 ----------
+
+_RULE_METRICS = {"metric": ("cpu", "mem", "disk", "load"),
+                 "status": ("service_down", "task_failed")}
+_SEVERITIES = ("P0", "P1", "P2", "P3")
+_ALERT_CHANNELS = ("email", "wecom", "webhook", "sms_aliyun", "feishu",
+                   "dingtalk")
+_SCOPE_TABLES = {"project": "projects", "env": "environments",
+                 "server": "servers", "service": "services"}
+_SCOPE_TIPS = {"project": "list_projects", "env": "list_environments",
+               "server": "manage_servers(action=list)",
+               "service": "list_services"}
+_HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+
+
+def _check_scope_ids(db, scope) -> str:
+    """scope.ids 悬空校验（对话防幻觉：id 必须真实存在，错误引导查询）"""
+    stype = scope.get("type")
+    if stype not in _SCOPE_TABLES:
+        return ""
+    ids = [x for x in scope.get("ids") or []
+           if isinstance(x, int) and not isinstance(x, bool)]
+    valid = {r["id"] for r in dbm.list_records(db, _SCOPE_TABLES[stype])}
+    missing = [x for x in ids if x not in valid]
+    if missing:
+        return (f"scope.ids 引用了不存在的 {stype} id: {missing}"
+                f"（可用 {_SCOPE_TIPS[stype]} 查询真实 id）")
+    return ""
+
+
+def _validate_alert_rule(db, body, partial=False) -> str:
+    """规则校验（镜像 alert_routes._validate_rule，含跨字段约束）；空串=通过
+
+    partial=True 仅校验已出现的字段（局部更新前的形态检查）。
+    """
+    def has(k):
+        return True if not partial else k in body
+
+    if has("name") and not (body.get("name") or "").strip():
+        return "规则名称必填"
+    if has("metric_type") and body.get("metric_type") not in (
+            "metric", "status", "log_keyword", "custom_monitor"):
+        return "metric_type 非法"
+    if has("metric"):
+        mt = body.get("metric_type")
+        if mt == "metric" and body.get("metric") not in _RULE_METRICS["metric"]:
+            return "metric 型规则的 metric 必须为 cpu/mem/disk/load"
+        if mt == "status" and body.get("metric") not in _RULE_METRICS["status"]:
+            return "status 型规则的 metric 必须为 service_down/task_failed"
+        if mt == "log_keyword":
+            kws = [k.strip() for k in (body.get("metric") or "").split(",")
+                   if k.strip()]
+            if not kws:
+                return "日志关键词不能为空"
+            if any(len(k) > 100 for k in kws):
+                return "单个关键词长度不能超过 100"
+    if has("exclude_keyword"):
+        for k in (body.get("exclude_keyword") or "").split(","):
+            if k.strip() and len(k.strip()) > 100:
+                return "单个排除关键词长度不能超过 100"
+    if has("severity") and body.get("severity") not in _SEVERITIES:
+        return "severity 必须为 P0/P1/P2/P3"
+    if has("compare") and body.get("compare") not in ("<", "<=", ">", ">="):
+        return "compare 必须为 < <= > >="
+    if has("threshold"):
+        try:
+            float(body.get("threshold", 0))
+        except (TypeError, ValueError):
+            return "threshold 必须为数字"
+    if has("duration_seconds"):
+        try:
+            duration = int(body.get("duration_seconds", 0))
+        except (TypeError, ValueError):
+            return "duration_seconds 非法"
+        if body.get("metric_type") == "metric" and duration > 1200:
+            return "duration_seconds 不能超过 1200（滑动窗口上限 20 分钟）"
+    if has("escalation_interval"):
+        try:
+            int(body.get("escalation_interval", 30))
+        except (TypeError, ValueError):
+            return "escalation_interval 必须为数字"
+    if has("scope"):
+        scope = body.get("scope") or {}
+        if not isinstance(scope, dict):
+            return "scope 格式错误"
+        if scope.get("type") not in ("all", "project", "env", "server", "service"):
+            return "scope type 非法"
+        if not isinstance(scope.get("ids"), list):
+            return "scope.ids 需为列表"
+        if "env_ids" in scope and not isinstance(scope["env_ids"], list):
+            return "scope.env_ids 需为列表"
+        mt = body.get("metric_type")
+        if mt == "metric" and scope.get("type") == "service":
+            return "指标规则不能选择服务作用域"
+        if mt in ("status", "log_keyword") and scope.get("type") == "server":
+            return "状态/日志规则不能选择服务器作用域"
+        err = _check_scope_ids(db, scope)
+        if err:
+            return err
+    if has("channels"):
+        channels = body.get("channels") or []
+        if not isinstance(channels, list):
+            return "channels 需为列表"
+        if channels and not set(channels) <= set(_ALERT_CHANNELS):
+            return "channels 包含非法渠道"
+    return ""
+
+
+def _rule_out(r) -> dict:
+    return {"id": r["id"], "name": r["name"],
+            "metric_type": r.get("metric_type"), "metric": r.get("metric", ""),
+            "compare": r.get("compare", ">"), "threshold": r.get("threshold", 0),
+            "duration_seconds": r.get("duration_seconds", 0),
+            "scope": r.get("scope") or {"type": "all", "ids": []},
+            "severity": r.get("severity", "P2"),
+            "channels": r.get("channels") or [],
+            "escalation_interval": r.get("escalation_interval", 30),
+            "enabled": bool(r.get("enabled")), "remark": r.get("remark", "")}
+
+
+def _manage_alert_rules(ctx, action=None, rule_id=None, name="",
+                        metric_type="", metric="", compare="",
+                        threshold=None, duration_seconds=None,
+                        scope=None, severity="", channels=None,
+                        escalation_interval=None, exclude_keyword=None,
+                        enabled=None, remark=None, **kw) -> dict:
+    """告警规则管理（operator/admin，与 Web 端同等效力）：
+    list/create/update/delete/toggle
+
+    update 为局部更新（未提供的字段保持原值），合并后整体复校验，
+    防止 metric_type/metric 跨字段组合失配被引擎静默忽略。
+    """
+    db = ctx.db_path
+    action = action or "list"
+    if action == "list":
+        rows = dbm.list_records(db, "alert_rules", "", (), "id")
+        return {"rules": [_rule_out(r) for r in rows],
+                "hint": "scope.ids 为实体 id（项目/环境/服务器/服务）"}
+    if action == "create":
+        body = dict(
+            name=name, metric_type=metric_type or "metric", metric=metric or "",
+            compare=compare or ">",
+            threshold=0 if threshold is None else threshold,
+            duration_seconds=0 if duration_seconds is None else duration_seconds,
+            scope=_jsonish(scope, "scope") or {"type": "all", "ids": []},
+            severity=severity or "P2", channels=channels or [],
+            escalation_interval=(30 if escalation_interval is None
+                                 else escalation_interval),
+            exclude_keyword=exclude_keyword or "",
+            enabled=True if enabled is None else enabled, remark=remark or "")
+        err = _validate_alert_rule(db, body)
+        if err:
+            raise ToolError(err)
+        now = int(time.time())
+        rid = dbm.create_record(db, "alert_rules", dict(
+            name=body["name"].strip(), metric_type=body["metric_type"],
+            metric=body["metric"], compare=body["compare"],
+            threshold=float(body["threshold"]),
+            duration_seconds=int(body["duration_seconds"]),
+            scope=body["scope"], severity=body["severity"],
+            channels=body["channels"],
+            escalation_interval=int(body["escalation_interval"]),
+            exclude_keyword=(body["exclude_keyword"] or "").strip(),
+            enabled=1 if body["enabled"] else 0,
+            remark=body["remark"], created_at=now, updated_at=now))
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_create_alert_rule", "alert_rule", rid,
+                         {"name": body["name"], "via": "agent"})
+        return {"id": rid, "hint": "规则已生效，下一轮引擎评估即按其触发"}
+    rule = dbm.get_record(db, "alert_rules", int(rule_id or 0)) \
+        if rule_id else None
+    if not rule:
+        raise ToolError("缺少或不存在 rule_id")
+    if action == "toggle":
+        new_enabled = 0 if rule["enabled"] else 1
+        dbm.update_record(db, "alert_rules", rule["id"],
+                          {"enabled": new_enabled})
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_toggle_alert_rule", "alert_rule", rule["id"],
+                         {"enabled": new_enabled, "via": "agent"})
+        return {"id": rule["id"], "enabled": bool(new_enabled)}
+    if action == "delete":
+        dbm.delete_record(db, "alert_rules", rule["id"])
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_delete_alert_rule", "alert_rule", rule["id"],
+                         {"name": rule["name"], "via": "agent"})
+        return {"ok": True, "id": rule["id"]}
+    if action != "update":
+        raise ToolError("action 仅支持 list/create/update/delete/toggle")
+    # 局部更新：仅采用已提供的字段，其余保持原值；合并后整体复校验
+    body = dict(rule)
+    if name:
+        body["name"] = name
+    if metric_type:
+        body["metric_type"] = metric_type
+    if metric:
+        body["metric"] = metric
+    if compare:
+        body["compare"] = compare
+    if threshold is not None:
+        body["threshold"] = threshold
+    if duration_seconds is not None:
+        body["duration_seconds"] = duration_seconds
+    if scope is not None:
+        body["scope"] = _jsonish(scope, "scope")
+    if severity:
+        body["severity"] = severity
+    if channels is not None:
+        body["channels"] = channels
+    if escalation_interval is not None:
+        body["escalation_interval"] = escalation_interval
+    if exclude_keyword is not None:
+        body["exclude_keyword"] = exclude_keyword
+    if enabled is not None:
+        body["enabled"] = bool(enabled)
+    if remark is not None:
+        body["remark"] = remark
+    err = _validate_alert_rule(db, body)
+    if err:
+        raise ToolError(err)
+    dbm.update_record(db, "alert_rules", rule["id"], dict(
+        name=str(body["name"]).strip(), metric_type=body["metric_type"],
+        metric=body["metric"], compare=body["compare"],
+        threshold=float(body["threshold"]),
+        duration_seconds=int(body["duration_seconds"]),
+        scope=body["scope"], severity=body["severity"],
+        channels=body["channels"],
+        escalation_interval=int(body["escalation_interval"]),
+        exclude_keyword=(body["exclude_keyword"] or "").strip(),
+        enabled=1 if body["enabled"] else 0,
+        remark=body["remark"], updated_at=int(time.time())))
+    dbm.create_audit(db, ctx.user_id, ctx.username,
+                     "agent_update_alert_rule", "alert_rule", rule["id"],
+                     {"name": body["name"], "via": "agent"})
+    return {"ok": True, "id": rule["id"]}
+
+
+def _check_silence_scope_ids(db, scope) -> str:
+    """静默 scope 悬空校验：rules/envs/servers 为对应实体 id"""
+    checks = (("rules", "alert_rules", "manage_alert_rules(action=list)"),
+              ("envs", "environments", "list_environments"),
+              ("servers", "servers", "manage_servers(action=list)"))
+    for key, table, tip in checks:
+        ids = [x for x in scope.get(key) or []
+               if isinstance(x, int) and not isinstance(x, bool)]
+        valid = {r["id"] for r in dbm.list_records(db, table)}
+        missing = [x for x in ids if x not in valid]
+        if missing:
+            return f"scope.{key} 引用了不存在的 id: {missing}（可用 {tip} 查询）"
+    return ""
+
+
+def _validate_silence(db, body) -> str:
+    """静默窗口校验（镜像 alert_routes 创建/更新校验）；空串=通过"""
+    if not (body.get("name") or "").strip():
+        return "窗口名称必填"
+    wtype = body.get("type")
+    if wtype not in ("one_time", "recurring"):
+        return "type 必须为 one_time 或 recurring"
+    start_at, end_at = str(body.get("start_at", "")), str(body.get("end_at", ""))
+    if wtype == "one_time":
+        try:
+            float(start_at); float(end_at)
+        except (TypeError, ValueError):
+            return "一次性窗口需 epoch 秒 start_at/end_at"
+    elif not (_HHMM_RE.match(start_at) and _HHMM_RE.match(end_at)):
+        return "周期窗口需 HH:MM 格式 start_at/end_at"
+    scope = body.get("scope")
+    if not isinstance(scope, dict) or not all(
+            isinstance(scope.get(k), list) for k in ("rules", "envs", "servers")):
+        return "scope 需为 {rules,envs,servers} 列表结构"
+    err = _check_silence_scope_ids(db, scope)
+    if err:
+        return err
+    if body.get("weekdays") is not None and not isinstance(
+            body.get("weekdays"), list):
+        return "weekdays 需为列表"
+    return ""
+
+
+def _silence_out(w) -> dict:
+    return {"id": w["id"], "name": w["name"], "type": w.get("type"),
+            "start_at": w.get("start_at"), "end_at": w.get("end_at"),
+            "weekdays": w.get("weekdays") or [],
+            "scope": (w.get("scope") or {"rules": [], "envs": [],
+                                            "servers": []}),
+            "enabled": bool(w.get("enabled")), "remark": w.get("remark", "")}
+
+
+def _manage_silences(ctx, action=None, silence_id=None, name="",
+                     type="", start_at="", end_at="", weekdays=None,
+                     scope=None, enabled=None, remark=None, **kw) -> dict:
+    """静默窗口管理（operator/admin，与 Web 端同等效力）：
+    list/create/update/delete
+
+    命中窗口的告警不发送通知（窗口过期后未通知的 firing 告警会补发）；
+    scope 三列表均空 = 全局静默。
+    """
+    db = ctx.db_path
+    action = action or "list"
+    if action == "list":
+        rows = dbm.list_records(db, "silence_windows", "", (), "id")
+        return {"silences": [_silence_out(w) for w in rows],
+                "hint": "scope.rules/envs/servers 为对应实体 id；全空=全局静默"}
+    if action == "create":
+        body = dict(
+            name=name, type=type or "one_time", start_at=start_at or "",
+            end_at=end_at or "", weekdays=weekdays or [],
+            scope=_jsonish(scope, "scope") or {"rules": [], "envs": [],
+                                                "servers": []},
+            enabled=True if enabled is None else enabled, remark=remark or "")
+        err = _validate_silence(db, body)
+        if err:
+            raise ToolError(err)
+        wid = dbm.create_record(db, "silence_windows", dict(
+            name=body["name"].strip(), type=body["type"],
+            start_at=str(body["start_at"]), end_at=str(body["end_at"]),
+            weekdays=body["weekdays"], scope=body["scope"],
+            enabled=1 if body["enabled"] else 0,
+            remark=body["remark"], created_at=int(time.time())))
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_create_silence", "silence", wid,
+                         {"name": body["name"], "type": body["type"],
+                          "via": "agent"})
+        return {"id": wid, "hint": "静默窗口已生效；窗口内新告警不通知"}
+    win = dbm.get_record(db, "silence_windows", int(silence_id or 0)) \
+        if silence_id else None
+    if not win:
+        raise ToolError("缺少或不存在 silence_id")
+    if action == "delete":
+        dbm.delete_record(db, "silence_windows", win["id"])
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_delete_silence", "silence", win["id"],
+                         {"name": win["name"], "via": "agent"})
+        return {"ok": True, "id": win["id"]}
+    if action != "update":
+        raise ToolError("action 仅支持 list/create/update/delete")
+    # 局部更新：仅采用已提供的字段，其余保持原值
+    body = dict(win)
+    if name:
+        body["name"] = name
+    if type:
+        body["type"] = type
+    if start_at:
+        body["start_at"] = str(start_at)
+    if end_at:
+        body["end_at"] = str(end_at)
+    if weekdays is not None:
+        body["weekdays"] = weekdays
+    if scope is not None:
+        body["scope"] = _jsonish(scope, "scope")
+    if enabled is not None:
+        body["enabled"] = bool(enabled)
+    if remark is not None:
+        body["remark"] = remark
+    err = _validate_silence(db, body)
+    if err:
+        raise ToolError(err)
+    dbm.update_record(db, "silence_windows", win["id"], dict(
+        name=body["name"].strip(), type=body["type"],
+        start_at=str(body["start_at"]), end_at=str(body["end_at"]),
+        weekdays=body["weekdays"] or [], scope=body["scope"],
+        enabled=1 if body["enabled"] else 0, remark=body["remark"]))
+    dbm.create_audit(db, ctx.user_id, ctx.username,
+                     "agent_update_silence", "silence", win["id"],
+                     {"name": body["name"], "via": "agent"})
+    return {"ok": True, "id": win["id"]}
+
+
 # ---------- 注册表 ----------
 
 def _spec(name, description, params, permission, fn):
@@ -2016,6 +2385,34 @@ def build_tools() -> list:
               "（确认告警请用 ack_alert）",
               {"alert_id": num, "action": str_req, "note": str_opt},
               "write", _set_alert_status),
+        _spec("manage_alert_rules",
+              "管理告警规则（与 Web 端同等效力）。action=list/create/update/"
+              "delete/toggle；metric_type=metric(cpu/mem/disk/load)/status("
+              "service_down/task_failed)/log_keyword(逗号分隔关键词)/"
+              "custom_monitor(到期监控)；scope={type:all/project/env/server/"
+              "service, ids:[实体id]}（指标规则禁 service 作用域、状态/日志"
+              "规则禁 server 作用域）；severity=P0-P3；channels 为数组"
+              "（email/wecom/webhook/sms_aliyun/feishu/dingtalk）；"
+              "update 为局部更新（未提供的字段保持原值）",
+              {"action": str_req, "rule_id": num_opt, "name": str_opt,
+               "metric_type": str_opt, "metric": str_opt, "compare": str_opt,
+               "threshold": {"type": "number"}, "duration_seconds": num_opt,
+               "scope": {"type": "object"}, "severity": str_opt,
+               "channels": {"type": "array"},
+               "escalation_interval": num_opt, "exclude_keyword": str_opt,
+               "enabled": bool_opt, "remark": str_opt},
+              "write", _manage_alert_rules),
+        _spec("manage_silences",
+              "管理告警静默窗口（与 Web 端同等效力）：命中窗口的告警不发送"
+              "通知，窗口过期后未通知的 firing 告警会补发。action=list/"
+              "create/update/delete；type=one_time(epoch 秒 start_at/end_at)/"
+              "recurring(HH:MM + weekdays)；scope={rules:[规则id], "
+              "envs:[环境id], servers:[服务器id]}，三列表全空=全局静默",
+              {"action": str_req, "silence_id": num_opt, "name": str_opt,
+               "type": str_opt, "start_at": str_opt, "end_at": str_opt,
+               "weekdays": {"type": "array"}, "scope": {"type": "object"},
+               "enabled": bool_opt, "remark": str_opt},
+              "write", _manage_silences),
 _spec("send_digest",
               "立即聚合并推送一次巡检日报（服务健康/告警/近24h发布/待审审批单"
               "/定时计划）到已配置的通知渠道；渠道未配置时提示先配置",

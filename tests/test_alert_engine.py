@@ -216,6 +216,28 @@ class TestAlertEngine(unittest.TestCase):
                                self._metric_rule(metric="disk", duration=0))
         self.assertFalse(e._silenced(other, {}))
 
+    def test_silence_by_env_and_server_scope(self):
+        """环境/服务器作用域按 id 配置、按名字匹配（快照加载时翻译）
+
+        回归：旧版 _silenced 拿 scope.envs（id 列表）直接与 target_info.env
+        （环境名）比较，按环境/服务器配置的静默窗口从不生效。
+        """
+        sid = dbm.create_record(self.db, "servers", dict(
+            host="h1", ssh_port=None, ssh_user=None, ssh_password=None,
+            ssh_key_file=None, nacos_ip="", remark="", enabled=1))
+        rule = dbm.get_record(self.db, "alert_rules",
+                              self._metric_rule(metric="cpu", duration=0))
+        # 环境作用域：按环境 id 配置 → 告警 env 名命中
+        win1 = self._silence(scope={"rules": [], "envs": [self.env_id], "servers": []})
+        e = self._engine()
+        self.assertTrue(e._silenced(rule, {"env": "test", "host": "other"}))
+        self.assertFalse(e._silenced(rule, {"env": "prod", "host": "h1"}))
+        dbm.delete_record(self.db, "silence_windows", win1)
+        # 服务器作用域：按服务器 id 配置 → 告警 host 命中（同名环境不误伤）
+        self._silence(scope={"rules": [], "envs": [], "servers": [sid]})
+        self.assertTrue(e._silenced(rule, {"env": "prod", "host": "h1"}))
+        self.assertFalse(e._silenced(rule, {"env": "test", "host": "other"}))
+
     def test_silence_recurring_weekday(self):
         e = self._engine()
         lt = time.localtime()

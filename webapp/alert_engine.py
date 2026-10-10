@@ -168,6 +168,8 @@ class AlertEngine:
         SQLite 连接 + PRAGMA，高频轮询下累积明显）。
         """
         rules = dbm.list_records(self._db_path, "alert_rules")
+        envs = dbm.list_records(self._db_path, "environments")
+        servers = dbm.list_records(self._db_path, "servers")
         return {
             "rules": rules,
             "metric_rules": [r for r in rules
@@ -178,15 +180,48 @@ class AlertEngine:
                                     if r.get("enabled") and r.get("metric") == "task_failed"),
                                    None),
             "projects": dbm.list_records(self._db_path, "projects"),
-            "envs": dbm.list_records(self._db_path, "environments"),
-            "servers": dbm.list_records(self._db_path, "servers"),
+            "envs": envs,
+            "servers": servers,
             "services": dbm.list_records(self._db_path, "services", "enabled=1"),
-            "windows": dbm.list_records(self._db_path, "silence_windows"),
+            "windows": self._translate_silence_scope(
+                dbm.list_records(self._db_path, "silence_windows"), envs, servers),
             "custom_monitors": dbm.list_records(
                 self._db_path, "custom_monitors",
                 "enabled=1 AND days_left IS NOT NULL"),
             "custom_monitor_config": self._load_custom_monitor_config(),
         }
+
+    def _translate_silence_scope(self, windows: list,
+                                  envs=None, servers=None) -> list:
+        """静默作用域 id→名预翻译（写回 window 派生键，不落库）
+
+        scope.envs/servers 按实体 id 配置（Web 表单口径），而告警
+        target_info 携带的是环境名/主机名；评估前把 id 翻译为名字集合，
+        _silenced 直接按名字匹配。非 id 元素原样保留（兼容名字直填/脏数据）。
+        envs/servers 传快照已加载的记录避免重复查库（None 时自查）。
+        """
+        if envs is None:
+            envs = dbm.list_records(self._db_path, "environments")
+        if servers is None:
+            servers = dbm.list_records(self._db_path, "servers")
+        env_names = {e["id"]: e["name"] for e in envs}
+        hosts = {s["id"]: s["host"] for s in servers}
+
+        def _names(mapping, ids):
+            out = set()
+            for x in ids or []:
+                try:
+                    out.add(mapping.get(int(x), x))
+                except (TypeError, ValueError):
+                    out.add(x)
+            return out
+
+        for w in windows:
+            scope = w.get("scope")
+            if isinstance(scope, dict):
+                w["_env_names"] = _names(env_names, scope.get("envs"))
+                w["_server_names"] = _names(hosts, scope.get("servers"))
+        return windows
 
     # ---------- 种子规则 ----------
 
@@ -693,11 +728,13 @@ class AlertEngine:
     def _silenced(self, rule: dict, target_info: dict, windows: list = None) -> bool:
         """命中任一启用窗口（作用域：规则/环境/服务器，空作用域=全局）
 
-        windows 传评估轮快照，避免每次触发都重新全表查询（_fire 热路径）
+        windows 传评估轮快照，避免每次触发都重新全表查询（_fire 热路径）；
+        环境按名字、服务器按主机名匹配（快照加载时已把 scope 的 id 翻译为名）。
         """
         now = time.time()
         if windows is None:
-            windows = dbm.list_records(self._db_path, "silence_windows")
+            windows = self._translate_silence_scope(
+                dbm.list_records(self._db_path, "silence_windows"))
         for w in windows:
             if not w.get("enabled") or not self._window_active(w, now):
                 continue
@@ -705,8 +742,8 @@ class AlertEngine:
             if not isinstance(scope, dict):
                 continue  # 脏数据：非法 scope 视为窗口不生效
             rules = scope.get("rules") or []
-            envs = scope.get("envs") or []
-            servers = scope.get("servers") or []
+            envs = w.get("_env_names") or set()
+            servers = w.get("_server_names") or set()
             if not (rules or envs or servers):
                 return True
             if rule["id"] in rules:
