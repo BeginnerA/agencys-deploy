@@ -8,6 +8,7 @@
     - 敏感信息（SSH 私钥/密码/Nacos 口令）一律不出现在工具输出中
 """
 import json
+import re
 import time
 
 from webapp import db as dbm
@@ -945,6 +946,251 @@ def _manage_canary(ctx, action=None, config_id=None, project=None,
     raise ToolError("action 仅支持 list/create/update/delete/set_default")
 
 
+def _require_admin(ctx, what: str) -> None:
+    """配置 CRUD 类工具与 Web 端权限对齐：仅 admin（复用 _manage_windows 惯例）"""
+    if (ctx.role or "").lower() != "admin":
+        raise ToolError(f"{what}仅 admin 可操作（与 Web 端权限一致）")
+
+
+def _service_in_pipeline(db: str, project_id: int, service_id: int) -> bool:
+    """服务是否被项目流水线 stages 引用（删除保护，与 Web 端语义一致）"""
+    for pl in dbm.list_pipelines(db, project_id):
+        for stage in pl.get("stages", []) or []:
+            if not isinstance(stage, dict):
+                continue
+            for svc in stage.get("services", []) or []:
+                if isinstance(svc, dict) and svc.get("service_id") == service_id:
+                    return True
+    return False
+
+
+def _service_out(s: dict) -> dict:
+    return {"id": s["id"], "name": s["name"],
+            "project_id": s["project_id"],
+            "image_name": s["image_name"],
+            "service_name": s["service_name"],
+            "build_type": s.get("build_type", "maven"),
+            "git_repo": s.get("git_repo", ""),
+            "git_branch": s.get("git_branch", ""),
+            "git_pull_before_build": bool(s.get("git_pull_before_build")),
+            "enabled": bool(s.get("enabled", 1)),
+            "health_url": s.get("health_url", ""),
+            "health_port": s.get("health_port", 0)}
+
+
+def _validate_git_repo(repo: str) -> str:
+    """git_repo 双形态校验：相对目录名，或 http(s) 远程 URL（末段须合法目录名）"""
+    repo = (repo or "").strip()
+    if repo.startswith(("http://", "https://")):
+        name = repo.rstrip("/").rsplit("/", 1)[-1]
+        if name.endswith(".git"):
+            name = name[:-4]
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise ToolError("远程 URL 末段须为合法目录名（字母数字 _ -），"
+                            "如 https://git.example.com/order-service.git")
+    elif repo.startswith(("..", "/", "\\")) or ":" in repo:
+        # 本地形态护栏：禁止越界/绝对路径/盘符（构建时会拼入 project_root）
+        raise ToolError("git_repo 本地形态须为相对 deploy.project_root 的"
+                        "目录名（不含 .. / 绝对路径 / 盘符）")
+    return repo
+
+
+def _manage_projects(ctx, action=None, project_id=None, name="",
+                     code="", description="", git_org="", **kw) -> dict:
+    """项目 CRUD（仅 admin，与 Web 端一致）：list/create/update/delete"""
+    db = ctx.db_path
+    _require_admin(ctx, "项目管理")
+    action = action or "list"
+    if action == "list":
+        rows = dbm.list_records(db, "projects", "", (), "id DESC")
+        return {"projects": [
+            {"id": p["id"], "name": p["name"], "code": p["code"],
+             "description": p.get("description", ""),
+             "git_org": p.get("git_org", ""),
+             "services": len(dbm.list_services(db, p["id"], enabled_only=True)),
+             "environments": len(dbm.list_environments(db, p["id"]))}
+            for p in rows[:50]]}
+    if action == "create":
+        name, code = (name or "").strip(), (code or "").strip()
+        if not name or not code:
+            raise ToolError("缺少 name / code")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", code):
+            raise ToolError("项目编码仅允许字母数字 _ -（导出时用作目录名）")
+        for p in dbm.list_records(db, "projects"):
+            if p["code"] == code:
+                raise ToolError(f"项目编码 {code} 已存在")
+        pid = dbm.create_record(db, "projects", dict(
+            name=name, code=code,
+            description=(description or "").strip(),
+            git_org=(git_org or "").strip(),
+            created_at=int(time.time())))
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_create_project", "projects", pid,
+                         {"name": name, "code": code, "via": "agent"})
+        return {"id": pid, "name": name, "code": code,
+                "hint": "项目已创建；可继续 manage_services 注册服务，"
+                        "再用 plan_operation 生成发布审批单"}
+    proj = dbm.get_record(db, "projects", int(project_id or 0)) \
+        if project_id else None
+    if not proj:
+        raise ToolError("缺少或不存在 project_id")
+    if action == "update":
+        fields = {}
+        if name:
+            fields["name"] = name.strip()
+        if description:
+            fields["description"] = description.strip()
+        if git_org:
+            fields["git_org"] = git_org.strip()
+        if not fields:
+            raise ToolError("未提供任何要修改的字段（name/description/git_org）")
+        dbm.update_record(db, "projects", proj["id"], fields)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_update_project", "projects", proj["id"],
+                         fields)
+        return {"ok": True, "updated": list(fields)}
+    if action == "delete":
+        ok, msg = dbm.delete_project(db, proj["id"])
+        if not ok:
+            raise ToolError(msg)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_delete_project", "projects", proj["id"],
+                         {"name": proj["name"], "via": "agent"})
+        return {"ok": True, "deleted": proj["name"]}
+    raise ToolError("action 仅支持 list/create/update/delete")
+
+
+def _manage_services(ctx, action=None, project=None, service_id=None,
+                     name="", image_name="", service_name="",
+                     docker_context="", dockerfile="", build_type="maven",
+                     snailjob_group="", health_url="", health_port=0,
+                     clear_log_dir="", git_repo="", git_branch="",
+                     git_pull_before_build=None, git_tag_enabled=None,
+                     enabled=None, nacos_groups=None, dubbo_services=None,
+                     log_error_keywords=None, build_order=None, **kw) -> dict:
+    """服务注册与管理（仅 admin，与 Web 端一致）：list/create/update/delete"""
+    db = ctx.db_path
+    _require_admin(ctx, "服务管理")
+    action = action or "list"
+    if action == "list":
+        proj = _resolve_project(db, project or "")
+        if proj:
+            rows = dbm.list_services(db, proj["id"])
+        else:
+            rows = dbm.list_records(db, "services", order="id")
+        return {"services": [_service_out(s) for s in rows[:50]]}
+    if action == "create":
+        proj = _resolve_project(db, project or "")
+        if not proj:
+            raise ToolError("缺少项目 project（id/code/name）")
+        name = (name or "").strip()
+        if not name or not (image_name or "").strip() \
+                or not (service_name or "").strip():
+            raise ToolError("缺少 name / image_name / service_name")
+        for s in dbm.list_services(db, proj["id"]):
+            if s["name"] == name:
+                raise ToolError(f"项目内服务名 {name} 已存在")
+        if build_type not in ("maven", "frontend"):
+            raise ToolError("build_type 必须为 maven 或 frontend")
+        fields = dict(
+            project_id=proj["id"], name=name,
+            image_name=image_name.strip(),
+            service_name=service_name.strip(),
+            docker_context=(docker_context or "").strip(),
+            dockerfile=(dockerfile or "").strip(),
+            build_type=build_type,
+            snailjob_group=(snailjob_group or "").strip(),
+            health_url=(health_url or "").strip(),
+            health_port=int(health_port or 0),
+            clear_log_dir=(clear_log_dir or "").strip(),
+            git_repo=_validate_git_repo(git_repo),
+            git_branch=(git_branch or "").strip(),
+            git_pull_before_build=1 if git_pull_before_build else 0,
+            git_tag_enabled=1 if git_tag_enabled is None or git_tag_enabled else 0,
+            enabled=1 if enabled is None or enabled else 0,
+            build_order=json.dumps(_jsonish(build_order, "build_order") or [],
+                                   ensure_ascii=False),
+            nacos_groups=json.dumps(
+                _jsonish(nacos_groups, "nacos_groups") or [],
+                ensure_ascii=False),
+            dubbo_services=json.dumps(
+                _jsonish(dubbo_services, "dubbo_services") or [],
+                ensure_ascii=False),
+            log_error_keywords=json.dumps(
+                _jsonish(log_error_keywords, "log_error_keywords") or [],
+                ensure_ascii=False))
+        sid = dbm.create_record(db, "services", fields)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_create_service", "services", sid,
+                         {"name": name, "pid": proj["id"], "via": "agent"})
+        return {"id": sid, "project": proj["code"], "name": name,
+                "hint": "服务已注册；git_repo 为远程 URL 时首次构建自动 clone，"
+                        "用 plan_operation 生成发布审批单即可部署"}
+    svc = dbm.get_record(db, "services", int(service_id or 0)) \
+        if service_id else None
+    if not svc:
+        raise ToolError("缺少或不存在 service_id")
+    if action == "update":
+        fields = {}
+        if name:
+            n = name.strip()
+            if n != svc["name"]:
+                for s in dbm.list_services(db, svc["project_id"]):
+                    if s["name"] == n and s["id"] != svc["id"]:
+                        raise ToolError(f"项目内服务名 {n} 已存在")
+            fields["name"] = n
+        for k, v in (("image_name", image_name),
+                     ("service_name", service_name),
+                     ("docker_context", docker_context),
+                     ("dockerfile", dockerfile),
+                     ("snailjob_group", snailjob_group),
+                     ("health_url", health_url),
+                     ("clear_log_dir", clear_log_dir)):
+            if v:
+                fields[k] = v.strip()
+        if build_type:
+            if build_type not in ("maven", "frontend"):
+                raise ToolError("build_type 必须为 maven 或 frontend")
+            fields["build_type"] = build_type
+        if git_repo:
+            fields["git_repo"] = _validate_git_repo(git_repo)
+        if git_branch:
+            fields["git_branch"] = git_branch.strip()
+        if health_port:
+            fields["health_port"] = int(health_port)
+        if git_pull_before_build is not None:
+            fields["git_pull_before_build"] = 1 if git_pull_before_build else 0
+        if git_tag_enabled is not None:
+            fields["git_tag_enabled"] = 1 if git_tag_enabled else 0
+        if enabled is not None:
+            fields["enabled"] = 1 if enabled else 0
+        for k, v in (("build_order", build_order),
+                     ("nacos_groups", nacos_groups),
+                     ("dubbo_services", dubbo_services),
+                     ("log_error_keywords", log_error_keywords)):
+            if v is not None:
+                arr = _jsonish(v, k)
+                if not isinstance(arr, list):
+                    raise ToolError(f"{k} 必须为数组")
+                fields[k] = json.dumps(arr, ensure_ascii=False)
+        if not fields:
+            raise ToolError("未提供任何要修改的字段")
+        dbm.update_record(db, "services", svc["id"], fields)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_update_service", "services", svc["id"],
+                         {"name": svc["name"], "updated": list(fields)})
+        return {"ok": True, "updated": list(fields)}
+    if action == "delete":
+        if _service_in_pipeline(db, svc["project_id"], svc["id"]):
+            raise ToolError("服务被流水线 stages 引用，请先调整流水线")
+        dbm.delete_record(db, "services", svc["id"])
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_delete_service", "services", svc["id"],
+                         {"name": svc["name"], "via": "agent"})
+        return {"ok": True, "deleted": svc["name"]}
+    raise ToolError("action 仅支持 list/create/update/delete")
+
+
 def _canary_decision(ctx, task_id=None, action=None, **kw) -> dict:
     """灰度运行中决策（与 Web 端 POST /deploy/canary-decisions 同语义）"""
     if action not in ("continue", "stop", "rollback"):
@@ -1116,6 +1362,33 @@ def build_tools() -> list:
                "version": str_opt,
                "tags": {"type": "array", "items": {"type": "string"}}},
               "write", _case_update),
+        _spec("manage_projects",
+              "项目 CRUD（仅 admin）。action=list/create/update/delete；"
+              "create 需 name+code（code 仅字母数字_-，导出时用作目录名），"
+              "description/git_org 可选；创建后可用 manage_services 注册服务",
+              {"action": str_req, "project_id": num_opt, "name": str_opt,
+               "code": str_opt, "description": str_opt,
+               "git_org": str_opt},
+              "write", _manage_projects),
+        _spec("manage_services",
+              "服务注册与管理（仅 admin）。action=list/create/update/delete；"
+              "create 需 project+name+image_name+service_name；"
+              "git_repo 支持相对目录名或 http(s) 远程 URL（首次构建自动 clone）；"
+              "nacos_groups/dubbo_services/log_error_keywords 为字符串数组，"
+              "build_order 为 [{name,path,goal}]（frontend 用 commands）",
+              {"action": str_req, "project": str_opt, "service_id": num_opt,
+               "name": str_opt, "image_name": str_opt, "service_name": str_opt,
+               "docker_context": str_opt, "dockerfile": str_opt,
+               "build_type": str_opt, "snailjob_group": str_opt,
+               "health_url": str_opt, "health_port": num_opt,
+               "clear_log_dir": str_opt, "git_repo": str_opt,
+               "git_branch": str_opt, "git_pull_before_build": bool_opt,
+               "git_tag_enabled": bool_opt, "enabled": bool_opt,
+               "nacos_groups": {"type": "array", "items": {"type": "string"}},
+               "dubbo_services": {"type": "array", "items": {"type": "string"}},
+               "log_error_keywords": {"type": "array", "items": {"type": "string"}},
+               "build_order": {"type": "array", "items": {"type": "object"}}},
+              "write", _manage_services),
         _spec("manage_schedules",
               "管理定时发布计划。action=list/create/update/delete/toggle/run；"
               "create 需 project+name+type（once 需 schedule_at Unix 秒，"

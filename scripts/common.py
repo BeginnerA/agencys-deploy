@@ -1,5 +1,6 @@
 """公共配置加载与日志工具"""
 import os
+import re
 import sys
 import yaml
 import paramiko
@@ -192,3 +193,37 @@ def log(msg: str):
 def fail(msg: str, code: int = 1):
     print(f"[platform] ERROR: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
+
+
+# ---------- Git 仓库地址解析 ----------
+# git_repo 字段双语义：相对 deploy.project_root 的本地路径，或 http(s) 远程 URL
+# （远程 URL 由构建前 git_prepare 自动 clone 到 project_root 下同名目录）
+_REPO_NAME_RE = re.compile(r"[A-Za-z0-9_-]+$")
+_URL_CRED_RE = re.compile(r"://[^/@]+@")
+
+
+def is_remote_git_url(repo: str) -> bool:
+    return repo.startswith(("http://", "https://"))
+
+
+def mask_git_url(url: str) -> str:
+    """日志脱敏：遮蔽 URL 内嵌凭证（https://user:token@host → https://***@host）"""
+    return _URL_CRED_RE.sub("://***@", url)
+
+
+def repo_local_path(repo: str, project_root) -> "Path | None":
+    """git_repo → 本地仓库路径。
+
+    - 远程 URL：取末段去 .git 作目录名（须匹配 [A-Za-z0-9_-]+ 白名单，
+      防路径穿越），返回 project_root/目录名；末段非法返回 None（调用方告警跳过）
+    - 其余：按相对路径原样拼接（兼容历史本地仓库配置）
+    """
+    repo = (repo or "").strip()
+    if is_remote_git_url(repo):
+        name = repo.rstrip("/").rsplit("/", 1)[-1]
+        if name.endswith(".git"):
+            name = name[:-4]
+        if not _REPO_NAME_RE.fullmatch(name):
+            return None
+        return Path(project_root) / name
+    return Path(project_root) / repo

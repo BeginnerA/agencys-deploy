@@ -791,10 +791,82 @@ class TestAgentManageTools(AgentBase):
         from agent import tools as tools_mod
         viewer_names = {t["name"] for t in tools_mod.visible_tools("viewer")}
         admin_names = {t["name"] for t in tools_mod.visible_tools("admin")}
-        for n in ("manage_schedules", "manage_windows", "manage_canary",
+        for n in ("manage_projects", "manage_services",
+                  "manage_schedules", "manage_windows", "manage_canary",
                   "canary_decision", "set_alert_status"):
             self.assertNotIn(n, viewer_names)
             self.assertIn(n, admin_names)
+
+    def test_projects_services_tool_lifecycle(self):
+        # viewer 拒绝（与 Web 端 admin-only 对齐）
+        denied = self._call("manage_projects",
+                            {"action": "create", "name": "订单", "code": "order"},
+                            role="viewer")
+        self.assertIn("error", denied)
+        # create 项目：code 白名单 + 唯一
+        out = self._call("manage_projects",
+                         {"action": "create", "name": "订单中心",
+                          "code": "order", "git_org": "shop"})
+        self.assertIn("id", out)
+        pid = out["id"]
+        bad_code = self._call("manage_projects",
+                              {"action": "create", "name": "x", "code": "非法!"})
+        self.assertIn("error", bad_code)
+        dup = self._call("manage_projects",
+                         {"action": "create", "name": "x2", "code": "order"})
+        self.assertIn("error", dup)
+        rows = self._call("manage_projects", {"action": "list"})
+        codes = [p["code"] for p in rows["projects"]]
+        self.assertIn("order", codes)
+        upd = self._call("manage_projects",
+                         {"action": "update", "project_id": pid,
+                          "description": "订单域"})
+        self.assertTrue(upd["ok"])
+        # 服务注册：git_repo 远程 URL / 本地越界护栏 / 项目内唯一
+        svc = self._call("manage_services", {
+            "action": "create", "project": "order", "name": "order-api",
+            "image_name": "order", "service_name": "hqb-order",
+            "git_repo": "https://git.example.com/order-api.git",
+            "git_pull_before_build": True, "health_port": 8080,
+            "nacos_groups": ["DEFAULT_GROUP"]})
+        self.assertIn("id", svc)
+        sid = svc["id"]
+        rec = dbm.get_record(self.db, "services", sid)
+        self.assertEqual(rec["git_repo"], "https://git.example.com/order-api.git")
+        self.assertEqual(rec["git_pull_before_build"], 1)
+        self.assertEqual(rec["nacos_groups"], ["DEFAULT_GROUP"])
+        escape = self._call("manage_services", {
+            "action": "create", "project": "order", "name": "bad",
+            "image_name": "b", "service_name": "b",
+            "git_repo": "../evil"})
+        self.assertIn("error", escape)
+        bad_url = self._call("manage_services", {
+            "action": "create", "project": "order", "name": "bad2",
+            "image_name": "b", "service_name": "b",
+            "git_repo": "https://git.example.com/非法.git"})
+        self.assertIn("error", bad_url)
+        dup_svc = self._call("manage_services", {
+            "action": "create", "project": "order", "name": "order-api",
+            "image_name": "b", "service_name": "b"})
+        self.assertIn("error", dup_svc)
+        # update：改 health_url + git_branch
+        upd2 = self._call("manage_services", {
+            "action": "update", "service_id": sid,
+            "health_url": "/actuator/health", "git_branch": "master"})
+        self.assertTrue(upd2["ok"])
+        rec = dbm.get_record(self.db, "services", sid)
+        self.assertEqual(rec["git_branch"], "master")
+        # 项目删除被服务阻塞（与 Web 端 delete_project 一致）
+        blocked = self._call("manage_projects",
+                             {"action": "delete", "project_id": pid})
+        self.assertIn("error", blocked)
+        # 删服务 → 删项目成功
+        dele = self._call("manage_services",
+                          {"action": "delete", "service_id": sid})
+        self.assertTrue(dele["ok"])
+        dele_p = self._call("manage_projects",
+                            {"action": "delete", "project_id": pid})
+        self.assertTrue(dele_p["ok"])
 
     def test_schedules_lifecycle(self):
         out = self._call("manage_schedules", {

@@ -642,6 +642,7 @@ cd {git_repo} && git tag v{version} && git push origin v{version}
 - `--skip-git-push`：打标签但不推送远端。
 - 未配置 `git_repo`、本地无该仓库、tag 已存在或 git 操作失败，仅打日志告警，不阻断发布。
 - 发布与全量回滚流程均会触发。
+- `git_repo` 支持两种形态：相对 `deploy.project_root` 的本地目录名，或 http(s) 远程 URL（如 `https://git.example.com/order-service.git`）。URL 形态首次构建时自动 clone 到 `project_root` 下同名目录（末段去 `.git`，须为字母数字 `_ -`），此后按本地仓库复用；clone 失败会阻断构建（区别于 checkout/pull 的仅告警），URL 内嵌凭证在日志中自动脱敏。
 
 ### 10.4 消息通知（飞书 / 钉钉）
 

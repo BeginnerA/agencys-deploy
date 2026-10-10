@@ -11,23 +11,49 @@ import shutil
 import subprocess
 import argparse
 from pathlib import Path
-from common import load_config, get_project_config, get_registry_auth, get_registry_mode, log, fail
+from common import (load_config, get_project_config, get_registry_auth,
+                    get_registry_mode, log, fail,
+                    is_remote_git_url, mask_git_url, repo_local_path)
 
 
 def git_prepare(proj: dict, project_root: Path) -> None:
-    """构建前 Git 准备：切换分支 + 拉取最新代码
+    """构建前 Git 准备：远程 URL 自动 clone + 切换分支 + 拉取最新代码
 
-    行为由 projects.yaml（或 DB services 表）的两个字段控制：
+    行为由 projects.yaml（或 DB services 表）的字段控制：
+      git_repo              - 本地仓库相对路径，或 http(s) 远程 URL；URL 形态
+                               首次构建自动 clone 到 project_root 下同名目录
+                               （末段去 .git），此后按本地仓库复用
       git_branch            - 构建前 checkout 的分支/tag，留空则不切换
       git_pull_before_build - 为 true 时在 checkout 后执行 git pull
 
-    Git 操作失败仅告警，不阻断构建流程（与 git_tag 保持一致）。
+    checkout / pull 失败仅告警不阻断（本地可能已手动同步，与 git_tag 一致）；
+    远程 URL clone 失败则 fail 阻断——clone 是该形态下源码的唯一来源，
+    继续构建必然失败，快速失败报错更清晰。URL 内嵌凭证在日志中脱敏。
     """
     repo = (proj.get("git_repo") or "").strip()
     if not repo:
         return
-    repo_path = project_root / repo
-    if not (repo_path / ".git").exists():
+    repo_path = repo_local_path(repo, project_root)
+    if repo_path is None:
+        log(f"警告: 远程 URL 末段目录名不合法（须字母数字 _ -），跳过: {mask_git_url(repo)}")
+        return
+    if is_remote_git_url(repo):
+        # 远程 URL：本地无仓库时自动 clone，已 clone 过则复用本地
+        if not (repo_path / ".git").exists():
+            log(f"远程仓库首次构建，自动 clone: {mask_git_url(repo)} → {repo_path}")
+            try:
+                result = subprocess.run(
+                    ["git", "clone", repo, str(repo_path)],
+                    capture_output=True, text=True, timeout=600,
+                )
+                if result.returncode != 0:
+                    fail(f"git clone 失败: {mask_git_url(repo)}: {result.stderr.strip()}")
+                log(f"git clone 完成: {repo_path.name}")
+            except subprocess.TimeoutExpired:
+                fail(f"git clone 超时（600 秒）: {mask_git_url(repo)}")
+            except FileNotFoundError:
+                fail("git 命令不存在，无法 clone 远程仓库")
+    elif not (repo_path / ".git").exists():
         log(f"警告: {repo_path} 不是 Git 仓库，跳过构建前 Git 操作")
         return
 
@@ -35,9 +61,10 @@ def git_prepare(proj: dict, project_root: Path) -> None:
     pull = bool(proj.get("git_pull_before_build"))
 
     if not branch and not pull:
-        return  # 两个都没配置，直接跳过
+        return  # 两个都没配置，直接跳过（远程 URL 已 clone/复用完成）
 
-    log(f"构建前 Git 准备: {repo}（branch={branch or '当前'}, pull={pull}）")
+    log(f"构建前 Git 准备: {mask_git_url(repo) if is_remote_git_url(repo) else repo}"
+        f"（branch={branch or '当前'}, pull={pull}）")
 
     # 1. 切换分支/tag
     if branch:

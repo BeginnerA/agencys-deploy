@@ -48,7 +48,7 @@
           </div>
           ${H.field({ label:'服务名', required:true, tip:'发布命令 --project 参数；须与 docker-compose 服务名、镜像名对应；项目内唯一', input:`<input id="sName" value="${esc(d.name)}" placeholder="如 service-biz">`, hint:'被流水线 stages 引用后改名不受影响（引用按 id），但请同步更新发布习惯' })}
           ${H.field({ label:'镜像短名', required:true, tip:'完整镜像名 = {registry}/{namespace}/{image_name}:{version}', input:`<input id="sImage" value="${esc(d.image_name)}" placeholder="如 biz">`, hint:'不要带命名空间前缀，命名空间来自环境配置' })}
-          ${H.field({ label:'Git 仓库路径', required:true, tip:'相对 deploy.project_root；发布成功后在仓库打 v{version}(-{后缀}) tag 并推送远端（可下方关闭）', input:`<input id="sGit" value="${esc(d.git_repo)}" placeholder="如 service-biz">`, hint:'多服务共用仓库时填仓库目录名' })}
+          ${H.field({ label:'Git 仓库路径', required:true, tip:'相对 deploy.project_root 的目录名，或 http(s) 远程 URL（首次构建自动 clone 到 project_root 下同名目录）；发布成功后在仓库打 v{version}(-{后缀}) tag 并推送远端（可下方关闭）', input:`<input id="sGit" value="${esc(d.git_repo)}" placeholder="如 service-biz 或 https://git.example.com/service-biz.git">`, hint:'多服务共用仓库时填仓库目录名；远程 URL 形态建议勾选下方「构建前拉取代码」' })}
           ${H.field({ label:'构建分支', tip:'构建前 checkout 的分支或 tag；留空则不切换，使用当前分支', input:`<input id="sGitBranch" value="${esc(d.git_branch || '')}" placeholder="如 master / v1.0.0">` })}
           <div class="field full" style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
             <label style="margin:0;white-space:nowrap">构建前拉取代码</label>
