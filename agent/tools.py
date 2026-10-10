@@ -2694,6 +2694,325 @@ def _manage_dependencies(ctx, action=None, project=None, dependency_id=None,
     return {"ok": True, "id": dependency_id}
 
 
+# ---------- 到期监控管理（operator/admin；config 写仅 admin） ----------
+
+_MONITOR_TYPES = ("ssl", "cloud_renewal", "license", "custom", "domain")
+
+
+def _monitor_out(m, now=None):
+    """监控项紧凑输出（days_left 按 expiry_at 实时重算，镜像 Web list_monitors）"""
+    now = now or int(time.time())
+    days_left = m.get("days_left")
+    if m.get("expiry_at"):
+        days_left = max(0, (int(m["expiry_at"]) - now) // 86400)
+    return {"id": m["id"], "type": m["type"], "name": m["name"],
+            "target": m["target"], "port": m.get("port"),
+            "expiry_at": _fmt_ts(m.get("expiry_at")),
+            "days_left": days_left, "warn_days": m.get("warn_days"),
+            "severity": m.get("severity", ""),
+            "channels": m.get("channels") or [],
+            "enabled": bool(m.get("enabled")), "owner": m.get("owner", ""),
+            "renewal_status": m.get("renewal_status", ""),
+            "last_checked": _fmt_ts(m.get("last_checked")),
+            "error": m.get("error", "")}
+
+
+def _validate_monitor_args(body, partial=False):
+    """监控项字段校验（镜像 Web _validate_monitor）；返回错误信息，空串=通过"""
+    if not partial:
+        if body.get("type") not in _MONITOR_TYPES:
+            return "type 仅支持 ssl/cloud_renewal/license/custom/domain"
+        if not (body.get("name") or "").strip():
+            return "名称 name 必填"
+        if not (body.get("target") or "").strip():
+            return "目标 target 必填"
+    if "type" in body and body["type"] not in _MONITOR_TYPES:
+        return "type 仅支持 ssl/cloud_renewal/license/custom/domain"
+    if "port" in body:
+        try:
+            p = int(body["port"])
+            if body.get("type") != "ssl" and p == 0:
+                pass
+            elif p < 1 or p > 65535:
+                return "port 需在 1-65535 之间"
+        except (TypeError, ValueError):
+            return "port 必须为数字"
+    if "warn_days" in body:
+        try:
+            if int(body["warn_days"]) < 0:
+                return "warn_days 需为非负整数"
+        except (TypeError, ValueError):
+            return "warn_days 必须为数字"
+    if body.get("severity") and body["severity"] not in _SEVERITIES:
+        return "severity 仅支持 P0/P1/P2/P3"
+    if "channels" in body:
+        ch = body.get("channels") or []
+        if not isinstance(ch, list):
+            return "channels 需为列表"
+        if ch and not set(ch) <= set(_ALERT_CHANNELS):
+            return f"channels 仅支持 {'/'.join(_ALERT_CHANNELS)}"
+    if not partial and body.get("type") not in ("ssl", "domain"):
+        if not body.get("expiry_at"):
+            return "非 ssl/domain 类型需提供 expiry_at（epoch 秒；domain 可自动 WHOIS）"
+    return ""
+
+
+def _manage_monitors(ctx, action=None, monitor_id=None, type="", name="",
+                     target="", port=None, expiry_at=None, warn_days=None,
+                     severity="", channels=None, owner="",
+                     renewal_status="", default_warn_days=None,
+                     default_severity="", default_channels=None,
+                     ssl_check_interval=None, **kw) -> dict:
+    """到期监控管理（operator/admin，与 Web 到期监控页同等效力）：
+    证书/域名/云续费/license/自定义到期项的 CRUD 与手动探测。"""
+    db = ctx.db_path
+    if action not in ("list", "create", "update", "delete", "toggle",
+                      "check", "whois", "config"):
+        raise ToolError("action 仅支持 list/create/update/delete/toggle/"
+                        "check/whois/config")
+
+    if action == "list":
+        now = int(time.time())
+        rows = dbm.list_records(db, "custom_monitors", "", (), "id")
+        return {"monitors": [_monitor_out(m, now) for m in rows],
+                "count": len(rows),
+                "hint": "days_left 实时重算（0=已过期）；check 手动探测，"
+                        "whois 查询域名到期；cert_monitors 工具为只读紧凑视图"}
+
+    if action == "config":
+        conn = dbm.get_conn(db)
+        try:
+            row = conn.execute(
+                "SELECT value FROM platform_settings WHERE key=?",
+                ("custom_monitor_config",)).fetchone()
+            current = json.loads(row["value"]) if row and row["value"] else {}
+        finally:
+            conn.close()
+        if not current:
+            current = {"default_warn_days": 30, "default_severity": "P1",
+                       "default_channels": ["feishu"],
+                       "ssl_check_interval": 3600}
+        writes = {}
+        if default_warn_days is not None:
+            if isinstance(default_warn_days, bool) \
+                    or not isinstance(default_warn_days, int) \
+                    or default_warn_days < 0:
+                raise ToolError("default_warn_days 需为非负整数")
+            writes["default_warn_days"] = default_warn_days
+        if default_severity:
+            if default_severity not in _SEVERITIES:
+                raise ToolError("default_severity 仅支持 P0/P1/P2/P3")
+            writes["default_severity"] = default_severity
+        if default_channels is not None:
+            if not isinstance(default_channels, list) \
+                    or not set(default_channels) <= set(_ALERT_CHANNELS):
+                raise ToolError(f"default_channels 仅支持 {'/'.join(_ALERT_CHANNELS)}")
+            writes["default_channels"] = default_channels
+        if ssl_check_interval is not None:
+            if isinstance(ssl_check_interval, bool) \
+                    or not isinstance(ssl_check_interval, int) \
+                    or ssl_check_interval < 60:
+                raise ToolError("ssl_check_interval 需为不小于 60 的整数（秒）")
+            writes["ssl_check_interval"] = ssl_check_interval
+        if not writes:
+            return {"ok": True, "config": current,
+                    "hint": "传 default_warn_days/default_severity/"
+                            "default_channels/ssl_check_interval 之一即可更新（仅 admin）"}
+        _require_admin(ctx, "到期监控全局配置写入")
+        current.update(writes)
+        now = int(time.time())
+        conn = dbm.get_conn(db)
+        try:
+            existing = conn.execute(
+                "SELECT id FROM platform_settings WHERE key=?",
+                ("custom_monitor_config",)).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE platform_settings SET value=?, updated_at=? "
+                    "WHERE key=?",
+                    (json.dumps(current, ensure_ascii=False), now,
+                     "custom_monitor_config"))
+            else:
+                conn.execute(
+                    "INSERT INTO platform_settings (key, value, updated_at) "
+                    "VALUES (?, ?, ?)",
+                    ("custom_monitor_config",
+                     json.dumps(current, ensure_ascii=False), now))
+            conn.commit()
+        finally:
+            conn.close()
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_update_monitor_config", "config", 0,
+                         {"config": current, "via": "agent"})
+        return {"ok": True, "config": current}
+
+    if action == "whois":
+        # 临时查询域名到期（无需建监控项）
+        domain = str(target or "").strip()
+        if not domain:
+            raise ToolError("action=whois 需要 target（域名）")
+        from webapp.routes.alert_routes import _whois_lookup
+        result = _whois_lookup(domain)
+        if result.get("error"):
+            raise ToolError(f"WHOIS 查询失败: {result['error']}")
+        return {"domain": domain, "expiry_at": _fmt_ts(result["expiry_at"]),
+                "days_left": result["days_left"],
+                "hint": "可 action=create type=domain 建立持续监控"}
+
+    if action == "check":
+        try:
+            monitor_id = int(monitor_id)
+        except (TypeError, ValueError):
+            raise ToolError("action=check 需要 monitor_id（整数）")
+        m = dbm.get_record(db, "custom_monitors", monitor_id)
+        if not m:
+            raise ToolError(f"监控项不存在: #{monitor_id}")
+        now = int(time.time())
+        if m["type"] == "ssl":
+            from webapp.ssl_monitor import get_ssl_monitor
+            mon = get_ssl_monitor()
+            if not mon:
+                raise ToolError("SSL 监控未启动（探测不可用）")
+            result = mon.probe_one_now(monitor_id)
+            if isinstance(result, dict) and result.get("error"):
+                raise ToolError(f"探测失败: {result['error']}")
+            return {"ok": True, "monitor": _monitor_out(result, now),
+                    "hint": "已即时探测并更新剩余天数"}
+        if m["type"] == "domain":
+            from webapp.routes.alert_routes import _whois_lookup
+            result = _whois_lookup(m["target"])
+            if result.get("error"):
+                dbm.update_record(db, "custom_monitors", monitor_id, dict(
+                    last_checked=now, error=result["error"], updated_at=now))
+                raise ToolError(f"WHOIS 查询失败: {result['error']}")
+            dbm.update_record(db, "custom_monitors", monitor_id, dict(
+                last_checked=now, expiry_at=result["expiry_at"],
+                days_left=result["days_left"], error="", updated_at=now))
+            return {"ok": True, "domain": m["target"],
+                    "expiry_at": _fmt_ts(result["expiry_at"]),
+                    "days_left": result["days_left"],
+                    "hint": "已更新该监控项的到期时间"}
+        raise ToolError("check 仅支持 ssl（探测）/domain（WHOIS）类型")
+
+    if action == "create":
+        body = {k: v for k, v in (("type", type), ("name", name),
+                                  ("target", target), ("port", port),
+                                  ("expiry_at", expiry_at),
+                                  ("warn_days", warn_days),
+                                  ("severity", severity),
+                                  ("channels", channels), ("owner", owner))
+                if v is not None and v != ""}
+        err = _validate_monitor_args(body)
+        if err:
+            raise ToolError(err)
+        now = int(time.time())
+        expiry = body.get("expiry_at")
+        days_left = None
+        if expiry:
+            if isinstance(expiry, bool) or not isinstance(expiry, int):
+                raise ToolError("expiry_at 需为 epoch 秒（整数）")
+            days_left = max(0, (expiry - now) // 86400)
+        # domain 类型无到期时间时自动 WHOIS（失败不阻断创建，后续可 check 补）
+        if body.get("type") == "domain" and not expiry:
+            from webapp.routes.alert_routes import _whois_lookup
+            whois = _whois_lookup(str(target).strip())
+            if whois.get("expiry_at"):
+                expiry = whois["expiry_at"]
+                days_left = whois["days_left"]
+        mid = dbm.create_record(db, "custom_monitors", dict(
+            type=body["type"], name=str(name).strip(),
+            target=str(target).strip(), port=body.get("port", 443),
+            expiry_at=expiry, days_left=days_left,
+            warn_days=body.get("warn_days", 0),
+            severity=body.get("severity", ""),
+            channels=body.get("channels", []), enabled=1,
+            owner=body.get("owner", ""), renewal_status="",
+            error="", created_at=now, updated_at=now))
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_create_monitor", "custom_monitor", mid,
+                         {"type": body["type"], "name": name,
+                          "target": target, "via": "agent"})
+        return {"ok": True, "id": mid,
+                "hint": "已创建；ssl 类型可用 action=check 手动探测一次"}
+
+    if action == "update":
+        try:
+            monitor_id = int(monitor_id)
+        except (TypeError, ValueError):
+            raise ToolError("action=update 需要 monitor_id（整数）")
+        old = dbm.get_record(db, "custom_monitors", monitor_id)
+        if not old:
+            raise ToolError(f"监控项不存在: #{monitor_id}")
+        body = {k: v for k, v in (("type", type), ("name", name),
+                                  ("target", target), ("port", port),
+                                  ("expiry_at", expiry_at),
+                                  ("warn_days", warn_days),
+                                  ("severity", severity),
+                                  ("channels", channels),
+                                  ("owner", owner),
+                                  ("renewal_status", renewal_status))
+                if v is not None and v != ""}
+        err = _validate_monitor_args(body, partial=True)
+        if err:
+            raise ToolError(err)
+        new_expiry = body.get("expiry_at", old.get("expiry_at"))
+        days_left = None
+        if new_expiry:
+            if isinstance(new_expiry, bool) or not isinstance(new_expiry, int):
+                raise ToolError("expiry_at 需为 epoch 秒（整数）")
+            days_left = max(0, (new_expiry - int(time.time())) // 86400)
+        fields = dict(
+            type=body.get("type", old["type"]),
+            name=(body.get("name") or old["name"]).strip(),
+            target=(body.get("target") or old["target"]).strip(),
+            port=body.get("port", old.get("port")),
+            expiry_at=new_expiry, days_left=days_left,
+            warn_days=body.get("warn_days", old.get("warn_days")),
+            severity=body.get("severity", old.get("severity", "")),
+            channels=body.get("channels", old.get("channels") or []),
+            owner=body.get("owner", old.get("owner", "")),
+            renewal_status=body.get("renewal_status",
+                                     old.get("renewal_status", "")),
+            updated_at=int(time.time()))
+        dbm.update_record(db, "custom_monitors", monitor_id, fields)
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_update_monitor", "custom_monitor", monitor_id,
+                         {"name": fields["name"], "fields": sorted(body),
+                          "via": "agent"})
+        return {"ok": True, "id": monitor_id}
+
+    if action == "toggle":
+        try:
+            monitor_id = int(monitor_id)
+        except (TypeError, ValueError):
+            raise ToolError("action=toggle 需要 monitor_id（整数）")
+        m = dbm.get_record(db, "custom_monitors", monitor_id)
+        if not m:
+            raise ToolError(f"监控项不存在: #{monitor_id}")
+        new_enabled = 0 if m.get("enabled") else 1
+        dbm.update_record(db, "custom_monitors", monitor_id,
+                          {"enabled": new_enabled})
+        dbm.create_audit(db, ctx.user_id, ctx.username,
+                         "agent_toggle_monitor", "custom_monitor", monitor_id,
+                         {"enabled": new_enabled, "via": "agent"})
+        return {"ok": True, "enabled": bool(new_enabled)}
+
+    # delete
+    try:
+        monitor_id = int(monitor_id)
+    except (TypeError, ValueError):
+        raise ToolError("action=delete 需要 monitor_id（整数，可先 list 查询）")
+    m = dbm.get_record(db, "custom_monitors", monitor_id)
+    if not m:
+        raise ToolError(f"监控项不存在: #{monitor_id}")
+    dbm.delete_record(db, "custom_monitors", monitor_id)
+    dbm.create_audit(db, ctx.user_id, ctx.username,
+                     "agent_delete_monitor", "custom_monitor", monitor_id,
+                     {"name": m.get("name"), "type": m.get("type"),
+                      "via": "agent"})
+    return {"ok": True, "id": monitor_id}
+
+
 # ---------- 注册表 ----------
 
 def _spec(name, description, params, permission, fn):
@@ -2968,6 +3287,22 @@ def build_tools() -> list:
                "dependency_id": num_opt, "source": str_opt, "target": str_opt,
                "dep_type": str_opt},
               "write", _manage_dependencies),
+_spec("manage_monitors",
+              "到期监控管理（operator/admin，与 Web 到期监控页同等效力）："
+              "证书/域名/云续费/license/自定义到期项。action=list/create/"
+              "update/delete/toggle/check/whois/config；create 时 type="
+              "ssl/cloud_renewal/license/custom/domain（domain 无到期时间则"
+              "自动 WHOIS；非 ssl/domain 需给 expiry_at）；check 手动探测"
+              "（ssl 探测证书剩余天数/domain WHOIS 刷新）；whois 临时查询"
+              "域名到期；config 全局默认值（写仅 admin）",
+              {"action": str_req, "monitor_id": num_opt, "type": str_opt,
+               "name": str_opt, "target": str_opt, "port": num_opt,
+               "expiry_at": num_opt, "warn_days": num_opt,
+               "severity": str_opt, "channels": str_opt, "owner": str_opt,
+               "renewal_status": str_opt, "default_warn_days": num_opt,
+               "default_severity": str_opt, "default_channels": str_opt,
+               "ssl_check_interval": num_opt},
+              "write", _manage_monitors),
 _spec("send_digest",
               "立即聚合并推送一次巡检日报（服务健康/告警/近24h发布/待审审批单"
               "/定时计划）到已配置的通知渠道；渠道未配置时提示先配置",

@@ -1052,6 +1052,7 @@ class TestAgentManageTools(AgentBase):
                   "canary_decision", "set_alert_status",
                   "manage_alert_rules", "manage_silences",
                   "manage_log_storage", "manage_dependencies",
+                  "manage_monitors",
                   "decide_run"):
             self.assertNotIn(n, viewer_names)
             self.assertIn(n, admin_names)
@@ -1486,6 +1487,94 @@ class TestAgentManageTools(AgentBase):
         again = self._call("manage_dependencies",
                            {"action": "delete", "dependency_id": dep_id})
         self.assertIn("不存在", again["error"])
+
+    def test_monitors_tool_lifecycle(self):
+        from webapp.routes import alert_routes as alert_routes_mod
+        # viewer 拒绝（write 级，与 Web operator/admin 对齐）
+        denied = self._call("manage_monitors", {"action": "list"},
+                            role="viewer")
+        self.assertIn("error", denied)
+        # 非法 type 拒绝
+        bad_type = self._call("manage_monitors",
+                              {"action": "create", "type": "cert",
+                               "name": "证书", "target": "a.com"})
+        self.assertIn("type", bad_type["error"])
+        # 非 ssl/domain 类型无 expiry_at 拒绝
+        no_exp = self._call("manage_monitors",
+                            {"action": "create", "type": "license",
+                             "name": "许可", "target": "xx-license"})
+        self.assertIn("expiry_at", no_exp["error"])
+        # domain 无 expiry_at → 自动 WHOIS（mock 防真实网络）
+        fake_expiry = int(time.time()) + 42 * 86400
+        with mock.patch.object(alert_routes_mod, "_whois_lookup",
+                               return_value={"expiry_at": fake_expiry,
+                                             "days_left": 42, "error": None}):
+            dom = self._call("manage_monitors",
+                             {"action": "create", "type": "domain",
+                              "name": "主域名", "target": "example.com",
+                              "warn_days": 30, "severity": "P1"})
+        self.assertTrue(dom["ok"])
+        dom_id = dom["id"]
+        rec = dbm.get_record(self.db, "custom_monitors", dom_id)
+        self.assertEqual(rec["expiry_at"], fake_expiry)
+        self.assertEqual(rec["days_left"], 42)
+        self.assertEqual(rec["severity"], "P1")
+        # ssl 类型无需 expiry_at；check 时探测线程未启动 → 拒绝
+        ssl = self._call("manage_monitors",
+                         {"action": "create", "type": "ssl",
+                          "name": "网关证书", "target": "gw.example.com"})
+        self.assertTrue(ssl["ok"])
+        with mock.patch("webapp.ssl_monitor.get_ssl_monitor",
+                        return_value=None):
+            probe = self._call("manage_monitors",
+                               {"action": "check", "monitor_id": ssl["id"]})
+        self.assertIn("未启动", probe["error"])
+        # whois 临时查询（无需建监控项）
+        with mock.patch.object(alert_routes_mod, "_whois_lookup",
+                               return_value={"expiry_at": fake_expiry,
+                                             "days_left": 42, "error": None}):
+            whois = self._call("manage_monitors",
+                               {"action": "whois", "target": "example.com"})
+        self.assertEqual(whois["days_left"], 42)
+        self.assertIn("create", whois["hint"])
+        # update：warn_days 调整 + days_left 重算
+        upd = self._call("manage_monitors",
+                         {"action": "update", "monitor_id": dom_id,
+                          "warn_days": 15})
+        self.assertTrue(upd["ok"])
+        rec = dbm.get_record(self.db, "custom_monitors", dom_id)
+        self.assertEqual(rec["warn_days"], 15)
+        # list：days_left 实时重算（0=已过期口径）
+        rows = self._call("manage_monitors", {"action": "list"})
+        self.assertEqual(rows["count"], 2)
+        # toggle 停用
+        tog = self._call("manage_monitors",
+                         {"action": "toggle", "monitor_id": dom_id})
+        self.assertFalse(tog["enabled"])
+        # config：默认读 → admin 写 → operator 写拒绝
+        cfg = self._call("manage_monitors", {"action": "config"})
+        self.assertEqual(cfg["config"]["default_warn_days"], 30)
+        cfg_w = self._call("manage_monitors",
+                           {"action": "config", "default_warn_days": 14,
+                            "ssl_check_interval": 7200})
+        self.assertTrue(cfg_w["ok"])
+        self.assertEqual(cfg_w["config"]["default_warn_days"], 14)
+        op_cfg = self._call("manage_monitors",
+                            {"action": "config", "default_warn_days": 7},
+                            role="operator")
+        self.assertIn("admin", op_cfg["error"])
+        # 审计落库
+        logs = dbm.list_audit_logs(self.db, 50)
+        actions = {l["action"] for l in logs}
+        self.assertIn("agent_create_monitor", actions)
+        self.assertIn("agent_update_monitor", actions)
+        self.assertIn("agent_update_monitor_config", actions)
+        # delete
+        dele = self._call("manage_monitors",
+                          {"action": "delete", "monitor_id": dom_id})
+        self.assertTrue(dele["ok"])
+        self.assertIsNone(
+            dbm.get_record(self.db, "custom_monitors", dom_id))
 
     def test_clone_environment_copies_server_bindings(self):
         # 新项目 → clone plat/prod 环境（含服务器绑定，order 保持）
