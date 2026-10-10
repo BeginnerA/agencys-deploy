@@ -20,8 +20,6 @@
     ? (localStorage.getItem('agentCurSession') || 'web')
     : 'web';
   let sessPinned = false;   // 当前会话置顶态（refreshSessSel 同步）
-  let sessSearchKw = '';    // 会话搜索词（防抖后置入下拉请求）
-  let sessSearchTimer = null; // 搜索防抖定时器（独立于页面轮询 timer）
 
   const RUN_LABEL = {
     awaiting_approval: {label:'待审批', cls:'pending', ico:'📝'},
@@ -104,11 +102,8 @@
       <div class="chat-wrap">
         ${canManage ? `
         <div class="chat-sessbar">
-          <input type="text" id="sessSearch" class="sess-search"
-                 placeholder="🔍 搜索会话" value="${esc(sessSearchKw)}"
-                 title="按标题或最后消息搜索会话">
-          <select id="sessSel" class="filter-sel sess-sel"
-                  title="切换历史会话（含悬浮助手会话；📌 为置顶）"></select>
+          <select id="sessSel" class="filter-sel sess-sel" data-search="1"
+                  title="切换历史会话（含悬浮助手会话；📌 为置顶；展开后可输入关键词筛选标题/末条消息）"></select>
           <button class="btn sm ghost" id="sessPin" title="置顶/取消置顶当前会话">📌</button>
           <button class="btn sm ghost" id="sessRename" title="重命名当前会话">✏️</button>
           <button class="btn sm ghost" id="sessNew" title="新建会话（从空历史开始）">＋ 新建</button>
@@ -137,17 +132,6 @@
     if (sessRename) sessRename.onclick = renameSession;
     const sessPin = document.getElementById('sessPin');
     if (sessPin) sessPin.onclick = pinSession;
-    const sessSearch = document.getElementById('sessSearch');
-    if (sessSearch){
-      // 搜索词变更 300ms 防抖后重拉会话列表（含空串恢复全量）
-      sessSearch.oninput = () => {
-        if (sessSearchTimer) clearTimeout(sessSearchTimer);
-        sessSearchTimer = setTimeout(() => {
-          sessSearchKw = (sessSearch.value || '').trim();
-          refreshSessSel(sessSearchKw);
-        }, 300);
-      };
-    }
     const send = () => {
       const text = (ta.value || '').trim();
       if (!text) return;
@@ -273,7 +257,7 @@
       await api('/api/agent/sessions/' + encodeURIComponent(currentSession)
         + '/title', {method: 'PUT', body: JSON.stringify({title: name})});
       toastSuccess(name ? '会话已重命名' : '已恢复自动标题');
-      refreshSessSel(sessSearchKw);
+      refreshSessSel();
     }catch(e){
       toastError('重命名失败：' + (e.message || ''));
     }
@@ -286,7 +270,7 @@
                    body: JSON.stringify({pinned: !sessPinned})});
       sessPinned = !!r.pinned;
       toastSuccess(sessPinned ? '会话已置顶' : '已取消置顶');
-      refreshSessSel(sessSearchKw);
+      refreshSessSel();
     }catch(e){
       toastError('置顶失败：' + (e.message || ''));
     }
@@ -1322,8 +1306,6 @@
       abortChat();
       if (timer) clearInterval(timer);
       timer = null;
-      if (sessSearchTimer) clearTimeout(sessSearchTimer);
-      sessSearchTimer = null;
     }
   };
 })();

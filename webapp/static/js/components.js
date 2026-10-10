@@ -185,10 +185,13 @@ function enhanceSelect(sel){
       if (f) f.classList.remove('open');
     });
     pop.innerHTML = '';
+    let searchEl = null;
     [...sel.options].forEach(o => {
       const d = document.createElement('div');
       d.className = 'sel-opt' + (o.selected ? ' on' : '');
       d.textContent = o.text;
+      // 检索键：显示文本 + option.title（会话下拉里存的是末条消息摘要），供 data-search 客户端过滤
+      d.dataset.k = ((o.text || '') + ' ' + (o.title || '')).toLowerCase();
       d.onclick = () => {
         sel.value = o.value;
         sel.dispatchEvent(new Event('change', { bubbles: true }));
@@ -197,6 +200,30 @@ function enhanceSelect(sel){
       };
       pop.appendChild(d);
     });
+    // 可搜索模式：面板顶部挂筛选框，即时隐藏不匹配项（无需再放独立搜索输入框）
+    if (sel.dataset.search){
+      const fi = document.createElement('input');
+      fi.type = 'text'; fi.className = 'sel-search'; fi.placeholder = '输入关键词筛选…';
+      const empty = document.createElement('div');
+      empty.className = 'sel-opt sel-empty hidden'; empty.textContent = '无匹配项';
+      const optEls = [...pop.querySelectorAll('.sel-opt:not(.sel-empty)')];
+      fi.oninput = () => {
+        const kw = fi.value.trim().toLowerCase();
+        let shown = 0;
+        optEls.forEach(d => {
+          const hit = !kw || (d.dataset.k || '').includes(kw);
+          d.classList.toggle('hidden', !hit);
+          if (hit) shown++;
+        });
+        empty.classList.toggle('hidden', shown !== 0);
+      };
+      // 拦截冒泡：点/键筛选框不应触发 face 的开合切换或外部关闭
+      fi.onclick = e => e.stopPropagation();
+      fi.onkeydown = e => { if (e.key === 'Escape'){ e.stopPropagation(); closePop(); } };
+      pop.insertBefore(fi, pop.firstChild);
+      pop.appendChild(empty);
+      searchEl = fi;
+    }
     syncFace();
     pop.classList.remove('hidden');
     face.classList.add('open');
@@ -220,6 +247,7 @@ function enhanceSelect(sel){
         pop.style.top = Math.max(0, r.top - ph - 4) + 'px';
       }
     }
+    if (searchEl) searchEl.focus(); // 可搜索下拉：展开即聚焦筛选框
   };
   face.onclick = e => { e.stopPropagation(); pop.classList.contains('hidden') ? openPop() : closePop(); };
   face.addEventListener('keydown', e => {

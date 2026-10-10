@@ -70,6 +70,18 @@
 .tag.tag-info{background:rgba(0,212,255,.12);color:var(--primary);border:1px solid rgba(0,212,255,.35)}
 
 /* ---- 表单 ---- */
+/* 文本类控件全局兜底主题：覆盖未接入 .field/.list-toolbar 等场景规则的裸输入框
+   （会话搜索/日志关键词/灰度批次/prompt 弹窗等）；场景规则特异性更高照常覆盖本条。
+   只枚举文本类型：checkbox/radio/range/file 等原生控件刻意不入列，防盒模型误伤 */
+input:not([type]),input[type="text"],input[type="number"],input[type="password"],
+input[type="search"],input[type="url"],input[type="tel"],input[type="date"],
+input[type="time"],input[type="datetime-local"],textarea{
+  background:rgba(0,212,255,.04);border:1px solid var(--border);border-radius:var(--r-ctl);
+  color:var(--text-1);padding:6px 10px;outline:none;transition:var(--t-fast)}
+input:not([type]):focus,input[type="text"]:focus,input[type="number"]:focus,
+input[type="password"]:focus,input[type="search"]:focus,input[type="url"]:focus,
+input[type="tel"]:focus,input[type="date"]:focus,input[type="time"]:focus,
+input[type="datetime-local"]:focus,textarea:focus{border-color:var(--primary);box-shadow:var(--shadow-glow)}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--sp-3) var(--sp-4)}
 .form-grid .full{grid-column:1/-1}
 .field label{display:block;font-size:var(--fs-12);color:var(--text-2);margin-bottom:4px}
@@ -145,6 +157,13 @@
 .sel-opt{padding:7px 10px;font-size:var(--fs-12);color:var(--text-1);border-radius:4px;cursor:pointer;white-space:nowrap}
 .sel-opt:hover{background:var(--bg-hover)}
 .sel-opt.on{color:var(--primary)}
+/* 可搜索下拉（data-search）：面板顶部筛选框 + 无匹配空态 */
+.sel-search{width:100%;box-sizing:border-box;margin:2px 0 6px;padding:6px 10px;font-size:var(--fs-12);
+  position:sticky;top:0;z-index:1;
+  background:var(--bg-panel);border:1px solid var(--border);border-radius:4px;color:var(--text-1);outline:none}
+.sel-search:focus{border-color:var(--primary);box-shadow:var(--shadow-glow)}
+.sel-empty{color:var(--text-3);cursor:default;text-align:center}
+.sel-empty:hover{background:none}
 .field .sel-face{padding:8px 10px;font-size:var(--fs-13)}
 .tab-btn{
   padding:6px 16px;border:1px solid var(--border);background:transparent;color:var(--text-2);
