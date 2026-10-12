@@ -15,8 +15,9 @@
 安全红线（脚本强制，不可绕过）：
     1. 白名单组装——data/、dist/、backups/、.venv/、.git/ 等永不进入包；
     2. 禁入断言——包内出现 *.db / secret_key / __pycache__ / 日志等即失败；
-    3. 凭据探针——从源 data/（含 platform.db 的 servers/environments 表）收集
-       真实值（服务器 IP、SSH 凭据、连接串），全包文本扫描，命中即失败。
+    3. 凭据探针——从源 data/（platform.db 的 servers/platform_settings/environments
+       等全部运行数据表 + 各 YAML）收集真实值（服务器 IP、SSH 凭据、LLM/告警渠道
+       密钥、连接串），并对包内文本做密钥形态识别；命中经公开面判定，泄漏即失败。
 """
 import argparse
 import hashlib
@@ -74,6 +75,14 @@ GENERIC_VALUES = {
     "127.0.0.1", "0.0.0.0", "localhost", "example.com",
     "192.168.1.1", "192.168.1.2", "xxx.xxx.xxx.xxx",
     "~/.ssh/id_rsa_deploy", "DEFAULT_GROUP", "public",
+}
+
+# 包内文本强密钥形态（独立于探针清单的兜底；命中值同样走公开面豁免判定）
+SHAPE_PATTERNS = {
+    "sk- 密钥": re.compile(r"sk-[A-Za-z0-9]{16,}"),
+    "LTAI 阿里云": re.compile(r"LTAI[A-Za-z0-9]{12,24}"),
+    "AKIA AWS": re.compile(r"AKIA[0-9A-Z]{16}"),
+    "ghp_ GitHub": re.compile(r"(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}"),
 }
 
 # 禁入断言：包内出现即失败
@@ -273,7 +282,12 @@ def _walk_json(obj, values: set, key_hint: str = ""):
 
 
 def _collect_db_probes(values: set):
-    """从运行时数据库收集真实值（servers 表 + environments 的 JSON 列）"""
+    """从运行时数据库收集真实值。
+
+    覆盖全部敏感数据面：servers 全表（服务器 IP / SSH 凭据 / 内网地址）、
+    platform_settings 配置中心（LLM 网关 api_key、告警渠道密钥等）、
+    environments JSON 列、custom_monitors / services / monitor_snapshots。
+    """
     for db_name in ("platform.db", "dashboard.db"):
         dbp = ROOT / "data" / db_name
         if not dbp.exists():
@@ -284,14 +298,52 @@ def _collect_db_probes(values: set):
             continue
         try:
             try:
-                rows = conn.execute(
-                    "SELECT host, ssh_user, ssh_password, ssh_key_file, nacos_ip"
-                    " FROM servers").fetchall()
-                for row in rows:
+                for row in conn.execute("SELECT * FROM servers"):
                     for v in row:
                         v = str(v).strip() if v is not None else ""
                         if v:
                             values.add(v)
+            except sqlite3.Error:
+                pass
+            try:
+                for _key, raw in conn.execute(
+                        "SELECT key, value FROM platform_settings"):
+                    raw = str(raw or "").strip()
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except (TypeError, ValueError):
+                        obj = None
+                    if obj is None:
+                        values.add(raw)
+                    else:
+                        _walk_json(obj, values)
+            except sqlite3.Error:
+                pass
+            try:
+                for row in conn.execute(
+                        "SELECT target, san_domains, owner FROM custom_monitors"):
+                    for v in row:
+                        if isinstance(v, str):
+                            for part in re.split(r"[,\s;]+", v):
+                                if part:
+                                    values.add(part)
+            except sqlite3.Error:
+                pass
+            try:
+                for row in conn.execute(
+                        "SELECT health_url, git_repo FROM services"):
+                    for v in row:
+                        if v:
+                            values.add(str(v).strip())
+            except sqlite3.Error:
+                pass
+            try:
+                for (h,) in conn.execute(
+                        "SELECT DISTINCT host FROM monitor_snapshots"):
+                    if h:
+                        values.add(str(h).strip())
             except sqlite3.Error:
                 pass
             try:
@@ -324,6 +376,10 @@ def collect_probes() -> dict:
             continue
         if re.fullmatch(r'[*xX. ]+', v):  # 纯占位符（xxx、***、......）
             continue
+        if re.fullmatch(r'[\d.\-:/ ]+', v) \
+                and not re.fullmatch(r'1[3-9]\d{9}', v) \
+                and not re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}', v):
+            continue  # 纯数字/日期/版本串（手机号与 IP 除外）
         probes[v] = True
     return probes
 
@@ -380,6 +436,7 @@ def _scan_probe_hits(probes: dict):
         return
     checks = [(val, _boundary_pattern(val)) for val in sorted(probes)]
     hits: dict = {}  # 命中值 -> [包内文件相对路径, ...]
+    shape_matched: set = set()  # 由密钥形态识别命中的值（打印与审计标注用）
     for fp in sorted(PKG_DIR.rglob("*")):
         if not fp.is_file():
             continue
@@ -397,8 +454,15 @@ def _scan_probe_hits(probes: dict):
         for val, pat in checks:
             if val in text and pat.search(text):  # 先子串快筛，再词边界确认
                 hits.setdefault(val, []).append(rel)
+        for _label, pat in SHAPE_PATTERNS.items():  # 密钥形态兜底
+            for m in pat.finditer(text):
+                matched = m.group(0)
+                if matched not in hits:
+                    shape_matched.add(matched)
+                hits.setdefault(matched, []).append(rel)
     if not hits:
-        log(f"[leak] 凭据探针通过（{len(probes)} 个真实值 × 全包文本，0 命中）")
+        log(f"[leak] 凭据探针通过（{len(probes)} 个真实值 + {len(SHAPE_PATTERNS)} 类密钥形态"
+            f" × 全包文本，0 命中）")
         return
 
     public_texts = _git_public_entries()
@@ -413,8 +477,9 @@ def _scan_probe_hits(probes: dict):
         log(f"[leak] 提示：{len(benign)} 个命中值已存在于 git 跟踪内容中"
             f"（将随公开仓库发布），按公开信息处理：")
         for val, files in benign:
+            tag = "（形态识别）" if val in shape_matched else ""
             sample = ", ".join(files[:3]) + (" 等" if len(files) > 3 else "")
-            log(f"       · {val}（{len(files)} 个包内文件：{sample}）")
+            log(f"       · {val}{tag}（{len(files)} 个包内文件：{sample}）")
     if leaks:
         detail = "\n  ".join(f"{val} → {', '.join(files[:5])}"
                             for val, files in leaks[:50])
