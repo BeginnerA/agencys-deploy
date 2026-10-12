@@ -1,7 +1,8 @@
-"""健康检查：HTTP 探活 + 远程容器日志错误关键字检查"""
+"""健康检查：HTTP 探活 + TCP 端口连通 + 远程容器运行/日志错误关键字检查"""
 import sys
 import time
 import re
+import socket
 import argparse
 import requests
 import paramiko
@@ -18,6 +19,19 @@ def check_http(url: str, timeout: int = 10) -> bool:
         return False
     except Exception as e:
         log(f"健康检查请求失败: {e}")
+        return False
+
+
+def check_tcp_port(host: str, port: int, timeout: int = 5) -> bool:
+    """TCP 端口连通性探测：仅判断服务端口是否在接受连接，不要求任何健康接口。
+    用于未提供检查端点、但暴露了业务端口的服务（比 SSH 容器检查更直接地反映
+    「应用已在监听端口」）。"""
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+        sock.close()
+        return True
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        log(f"TCP 端口探测失败 {host}:{port}: {e}")
         return False
 
 
@@ -81,13 +95,19 @@ def wait_for_healthy(host: str, project_name: str, version: str = None, ssh_over
     if interval <= 0:
         interval = 5
     service_name = proj["service_name"]
+    health_port = proj.get("health_port") or 0
 
     if health_url:
         log(f"开始健康检查: {health_url}，超时 {timeout} 秒")
         is_ok = lambda: check_http(health_url)
+    elif health_port:
+        # 未配置 health_url 但配了业务端口：退化为 TCP 端口连通检查
+        # （现实项目极少遗留专用检查接口，端口在监听即说明应用已起）
+        log(f"未配置 health_url，改用 TCP 端口连通检查: {host}:{health_port}，超时 {timeout} 秒")
+        is_ok = lambda: check_tcp_port(host, health_port)
     else:
-        # 未配置 health_url：跳过 HTTP 检查，退化为容器运行状态检查，避免盲发
-        log(f"未配置 health_url，改用容器运行状态检查: {service_name}，超时 {timeout} 秒")
+        # 既无 health_url 也无 health_port：跳过网络检查，退化为容器运行状态检查，避免盲发
+        log(f"未配置 health_url/health_port，改用容器运行状态检查: {service_name}，超时 {timeout} 秒")
         is_ok = lambda: check_container_running(host, service_name, ssh_cfg)
 
     deadline = time.time() + timeout

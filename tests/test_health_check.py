@@ -38,3 +38,25 @@ class TestContainerRunningCheck(unittest.TestCase):
     def test_empty_output_returns_false(self):
         _, result = self._run_check(b"")
         self.assertFalse(result)
+
+
+class TestTcpPortCheck(unittest.TestCase):
+    """check_tcp_port：未配健康接口时的端口连通退化检查"""
+
+    def test_open_port_returns_true(self):
+        with mock.patch("socket.create_connection") as cc:
+            cc.return_value = mock.Mock()
+            self.assertTrue(hc.check_tcp_port("10.0.0.1", 9210))
+            cc.return_value.close.assert_called_once()
+
+    def test_refused_returns_false(self):
+        import socket as _s
+        with mock.patch("socket.create_connection",
+                        side_effect=ConnectionRefusedError("refused")):
+            self.assertFalse(hc.check_tcp_port("10.0.0.1", 9210))
+
+    def test_timeout_returns_false(self):
+        import socket as _s
+        with mock.patch("socket.create_connection",
+                        side_effect=_s.timeout("t")):
+            self.assertFalse(hc.check_tcp_port("10.0.0.1", 9210))

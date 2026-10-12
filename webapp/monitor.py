@@ -323,18 +323,51 @@ def _http_session() -> requests.Session:
     return session
 
 
-def _probe_health_url(host: str, port: int, url: str, timeout: int = 5) -> dict:
-    """HTTP 健康检查，返回 {"ok": bool, "ms": int}"""
+def _probe_tcp_port(host: str, port: int, timeout: int = 3) -> dict:
+    """TCP 端口连通性探测：仅判断端口是否在接受连接，不要求任何业务接口。
+    适用于未提供健康检查端点的服务，返回 {"ok": bool, "ms": int, "method": "tcp"}"""
+    import socket
+    try:
+        t0 = time.time()
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.close()
+        ms = int((time.time() - t0) * 1000)
+        return {"ok": True, "ms": ms, "method": "tcp"}
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return {"ok": False, "ms": -1, "method": "tcp"}
+
+
+def _probe_health_url(host: str, port: int, url: str, timeout: int = 5,
+                     strict: bool = True) -> dict:
+    """HTTP 健康检查，返回 {"ok": bool, "ms": int, "method": str}
+
+    strict=True：专用健康端点模式，要求 200（配了 health_url 时）；
+    strict=False：宽松存活模式，未配专用接口时探测根路径，只要服务器
+                 返回任意 HTTP 状态码（含 404/401/5xx）即说明应用层在响应，
+                 视为存活；连接失败/超时才判不健康。"""
     if not url.startswith("/"):
         url = "/" + url
     full_url = f"http://{host}:{port}{url}"
+    method = "http_strict" if strict else "http_loose"
     try:
         t0 = time.time()
         r = _http_session().get(full_url, timeout=timeout, allow_redirects=False)
         ms = int((time.time() - t0) * 1000)
-        return {"ok": r.status_code == 200, "ms": ms}
+        ok = (r.status_code == 200) if strict else True  # 拿到响应即存活
+        return {"ok": ok, "ms": ms, "method": method}
     except Exception:
-        return {"ok": False, "ms": -1}
+        return {"ok": False, "ms": -1, "method": method}
+
+
+def _probe_health_adaptive(host: str, port: int, timeout: int = 5) -> dict:
+    """自适应健康检查（服务未配专用 health_url 时使用）：
+    先尝试宽松 HTTP（任意响应即存活）；HTTP 失败（端口非 HTTP 协议或被
+    拦截）再降级 TCP 连通性探测。任一方式成功即视为健康。"""
+    loose = _probe_health_url(host, port, "/", timeout, strict=False)
+    if loose["ok"]:
+        return loose
+    # HTTP 不可达（非 HTTP 服务 / 拒绝连接）：降级 TCP 端口探测
+    return _probe_tcp_port(host, port, timeout=3)
 
 
 def _compute_security(servers: list) -> dict:
@@ -898,17 +931,25 @@ class MonitorScheduler:
                         result["services"][s["name"]]["instances"] = fut.result(timeout=20)
                     except Exception:
                         result["services"][s["name"]]["instances"] = -1
-        # HTTP 健康检查（在线服务，并发探测）+ 响应时间持久化
+        # 健康检查（在线服务，并发探测）+ 响应时间持久化
+        # 分层退化：配了专用 health_url → 严格 HTTP（要求 200）；
+        # 仅配 health_port 无接口 → 自适应（宽松 HTTP → TCP 连通性兜底）。
         if online:
             health_futures = {}
             with ThreadPoolExecutor(max_workers=min(8, len(online))) as pool:
                 for svc in online:
                     hp = svc.get("health_port") or 0
-                    hu = svc.get("health_url") or "/"
-                    if hp > 0:
-                        for host in health_hosts.get(svc["name"], [])[:2]:  # 最多探测 2 台
-                            health_futures[pool.submit(_probe_health_url, host, hp, hu)] = (
-                                svc["name"], host)
+                    hu = (svc.get("health_url") or "").strip()
+                    if hp <= 0:
+                        continue
+                    for host in health_hosts.get(svc["name"], [])[:2]:  # 最多探测 2 台
+                        if hu:
+                            future = pool.submit(_probe_health_url, host, hp, hu,
+                                                 5, True)
+                        else:
+                            # 未配专用健康接口：自适应（宽松 HTTP 优先，TCP 兜底）
+                            future = pool.submit(_probe_health_adaptive, host, hp)
+                        health_futures[future] = (svc["name"], host)
                 for fut, (svc_name, host) in health_futures.items():
                     try:
                         hr = fut.result(timeout=10)

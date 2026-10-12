@@ -76,6 +76,8 @@
   }
   function renderCards(services){
     const svcStatus = (monitorCache && monitorCache.services) || {};
+    const hcStatus = (monitorCache && monitorCache.health_checks) || {};
+    const HC_LABEL = { http_strict: '接口探活', http_loose: 'HTTP存活', tcp: '端口连通' };
     const running = tasksCache.filter(t => t.status === 'running');
     const root = document.getElementById('pageRoot');
     const wall = root.querySelector('#svcWall');
@@ -89,6 +91,11 @@
       const inst = st.instances !== undefined && st.instances !== -1 ? st.instances : '—';
       const ts = st.ts ? fmtTime(st.ts) : '';
       const dotCls = dotClass(st, run);
+      // 健康探测结果（无专用接口时由后端自适应：宽松 HTTP → TCP 兜底）
+      const hc = hcStatus[s.name];
+      const hcTxt = hc && hc.ok
+        ? `<span class="ok">健康</span> <span class="weak" style="font-size:11px">${HC_LABEL[hc.method] || '探活'}${hc.ms > 0 ? ' '+hc.ms+'ms' : ''}</span>`
+        : (st.status === 'online' ? '<span class="weak" style="font-size:11px">未配探活端口</span>' : '<span class="weak" style="font-size:11px">—</span>');
       const upTxt = st.uptime_hours != null && st.uptime_hours >= 0
         ? (st.uptime_hours >= 24 ? Math.floor(st.uptime_hours/24)+'天'+Math.floor(st.uptime_hours%24)+'时' : Math.floor(st.uptime_hours)+'时')
         : '';
@@ -102,6 +109,7 @@
                <span class="weak" style="margin-left:10px">状态</span> ${svcLabel(st, run)}</div>
           <div><span class="weak">端口</span> <span class="num">${s.health_port || '-'}</span>
                ${ts ? `<span class="weak" style="margin-left:10px">探测</span> ${ts}` : ''}</div>
+          <div><span class="weak">健康</span> ${hcTxt}</div>
         </div>
         <div class="svc-foot">
           ${canDeploy() ? `<button class="btn sm primary" data-pub="${s.id}">发布</button>

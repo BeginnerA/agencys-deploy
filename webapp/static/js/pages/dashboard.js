@@ -215,12 +215,13 @@
             // Docker 磁盘
             const ddf = ext.docker_df || {};
             const dockerTotal = (ddf.images||0) + (ddf.containers||0) + (ddf.volumes||0);
-            // 健康检查延迟（取该服务器上在线服务的健康检查结果）
+            // 健康检查延迟（取该服务器上在线服务的健康检查结果）+ 探测方式
             const hcData = mon && mon.health_checks || {};
-            let hcMs = null;
+            let hcMs = null, hcMethod = '';
+            const HC_METHOD = { http_strict: '接口', http_loose: 'HTTP', tcp: 'TCP' };
             for (const [sn, hd] of Object.entries(hcData)) {
               if (csObj[sn] || Object.keys(csObj).length === 0) {
-                if (hd.ms > 0) { hcMs = hd.ms; break; }
+                if (hd.ms > 0) { hcMs = hd.ms; hcMethod = HC_METHOD[hd.method] || ''; break; }
               }
             }
             return `<tr>
@@ -238,7 +239,7 @@
               <td class="num" style="font-size:11px">${tcpEST > 0 ? `E:${tcpEST}` : ''}${tcpCW > 0 ? ` <span class="${tcpCW>50?'hm-high':'hm-mid'}">CW:${tcpCW}</span>` : ''}${tcpEST === 0 && tcpCW === 0 ? '<span class="muted">—</span>' : ''}</td>
               <td class="num" style="font-size:11px">${ext.disk_read != null ? `R:${fmtRate(ext.disk_read*512)}` : ''}${ext.disk_write != null ? `<br>W:${fmtRate(ext.disk_write*512)}` : ''}${ext.disk_read == null && ext.disk_write == null ? '<span class="muted">—</span>' : ''}</td>
               <td class="num" style="font-size:11px">${dockerTotal > 0 ? fmtBytes(dockerTotal) : '<span class="muted">—</span>'}</td>
-              <td class="num">${hcMs != null && hcMs > 0 ? `<span class="${hcMs>1000?'hm-high':hcMs>500?'hm-mid':'hm-low'}">${hcMs}ms</span>` : '<span class="muted">—</span>'}</td>
+              <td class="num">${hcMs != null && hcMs > 0 ? `<span class="${hcMs>1000?'hm-high':hcMs>500?'hm-mid':'hm-low'}">${hcMs}ms</span>${hcMethod ? ` <span class="weak" style="font-size:10px">${hcMethod}</span>` : ''}` : '<span class="muted">—</span>'}</td>
               <td class="muted">${sv.error ? esc(sv.error) : (sv.ts ? fmtTime(sv.ts) : '—')}</td></tr>`;
           }).join('') : `<tr><td colspan="14" class="muted" style="text-align:center;padding:20px">暂无服务器数据</td></tr>`}
         </tbody></table></div>

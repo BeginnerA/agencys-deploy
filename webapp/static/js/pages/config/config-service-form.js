@@ -112,8 +112,8 @@
       // ④ 健康检查与日志
       const health = `
         <div class="form-grid">
-          ${H.field({ label:'健康检查端口', tip:'用于判断服务是否已启动', input:`<input id="sHealthPort" type="number" value="${esc(d.health_port || '')}" placeholder="如 8080">` })}
-          ${H.field({ label:'健康检查 URL', tip:'{ip} 会被替换为当前服务器 IP', input:`<input id="sHealthUrl" value="${esc(d.health_url)}" placeholder="如 http://{ip}:8080/actuator/health">`, hint:'留空则退化为容器状态 + 日志检查' })}
+          ${H.field({ label:'探活端口', tip:'服务业务端口；无专用健康接口时监控会自动用宽松 HTTP/TCP 探活', input:`<input id="sHealthPort" type="number" value="${esc(d.health_port || '')}" placeholder="如 8080">` })}
+          ${H.field({ label:'健康检查 URL', tip:'（可选）专用探活接口，{ip} 会被替换为当前服务器 IP', input:`<input id="sHealthUrl" value="${esc(d.health_url)}" placeholder="如 /actuator/health（仅在需严格 200 时填）">`, hint:'留空则自动退化：宽松 HTTP（任意响应码即存活）→ TCP 端口连通兜底' })}
           <div class="field full"><label>启动失败关键字（log_error_keywords）</label>
             ${H.tagInput({ id:'sLogKw', values: d.log_error_keywords, placeholder:'输入关键字后回车' }).html}
             <div class="f-hint">启动日志中出现任一关键字即判定启动失败；默认已预填常用关键字。</div>
