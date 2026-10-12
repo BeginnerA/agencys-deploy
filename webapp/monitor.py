@@ -178,17 +178,17 @@ def _probe_health_via_ssh(host: str, ssh_port: int, ssh_cfg: dict,
             url = hu.replace("{ip}", "127.0.0.1")
             target = shlex.quote(f"http://127.0.0.1:{hp}{url}")
             bodies.append(
-                f"T=$(date +%s%3N); C=$(curl -s -o /dev/null -m 3 -w '%{{http_code}}' {target} 2>/dev/null); "
-                f"E=$(date +%s%3N); echo {qn}|http_strict|$((E-T))|$C"
+                f"N={qn}; T=$(date +%s%3N); C=$(curl -s -o /dev/null -m 3 -w '%{{http_code}}' {target} 2>/dev/null); "
+                f"E=$(date +%s%3N); echo \"$N|http_strict|$((E-T))|$C\""
             )
         else:
             target = shlex.quote(f"http://127.0.0.1:{hp}/")
             bodies.append(
-                f"T=$(date +%s%3N); C=$(curl -s -o /dev/null -m 3 -w '%{{http_code}}' {target} 2>/dev/null); "
+                f"N={qn}; T=$(date +%s%3N); C=$(curl -s -o /dev/null -m 3 -w '%{{http_code}}' {target} 2>/dev/null); "
                 f"E=$(date +%s%3N); "
-                f"if [ -n \"$C\" ] && [ \"$C\" != 000 ]; then echo {qn}|http_loose|$((E-T))|$C; "
+                f"if [ -n \"$C\" ] && [ \"$C\" != 000 ]; then echo \"$N|http_loose|$((E-T))|$C\"; "
                 f"else T2=$(date +%s%3N); timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{hp}' 2>/dev/null "
-                f"&& E2=$(date +%s%3N) && echo {qn}|tcp|$((E2-T2))|1 || echo {qn}|down|-1|0; fi"
+                f"&& E2=$(date +%s%3N) && echo \"$N|tcp|$((E2-T2))|1\" || echo \"$N|down|-1|0\"; fi"
             )
     cmd = " ".join(f"( {b} ) &" for b in bodies) + " wait"
     try:

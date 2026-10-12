@@ -137,6 +137,17 @@ class TestProbeHealthViaSsh(unittest.TestCase):
         self.assertEqual(cmd.count(" ) &"), 2)
         self.assertTrue(cmd.rstrip().endswith("wait"))
 
+    def test_echo_payload_is_quoted_against_pipe_bug(self):
+        """回归护栏：echo 输出必须整体双引号包裹，否则 `|` 会被远端 bash
+        当管道符（历史 bug：http_loose/200 被当作命令执行，stdout 全为报错）。"""
+        _, cmd = self._run("")
+        # 服务名写入变量 N，echo 用 "$N|..." 形式
+        self.assertIn('echo "$N|http_loose|', cmd)
+        self.assertIn('echo "$N|http_strict|', cmd)
+        # 绝不能出现未加引号的 `echo <name>|`（会被当管道）
+        self.assertNotIn("echo svcA|", cmd)
+        self.assertNotIn("echo svcB|", cmd)
+
     def test_ssh_failure_returns_empty(self):
         with mock.patch.object(monitor, "_ssh_exec",
                                side_effect=OSError("ssh down")):
