@@ -31,3 +31,12 @@ input,select,textarea,button{font-family:inherit;font-size:inherit;color:inherit
 .gap-2{gap:var(--sp-2)} .gap-3{gap:var(--sp-3)} .gap-4{gap:var(--sp-4)}
 /* 文本省略 */
 .ellipsis{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* 动效敏感降级：系统开启「减弱动态效果」时停掉全部动画与过渡
+   （骨架微光、指示灯呼吸环、弹层滑入等十余处逐条判定成本远高于此统一闸门） */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{
+    animation-duration:.01ms!important;animation-iteration-count:1!important;
+    transition-duration:.01ms!important;scroll-behavior:auto!important;
+  }
+}

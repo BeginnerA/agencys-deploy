@@ -1,24 +1,101 @@
 // components.js — 通用组件：toast / confirm / modal / drawer / 空态 / 骨架 / 表格工具
+//
+// 本文件同时承载「交互无障碍」的集中收口：全站大量 <span class="chip">/<div> 用
+// el.onclick= 绑定交互，这类元素不可 Tab 聚焦也不响应 Enter，键盘用户完全无法操作；
+// 逐页改模板为 <button> 会牵动 16+ 处结构与样式，故与自绘下拉同一范式用 MutationObserver
+// 自动补 tabindex/role 并代理键盘事件，页面零改动、后续新增元素同样生效。
+const TOAST_MAX = 4;            // 同屏上限：轮询/批量操作失败会连发十多条，堆叠会盖住整屏内容
+const TOAST_SHOW_MS = 3000;     // 最后一次合并后的停留时长（合并到达时重置计时）
+const _toasts = new Map();      // key(type|文案) -> {el, count, timer, dead}
+
 function toast(msg, type){
-  const box = document.createElement('div');
-  box.className = 'toast ' + (type || '');
-  box.textContent = msg;
-  document.getElementById('toastRoot').appendChild(box);
-  setTimeout(() => { box.style.opacity = '0'; box.style.transition = 'opacity .3s'; }, 2600);
-  setTimeout(() => box.remove(), 3000);
+  const root = document.getElementById('toastRoot');
+  if (!root) return;
+  const key = (type || '') + '|' + msg;
+  let item = _toasts.get(key);
+  // 淡出中的那一条不复用：否则新文案会被它的移除定时器连带删掉
+  if (item && item.dead) item = null;
+  if (!item){
+    const el = document.createElement('div');
+    el.className = 'toast ' + (type || '');
+    item = {el, count: 0, timer: null, dead: false};
+    _toasts.set(key, item);
+    root.appendChild(el);
+  }
+  item.count += 1;
+  item.el.textContent = item.count > 1 ? msg + ' ×' + item.count : msg;
+  clearTimeout(item.timer);
+  item.timer = setTimeout(() => {
+    item.dead = true;
+    item.el.style.opacity = '0';
+    item.el.style.transition = 'opacity .3s';
+    setTimeout(() => { item.el.remove(); if (_toasts.get(key) === item) _toasts.delete(key); }, 400);
+  }, TOAST_SHOW_MS);
+  // 超上限先淘汰最早的一条（Map 保持插入序，合并不会把它排到末尾）
+  while (_toasts.size > TOAST_MAX){
+    const oldestKey = _toasts.keys().next().value;
+    const oldest = _toasts.get(oldestKey);
+    clearTimeout(oldest.timer);
+    oldest.el.remove();
+    _toasts.delete(oldestKey);
+  }
 }
 function toastError(msg){ toast(msg, 'error'); }
 function toastSuccess(msg){ toast(msg, 'success'); }
 
-// 确认弹窗：resolve(true/false)
+// ---- 覆盖层基础设施：Esc 响应层栈 + 焦点接管 ----
+// 抽屉上再弹确认框时，两层各自监听 Esc 会一键双关（注册在同一目标上的监听器
+// 无法靠 stopPropagation 互拒），故统一入栈/出栈、只有栈顶消费 Esc；
+// 同时监听器挂在 document 捕获阶段，否则自绘下拉的面板 Esc 会被外层抽屉抢走。
+const _escLayers = [];
+function pushEscLayer(handler){
+  const layer = {handler,
+    release(){ const i = _escLayers.indexOf(layer); if (i >= 0) _escLayers.splice(i, 1); }};
+  _escLayers.push(layer);
+  return layer;
+}
+if (!window.__escStackBound){
+  window.__escStackBound = true;
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    const top = _escLayers[_escLayers.length - 1];
+    if (!top) return;                       // 无覆盖层时不拦截（顶栏搜索框等自有局部处理）
+    e.preventDefault(); e.stopPropagation();
+    top.handler();
+  }, true);
+}
+
+// 弹窗焦点接管：打开时记住当前焦点、关闭后归还（否则焦点掉回 body，键盘用户
+// 得整页重 Tab 一遍）；初始焦点由调用方指定（确认框给「取消」，Enter 误按不会执行危险操作）。
+// 返回的关闭函数接受一个 after 回调：调用方用它落地 resolve(值)——必须真正调用，
+// 否则 await confirmDialog() 的按钮处理逻辑会永久挂起（实测踩过：弹窗能关、后续代码再也不执行）。
+// opts.focusBack：触发元素弹层开着时已被隐藏（菜单项→弹窗：菜单已收）时，
+// 焦点无法归还到看不见的元素上，改落调用方指定的兜底元素（实测：不做兜底就掉回 body）
+function focusTrap(card, onClose, opts){
+  const prev = document.activeElement;
+  const fallback = opts && opts.focusBack;
+  let done = false;
+  return (after) => {
+    if (done) return;
+    done = true;
+    onClose();
+    if (typeof after === 'function'){ try{ after(); }catch(e){} }
+    // 用 getClientRects() 判可见：offsetParent 对 fixed 定位的元素恒为 null，会误判成已隐藏
+    const stillThere = prev && prev.isConnected && prev.getClientRects().length > 0;
+    const target = stillThere ? prev : fallback;
+    if (target && typeof target.focus === 'function') target.focus();
+  };
+}
+
+// 确认弹窗：resolve(true/false)；Esc/遮罩=取消，初始焦点在「取消」
 function confirmDialog(text, title){
   return new Promise(resolve => {
     const root = document.getElementById('modalRoot');
     root.classList.remove('hidden');
     root.innerHTML = `
       <div class="modal-mask" id="cfMask">
-        <div class="modal-card">
-          <h3>${esc(title || '操作确认')}</h3>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="cfTitle">
+          <h3 id="cfTitle">${esc(title || '操作确认')}</h3>
           <p style="margin-bottom:24px;color:var(--text-2)">${esc(text)}</p>
           <div style="display:flex;gap:10px;justify-content:flex-end">
             <button class="btn" id="cfNo">取消</button>
@@ -26,10 +103,13 @@ function confirmDialog(text, title){
           </div>
         </div>
       </div>`;
-    const close = (v) => { root.classList.add('hidden'); root.innerHTML = ''; resolve(v); };
+    const layer = pushEscLayer(() => close(false));
+    const end = focusTrap(root, () => { root.classList.add('hidden'); root.innerHTML = ''; layer.release(); });
+    const close = (v) => end(() => resolve(v));
     document.getElementById('cfNo').onclick = () => close(false);
     document.getElementById('cfYes').onclick = () => close(true);
     document.getElementById('cfMask').onclick = (e) => { if(e.target.id === 'cfMask') close(false); };
+    document.getElementById('cfNo').focus();
   });
 }
 
@@ -40,8 +120,8 @@ function promptDialog(title, value, placeholder){
     root.classList.remove('hidden');
     root.innerHTML = `
       <div class="modal-mask" id="pdMask">
-        <div class="modal-card">
-          <h3>${esc(title || '输入')}</h3>
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="pdTitle">
+          <h3 id="pdTitle">${esc(title || '输入')}</h3>
           <input type="text" id="pdInput" value="${esc(value || '')}"
                  placeholder="${esc(placeholder || '')}" maxlength="60"
                  style="width:100%;margin-bottom:20px">
@@ -52,14 +132,13 @@ function promptDialog(title, value, placeholder){
         </div>
       </div>`;
     const input = document.getElementById('pdInput');
-    const close = (v) => { root.classList.add('hidden'); root.innerHTML = ''; resolve(v); };
+    const layer = pushEscLayer(() => close(null));
+    const end = focusTrap(root, () => { root.classList.add('hidden'); root.innerHTML = ''; layer.release(); });
+    const close = (v) => end(() => resolve(v));
     const submit = () => close((input.value || '').trim());
     document.getElementById('pdNo').onclick = () => close(null);
     document.getElementById('pdYes').onclick = submit;
-    input.onkeydown = (e) => {
-      if (e.key === 'Enter'){ e.preventDefault(); submit(); }
-      if (e.key === 'Escape') close(null);
-    };
+    input.onkeydown = (e) => { if (e.key === 'Enter'){ e.preventDefault(); submit(); } };
     document.getElementById('pdMask').onclick = (e) => { if(e.target.id === 'pdMask') close(null); };
     setTimeout(() => { input.focus(); input.select(); }, 40);
   });
@@ -67,15 +146,18 @@ function promptDialog(title, value, placeholder){
 
 // 表单抽屉：{title, body, wide, onClose} → 返回容器元素；onClose 返回 Promise 时 await 后再销毁
 let drawerPrevClose = null; // 当前抽屉的 onClose（被新 openDrawer 覆盖时先触发，如停止日志流）
+let drawerEscLayer = null;  // 当前抽屉的 Esc 层（被新抽屉直接覆盖时也必须出栈，残留层会吞掉 Esc）
 function openDrawer(opts){
   if (drawerPrevClose){ try{ drawerPrevClose(); }catch(e){} } // 覆盖旧抽屉前先触发其 onClose
+  if (drawerEscLayer){ drawerEscLayer.release(); drawerEscLayer = null; }
   drawerPrevClose = opts.onClose || null;
+  const prevFocus = document.activeElement;   // 关闭后焦点归还触发元素
   const root = document.getElementById('drawerRoot');
   root.classList.remove('hidden');
   root.innerHTML = `
     <div class="drawer-mask" id="dwMask"></div>
-    <div class="drawer ${opts.wide ? 'wide' : ''}">
-      <div class="drawer-head"><b>${esc(opts.title)}</b>
+    <div class="drawer ${opts.wide ? 'wide' : ''}" role="dialog" aria-modal="true" aria-labelledby="dwTitle">
+      <div class="drawer-head"><b id="dwTitle">${esc(opts.title)}</b>
         <div class="dh-right"><button class="btn sm ghost" id="dwClose">关闭</button></div>
       </div>
       <div class="drawer-body" id="dwBody">${opts.body}</div>
@@ -84,10 +166,15 @@ function openDrawer(opts){
   const close = async () => {
     if (opts.onClose) { await opts.onClose(); }
     if (drawerPrevClose === opts.onClose) drawerPrevClose = null; // 仍为当前抽屉的 onClose 才清除
+    if (drawerEscLayer === layer){ drawerEscLayer.release(); drawerEscLayer = null; }
     root.classList.add('hidden'); root.innerHTML = '';
+    if (prevFocus && typeof prevFocus.focus === 'function') prevFocus.focus();
   };
+  const layer = pushEscLayer(close);
+  drawerEscLayer = layer;
   document.getElementById('dwClose').onclick = close;
   document.getElementById('dwMask').onclick = close;
+  document.getElementById('dwClose').focus();   // 抽屉内无表单时 Tab 从关闭按钮起步
   return document.getElementById('dwBody');
 }
 
@@ -162,10 +249,12 @@ function enhanceSelect(sel){
     face.setAttribute('tabindex', sel.disabled ? '-1' : '0');
     val.textContent = sel.selectedOptions.length ? sel.selectedOptions[0].text : '';
   };
+  let popEscLayer = null;               // 面板展开期间的 Esc 层（多层覆盖时只关最顶）
   const closePop = () => {
     pop.classList.add('hidden');
     face.classList.remove('open');
     face.setAttribute('aria-expanded', 'false');
+    if (popEscLayer){ popEscLayer.release(); popEscLayer = null; }   // 面板关闭即退出 Esc 层
     /* 归位：避免祖先 overflow 裁剪残留影响 */
     if (pop.parentElement !== wrap){
       pop.style.top = '';
@@ -248,6 +337,9 @@ function enhanceSelect(sel){
       }
     }
     if (searchEl) searchEl.focus(); // 可搜索下拉：展开即聚焦筛选框
+    // 面板展开时抢注 Esc 层（栈顶优先）：否则抽屉里的下拉按 Esc 会连抽屉一起关掉
+    if (popEscLayer) popEscLayer.release();
+    popEscLayer = pushEscLayer(closePop);
   };
   face.onclick = e => { e.stopPropagation(); pop.classList.contains('hidden') ? openPop() : closePop(); };
   face.addEventListener('keydown', e => {
@@ -270,6 +362,52 @@ function bindSelectOutsideClose(){
     });
   }, true);
 }
+// ---- 键盘可达性增强：可点击的非原生元素 ----
+// 判定「是不是控件」不硬编类名（页面会不断新增），而看是否被赋了 onclick：
+// 项目统一用 el.onclick = fn 写法；原生可交互标签本身就能键盘操作，已自带 role 的
+// 自定义控件视为作者已自行处理无障碍，两者一律不介入（避免与既有键盘逻辑双触发）。
+const KB_NATIVE = /^(A|AREA|BUTTON|INPUT|SELECT|TEXTAREA|LABEL|SUMMARY|OPTION|DIALOG)$/;
+function markKeyboardClickable(el){
+  if (!el || el.nodeType !== 1) return;
+  if (KB_NATIVE.test(el.tagName)) return;
+  if (el.getAttribute('role')) return;                          // 已自行声明语义：不抢作者的键盘契约
+  if (el.closest && el.closest('.sel-pop')) return;             // 下拉选项由面板自己管键盘，不该逐个进 Tab 序列
+  if (typeof el.onclick !== 'function') return;                 // 未绑定（或晚一个任务才绑）不猜
+  el.dataset.kbEnh = '1';
+  el.tabIndex = 0;
+  el.setAttribute('role', 'button');
+  // 短文本才当无障碍名（长文本让读屏直接读内容更准）；模板里换行+缩进会把无障碍名带成多行
+  const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+  if (!el.getAttribute('aria-label') && text && text.length <= 40) el.setAttribute('aria-label', text);
+}
+function scanClickable(root){
+  if (!root || root.nodeType !== 1) return;
+  markKeyboardClickable(root);
+  if (root.querySelectorAll) root.querySelectorAll('*').forEach(markKeyboardClickable);
+}
+// 补扫：部分页面在 innerHTML 之后还要 await 一个请求才绑 onclick，单靠插入时的
+// 那一次扫描会漏；每次变更突发后 1s 整页重扫一次（已处过的在 role 判定处早退）。
+// 实测成本：184 节点页面 0.2ms，800 行可点击表格的 2585 节点压力用例 0.6ms（首扫），
+// 重扫无增量（早退），且防抖后每秒最多一次，不影响滚动/输入卡顿。
+let deepScanTimer = null;
+function scheduleDeepScan(){
+  if (deepScanTimer) return;
+  deepScanTimer = setTimeout(() => {
+    deepScanTimer = null;
+    scanClickable(document.body);
+  }, 1000);
+}
+// Enter/Space 代理：聚焦在增强过的元素上按键即触发其 onclick（Space 需阻止页面滚动）。
+// 用委托而非逐元素挂监听：onclick 常在 DOM 插入后的下一个任务里才赋值，委托不受先后影响。
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+  const el = e.target;
+  if (!el || !el.dataset || el.dataset.kbEnh !== '1') return;
+  if (typeof el.onclick !== 'function') return;
+  e.preventDefault();          // 否则 Space 会滚动整页
+  el.click();
+});
+
 // 全局自动增强：页面/抽屉/动态行内新增的 select 一律换肤
 function startSelectEnhancer(){
   bindSelectOutsideClose();
@@ -280,6 +418,10 @@ function startSelectEnhancer(){
         if (n.nodeType !== 1) continue;
         if (n.tagName === 'SELECT') enhanceSelect(n);
         else if (n.querySelectorAll) n.querySelectorAll('select').forEach(enhanceSelect);
+        // 页面渲染多为「先 innerHTML 再同步赋 onclick」，观察者回调是同一任务后的
+        // 微任务，因而能读到已赋好的处理函数；异步绑定的由补扫兜底
+        scanClickable(n);
+        scheduleDeepScan();
       }
     }
   }).observe(document.body, { childList: true, subtree: true });

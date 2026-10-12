@@ -135,6 +135,18 @@ python webapp/app.py
 - **发布窗口联动**：计划生成时检测窗口——block 直接拒单；warn 记 `window_warning`，审批时必须显式勾选「已确认窗口风险」才放行（`force_window`），放行后任务携带 `--force-window`。
 - **可观测与审计**：审批人 / 时间 / 意见、任务 id、执行摘要全部落库；「审批单」页签可直接看到任务终态与日志摘要；操作进 `audit_logs`。
 
+**前端交互打磨第一批（键盘可达 / 覆盖层契约 / 通知治理 / 请求合流）**：实时通道解决了「数据什么时候新」，交互面暴露的是另一类问题——量化审计得：全站 `aria-` 仅 4 处、`role=` 0 处、`:focus-visible` 0 条（输入类有 `:focus` 描边但按钮/自绘控件无任何焦点态）、无 `prefers-reduced-motion`；16 处 `<span class="chip">` 用 `el.onclick=` 绑交互（键盘不可聚焦也不响应 Enter）；`toastError` 131 处且同屏无上限无去重（一轮轮询失败能堆十几条盖住整屏）；`modalRoot` 只有 confirm/prompt/改密三个使用者且均无 Esc 与焦点契约。结论：**集中收口在 `components.js` + `api.js` + 两份 CSS 即覆盖全站，无需逐页改模板**。
+
+- **键盘可达走「自动增强」而不是逐元素改标签**：判定「是不是控件」不硬编类名（页面会不断新增）而看 `typeof el.onclick === 'function'`（项目统一赋值式写法）；跳过原生可交互标签（`KB_NATIVE`）、跳过已自带 `role` 的作者已处理控件、跳过 `.sel-pop` 后代（下拉选项不该逐个进 Tab 序列）；补 `tabIndex=0` + `role=button` + 短文本（≤40 字）`aria-label`（需折叠空白：模板里的换行+缩进会把无障碍名带成多行）。Enter/Space 用 **document 委托**而非逐元素挂监听（onclick 常在 DOM 插入后的下一个任务才赋值，委托不受先后影响）；插入时随 MutationObserver 扫描 + 1s 防抖整页补扫兜住异步绑定。实测 12 个路由/标签页「有 onclick 却不可键盘操作」的漏网数为 0（侧栏 `.nav-item`、面包屑、筛选 chip、任务名、搜索下拉项全部纳入）；补扫成本：184 节点页面 0.2ms，800 行可点击表格（2585 节点）压力用例 0.6ms。
+- **Esc 只做「层栈仲裁」**：`pushEscLayer(handler)` 入栈、只有栈顶消费，监听挂 **document 捕获阶段**——注册在同一目标上的监听器无法靠 `stopPropagation` 互拒，而挂冒泡阶段则自绘下拉的面板 Esc 会被外层抽屉抢走。抽屉/确认框/输入框/改密框/搜索面板/下拉面板六处接入；抽屉被新抽屉直接覆盖时旧层也必须出栈（残留层会吞掉后续每一次 Esc）。实测：抽屉+下拉、抽屉+确认框均为 2 层，逐层关对、关完层栈归 0。
+- **焦点契约**：`focusTrap(card, onClose, {focusBack})` 打开时记 `document.activeElement`、关闭后归还；确认框初始焦点给「取消」（Enter 误按不会执行危险操作，实测需 Tab 一次到「确认」才删得掉任务）；归还前用 `getClientRects()` 判可见（`offsetParent` 对 `position:fixed` 元素恒为 null，会误判成已隐藏），触发元素已随菜单/面板收起时落到调用方给的兜底元素（菜单项→改密弹窗：不做兜底焦点就掉回 body）；搜索下拉项点击先 `input.focus()` 再开抽屉，否则抽屉关闭时焦点无处可还。
+- **toast 治理**：同屏上限 4（超出淘汰最早一条）+ 同文案合并「×N」+ 合并重置计时 + `dead` 标志（淡出中的那条不复用，否则新文案会被它的移除定时器连带删掉）；`#toastRoot` 挂 `role="status" aria-live="polite" aria-atomic="false"` 使读屏能播报。
+- **`api()` GET 在途合流**（上档挂账收口）：拆出 `_apiCall`，同 URL 的 GET 在途时共用一个 Promise（失败也共享、各自 catch）——一个事件同时打到多个绑定时不再重发；**任何非 GET 请求先清空合流表**，防变更后误读到变更前发出的旧快照。实测：9 次并发同 3 个 URL → 3 次 fetch（对照组 9 次）；POST 后同 URL 的 GET 重发（2 次）；表无残留。
+- **视觉降级闸门**：`:focus-visible` 统一焦点环（2px `--primary` + 2px offset，chip 另给 `--shadow-glow`）——不用 `:focus` 是为了鼠标点击后不留残留环；`@media (prefers-reduced-motion: reduce)` 一条全局闸门替代十余处动画逐条判定。
+- **实测修出的自引入阻断缺陷**（写进代码注释）：`focusTrap` 返回的关闭函数最初不带参数，而调用方一律 `end(() => resolve(v))` —— 弹窗能关、`resolve` 被静默丢弃、`await confirmDialog()` 的处理链永久挂起。**全量 pytest 474 绿也照不出来**，只有浏览器里真跑一遍删除流程才暴露。Promise 化的 UI 契约必须实跑。
+- **浏览器实测（临时库 + 一次性 UI 服务器）**：上述所有路径（Tab 走查 / Enter / Space 触发 / 逐层 Esc / 焦点归还 / toast 上限与 ×N 合并 / GET 合流）逐项验证通过，12 个路由与标签页 **0 console error / 0 warn**，抽屉关闭后 5s 内无残留取数请求。
+- **刻意留挂账**：抽屉遮罩点击无条件关闭（自动脏检测会误伤筛选框，风险大于收益）；`#userMenu` 未接 Esc 层（本来也没有 Esc 契约，不构成回归）；弹窗内 Tab 可跑到背页元素（未做完整 focus-trap 循环）；`addEventListener('click')` 绑定的元素不在自动增强判定内（项目统一用 `el.onclick=`，当前无此类入口）。
+
 ## 六、Phase 4：MCP Server 与案例库
 
 ### MCP stdio

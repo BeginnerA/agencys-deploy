@@ -45,10 +45,17 @@ function renderTopbar(){
   const input = document.getElementById('globalSearch');
   const drop = document.getElementById('searchDrop');
   let searchTimer = null;
+  // 面板打开期间入 Esc 层：与抽屉/弹窗共用一个层栈仲裁，否则抽屉开着时一次 Esc
+  // 会把两层同时关掉（注册在同一目标上的监听器无法靠 stopPropagation 互拒）
+  let searchEscLayer = null;
+  function closeSearchDrop(){
+    drop.style.display = 'none';
+    if (searchEscLayer){ searchEscLayer.release(); searchEscLayer = null; }
+  }
   input.addEventListener('input', () => {
     clearTimeout(searchTimer);
     const kw = input.value.trim();
-    if (!kw){ drop.style.display = 'none'; return; }
+    if (!kw){ closeSearchDrop(); return; }
     searchTimer = setTimeout(async () => {
       try{
         const tasks = await api('/api/tasks?limit=100').catch(() => []);
@@ -71,18 +78,24 @@ function renderTopbar(){
         if (!rows.length){ drop.innerHTML = '<div class="drop-item">无匹配结果</div>'; }
         else {
           drop.innerHTML = rows.map(r => `<div class="drop-item">${esc(r.label)}<span class="k">${esc(r.sub)}</span></div>`).join('');
-          [...drop.children].forEach((el, i) => el.onclick = () => { drop.style.display='none'; input.value=''; rows[i].goto(); });
+          [...drop.children].forEach((el, i) => el.onclick = () => {
+            closeSearchDrop(); input.value = '';
+            // 面板已隐，不能把焦点还给看不见的选项：先回到搜索框，后面的抽屉/弹窗关闭时才能把焦点退回这里
+            input.focus();
+            rows[i].goto();
+          });
         }
         const r = input.getBoundingClientRect();
         drop.style.top = (r.bottom + 6) + 'px';
         drop.style.left = r.left + 'px';
         drop.style.width = Math.max(280, r.width) + 'px';
         drop.style.display = 'block';
+        if (searchEscLayer) searchEscLayer.release();
+        searchEscLayer = pushEscLayer(() => { closeSearchDrop(); input.value = ''; input.blur(); });
       }catch(e){ /* 搜索失败静默 */ }
     }, 300);
   });
-  input.addEventListener('keydown', e => { if(e.key === 'Escape'){ drop.style.display = 'none'; input.value=''; } });
-  document.addEventListener('click', (e) => { if(!input.contains(e.target) && !drop.contains(e.target)) drop.style.display='none'; });
+  document.addEventListener('click', (e) => { if(!input.contains(e.target) && !drop.contains(e.target)) closeSearchDrop(); });
 }
 // 修改密码弹窗（首登强制改密复用；改密成功前业务 API 均 403）
 function openPwdModal(){
@@ -90,8 +103,8 @@ function openPwdModal(){
   root.classList.remove('hidden');
   root.innerHTML = `
     <div class="modal-mask" id="pwdMask">
-      <div class="modal-card">
-        <h3>修改密码</h3>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="pwdTitle">
+        <h3 id="pwdTitle">修改密码</h3>
         <div class="field" style="margin-bottom:12px"><label>原密码</label>
           <input type="password" id="pwdOld" placeholder="原密码"></div>
         <div class="field" style="margin-bottom:20px"><label>新密码（至少 6 位）</label>
@@ -102,7 +115,13 @@ function openPwdModal(){
         </div>
       </div>
     </div>`;
-  const close = () => { root.classList.add('hidden'); root.innerHTML = ''; };
+  // 与 confirm/prompt 同一套覆盖层契约：Esc 可关（与现有的遮罩点击可关同效）、
+  // 打开即聚焦首个输入框、关闭后焦点归还触发元素（focusTrap 内部已记并归还）
+  const layer = pushEscLayer(close);
+  // 菜单项→弹窗：菜单已收，prev 元素看不见，兜底回用户芯片
+  const end = focusTrap(root, () => { root.classList.add('hidden'); root.innerHTML = ''; layer.release(); },
+                        {focusBack: document.getElementById('userChip')});
+  function close(){ end(); }
   document.getElementById('pwdMask').onclick = (e) => { if(e.target.id === 'pwdMask') close(); };
   document.getElementById('pwdCancel').onclick = close;
   document.getElementById('pwdOk').onclick = async () => {
@@ -115,6 +134,7 @@ function openPwdModal(){
       close(); toastSuccess('密码已修改');
     }catch(e){ toastError(e.message); }
   };
+  document.getElementById('pwdOld').focus();
 }
 // 跑马灯：渲染最近发布事件
 function renderMarquee(latest){
