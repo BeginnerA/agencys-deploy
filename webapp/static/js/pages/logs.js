@@ -428,7 +428,7 @@
     if (result){
       html += `<div style="color:var(--success);margin-top:6px">本次清理：删除 ${result.deleted_entries || 0} 条索引、归档 ${result.archived_files || 0} 个文件、永久删除 ${result.purged_files || 0} 个归档；数据库 ${fmtMB(result.db_size_before)} → ${fmtMB(result.db_size_after)}</div>`;
       if (result.needs_full_vacuum){
-        html += `<div class="warn" style="margin-top:4px;line-height:1.7">⚠ 检测到 ${result.freelist_mb_after || ''} MB 空闲页无法增量回收（数据库尚未完成一次性 VACUUM 转换，incremental_vacuum 不生效）。若想真正缩小文件：先下调「日志保留天数」清掉大量旧数据，再停止平台执行 <code>python scripts/db_vacuum.py</code>。</div>`;
+        html += `<div class="warn" style="margin-top:4px;line-height:1.7">⚠ 检测到 ${result.freelist_mb_after || ''} MB 空闲页本轮未能增量回收（常见原因：平台正在运行占用数据库文件、原地截断被阻止；或库尚未完成一次性 VACUUM 转换）。若想真正缩小文件：停止平台后执行 <code>python scripts/db_vacuum.py</code>（做一次完整 VACUUM 即可强制回收）。</div>`;
       }
     }
     return html;
