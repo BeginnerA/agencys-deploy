@@ -18,17 +18,19 @@
   let _svcLogRows = [];
 
   // 服务卡片：状态灯优先级 发布中 > 探测结果（沿用旧 dotClass 语义）
-  function dotClass(svc, runningTask){
+  function dotClass(svc, runningTask, isStatic){
     if (runningTask) return 'warn';
     const st = svc.status;
     if (st === 'online') return 'ok';
     if (st === 'error' || st === 'stopped') return 'bad';
     if (st === 'probe_failed') return 'warn';
+    if (st === 'unknown' && isStatic) return 'gray';  // 静态未配探活：中性灰，不红
     return 'gray';
   }
-  function svcLabel(st, run){
+  function svcLabel(st, run, isStatic){
     if (run) return '发布中';
     const map = {online:'在线', error:'异常', stopped:'已停止', not_deployed:'未部署', probe_failed:'探测失败'};
+    if (isStatic && (st.status === 'unknown' || !st.status)) return '未配探活';
     return map[st.status] || '未知';
   }
 
@@ -88,10 +90,14 @@
       const run = running.find(r =>
         (r.type === 'project' && r.name === s.name && r.env === state.currentEnv) ||
         (r.type === 'restart' && r.ref_id === s.id && r.env === state.currentEnv));
-      const ver = st.version || '—';
+      // 静态站点无镜像/容器版本可采，在线版本取最近一次成功发布任务的版本
+      // （平台是线上 .deploy_version 的唯一写入方，tasksCache 按 id DESC 故 find 即最新）
+      const lastOk = isStatic ? tasksCache.find(t =>
+        t.name === s.name && t.env === state.currentEnv && t.status === 'success' && t.version) : null;
+      const ver = isStatic ? ((lastOk && lastOk.version) || '—') : (st.version || '—');
       const inst = st.instances !== undefined && st.instances !== -1 ? st.instances : '—';
       const ts = st.ts ? fmtTime(st.ts) : '';
-      const dotCls = dotClass(st, run);
+      const dotCls = dotClass(st, run, isStatic);
       // 健康探测结果（无专用接口时由后端自适应：宽松 HTTP → TCP 兜底）
       const hc = hcStatus[s.name];
       const hcTxt = hc && hc.ok
@@ -105,12 +111,20 @@
           ${s.enabled ? '' : '<span class="weak" style="font-size:11px">(停用)</span>'}
           ${upTxt ? '<span class="weak" style="margin-left:auto;font-size:11px">⏱'+upTxt+'</span>' : ''}</div>
         <div class="svc-meta">
-          <div><span class="weak">${isStatic ? '版本' : '镜像'}</span> <span class="num">${esc(ver)}</span></div>
+          ${isStatic ? `
+          <div><span class="weak">版本</span> <span class="num">${esc(ver)}</span>
+               <span class="weak" style="margin-left:10px">状态</span> ${svcLabel(st, run, isStatic)}</div>
+          <div><span class="weak">站点根</span> <span class="num ellipsis" style="display:inline-block;max-width:78%;vertical-align:bottom" title="${esc(s.site_root || '')}">${esc(s.site_root || '未配置')}</span></div>
+          <div><span class="weak">探活</span> ${s.health_url
+            ? `<span class="num ellipsis" style="display:inline-block;max-width:60%;vertical-align:bottom" title="${esc(s.health_url)}">${esc(s.health_url)}</span>`
+            : '<span class="weak" style="font-size:11px">未配置，无法探测在线状态</span>'}
+               ${ts ? `<span class="weak" style="margin-left:10px">探测</span> ${ts}` : ''}</div>` : `
+          <div><span class="weak">镜像</span> <span class="num">${esc(ver)}</span></div>
           <div><span class="weak">实例</span> <span class="num">${inst}</span>
                <span class="weak" style="margin-left:10px">状态</span> ${svcLabel(st, run)}</div>
           <div><span class="weak">端口</span> <span class="num">${s.health_port || '-'}</span>
                ${ts ? `<span class="weak" style="margin-left:10px">探测</span> ${ts}` : ''}</div>
-          <div><span class="weak">健康</span> ${hcTxt}</div>
+          <div><span class="weak">健康</span> ${hcTxt}</div>`}
         </div>
         <div class="svc-foot">
           ${canDeploy() ? `<button class="btn sm primary" data-pub="${s.id}">发布</button>

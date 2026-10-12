@@ -95,7 +95,7 @@
           ${isFrontend ? `
           <div class="field full"><label>构建步骤（commands）</label>
             ${H.cmdList({ id:'sBuildOrder', rows: d.build_order }).html}
-            <div class="f-hint">每个步骤填写工作目录和命令列表（每行一条命令）；支持 \${VERSION} 变量替换；自动探测 npm/pnpm/yarn 可执行路径。</div>
+            <div class="f-hint">每个步骤填写工作目录和命令列表（每行一条命令，框高随内容自动伸展）；支持 \${VERSION} 变量替换；自动探测 npm/pnpm/yarn 可执行路径；步骤级环境变量（env，如 NODE_OPTIONS）保存时原样保留。</div>
           </div>` : `
           <div class="field full"><label>构建顺序（build_order）</label>
             ${H.rowList({ id:'sBuildOrder', rows: d.build_order }).html}

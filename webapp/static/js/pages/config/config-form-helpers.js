@@ -118,14 +118,18 @@
   }
 
   // ---- 行编辑器（build_order：模块名/相对路径/goal/额外 profile） ----
-  // ---- 前端构建步骤编辑器（name/path/commands 多行文本） ----
+  // ---- 前端构建步骤编辑器（name/path/commands；commands 为数组：一个步骤按序执行
+  // 多条命令，用「每行一条」的 textarea 承载最自然；rows=1 + 自动增高，
+  // 单条命令时视觉等同单行输入框。步骤级 env（如 NODE_OPTIONS）由 CLI/配置 API
+  // 写入，UI 不透传编辑但随行承载回读，杜绝整体重建保存时静默丢失） ----
   function cmdList({id, rows}){
     const buildRow = (r, i) => {
       const cmds = (r.commands || []).join('\n');
-      return `<div class="row-item" data-i="${i}">
+      const envJson = (r.env && Object.keys(r.env).length) ? JSON.stringify(r.env) : '';
+      return `<div class="row-item" data-i="${i}" data-env="${esc(envJson)}">
         <input class="ri-name" placeholder="步骤名（仅展示）" value="${esc(r.name || '')}">
         <input class="ri-path" placeholder="工作目录（相对 project_root）" value="${esc(r.path || '')}">
-        <textarea class="ri-cmds" rows="3" placeholder="每行一条命令，如&#10;npm install&#10;npm run build">${esc(cmds)}</textarea>
+        <textarea class="ri-cmds" rows="1" placeholder="每行一条命令，如&#10;npm install&#10;npm run build">${esc(cmds)}</textarea>
         <span class="ri-btns">
           <button data-act="up" title="上移">↑</button>
           <button data-act="down" title="下移">↓</button>
@@ -133,14 +137,23 @@
         </span>
       </div>`;
     };
+    // 自适应高度：内容几行就撑多高，上限与滚动条由 CSS 控制
+    const autoGrow = ta => { ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 'px'; };
+    const growAll = box => box.querySelectorAll('.ri-cmds').forEach(ta => {
+      if (!ta.dataset.growBound){ ta.dataset.growBound = '1'; ta.addEventListener('input', () => autoGrow(ta)); }
+      autoGrow(ta);
+    });
     const getBox = () => document.getElementById(id);
     const readRow = el => {
       const cmds = el.querySelector('.ri-cmds').value.split('\n').map(s => s.trim()).filter(Boolean);
-      return {
+      const row = {
         name: el.querySelector('.ri-name').value.trim(),
         path: el.querySelector('.ri-path').value.trim(),
         commands: cmds,
       };
+      const envJson = el.getAttribute('data-env');
+      if (envJson){ try{ const env = JSON.parse(envJson); if (env && typeof env === 'object' && Object.keys(env).length) row.env = env; }catch(e){} }
+      return row;
     };
     return {
       html: `<div class="row-list" id="${id}">
@@ -163,6 +176,7 @@
                 else if (act === 'del') arr.splice(i, 1);
                 box.querySelectorAll('.row-item').forEach(el => el.remove());
                 arr.forEach((r, j) => box.insertAdjacentHTML('beforeend', buildRow(r, j)));
+                growAll(box);
                 bindActions();
               };
             });
@@ -170,8 +184,10 @@
         };
         box.querySelector('.row-add button').onclick = () => {
           box.insertAdjacentHTML('beforeend', buildRow({name:'', path:'', commands:[]}, read().length));
+          growAll(box);
           bindActions();
         };
+        growAll(box);
         bindActions();
       },
       read(){
