@@ -1,0 +1,30 @@
+智能运维平台 便携版 - 第三方组件与许可声明
+==================================================
+
+本便携包内含以下第三方组件，版权归各自作者所有：
+
+【运行时】
+- Python 3.12（PSF License）
+
+【直接依赖】
+- Flask          BSD-3-Clause
+- PyYAML         MIT
+- requests       Apache-2.0
+- PyMySQL        MIT
+- paramiko       LGPL-2.1
+- PyJWT          MIT
+- croniter       MIT
+- cryptography   Apache-2.0 / BSD-3-Clause
+
+【传递依赖】
+- Werkzeug / Jinja2 / MarkupSafe / itsdangerous   BSD-3-Clause
+- click（BSD-3-Clause）、blinker（MIT）
+- urllib3（MIT）、certifi（MPL-2.0）、charset-normalizer（MIT）、idna（BSD-3-Clause）
+- cffi（MIT）、pycparser（BSD-3-Clause）
+- bcrypt（Apache-2.0）、PyNaCl（Apache-2.0）
+- python-dateutil（Apache-2.0 / BSD-3-Clause）、six（MIT）、invoke（BSD-2-Clause）
+
+完整依赖清单见包内 requirements.txt；各组件元数据（含完整许可文本）
+见 runtime\python\Lib\site-packages 下对应的 *.dist-info 目录。
+
+本项目自身以 Apache-2.0 许可开源（见 LICENSE）。
