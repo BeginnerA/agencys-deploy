@@ -55,8 +55,9 @@
     if (b.dead) return;
     b.lastRun = Date.now();
     let r;
-    try{ r = b.fn(); }catch(e){ /* 刷新失败静默：与既有 poll() 口径一致 */ }
-    // 约定沿用 poll()：回调返回 false 表示不再需要该绑定（如跑马灯被关闭）；
+    // 取数回调失败一律静默（通道降级或后端瞬时不可用会成批触发，不能弹 toast 刷屏）
+    try{ r = b.fn(); }catch(e){ /* 静默 */ }
+    // 约定：回调返回 false 表示不再需要该绑定（如跑马灯被关闭）；
     // 异步回调拿到的是 Promise，必须解包后再判 false
     if (r && typeof r.then === 'function'){
       r.then(v => { if (v === false) unbind(b); }).catch(() => {});

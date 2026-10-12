@@ -121,7 +121,7 @@ python webapp/app.py
 - **事件总线**（`webapp/events.py`，进程内）：`subscribe(topics)`/`publish(topic, data)`/`next_event(sub, timeout)`；每订阅者一条 `maxsize=100` 有界队列，写满只置 `gap` 标记并计 `dropped`、**绝不抛错影响业务**（`publish` 内部全吞异常返回 False）；队列曾溢出且当前排空时补一帧 `{"topic":"resync"}` 提示前端全量重取；全局单调 `seq` 便于排障；订阅者上限 64，超限拒接新连接。事件只作**信号**、不带业务数据契约，客户端收到后仍走原有 REST 取数，避免为推送另立一份易漂移的数据结构。
 - **生产者埋点取「唯一漏斗」**：任务状态只在 `db.update_task`（`status` 变化才推）推、告警/运行单/建议状态只在 `db.update_record` 的**表→主题映射表** `_STATUS_TOPICS`（`alerts`→alerts、`agent_runs`/`agent_advice`→agent，且载荷统一为 `{table,id,status}`）推——后者一处即覆盖 route 层手工 ack/resolve/reopen/批量与引擎自动恢复，比在 5 个处理点重复埋点更不易漏、也不会双发；映射表**显式不含 `tasks`**（该表走 `update_task` 专属漏斗，双埋会造成每个状态两帧）；`db.create_task` 是 Web/CLI/Agent/调度/webhook 六个创建入口的共同漏斗，在此推 `tasks` 的 `created` 事件（排队项新建也是列表变化源）；`monitor._cycle/refresh` 推 `{round, envs}`；`alert_engine._fire` 只在**新建告警**分支推（同指纹每轮重复命中不推，防事件风暴）；`advisor.save_advice` 推 `agent`；`LogCollector` 在**轮末**汇总一帧 `logs`（本轮新增行数 + 涉及服务，无增量不推，避免每容器一帧把已绑页面打成重取风暴）。
 - **事件化边界靠「是否本进程写入」判定**：服务日志由采集器线程写 `log_entries`（进程内）→ 事件化；**任务日志文件由发布子进程直接写**（`/api/tasks/<id>/log` 走 `tail_log(task["log_file"])`，跨进程收不到总线事件）→ 发布抽屉 2s、日志中心 3s 的**增量追尾轮询必须保留**，只把「终态收尾与列表徽标刷新」交给 `tasks` 事件。此取舍写进代码注释，防止后来者误删轮询导致日志不再追尾。
-- **前端双态调度**（`webapp/static/js/live.js`）：`liveBind(topic | topics[], fn, fallbackMs) → off()`，一个刷新函数可吃多个事件源（如设备卡片墙同时盯 `monitor`+`tasks`）——**多主题必须绑一条**，绑多条会让合并窗口各自失效、同一事件重复重取。通道 online 时靠事件驱动（同绑定 400ms 合并，沿用轮询性能口径）并清掉兜底定时器；connecting/degraded 时按各自 `fallbackMs` 退回轮询——**任何时刻都存在取数路径，不存在「既不推也不轮」的死角**；页面 hidden 释放长连接并降频至 ≥60s、回前台立即重连（已 online 且可见时跳过重建，防可见性抖动重复订阅）；沿用既有 `poll()` 的「回调返回 false 即自动解绑」契约（异步回调返回 Promise 需先解包再判）。落地节奏：先接 dashboard / alerts / 全局角标跑马灯三处，随后一次收口余下五处（deploy 列表 5s、devices 卡片墙 3s 与服务日志 5s、agent 15s、schedules 10s、logs 任务下拉 3s）——**平台已无盲轮询，仅存两处刻意保留的子进程日志追尾轮询**。页面改造统一走 `liveOffs` + `clearLiveOffs()` + `destroy()` 解绑，`render()` 仍返回定时器数组（现为空数组）以守路由契约。
+- **前端双态调度**（`webapp/static/js/live.js`）：`liveBind(topic | topics[], fn, fallbackMs) → off()`，一个刷新函数可吃多个事件源（如设备卡片墙同时盯 `monitor`+`tasks`）——**多主题必须绑一条**，绑多条会让合并窗口各自失效、同一事件重复重取。通道 online 时靠事件驱动（同绑定 400ms 合并，沿用轮询性能口径）并清掉兜底定时器；connecting/degraded 时按各自 `fallbackMs` 退回轮询——**任何时刻都存在取数路径，不存在「既不推也不轮」的死角**；页面 hidden 释放长连接并降频至 ≥60s、回前台立即重连（已 online 且可见时跳过重建，防可见性抖动重复订阅）；沿用已退役的 `poll()` “回调返回 false 即自动解绑”契约（异步回调返回 Promise 需先解包再判；`poll()` 本体已在本批删除，详见下段）。落地节奏：先接 dashboard / alerts / 全局角标跑马灯三处，随后一次收口余下五处（deploy 列表 5s、devices 卡片墙 3s 与服务日志 5s、agent 15s、schedules 10s、logs 任务下拉 3s）——**平台已无盲轮询，仅存两处刻意保留的子进程日志追尾轮询**。页面改造统一走 `liveOffs` + `clearLiveOffs()` + `destroy()` 解绑，`render()` 仍返回定时器数组（现为空数组）以守路由契约。
 - **重连退避只能以 `hello` 帧为凭**（实测踩坑）：首版在 HTTP 200 就复位退避计数，而服务端订阅满时会返回 **200 + `error` 帧并立即收尾**，于是 online→closed→degraded→1s 重连形成风暴（deploy 页 13s 内约 12 次 `/api/stream`）。改为收到 `hello` 才复位 `attempt`、收到 `error` 置 `capped` 并把下次退避抬到 30s 下限。
 - **通道可视**：顶栏通道指示灯做成胶囊芯片（`.live-chip` + 在线呼吸光环，复用既有 `.dot.ok/warn/gray` 与主题 token，不引入新视觉语系；原 `.tb-btn` 32px 方壳会把圆点+文字挤掉），点击展开详情小面板（定位范式同 `#userMenu`）显示通道状态 / 最近事件时间 / 订阅主题 / 一键重连，面板开着时随事件跳动刷新；`GET /api/stream?topics=` 订阅须在**生成器体内**发生（视图里订阅会在「客户端一帧未读即断开」时因生成器从未启动、`finally` 不执行而泄漏订阅者），超限改发 `error` 帧并立即收尾；死连接要等下一次写帧（事件或 15s 心跳）才因 BrokenPipe 退出生成器，回收窗口上界即心跳周期。
 - **Agent 侧**：新增只读工具 `live_status`（三级角色全可见）返回订阅数/累计发布/丢弃数/主题与 monitor、alert_engine、log_collector 是否在跑及其周期，用于回答「数据为什么不即时更新」。
@@ -146,6 +146,7 @@ python webapp/app.py
 - **实测修出的自引入阻断缺陷**（写进代码注释）：`focusTrap` 返回的关闭函数最初不带参数，而调用方一律 `end(() => resolve(v))` —— 弹窗能关、`resolve` 被静默丢弃、`await confirmDialog()` 的处理链永久挂起。**全量 pytest 474 绿也照不出来**，只有浏览器里真跑一遍删除流程才暴露。Promise 化的 UI 契约必须实跑。
 - **浏览器实测（临时库 + 一次性 UI 服务器）**：上述所有路径（Tab 走查 / Enter / Space 触发 / 逐层 Esc / 焦点归还 / toast 上限与 ×N 合并 / GET 合流）逐项验证通过，12 个路由与标签页 **0 console error / 0 warn**，抽屉关闭后 5s 内无残留取数请求。
 - **刻意留挂账**：抽屉遮罩点击无条件关闭（自动脏检测会误伤筛选框，风险大于收益）；`#userMenu` 未接 Esc 层（本来也没有 Esc 契约，不构成回归）；弹窗内 Tab 可跑到背页元素（未做完整 focus-trap 循环）；`addEventListener('click')` 绑定的元素不在自动增强判定内（项目统一用 `el.onclick=`，当前无此类入口）。
+- **顺手清掉上一档遗留的死代码**：全站迁到 `liveBind` 后，`api.js` 的 `poll()` 盲轮询封装已无任何调用点（全仓 grep 仅余定义与两句注释引用），留着只会诱导新页面退回定时轮询，故删除并在原位置注明“为何需要定时器的两处（发布抽屉 2s / 日志中心 3s 子进程日志追尾）直接用自己的 setInterval”；`live.js` 里两处“沿用 poll() 契约”的注释改为自包含描述。
 
 ## 六、Phase 4：MCP Server 与案例库
 
@@ -207,7 +208,7 @@ python agent/mcp_server.py --db data/platform.db --role operator --user ops
 | GET | /agent/config | 网关配置状态（**不回显 api_key**） | admin |
 | POST | /agent/config | 保存网关配置（base_url/api_key/model） | admin |
 | GET | /deploy/canary-decisions/<task_id> | 既有灰度接口，waiting 时附加 advice 建议 | 登录用户 |
-| GET | /stream | 页面实时通道（SSE，`text/event-stream`）；topics=monitor/alerts/tasks/agent 过滤，15s 心跳，带 `X-Accel-Buffering: no` | 登录用户 |
+| GET | /stream | 页面实时通道（SSE，`text/event-stream`）；topics=monitor/alerts/tasks/agent/logs 过滤，15s 心跳，带 `X-Accel-Buffering: no` | 登录用户 |
 
 ## 九、配置项
 
