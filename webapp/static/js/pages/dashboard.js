@@ -215,14 +215,13 @@
             // Docker 磁盘
             const ddf = ext.docker_df || {};
             const dockerTotal = (ddf.images||0) + (ddf.containers||0) + (ddf.volumes||0);
-            // 健康检查延迟（取该服务器上在线服务的健康检查结果）+ 探测方式
+            // 健康检查延迟（取本服务器上探测成功的服务）+ 探测方式
+            // health_checks 按服务名索引，值带 host 字段（后端 SSH 本地探测回填）
             const hcData = mon && mon.health_checks || {};
             let hcMs = null, hcMethod = '';
             const HC_METHOD = { http_strict: '接口', http_loose: 'HTTP', tcp: 'TCP' };
-            for (const [sn, hd] of Object.entries(hcData)) {
-              if (csObj[sn] || Object.keys(csObj).length === 0) {
-                if (hd.ms > 0) { hcMs = hd.ms; hcMethod = HC_METHOD[hd.method] || ''; break; }
-              }
+            for (const hd of Object.values(hcData)) {
+              if (hd.host === sv.host && hd.ms >= 0) { hcMs = hd.ms; hcMethod = HC_METHOD[hd.method] || ''; break; }
             }
             return `<tr>
               <td><span class="dot ${sv.ssh_ok?'ok':'bad'}"></span><span class="num">${esc(sv.host)}</span></td>

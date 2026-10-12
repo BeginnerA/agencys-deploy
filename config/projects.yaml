@@ -35,11 +35,13 @@
 # nacos_groups           - Nacos 分组列表，服务在多个分组下注册时须全部列出（上下线会遍历所有分组）
 # dubbo_services         - Dubbo 额外服务名列表（Nacos 里除应用服务名外还可能出现的服务名）
 # snailjob_group         - SnailJob group_name，非定时任务项目留空
-# health_url             - （可选）专用健康检查 URL，{ip} 会被替换为当前服务器 IP；配置后按严格模式检查（须返回 200）
-# health_port            - 服务业务端口，用于探活/发布启动判定；监控面板按下述分层退化检查：
-#                         ① 有 health_url → HTTP 严格（要求 200）；② 无 health_url 但有 health_port
-#                         → 自适应（宽松 HTTP：任意响应码即存活 → TCP 端口连通兜底）；
-#                         ③ 两者均无 → 发布时退化为容器运行状态 + 日志检查（现实项目大多适用 ②）
+# health_url             - （可选）专用健康检查 URL，{ip} 会被替换为探测目标 IP；配置后按严格模式检查（须返回 200）
+# health_port            - 服务业务端口，用于探活/发布启动判定。监控面板的健康检查经 SSH 在
+#                         目标服务器本地对 127.0.0.1:{health_port} 执行（微服务业务端口通常不对
+#                         公网放行，从监控机直连必失败），按下述分层退化：
+#                         ① 有 health_url → curl 严格（须 200）；② 无 health_url → curl 宽松
+#                         （任意 HTTP 响应码即存活）→ /dev/tcp 端口连通兜底；
+#                         ③ 无 health_port → 不探测（健康列留空）
 # log_error_keywords     - 日志中判定启动失败的错误关键字
 # clear_log_dir          - 宿主机应用日志目录（如 1Panel 挂载的 logs 目录）；配置了该路径则在启动新
 #                         容器前清空该目录下所有文件（保留目录结构）；省略/留空则不清空（默认）

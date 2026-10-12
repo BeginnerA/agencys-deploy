@@ -79,5 +79,71 @@ class TestProbeHealthAdaptive(unittest.TestCase):
         self.assertEqual(r["method"], "tcp")
 
 
+class TestProbeHealthViaSsh(unittest.TestCase):
+    """SSH 本地探测：微服务端口不对公网放行，改为在服务器 localhost 探测。
+    验证命令生成（针对 127.0.0.1、分层、并行）与输出解析。"""
+
+    def _run(self, out):
+        captured = {}
+
+        def fake_ssh_exec(host, port, ssh_cfg, cmd, timeout=10):
+            captured["cmd"] = cmd
+            return out
+
+        with mock.patch.object(monitor, "_ssh_exec", side_effect=fake_ssh_exec):
+            res = monitor._probe_health_via_ssh(
+                "10.0.0.1", 22, {}, [("svcA", 9210, ""), ("svcB", 9207, "/x/health")])
+        return dict(res), captured["cmd"]
+
+    def test_parses_all_layers(self):
+        out = ("svcA|tcp|2|1\n"
+               "svcB|http_strict|8|200\n")
+        res, cmd = self._run(out)
+        self.assertTrue(res["svcA"]["ok"])
+        self.assertEqual(res["svcA"]["method"], "tcp")
+        self.assertEqual(res["svcA"]["ms"], 2)
+        self.assertTrue(res["svcB"]["ok"])
+        self.assertEqual(res["svcB"]["method"], "http_strict")
+
+    def test_strict_non200_is_not_ok(self):
+        out = "svcB|http_strict|5|404\n"
+        res, _ = self._run(out)
+        self.assertFalse(res["svcB"]["ok"])
+        self.assertEqual(res["svcB"]["ms"], -1)
+
+    def test_loose_any_code_alive(self):
+        # 无 health_url 服务 curl 拿到 401 也算存活
+        out = "svcA|http_loose|3|401\n"
+        res, _ = self._run(out)
+        self.assertTrue(res["svcA"]["ok"])
+        self.assertEqual(res["svcA"]["method"], "http_loose")
+
+    def test_down_not_ok(self):
+        out = "svcA|down|-1|0\n"
+        res, _ = self._run(out)
+        self.assertFalse(res["svcA"]["ok"])
+
+    def test_zero_ms_bumped_to_one_for_display(self):
+        out = "svcA|tcp|0|1\n"
+        res, _ = self._run(out)
+        self.assertEqual(res["svcA"]["ms"], 1)
+
+    def test_command_targets_localhost_and_parallel(self):
+        _, cmd = self._run("")
+        self.assertIn("127.0.0.1:9210", cmd)
+        self.assertIn("127.0.0.1:9207/x/health", cmd)
+        self.assertIn("/dev/tcp/127.0.0.1/9210", cmd)
+        # 两个检查各自后台并行，末尾统一 wait
+        self.assertEqual(cmd.count(" ) &"), 2)
+        self.assertTrue(cmd.rstrip().endswith("wait"))
+
+    def test_ssh_failure_returns_empty(self):
+        with mock.patch.object(monitor, "_ssh_exec",
+                               side_effect=OSError("ssh down")):
+            res = monitor._probe_health_via_ssh(
+                "10.0.0.1", 22, {}, [("svcA", 9210, "")])
+        self.assertEqual(res, [])
+
+
 if __name__ == "__main__":
     unittest.main()

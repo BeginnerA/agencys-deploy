@@ -153,6 +153,70 @@ def _merge_server_ssh(env_ssh: dict, s: dict) -> dict:
     return ssh
 
 
+def _probe_health_via_ssh(host: str, ssh_port: int, ssh_cfg: dict,
+                          checks: list, timeout: int = 15) -> list:
+    """通过 SSH 在目标服务器本地探测服务健康（对 127.0.0.1:port）。
+
+    现实项目里微服务业务端口通常只在宿主机 localhost / 内网暴露，云安全组不对
+    公网放行，从监控机直连必然超时（历史 response_time_history 全为 -1/0 即此因）。
+    改为复用 _probe_server_full 已建立的 SSH 连接，在服务器本地一次性批量探测该主机
+    上的全部在线服务端口，规避外部网络不可达问题。
+
+    checks: [(svc_name, health_port, health_url), ...]
+    返回 [(svc_name, {"ok": bool, "ms": int, "method": str}), ...]。
+    分层（均在 localhost 执行）：有 health_url → curl 严格（须 200）；
+    无 health_url → curl 宽松（任意 HTTP 响应码即存活）→ /dev/tcp 端口连通兜底。
+    各检查后台并行执行（&）+ wait，总耗时≈单个最慢检查而非累加。
+    """
+    if not checks:
+        return []
+    bodies = []
+    for name, hp, hu in checks:
+        qn = shlex.quote(str(name))
+        hp = int(hp)
+        if hu:
+            url = hu.replace("{ip}", "127.0.0.1")
+            target = shlex.quote(f"http://127.0.0.1:{hp}{url}")
+            bodies.append(
+                f"T=$(date +%s%3N); C=$(curl -s -o /dev/null -m 3 -w '%{{http_code}}' {target} 2>/dev/null); "
+                f"E=$(date +%s%3N); echo {qn}|http_strict|$((E-T))|$C"
+            )
+        else:
+            target = shlex.quote(f"http://127.0.0.1:{hp}/")
+            bodies.append(
+                f"T=$(date +%s%3N); C=$(curl -s -o /dev/null -m 3 -w '%{{http_code}}' {target} 2>/dev/null); "
+                f"E=$(date +%s%3N); "
+                f"if [ -n \"$C\" ] && [ \"$C\" != 000 ]; then echo {qn}|http_loose|$((E-T))|$C; "
+                f"else T2=$(date +%s%3N); timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{hp}' 2>/dev/null "
+                f"&& E2=$(date +%s%3N) && echo {qn}|tcp|$((E2-T2))|1 || echo {qn}|down|-1|0; fi"
+            )
+    cmd = " ".join(f"( {b} ) &" for b in bodies) + " wait"
+    try:
+        out = _ssh_exec(host, ssh_port, ssh_cfg, cmd, timeout=timeout)
+    except Exception:
+        return []
+    results = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.count("|") < 3:
+            continue
+        name, method, ms_s, extra = line.split("|", 3)
+        try:
+            ms = int(float(ms_s))
+        except ValueError:
+            ms = -1
+        if method == "http_strict":
+            ok = (extra.strip() == "200")
+        elif method in ("http_loose", "tcp"):
+            ok = True
+        else:  # down
+            ok = False
+        if ok and ms < 1:
+            ms = 1  # localhost 亚毫秒连接按 1ms 计，保证前端有值可显
+        results.append((name, {"ok": ok, "ms": ms if ok else -1, "method": method}))
+    return results
+
+
 def _probe_server_full(host: str, port: int, ssh_cfg: dict, service_names: set,
                        timeout: int = 10, skip_extended: bool = False) -> dict:
     """单连接探测整台服务器：容器镜像 + docker stats 资源 + 主机指标 + 扩展指标
@@ -931,39 +995,48 @@ class MonitorScheduler:
                         result["services"][s["name"]]["instances"] = fut.result(timeout=20)
                     except Exception:
                         result["services"][s["name"]]["instances"] = -1
-        # 健康检查（在线服务，并发探测）+ 响应时间持久化
-        # 分层退化：配了专用 health_url → 严格 HTTP（要求 200）；
-        # 仅配 health_port 无接口 → 自适应（宽松 HTTP → TCP 连通性兜底）。
+        # 健康检查（在线服务）：经 SSH 在服务器本地探测 127.0.0.1:health_port。
+        # 微服务业务端口不对公网放行（云安全组只挡外部），从监控机直连必失败，
+        # 故复用 _probe_server_full 已建立的 SSH 连接在宿主机 localhost 探测。
+        # 分层：有 health_url→curl 严格(须 200)；无→curl 宽松(任意响应码即存活)
+        # →/dev/tcp 端口连通兜底。每台主机一次批量 SSH（内部并行），多主机并发。
         if online:
-            health_futures = {}
-            with ThreadPoolExecutor(max_workers=min(8, len(online))) as pool:
-                for svc in online:
-                    hp = svc.get("health_port") or 0
-                    hu = (svc.get("health_url") or "").strip()
-                    if hp <= 0:
-                        continue
-                    for host in health_hosts.get(svc["name"], [])[:2]:  # 最多探测 2 台
-                        if hu:
-                            future = pool.submit(_probe_health_url, host, hp, hu,
-                                                 5, True)
-                        else:
-                            # 未配专用健康接口：自适应（宽松 HTTP 优先，TCP 兜底）
-                            future = pool.submit(_probe_health_adaptive, host, hp)
-                        health_futures[future] = (svc["name"], host)
-                for fut, (svc_name, host) in health_futures.items():
-                    try:
-                        hr = fut.result(timeout=10)
-                        if hr["ok"]:
-                            result["health_checks"][svc_name] = hr
-                        # 持久化响应时间（无论成功失败都记录）
+            env_ssh = env.get("ssh") or {}
+            server_by_host = {s["host"]: s for s in servers}
+            host_checks = {}  # {host: [(svc_name, hp, hu), ...]}
+            for svc in online:
+                hp = svc.get("health_port") or 0
+                hu = (svc.get("health_url") or "").strip()
+                if hp <= 0:
+                    continue
+                for host in health_hosts.get(svc["name"], []):
+                    host_checks.setdefault(host, []).append((svc["name"], hp, hu))
+            if host_checks:
+                def _run_host_checks(host, checks):
+                    s = server_by_host.get(host)
+                    if not s:
+                        return host, []
+                    ssh_cfg = _merge_server_ssh(env_ssh, s)
+                    sport = int(s.get("ssh_port") or 22)
+                    return host, _probe_health_via_ssh(host, sport, ssh_cfg, checks)
+                with ThreadPoolExecutor(max_workers=min(8, len(host_checks))) as pool:
+                    futs = [pool.submit(_run_host_checks, h, cs)
+                            for h, cs in host_checks.items()]
+                    for fut in futs:
                         try:
-                            dbm.save_response_time(
-                                self._db_path, env["id"], svc_name, host,
-                                hr["ms"] if hr["ms"] > 0 else -1, hr["ok"])
+                            host, hr_list = fut.result(timeout=30)
                         except Exception:
-                            pass
-                    except Exception:
-                        pass
+                            continue
+                        for svc_name, hr in hr_list:
+                            # 持久化响应时间（无论成功失败都记录）
+                            try:
+                                dbm.save_response_time(
+                                    self._db_path, env["id"], svc_name, host,
+                                    hr["ms"] if hr["ms"] > 0 else -1, hr["ok"])
+                            except Exception:
+                                pass
+                            if hr["ok"] and svc_name not in result["health_checks"]:
+                                result["health_checks"][svc_name] = {**hr, "host": host}
         # 持久化扩展指标快照：仅本轮新采集的 host（节流轮与采集失败轮不落库，
         # 快照写放大 3× → 1×）
         for host in fresh_hosts:
