@@ -109,6 +109,7 @@
       return `<div class="svc-card ${run ? 'publishing' : ''}" data-id="${s.id}">
         <div class="svc-head"><span class="dot ${dotCls}"></span><b class="ellipsis">${esc(s.name)}</b>
           ${s.enabled ? '' : '<span class="weak" style="font-size:11px">(停用)</span>'}
+          ${isStatic ? `<span class="weak" style="margin-left:${upTxt ? '8' : 'auto'};font-size:11px">🗂️ 静态站点</span>` : ''}
           ${upTxt ? '<span class="weak" style="margin-left:auto;font-size:11px">⏱'+upTxt+'</span>' : ''}</div>
         <div class="svc-meta">
           ${isStatic ? `
@@ -116,9 +117,9 @@
                <span class="weak" style="margin-left:10px">状态</span> ${svcLabel(st, run, isStatic)}</div>
           <div><span class="weak">站点根</span> <span class="num ellipsis" style="display:inline-block;max-width:78%;vertical-align:bottom" title="${esc(s.site_root || '')}">${esc(s.site_root || '未配置')}</span></div>
           <div><span class="weak">探活</span> ${s.health_url
-            ? `<span class="num ellipsis" style="display:inline-block;max-width:60%;vertical-align:bottom" title="${esc(s.health_url)}">${esc(s.health_url)}</span>`
-            : '<span class="weak" style="font-size:11px">未配置，无法探测在线状态</span>'}
-               ${ts ? `<span class="weak" style="margin-left:10px">探测</span> ${ts}` : ''}</div>` : `
+            ? `<span class="num ellipsis" style="display:inline-block;max-width:78%;vertical-align:bottom" title="${esc(s.health_url)}">${esc(s.health_url)}</span>`
+            : '<span class="weak" style="font-size:11px">未配置，无法探测在线状态</span>'}</div>
+          ${ts ? `<div><span class="weak">探测</span> ${ts}</div>` : ''}` : `
           <div><span class="weak">镜像</span> <span class="num">${esc(ver)}</span></div>
           <div><span class="weak">实例</span> <span class="num">${inst}</span>
                <span class="weak" style="margin-left:10px">状态</span> ${svcLabel(st, run)}</div>
@@ -129,8 +130,8 @@
         <div class="svc-foot">
           ${canDeploy() ? `<button class="btn sm primary" data-pub="${s.id}">发布</button>
           <button class="btn sm ghost" data-roll="${s.id}">回滚</button>
-          ${isStatic ? '' : `<button class="btn sm ghost" data-restart="${s.id}">⭯ 重启</button>`}${isStatic ? '<span class="weak" style="font-size:11px">🗂️ 静态站点</span>' : ''}` : '<span class="weak" style="font-size:11px">只读账号</span>'}
-          <button class="svc-log-btn" data-svc="${esc(s.name)}" title="查看实时日志">📋 日志</button>
+          ${isStatic ? '' : `<button class="btn sm ghost" data-restart="${s.id}">⭯ 重启</button>`}` : '<span class="weak" style="font-size:11px">只读账号</span>'}
+          <button class="svc-log-btn" data-svc="${esc(s.name)}" data-static="${isStatic ? 1 : 0}" title="${isStatic ? '查看发布日志' : '查看实时日志'}">📋 日志</button>
         </div>
       </div>`;
     }).join('') || emptyState('📭', '该项目暂无服务');
@@ -138,7 +139,11 @@
     wall.querySelectorAll('[data-roll]').forEach(b => b.onclick = () => openDeployDrawer(Number(b.dataset.roll), true));
     wall.querySelectorAll('[data-restart]').forEach(b => b.onclick = () => restartService(Number(b.dataset.restart)));
     wall.querySelectorAll('.svc-log-btn').forEach(btn => {
-      btn.onclick = (e) => { e.stopPropagation(); openServiceLogDrawer(btn.dataset.svc); };
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        if (btn.dataset.static === '1') openStaticLogDrawer(btn.dataset.svc);
+        else openServiceLogDrawer(btn.dataset.svc);
+      };
     });
   }
   function renderServers(){
@@ -420,6 +425,19 @@
     if (svcLogShowTs && r.ts) prefix += `<span class="log-ts">${fmtTime(r.ts)}</span> `;
     if (r.env) prefix += `<span class="log-env">[${esc(r.env)}]</span> `;
     return prefix + contentSpan + '\n';
+  }
+
+  // ---- 静态站点日志：无容器运行日志，「日志」映射为最近一次发布任务的
+  // 构建/部署日志（复用发布中心 openTaskLogDrawer 全功能日志流：增量
+  // 追尾/终止/重跑）；tasksCache 仅含最近 20 条且可能滑出，故现取最新一条
+  async function openStaticLogDrawer(svcName){
+    let tasks;
+    try{ tasks = await api(`/api/tasks?project_id=${state.currentProject.id}&limit=50`); }
+    catch(e){ toastError('发布记录加载失败：' + e.message); return; }
+    if (destroyed) return;
+    const t = (tasks || []).find(x => x.name === svcName && x.env === state.currentEnv && x.type === 'project');
+    if (!t){ toastError('该服务暂无发布任务记录（先发布一次后可查看日志）'); return; }
+    if (window.openTaskLogDrawer) openTaskLogDrawer(t.id);
   }
 
   // ---- 模块导出 ----
