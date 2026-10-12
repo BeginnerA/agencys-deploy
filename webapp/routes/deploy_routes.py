@@ -66,6 +66,8 @@ def create_task():
         return jsonify({"error": "rollback/auto_version/skip_build/no_git_tag/force_window/canary 必须为布尔值"}), 400
     if type_ == "restart":
         # 重启：env 必填且必须属于该项目；版本/构建类字段不适用，一律强制缺省
+        if (rec.get("deploy_mode") or "container") == "static_archive":
+            return jsonify({"error": f"服务「{rec['name']}」为静态发布（无容器），不支持重启"}), 400
         if not env:
             return jsonify({"error": "重启任务 env 必填"}), 400
         if not dbm.get_env_by_name(current_app.config["DB_PATH"], project_id, env):

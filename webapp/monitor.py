@@ -949,6 +949,8 @@ class MonitorScheduler:
                     per_server_extended[s["host"]] = cur_ext
             ext_cs = (cur_ext or {}).get("container_status") or {}
             for svc in services:
+                if (svc.get("deploy_mode") or "container") == "static_archive":
+                    continue  # 静态托管无容器，不参与容器匹配（循环后按 HTTP 统一探测）
                 image = (r.get("containers") or {}).get(svc["service_name"])
                 st = result["services"].setdefault(svc["name"],
                                                    {"status": "not_deployed",
@@ -975,6 +977,26 @@ class MonitorScheduler:
                         st["status"] = "stopped"
         result["host_metrics"] = per_server_metrics
         result["extended_metrics"] = per_server_extended
+        # 静态托管服务：无容器/Nacos 可查，配了 health_url 则 HTTP 探活（200 即在线，
+        # 静态首页无 UP 体，不能复用 check_http 的 Actuator 语义）；未配置则 unknown
+        for svc in services:
+            if (svc.get("deploy_mode") or "container") != "static_archive":
+                continue
+            url = (svc.get("health_url") or "").strip()
+            st = {"version": "", "instances": -1, "ts": time.time()}
+            if url:
+                try:
+                    try:
+                        target = url.format(ip="")
+                    except (KeyError, IndexError, ValueError):
+                        target = url  # 含非 {ip} 花括号占位：按原 URL 探测
+                    resp = _http_session().get(target, timeout=8)
+                    st["status"] = "online" if resp.status_code == 200 else "stopped"
+                except Exception:
+                    st["status"] = "stopped"
+            else:
+                st["status"] = "unknown"
+            result["services"][svc["name"]] = st
         # SSH 全部失败时服务状态标 probe_failed（区分"确实未部署"与"探测不到"，
         # 避免把运行中的服务误报为未部署）
         if result["servers"] and not any(e["ssh_ok"] for e in result["servers"]):

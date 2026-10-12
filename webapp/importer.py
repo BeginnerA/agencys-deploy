@@ -43,15 +43,18 @@ def _import_projects(db_path: str, path: Path) -> tuple:
         # 前端项目的 build_order 元素含 commands 数组（无 goal 字段），原样保留
         normalised_build_order = []
         for b in build_order:
+            # 步骤级构建环境变量（如 NODE_OPTIONS）原样保留，与 exporter 往返对称
             if "commands" in b:
                 normalised_build_order.append({"name": b.get("name", ""),
                                                "path": b.get("path", ""),
-                                               "commands": b["commands"]})
+                                               "commands": b["commands"],
+                                               **({"env": b["env"]} if b.get("env") else {})})
             else:
                 normalised_build_order.append({"name": b.get("name", ""),
                                                "path": b.get("path", ""),
                                                "goal": b.get("goal", "package"),
-                                               "extra_profile": b.get("extra_profile", "")})
+                                               "extra_profile": b.get("extra_profile", ""),
+                                               **({"env": b["env"]} if b.get("env") else {})})
         dbm.create_record(db_path, "services", dict(
             project_id=pid, name=name,
             image_name=cfg.get("image_name", name),
@@ -60,6 +63,13 @@ def _import_projects(db_path: str, path: Path) -> tuple:
             dockerfile=cfg.get("dockerfile", ""),
             build_order=normalised_build_order,
             build_type=cfg.get("build_type", "maven"),
+            deploy_mode=cfg.get("deploy_mode") or "container",
+            site_root=cfg.get("site_root", ""),
+            backup_dir=cfg.get("backup_dir", ""),
+            static_dist_dir=cfg.get("static_dist_dir", ""),
+            zip_prefix=cfg.get("zip_prefix", ""),
+            entry_file=cfg.get("entry_file", ""),
+            file_mode=cfg.get("file_mode", ""),
             nacos_groups=cfg.get("nacos_groups", []) or [],
             dubbo_services=cfg.get("dubbo_services", []) or [],
             snailjob_group=cfg.get("snailjob_group", ""),

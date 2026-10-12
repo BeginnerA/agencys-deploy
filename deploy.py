@@ -26,6 +26,7 @@ from nacos_manager import NacosClient
 from snailjob_manager import backup_jobs, set_job_status, restore_jobs, clear_summary
 from health_check import wait_for_healthy
 from notify import send_notify
+from deploy_strategies import create_strategy
 
 
 # ---------- 灰度 Web 决策：deploy.py 子进程 ↔ Web 决策 API 的文件协议 ----------
@@ -463,8 +464,19 @@ class Deployer:
         self.registry_host = config["registry"]["host"]
         self.registry_namespace = config["registry"]["namespace"]
         self.registry_auth = get_registry_auth(config)
-        self.image_name = self.proj_cfg["image_name"]
-        self.service_name = self.proj_cfg["service_name"]
+        self.image_name = self.proj_cfg.get("image_name") or project
+        self.service_name = self.proj_cfg.get("service_name") or project
+        # dist/传输优化字段：容器直传与静态包发布均需，统一设置（1 = 传统单流上传）
+        deploy_cfg = config["deploy"]
+        self.dist_dir = Path(deploy_cfg.get("dist_dir", "dist"))
+        if not self.dist_dir.is_absolute():
+            self.dist_dir = Path(__file__).resolve().parent / self.dist_dir
+        self.remote_tmp_dir = deploy_cfg.get("remote_tmp_dir", "/tmp/platform-deploy")
+        # 并行上传通道数（1-8）与镜像包压缩级别（1-9）；0/空串等非法值回退类默认
+        cfg_streams = as_number(deploy_cfg.get("upload_streams"), self.upload_streams)
+        self.upload_streams = max(1, min(int(cfg_streams) or self.upload_streams, 8))
+        cfg_level = as_number(deploy_cfg.get("image_compress_level"), self.image_compress_level)
+        self.image_compress_level = max(1, min(int(cfg_level) or self.image_compress_level, 9))
         if self.registry_mode == "direct":
             # 直传模式：镜像名 = {namespace}/{image_name}:{version}（与 IDEA 直推格式一致）
             # namespace 留空则不带前缀；镜像只存在于本地与目标服务器
@@ -473,16 +485,6 @@ class Deployer:
             self.full_image = f"{self.image_prefix}{self.image_name}:{self.version}"
             # 首次发版无回滚版本（previous_version 未指定）时 prev_image 置空，失败则跳过容器回滚
             self.prev_image = self._make_image(self.previous_version) if self.previous_version else None
-            deploy_cfg = config["deploy"]
-            self.dist_dir = Path(deploy_cfg.get("dist_dir", "dist"))
-            if not self.dist_dir.is_absolute():
-                self.dist_dir = Path(__file__).resolve().parent / self.dist_dir
-            self.remote_tmp_dir = deploy_cfg.get("remote_tmp_dir", "/tmp/platform-deploy")
-            # 并行上传通道数（1-8）与镜像包压缩级别（1-9）；0/空串等非法值回退类默认
-            cfg_streams = as_number(deploy_cfg.get("upload_streams"), self.upload_streams)
-            self.upload_streams = max(1, min(int(cfg_streams) or self.upload_streams, 8))
-            cfg_level = as_number(deploy_cfg.get("image_compress_level"), self.image_compress_level)
-            self.image_compress_level = max(1, min(int(cfg_level) or self.image_compress_level, 9))
         else:
             self.full_image = f"{self.registry_host}/{self.registry_namespace}/{self.image_name}:{self.version}"
             # 首次发版无回滚版本（previous_version 未指定）时 prev_image 置空，失败则跳过容器回滚
@@ -490,6 +492,20 @@ class Deployer:
         self._docker_logged_in = set()  # 已登录的远程主机，避免重复登录
         self._no_git_tag = False
         self._skip_git_push = False
+        # 发布策略：按项目配置 deploy_mode 路由（缺省 container，行为与既有完全一致）
+        self._strategy = create_strategy(self.proj_cfg.get("deploy_mode", "container"), self)
+
+    @property
+    def strategy(self):
+        """发布策略实例（懒兑底：测试绕过 __init__ 构造时首次访问自动回退容器策略）
+
+        容器策略是纯适配层，全部方法委托回 Deployer 既有同名方法，
+        既有测试的 patch 点（Deployer 方法、deploy.wait_for_healthy）不受影响。
+        """
+        if getattr(self, "_strategy", None) is None:
+            mode = getattr(self, "proj_cfg", {}) or {}
+            self._strategy = create_strategy(mode.get("deploy_mode", "container"), self)
+        return self._strategy
 
     def _make_image(self, version: str) -> str:
         """按当前 registry 模式拼装镜像全名（direct 直传模式不带仓库前缀）"""
@@ -813,6 +829,11 @@ class Deployer:
             (f"，失败 {len(failures)} 台: {failures}（滚动阶段自动重试）" if failures else "，全部就绪"))
         return failures
 
+    def wait_health(self, host: str, server_entry: dict = None):
+        """健康验证薄封装：供策略层调用；内部仍走模块级 wait_for_healthy，
+        保持既有测试 mock.patch("deploy.wait_for_healthy") 的 patch 点不变。"""
+        wait_for_healthy(host, self.project, ssh_override=server_entry, env=self.env)
+
     def _nacos_ip(self, server_entry: dict) -> str:
         """Nacos 操作使用的 IP：优先用 nacos_ip（内网），回退到 ip（外网）"""
         if server_entry and server_entry.get("nacos_ip"):
@@ -826,13 +847,18 @@ class Deployer:
         nacos_ip = self._nacos_ip(server_entry)
         if self.nacos_groups() and nacos_ip != host:
             log(f"Nacos 使用内网 IP: {nacos_ip}（SSH 外网 IP: {host}）")
-        self.container_modified = False  # 跟踪容器是否已被修改（docker pull 成功后置 True）
+        self.container_modified = False  # 跟踪目标状态是否已被修改（容器：docker pull 成功后置 True）
         try:
-            self.ensure_docker_login(server)
-            self.nacos_offline(nacos_ip)
-            self.update_container(server)
-            wait_for_healthy(host, self.project, ssh_override=server_entry, env=self.env)
-            self.nacos_online(nacos_ip, weight=1.0)
+            self.strategy.check(server)
+            self.strategy.prepare(server)
+            if self.strategy.supports_nacos:
+                self.nacos_offline(nacos_ip)
+            # 传输阶段幂等（预传输成功时秒级跳过），滚动阶段自动重试预传输失败的机器
+            self.strategy.transfer(server)
+            self.strategy.switch(server)
+            self.strategy.verify(server, server_entry)
+            if self.strategy.supports_nacos:
+                self.nacos_online(nacos_ip, weight=1.0)
             wait_sec = as_number(self.config["deploy"].get("canary_wait"), 0)
             if is_canary and wait_sec > 0:
                 log(f"首台灰度观察 {wait_sec} 秒，请观察业务指标...")
@@ -844,7 +870,7 @@ class Deployer:
             if self.container_modified and self.previous_version:
                 # 容器已被修改（旧容器已停止/删除），且有回滚版本，回滚到旧版本
                 try:
-                    self.rollback_container(server)
+                    self.strategy.rollback(server)
                 except Exception as re:
                     log(f"[{host}] 容器回滚也失败: {re}")
             elif self.container_modified and not self.previous_version:
@@ -853,9 +879,10 @@ class Deployer:
             else:
                 # 容器未被修改（如镜像传输失败），旧容器仍在运行，无需回滚容器
                 log(f"[{host}] 容器未被修改（旧容器仍在运行），跳过容器回滚")
-            # 无论容器是否回滚，都必须恢复 Nacos 上线
+            # 无论容器是否回滚，都必须恢复 Nacos 上线（无 Nacos 能力的发布方式自动跳过）
             try:
-                self.nacos_online(nacos_ip, weight=1.0)
+                if self.strategy.supports_nacos:
+                    self.nacos_online(nacos_ip, weight=1.0)
             except Exception as ne:
                 log(f"[{host}] Nacos 恢复上线失败: {ne}")
             if self.container_modified and self.previous_version:
@@ -870,11 +897,11 @@ class Deployer:
             server.close()
 
     def run(self, servers: list, skip_build: bool = False, skip_snailjob: bool = False, clear_summary_flag: bool = False):
-        # 普通发布未指定回滚版本时，自动查询当前线上版本作为失败回滚目标；
-        # 首次发版（查不到容器）或查询失败时维持现状：previous_version 保持空，失败则跳过容器回滚
+        # 普通发布未指定回滚版本时，自动查询当前线上版本作为失败回滚目标（策略层按发布方式实现）；
+        # 首次发版（查不到线上版本）或查询失败时维持现状：previous_version 保持空，失败则跳过回滚
         if not self.previous_version:
             try:
-                current = get_current_remote_version(self.project, self.config, env=self.env)
+                current = self.strategy.query_current_version()
             except Exception as e:
                 log(f"自动查询回滚版本失败（{e}），本次发布失败时将跳过容器回滚")
                 current = None
@@ -884,11 +911,12 @@ class Deployer:
                 log(f"自动回滚兜底：未指定回滚版本，当前线上版本 {current} 将作为失败回滚目标")
             else:
                 log("未指定回滚版本且未发现运行中容器（首次发版），发布失败时将跳过容器回滚")
+        # prev_image 仅供容器策略回滚使用；无 previous_version 保持空跳过回滚
         send_notify(self.config, "start", project=self.project, version=self.version,
                     previous_version=self.previous_version, env=self.env)
         start_ts = time.time()
         if not skip_build:
-            log(">>> 步骤 1/5: Maven 构建并推送镜像")
+            log(">>> 步骤 1/5: " + ("前端构建并打包静态 zip" if self.strategy.name != "container" else "Maven 构建并推送镜像"))
             build_project(self.project, self.version, env=self.env)
         else:
             log(">>> 步骤 1/5: 跳过构建")
@@ -902,9 +930,17 @@ class Deployer:
         else:
             log(">>> 步骤 2/5: 无需暂停 SnailJob")
 
-        log(">>> 步骤 3/6: 并行预传输镜像" +
-            ("（直传模式，上传+load 并行）" if self.registry_mode == "direct" else "（仓库模式，构建时已推送，跳过）"))
-        prefetch_failures = self.prefetch_images(servers)
+        if self.strategy.supports_prefetch:
+            if self.strategy.name != "container":
+                log(">>> 步骤 3/6: 并行预传输制品（各服务器并行）")
+            elif self.registry_mode == "direct":
+                log(">>> 步骤 3/6: 并行预传输镜像（直传模式，上传+load 并行）")
+            else:
+                log(">>> 步骤 3/6: 并行预传输镜像（仓库模式，构建时已推送，跳过）")
+            prefetch_failures = self.strategy.prefetch(servers)
+        else:
+            log(">>> 步骤 3/6: 当前发布方式无预传输阶段，跳过")
+            prefetch_failures = []
         if prefetch_failures:
             log(f"预传输失败 {len(prefetch_failures)} 台（滚动发布时将自动重试）: {prefetch_failures}")
         log(">>> 步骤 4/6: 滚动发布" + ("（金丝雀模式）" if self.canary else ""))
@@ -970,14 +1006,17 @@ class Deployer:
                                 rollback_server = RemoteServer(host, merge_server_ssh(self.ssh_cfg, srv))
                                 try:
                                     nacos_ip = self._nacos_ip(srv)
-                                    self.nacos_offline(nacos_ip)
-                                    self.rollback_container(rollback_server)
-                                    self.nacos_online(nacos_ip, weight=1.0)
+                                    if self.strategy.supports_nacos:
+                                        self.nacos_offline(nacos_ip)
+                                    self.strategy.rollback(rollback_server)
+                                    if self.strategy.supports_nacos:
+                                        self.nacos_online(nacos_ip, weight=1.0)
                                     log(f"首台 {host} 已回滚")
                                 except Exception as re:
                                     log(f"首台回滚失败: {re}")
                                     try:
-                                        self.nacos_online(nacos_ip, weight=1.0)
+                                        if self.strategy.supports_nacos:
+                                            self.nacos_online(nacos_ip, weight=1.0)
                                     except Exception:
                                         pass
                                 finally:
@@ -1066,16 +1105,17 @@ class Deployer:
             snapshotted = False
             container_rolled_back = False
             try:
-                self.nacos_offline(nacos_ip)
-                # 记录回滚前 Nacos 是否确实有该服务的实例（用于后续判断是否需要等待 Nacos 上线）
-                snapshotted = any(
-                    (svc, grp, nacos_ip) in self.nacos._snapshotted_keys
-                    for svc in self.service_names()
-                    for grp in self.nacos_groups()
-                )
-                self.rollback_container(server)
-                container_rolled_back = True  # rollback_container 成功即标记
-                wait_for_healthy(host, self.project, ssh_override=srv, env=self.env)
+                if self.strategy.supports_nacos:
+                    self.nacos_offline(nacos_ip)
+                    # 记录回滚前 Nacos 是否确实有该服务的实例（用于后续判断是否需要等待 Nacos 上线）
+                    snapshotted = any(
+                        (svc, grp, nacos_ip) in self.nacos._snapshotted_keys
+                        for svc in self.service_names()
+                        for grp in self.nacos_groups()
+                    )
+                self.strategy.rollback(server)
+                container_rolled_back = True  # 回滚执行成功即标记
+                self.strategy.verify(server, srv)
                 # 容器回滚成功 + 健康检查通过
                 if snapshotted:
                     # 回滚前服务在 Nacos 有注册，需要恢复上线并等待健康
@@ -1084,7 +1124,7 @@ class Deployer:
                     except Exception as ne:
                         # 容器已回滚成功，仅 Nacos 上线失败，记为警告而非失败
                         log(f"[{host}] 警告: 容器回滚成功，但 Nacos 上线异常: {ne}")
-                else:
+                elif self.strategy.supports_nacos:
                     # 回滚前服务就未在 Nacos 注册，尝试上线但不等待健康
                     try:
                         self.nacos_online(nacos_ip, weight=1.0)
@@ -1211,11 +1251,13 @@ def main():
     if args.auto_version and (args.version or args.previous_version):
         parser.error("--auto-version 与显式 --version/--previous-version 互斥")
     if args.auto_version:
-        current = get_current_remote_version(args.project, config, env=args.env)
+        # 版本推导下沉策略层：容器=semver patch+1，静态=日期号（YYYYMMDD[-N]）
+        probe = Deployer(args.project, None, None, config, env=args.env)
+        current = probe.strategy.query_current_version()
         if current is None:
-            parser.error("服务器上未发现运行中的容器（首次发版），请手动指定 --version 和 --previous-version")
+            parser.error("服务器上未发现运行中容器/已发布站点（首次发版），请手动指定 --version 和 --previous-version")
         args.previous_version = current
-        args.version = bump_patch_version(current)
+        args.version = probe.strategy.next_version(current)
         log(f"自动版本: 当前线上 {current} → 新版本 {args.version}")
     if args.build_only:
         log(f">>> 仅构建模式：{args.project} {args.version}")

@@ -84,6 +84,7 @@
     if (!wall) return;
     wall.innerHTML = services.map(s => {
       const st = svcStatus[s.name] || {};
+      const isStatic = (s.deploy_mode || 'container') === 'static_archive';
       const run = running.find(r =>
         (r.type === 'project' && r.name === s.name && r.env === state.currentEnv) ||
         (r.type === 'restart' && r.ref_id === s.id && r.env === state.currentEnv));
@@ -104,7 +105,7 @@
           ${s.enabled ? '' : '<span class="weak" style="font-size:11px">(停用)</span>'}
           ${upTxt ? '<span class="weak" style="margin-left:auto;font-size:11px">⏱'+upTxt+'</span>' : ''}</div>
         <div class="svc-meta">
-          <div><span class="weak">镜像</span> <span class="num">${esc(ver)}</span></div>
+          <div><span class="weak">${isStatic ? '版本' : '镜像'}</span> <span class="num">${esc(ver)}</span></div>
           <div><span class="weak">实例</span> <span class="num">${inst}</span>
                <span class="weak" style="margin-left:10px">状态</span> ${svcLabel(st, run)}</div>
           <div><span class="weak">端口</span> <span class="num">${s.health_port || '-'}</span>
@@ -114,7 +115,7 @@
         <div class="svc-foot">
           ${canDeploy() ? `<button class="btn sm primary" data-pub="${s.id}">发布</button>
           <button class="btn sm ghost" data-roll="${s.id}">回滚</button>
-          <button class="btn sm ghost" data-restart="${s.id}">⭯ 重启</button>` : '<span class="weak" style="font-size:11px">只读账号</span>'}
+          ${isStatic ? '' : `<button class="btn sm ghost" data-restart="${s.id}">⭯ 重启</button>`}${isStatic ? '<span class="weak" style="font-size:11px">🗂️ 静态站点</span>' : ''}` : '<span class="weak" style="font-size:11px">只读账号</span>'}
           <button class="svc-log-btn" data-svc="${esc(s.name)}" title="查看实时日志">📋 日志</button>
         </div>
       </div>`;
@@ -186,6 +187,7 @@
     }catch(e){ toastError('发布配置加载失败：' + e.message); return; }
     if (destroyed) return; // 路由切换后在途响应丢弃，防新页面弹出旧抽屉
     const svc = services.find(s => s.id === sid);
+    const isStaticSvc = !!(svc && (svc.deploy_mode || 'container') === 'static_archive');
     const envs = state.envs;
     // 回滚入口来自服务卡片：锁定服务发布类型与目标服务，仅需回滚目标版本。
     // 版本号/自动版本号/跳过构建与回滚无关（--auto-version 与 --rollback 互斥、
@@ -196,7 +198,7 @@
           <input value="${esc(svc ? svc.name : '')}" readonly></div>
         <div class="field"><label>环境</label>
           <select id="dpEnv">${envs.map(e => `<option ${e.name === state.currentEnv ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</select></div>
-        <div class="field"><label>回滚目标版本</label><input id="dpPrevVersion" placeholder="必填，回滚到的版本"></div>
+        <div class="field"><label>回滚目标版本</label><input id="dpPrevVersion" placeholder="${isStaticSvc ? '必填，日期版本号如 20261011（backup 历代包）' : '必填，回滚到的版本'}"></div>
       </div>
       <div style="display:flex;gap:10px;margin-top:20px">
         <button class="btn primary flex-1" id="dpSubmit">确认回滚</button>
@@ -211,7 +213,8 @@
           <select id="dpRef"></select></div>
         <div class="field"><label>环境</label>
           <select id="dpEnv">${envs.map(e => `<option ${e.name === state.currentEnv ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</select></div>
-        <div class="field"><label>版本号（可留空）</label><input id="dpVersion" placeholder="如 1.0.3"></div>
+        <div class="field"><label>版本号（可留空）</label><input id="dpVersion" placeholder="${isStaticSvc ? '留空自动生成日期号 YYYYMMDD' : '如 1.0.3'}"></div>
+        ${isStaticSvc ? '<div class="hint full">🗂️ 静态站点发布：zip 上传 1Panel 站点目录原子换入，无容器/无 Nacos；版本号为日期号（当日重复发布自动追加 -N 后缀），回滚从 backup 历代包还原</div>' : ''}
         <div class="field full"><label>当前线上版本（失败回滚基线）</label><input id="dpPrevVersion" placeholder="发布失败时自动回滚到该版本"><div class="hint" id="dpPrevHint">手动指定版本时填写，发布失败自动回滚到该版本；留空视为首次发版（失败不自动回滚）；勾选「自动版本号」时由系统自动探测，无需填写</div></div>
         <div class="field check full" style="gap:24px"><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpAuto"> 自动版本号</label><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpSkip"> 跳过构建</label><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpNoTag"> 本次不打 Git Tag</label><label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="dpCanary"> 🐤 灰度发布</label></div>
         <div class="hint full" id="dpCanaryHint" style="display:none;width:100%;box-sizing:border-box;font-size:12px;color:var(--text-3);line-height:1.9;margin-top:8px;margin-bottom:8px;padding:8px 10px;border:1px solid var(--border);border-left:3px solid var(--primary);border-radius:var(--r-ctl);background:rgba(0,212,255,.05)"><b style="color:var(--text-2)">🐤 灰度发布说明：</b><br>按项目「灰度策略」页的默认策略分批发布；批次间等待人工确认时，在任务抽屉中操作「继续 / 停止 / 回滚首台」</div>

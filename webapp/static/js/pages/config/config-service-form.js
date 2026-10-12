@@ -10,7 +10,8 @@
       data: svc ? Object.assign(JSON.parse(JSON.stringify(svc)), { enabled: !!svc.enabled }) : {
         name:'', image_name:'', service_name:'', git_repo:'',
         git_branch:'', git_pull_before_build:false, git_tag_enabled:true,
-        build_type:'maven',
+        build_type:'maven', deploy_mode:'container',
+        site_root:'', backup_dir:'', static_dist_dir:'', zip_prefix:'', entry_file:'', file_mode:'',
         build_order:[], docker_context:'', dockerfile:'',
         nacos_groups:[], dubbo_services:[], snailjob_group:'',
         health_port:'', health_url:'',
@@ -35,8 +36,17 @@
         if (!Array.isArray(d[k])) d[k] = [];
       });
       // ① 基本信息
+      const isStatic = (d.deploy_mode || 'container') === 'static_archive';
       const basic = `
         <div class="form-grid">
+          <div class="field full">
+            <label>发布方式</label>
+            <select id="sDeployMode">
+              <option value="container" ${!isStatic ? 'selected' : ''}>🐳 容器（Docker 镜像 + compose）</option>
+              <option value="static_archive" ${isStatic ? 'selected' : ''}>🗂️ 静态站点（zip → 1Panel/nginx 目录）</option>
+            </select>
+            <div class="f-hint">静态站点：前端构建产物 zip 上传 1Panel 站点目录解压切换，无容器无 Nacos；版本号用日期号 YYYYMMDD 而非 semver</div>
+          </div>
           <div class="field full" style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
             <label style="margin:0;white-space:nowrap">启用状态</label>
             <input type="checkbox" id="sEnabled" ${d.enabled ? 'checked' : ''} style="display:none">
@@ -46,9 +56,9 @@
             </div>
             <span id="swEnabledTxt" class="weak" style="font-size:12px">${d.enabled ? '启用中 — 参与监控、告警与发布' : '已停用 — 不出现在监控/告警/总览'}</span>
           </div>
-          ${H.field({ label:'服务名', required:true, tip:'发布命令 --project 参数；须与 docker-compose 服务名、镜像名对应；项目内唯一', input:`<input id="sName" value="${esc(d.name)}" placeholder="如 service-biz">`, hint:'被流水线 stages 引用后改名不受影响（引用按 id），但请同步更新发布习惯' })}
-          ${H.field({ label:'镜像短名', required:true, tip:'完整镜像名 = {registry}/{namespace}/{image_name}:{version}', input:`<input id="sImage" value="${esc(d.image_name)}" placeholder="如 biz">`, hint:'不要带命名空间前缀，命名空间来自环境配置' })}
-          ${H.field({ label:'Git 仓库路径', required:true, tip:'相对 deploy.project_root 的目录名，或 http(s) 远程 URL（首次构建自动 clone 到 project_root 下同名目录）；发布成功后在仓库打 v{version}(-{后缀}) tag 并推送远端（可下方关闭）', input:`<input id="sGit" value="${esc(d.git_repo)}" placeholder="如 service-biz 或 https://git.example.com/service-biz.git">`, hint:'多服务共用仓库时填仓库目录名；远程 URL 形态建议勾选下方「构建前拉取代码」' })}
+          ${H.field({ label:'服务名', required:true, tip:'发布命令 --project 参数；容器模式须与 docker-compose 服务名、镜像名对应；项目内唯一', input:`<input id="sName" value="${esc(d.name)}" placeholder="如 service-biz">`, hint:'被流水线 stages 引用后改名不受影响（引用按 id），但请同步更新发布习惯' })}
+          ${H.field({ label:'镜像短名', required:!isStatic, tip:'完整镜像名 = {registry}/{namespace}/{image_name}:{version}；静态站点不适用，留空自动回退服务名', input:`<input id="sImage" value="${esc(d.image_name)}" placeholder="${isStatic ? '留空即可（静态站点）' : '如 biz'}">`, hint:'不要带命名空间前缀，命名空间来自环境配置' })}
+          ${H.field({ label:'Git 仓库路径', required:!isStatic, tip:'相对 deploy.project_root 的目录名，或 http(s) 远程 URL（首次构建自动 clone 到 project_root 下同名目录）；发布成功后在仓库打 v{version}(-{后缀}) tag 并推送远端（可下方关闭）', input:`<input id="sGit" value="${esc(d.git_repo)}" placeholder="如 service-biz 或 https://git.example.com/service-biz.git">`, hint:'多服务共用仓库时填仓库目录名；远程 URL 形态建议勾选下方「构建前拉取代码」；手工传 zip 的静态发布可留空' })}
           ${H.field({ label:'构建分支', tip:'构建前 checkout 的分支或 tag；留空则不切换，使用当前分支', input:`<input id="sGitBranch" value="${esc(d.git_branch || '')}" placeholder="如 master / v1.0.0">` })}
           <div class="field full" style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
             <label style="margin:0;white-space:nowrap">构建前拉取代码</label>
@@ -68,19 +78,19 @@
             </div>
             <span id="swGitTagTxt" class="weak" style="font-size:12px">${d.git_tag_enabled ? '开启 — 发布成功后打 v{version}(-{环境后缀}) tag 并推送远端' : '关闭 — 发布成功不打 Git Tag'}</span>
           </div>
-          ${H.field({ label:'docker-compose 服务名', required:true, tip:'docker-compose.yml 里的服务名', input:`<input id="sCompose" value="${esc(d.service_name)}" placeholder="留空自动填服务名">` })}
+          ${H.field({ label:'docker-compose 服务名', required:!isStatic, tip:'docker-compose.yml 里的服务名；静态站点不适用，留空自动回退服务名', input:`<input id="sCompose" value="${esc(d.service_name)}" placeholder="留空自动填服务名">` })}
         </div>`;
-      // ② 构建配置
-      const isFrontend = d.build_type === 'frontend';
+      // ② 构建配置（静态发布无 Docker 环节，隐藏上下文/Dockerfile 字段）
+      const isFrontend = d.build_type === 'frontend' || isStatic;
       const build = `
         <div class="form-grid">
           <div class="field full">
             <label>构建类型</label>
-            <select id="sBuildType">
-              <option value="maven" ${!isFrontend ? 'selected' : ''}>☕ Java (Maven)</option>
-              <option value="frontend" ${isFrontend ? 'selected' : ''}>🌐 Web 前端 (npm/pnpm/yarn)</option>
+            <select id="sBuildType" ${isStatic ? 'disabled' : ''}>
+              <option value="maven" ${!isFrontend && !isStatic ? 'selected' : ''}>☕ Java (Maven)</option>
+              <option value="frontend" ${isFrontend || isStatic ? 'selected' : ''}>🌐 Web 前端 (npm/pnpm/yarn)</option>
             </select>
-            <div class="f-hint">Java 项目使用 Maven 构建；Web 前端项目使用 npm/pnpm/yarn 等命令构建</div>
+            <div class="f-hint">${isStatic ? '静态站点固定为前端构建（构建产出目录打包 zip，不产镜像）' : 'Java 项目使用 Maven 构建；Web 前端项目使用 npm/pnpm/yarn 等命令构建'}</div>
           </div>
           ${isFrontend ? `
           <div class="field full"><label>构建步骤（commands）</label>
@@ -91,9 +101,20 @@
             ${H.rowList({ id:'sBuildOrder', rows: d.build_order }).html}
             <div class="f-hint">按顺序对每个模块执行 mvn clean {goal} -P{profile}；common-build / api 等被依赖模块一般 install，最终服务模块 package；extra_profile 用于同一仓库按 profile 产出不同 jar 的项目。</div>
           </div>`}
+          ${isStatic ? '' : `
           ${H.field({ label:'Docker 上下文目录', tip:'docker build 的上下文', input:`<input id="sDockerCtx" value="${esc(d.docker_context)}" placeholder="如 .">` })}
-          ${H.field({ label:'Dockerfile 路径', tip:'相对 docker_context', input:`<input id="sDockerfile" value="${esc(d.dockerfile)}" placeholder="如 Dockerfile">` })}
+          ${H.field({ label:'Dockerfile 路径', tip:'相对 docker_context', input:`<input id="sDockerfile" value="${esc(d.dockerfile)}" placeholder="如 Dockerfile">` })}`}
         </div>`;
+      // ②b 静态站点专属配置（deploy_mode=static_archive）
+      const staticCfg = isStatic ? `
+        <div class="form-grid">
+          ${H.field({ label:'站点根目录（site_root）', required:true, tip:'1Panel 站点根，如 /data/1panel/www/sites/example.com/index；切换是同父目录两次 rename 原子换入，路径本身不变，nginx 无需改动', input:`<input id="sSiteRoot" value="${esc(d.site_root || '')}" placeholder="/data/1panel/www/sites/example.com/index">`, hint:'必须为绝对路径；站点须已在 1Panel 创建（平台不会代建站点）' })}
+          ${H.field({ label:'备份目录（backup_dir）', tip:'历代 zip 存放目录，默认站点根父目录下的 backup/（即 1Panel 站点的 backup/ 约定）；回滚源', input:`<input id="sBackupDir" value="${esc(d.backup_dir || '')}" placeholder="留空默认：站点父目录/backup">` })}
+          ${H.field({ label:'构建产出目录（static_dist_dir）', tip:'相对 deploy.project_root 的构建产出目录，打包为 zip', input:`<input id="sStaticDist" value="${esc(d.static_dist_dir || '')}" placeholder="如 web/dist">`, hint:'手工上传 zip 不自动构建时可留空（把 {前缀}-{版本}.zip 放入平台 dist 目录，发布时勾选跳过构建）' })}
+          ${H.field({ label:'zip 名前缀（zip_prefix）', tip:'产物为 {前缀}-{版本}.zip，默认取服务名；与现有手动发布习惯对齐可填「达人端」这类名称', input:`<input id="sZipPrefix" value="${esc(d.zip_prefix || '')}" placeholder="留空默认取服务名">` })}
+          ${H.field({ label:'入口文件（entry_file）', tip:'解压后据此定位产物根目录（兼容 zip 多包一层目录），默认 index.html', input:`<input id="sEntryFile" value="${esc(d.entry_file || '')}" placeholder="留空默认 index.html">` })}
+          ${H.field({ label:'文件权限（file_mode）', tip:'换入后文件权限归一，默认 0644（目录固定 0755，属主 root:root）', input:`<input id="sFileMode" value="${esc(d.file_mode || '')}" placeholder="留空默认 0644">` })}
+        </div>` : '';
       // ③ 注册中心与任务调度
       const reg = `
         <div class="form-grid">
@@ -124,10 +145,12 @@
         </div>`;
 
       const groups = [
-        H.section({ id:'basic', icon:'📝', title:'基本信息', desc:'服务名 / 镜像 / 仓库 / compose 关联', open:true, body: basic }),
-        H.section({ id:'build', icon:'🔨', title:'构建配置', desc:'构建顺序与 Docker 上下文', open:!!d.build_order.length, body: build }),
-        H.section({ id:'reg', icon:'🛰️', title:'注册中心与任务调度', desc:'Nacos 分组 / Dubbo / SnailJob', open:!!(d.nacos_groups.length || d.dubbo_services.length || d.snailjob_group), body: reg }),
-        H.section({ id:'health', icon:'💚', title:'健康检查与日志', desc:'探活端口 / URL / 启动失败判定', open:true, body: health }),
+        H.section({ id:'basic', icon:'📝', title:'基本信息', desc:'发布方式 / 服务名 / 镜像 / 仓库关联', open:true, body: basic }),
+        H.section({ id:'build', icon:'🔨', title:'构建配置', desc:isStatic ? '前端构建步骤与静态打包产出' : '构建顺序与 Docker 上下文', open:!!(d.build_order.length || isStatic), body: build }),
+        isStatic
+          ? H.section({ id:'static', icon:'🗂️', title:'静态站点', desc:'1Panel 站点目录与 zip 产物约定', open:true, body: staticCfg })
+          : H.section({ id:'reg', icon:'🛰️', title:'注册中心与任务调度', desc:'Nacos 分组 / Dubbo / SnailJob', open:!!(d.nacos_groups.length || d.dubbo_services.length || d.snailjob_group), body: reg }),
+        H.section({ id:'health', icon:'💚', title:'健康检查与日志', desc:isStatic ? '站点探活 URL（发布后 HTTP 验证）' : '探活端口 / URL / 启动失败判定', open:true, body: health }),
       ];
 
       bodyEl.innerHTML = `
@@ -146,6 +169,13 @@
       } else {
         H.rowList({ id:'sBuildOrder', rows: d.build_order }).bind();
       }
+      // 发布方式切换：静态↔容器重新渲染表单（字段集差异大，整体重建最可靠）
+      const dmSel = document.getElementById('sDeployMode');
+      if (dmSel) dmSel.onchange = e => {
+        d.deploy_mode = e.target.value;
+        if (d.deploy_mode === 'static_archive') d.build_type = 'frontend';
+        render();
+      };
       // 构建类型切换：重新渲染表单
       const btSel = document.getElementById('sBuildType');
       if (btSel) btSel.onchange = e => {
@@ -195,6 +225,10 @@
           git_repo: d.git_repo, git_branch: d.git_branch, git_pull_before_build: d.git_pull_before_build,
           git_tag_enabled: d.git_tag_enabled,
           build_type: d.build_type || 'maven',
+          deploy_mode: d.deploy_mode || 'container',
+          site_root: d.site_root || '', backup_dir: d.backup_dir || '',
+          static_dist_dir: d.static_dist_dir || '', zip_prefix: d.zip_prefix || '',
+          entry_file: d.entry_file || '', file_mode: d.file_mode || '',
           docker_context: d.docker_context, dockerfile: d.dockerfile,
           build_order: d.build_order, nacos_groups: d.nacos_groups, dubbo_services: d.dubbo_services,
           snailjob_group: d.snailjob_group, health_url: d.health_url,
@@ -220,6 +254,14 @@
       d.git_branch = val('sGitBranch').trim();
       d.git_pull_before_build = document.getElementById('sGitPull').checked;
       d.git_tag_enabled = document.getElementById('sGitTag').checked;
+      d.deploy_mode = val('sDeployMode') || 'container';
+      const isStatic = d.deploy_mode === 'static_archive';
+      d.site_root = val('sSiteRoot').trim();
+      d.backup_dir = val('sBackupDir').trim();
+      d.static_dist_dir = val('sStaticDist').trim();
+      d.zip_prefix = val('sZipPrefix').trim();
+      d.entry_file = val('sEntryFile').trim();
+      d.file_mode = val('sFileMode').trim();
       d.build_type = val('sBuildType') || 'maven';
       d.service_name = val('sCompose').trim();
       d.docker_context = val('sDockerCtx').trim();
@@ -238,15 +280,18 @@
       d.log_error_keywords = H.tagInput({ id:'sLogKw', values:[] }).read();
       // 就地校验
       let ok = true;
-      const checks = [
-        ['sName', 'name', '服务名必填'],
-        ['sImage', 'image_name', '镜像短名必填'],
-        ['sGit', 'git_repo', 'Git 仓库路径必填'],
-      ];
+      const checks = isStatic
+        ? [['sName', 'name', '服务名必填']]
+        : [['sName', 'name', '服务名必填'],
+           ['sImage', 'image_name', '镜像短名必填'],
+           ['sGit', 'git_repo', 'Git 仓库路径必填']];
       checks.forEach(([id, key, msg]) => {
         if (!d[key]){ H.fieldErr(id, msg); ok = false; }
         else H.fieldErr(id, '');
       });
+      if (isStatic && !d.site_root.startsWith('/')){
+        H.fieldErr('sSiteRoot', '静态发布必须填写站点根绝对路径（如 /data/1panel/www/sites/example.com/index）'); ok = false;
+      } else if (isStatic) H.fieldErr('sSiteRoot', '');
       if (!Number.isInteger(d.health_port) || d.health_port < 0){
         H.fieldErr('sHealthPort', '健康检查端口必须为非负整数'); ok = false;
       }else H.fieldErr('sHealthPort', '');

@@ -564,6 +564,16 @@ def _migrate(conn):
     srv_cols_now3 = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
     if "build_type" not in srv_cols_now3:
         conn.execute("ALTER TABLE services ADD COLUMN build_type TEXT DEFAULT 'maven'")
+    # services 表补静态发布列（deploy_mode=static_archive 专属；存量库幂等加列）：
+    # 发布方式路由 + 1Panel 站点目录约定（策略层字段名与 projects.yaml 保持一致）
+    if "deploy_mode" not in srv_cols_now3:
+        conn.execute("ALTER TABLE services ADD COLUMN deploy_mode TEXT DEFAULT 'container'")
+    for col, default in (("site_root", "''"), ("backup_dir", "''"), ("static_dist_dir", "''"),
+                         ("zip_prefix", "''"), ("entry_file", "''"), ("file_mode", "''")):
+        # 逐列实时复查：存量库可能已含部分新列（半升级状态），重复 ALTER 会报错
+        live_cols = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
+        if col not in live_cols:
+            conn.execute(f"ALTER TABLE services ADD COLUMN {col} TEXT DEFAULT {default}")
     # release_windows 补 scope 列（作用域配置，与 alert_rules.scope 同构）
     rw_cols = {r["name"] for r in conn.execute("PRAGMA table_info(release_windows)")}
     if "scope" not in rw_cols:

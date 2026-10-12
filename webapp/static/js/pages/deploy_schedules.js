@@ -147,6 +147,13 @@
     document.getElementById('schedVerMode').onchange = (e) => {
       document.getElementById('schedVerWrap').style.display = e.target.value === 'manual' ? '' : 'none';
     };
+    // 静态站点服务无 semver，手动版本号改用日期号占位提示（全量发布仍默认 semver）
+    document.getElementById('schedSvc').onchange = (e) => {
+      const svcs = svcCache[document.getElementById('schedProj').value] || [];
+      const s = svcs.find(v => String(v.id) === e.target.value);
+      document.getElementById('schedVer').placeholder =
+        (s && (s.deploy_mode || 'container') === 'static_archive') ? '日期号，如 20261012' : '1.0.0';
+    };
     document.getElementById('schedType').onchange = (e) => {
       document.getElementById('schedTimeWrap').style.display = e.target.value === 'once' ? '' : 'none';
       document.getElementById('schedCronWrap').style.display = e.target.value === 'cron' ? '' : 'none';

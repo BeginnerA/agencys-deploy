@@ -16,6 +16,13 @@ from webapp.deploy_scheduler import check_release_window
 from webapp import task_manager
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+# 静态站点（deploy_mode=static_archive）日期号：与策略层 next_version 对齐（YYYYMMDD[-N]）
+DATE_VERSION_RE = re.compile(r"^\d{8}(-\d+)?$")
+
+
+def _version_ok(v: str, is_static: bool) -> bool:
+    """版本号格式校验：容器 semver x.y.z；静态站点日期号 YYYYMMDD[-N]"""
+    return bool((DATE_VERSION_RE if is_static else VERSION_RE).match(v))
 # 审批后后台等待任务终态的时长上限（任务实际执行通常远小于该值）
 _WATCH_TIMEOUT = 6 * 3600
 _WATCH_INTERVAL = 5.0
@@ -127,7 +134,13 @@ def _normalize_args(op: str, project_code: str = "", target: str = "",
         raise ExecutorError(f"项目下不存在环境「{env}」")
     # 版本校验
     auto_version = bool(flags.get("auto_version"))
+    # 目标为服务时感知发布方式：静态站点无容器，restart 不支持、版本号用日期号
+    is_static = bool(svc) and (svc.get("deploy_mode") or "container") == "static_archive"
+    ver_label = "YYYYMMDD[-N] 日期号" if is_static else "x.y.z"
     if op == "restart":
+        if is_static:
+            raise ExecutorError(
+                f"静态站点服务「{target}」无容器，不支持重启；回退旧版本请用 rollback（从 backup 历代包还原）")
         version = previous_version = ""
     elif op == "rollback":
         if auto_version:
@@ -136,8 +149,8 @@ def _normalize_args(op: str, project_code: str = "", target: str = "",
             raise ExecutorError("回滚需提供 version（回滚目标版本）或 previous_version")
         for v, tag in ((version, "version"), (previous_version,
                                                "previous_version")):
-            if v and not VERSION_RE.match(v):
-                raise ExecutorError(f"{tag} 版本号格式非法（应为 x.y.z）: {v}")
+            if v and not _version_ok(v, is_static):
+                raise ExecutorError(f"{tag} 版本号格式非法（应为 {ver_label}）: {v}")
         if version and previous_version and version == previous_version:
             raise ExecutorError("version 与 previous_version 不能相同（回滚目标需不同于当前版本）")
     elif op == "deploy":
@@ -147,14 +160,14 @@ def _normalize_args(op: str, project_code: str = "", target: str = "",
         else:
             if not version:
                 raise ExecutorError("缺少版本号 version（或使用 auto_version 自动推导）")
-            if not VERSION_RE.match(version):
+            if not _version_ok(version, is_static):
                 raise ExecutorError(
-                    f"版本号格式非法（应为 x.y.z）: {version}")
+                    f"版本号格式非法（应为 {ver_label}）: {version}")
             if previous_version and previous_version == version:
                 raise ExecutorError("previous_version 不能与 version 相同")
-            if previous_version and not VERSION_RE.match(previous_version):
+            if previous_version and not _version_ok(previous_version, is_static):
                 raise ExecutorError(
-                    f"previous_version 格式非法（应为 x.y.z）: {previous_version}")
+                    f"previous_version 格式非法（应为 {ver_label}）: {previous_version}")
     else:
         raise ExecutorError(f"不支持的操作类型: {op}")
     if op == "rollback" and flags.get("canary"):

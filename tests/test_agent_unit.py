@@ -587,6 +587,33 @@ class TestExecutor(AgentBase):
         with self.assertRaises(ExecutorError):
             self._plan(op="rollback", canary=True, version="1.0.0")
 
+    def test_static_restart_blocked_and_date_version_ok(self):
+        # 静态站点服务：restart 拒绝；版本号认日期号 YYYYMMDD[-N]，semver 反被拒
+        from agent.executor import ExecutorError
+        dbm.create_record(self.db, "services", dict(
+            project_id=self.proj_id, name="web", image_name="",
+            service_name="", docker_context="", dockerfile="",
+            build_order="[]", nacos_groups="[]", dubbo_services="[]",
+            snailjob_group="", health_url="", health_port=0,
+            log_error_keywords="[]", clear_log_dir="", git_repo="", enabled=1,
+            deploy_mode="static_archive",
+            site_root="/data/1panel/www/sites/x/index", zip_prefix="达人端"))
+        with self.assertRaises(ExecutorError) as cm:
+            self._plan(op="restart", target="web")
+        self.assertIn("静态站点", str(cm.exception))
+        run = self._plan(target="web", version="20261012")
+        self.assertEqual(run["status"], "awaiting_approval")
+        run_sfx = self._plan(target="web", version="20261012-2")
+        self.assertEqual(run_sfx["version"], "20261012-2")
+        with self.assertRaises(ExecutorError):
+            self._plan(target="web", version="1.2.0")
+        # 回滚日期号放行
+        run2 = self._plan(op="rollback", target="web", version="20261011")
+        self.assertEqual(run2["version"], "20261011")
+        # 容器服务不受影响：仍须 semver，日期号被拒
+        with self.assertRaises(ExecutorError):
+            self._plan(target="auth", version="20261012")
+
     def test_block_window_forbids_plan(self):
         now = int(time.time())
         dbm.create_record(self.db, "release_windows", dict(

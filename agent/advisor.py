@@ -550,7 +550,7 @@ def run_precheck(db_path: str, target: str, env: str = "",
 
     target 为服务名或流水线名（先服务后流水线，与 executor 同语义）。
     """
-    from .executor import VERSION_RE
+    from .executor import _version_ok
     checks = []
     def add(item: str, status: str, detail: str):
         checks.append({"item": item, "status": status, "detail": detail})
@@ -581,8 +581,12 @@ def run_precheck(db_path: str, target: str, env: str = "",
             + ("，顺序: " + ", ".join(s["host"] for s in servers[:6])
                + (" 等" if len(servers) > 6 else "") if servers else "未绑定服务器无法发布"))
     if version:
-        add("版本号格式 x.y.z", "ok" if VERSION_RE.match(version) else "block",
-            version if VERSION_RE.match(version) else f"{version} 格式非法")
+        # 静态站点服务用日期号（与 executor 版本校验同源），其余维持 semver
+        is_static = bool(svc) and (rec.get("deploy_mode") or "container") == "static_archive"
+        ver_label = "YYYYMMDD[-N]" if is_static else "x.y.z"
+        ok = _version_ok(version, is_static)
+        add(f"版本号格式 {ver_label}", "ok" if ok else "block",
+            version if ok else f"{version} 格式非法")
         # 同版本最近发布成功过 → 提示重复发布
         dups = [t for t in _recent_service_tasks(db_path, target, hours=24, limit=20)
                 if t.get("version") == version and t.get("status") == "success"]

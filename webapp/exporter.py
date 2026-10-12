@@ -31,7 +31,7 @@ def export_projects_yaml(db_path: str, project_id: int) -> str:
             if not isinstance(b, dict):
                 continue
             if "commands" in b:
-                # 前端构建步骤：保留 commands 数组
+                # 前端构建步骤：保留 commands 数组与步骤级构建环境变量
                 entry = {"name": b.get("name", ""), "path": b.get("path", ""),
                          "commands": b["commands"]}
             else:
@@ -39,6 +39,8 @@ def export_projects_yaml(db_path: str, project_id: int) -> str:
                          "goal": b.get("goal", "package")}
                 if b.get("extra_profile"):
                     entry["extra_profile"] = b["extra_profile"]
+            if b.get("env"):
+                entry["env"] = b["env"]
             build_order.append(entry)
         cfg = {
             "build_order": build_order,
@@ -54,6 +56,14 @@ def export_projects_yaml(db_path: str, project_id: int) -> str:
         # build_type 仅非默认值时输出（保持向后兼容）
         if s.get("build_type") and s["build_type"] != "maven":
             cfg["build_type"] = s["build_type"]
+        # 发布方式与静态专属字段仅非默认时输出（container 项目导出不新增字段，向后兼容）
+        deploy_mode = s.get("deploy_mode") or "container"
+        if deploy_mode != "container":
+            cfg["deploy_mode"] = deploy_mode
+            for key in ("site_root", "backup_dir", "static_dist_dir",
+                        "zip_prefix", "entry_file", "file_mode"):
+                if s.get(key):
+                    cfg[key] = s[key]
         if s.get("git_branch"):
             cfg["git_branch"] = s["git_branch"]
         if s.get("git_pull_before_build"):

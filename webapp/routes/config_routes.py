@@ -13,7 +13,6 @@ config_bp = Blueprint("config", __name__)
 DEPLOY_ROOT = Path(__file__).resolve().parent.parent.parent
 CONFIG_DIR = DEPLOY_ROOT / "config"
 
-REQUIRED_SERVICE = ("name", "image_name", "service_name")
 REQUIRED_ENV = ("name",)
 REQUIRED_PIPELINE = ("name",)
 
@@ -220,9 +219,21 @@ def create_service(pid):
     body = _json_body()
     if body is None:
         return _err("请求体必须为 JSON 对象")
-    for k in REQUIRED_SERVICE:
-        if not isinstance(body.get(k), str) or not body.get(k).strip():
-            return _err(f"{k} 必填")
+    if not isinstance(body.get("name"), str) or not body.get("name").strip():
+        return _err("name 必填")
+    deploy_mode = body.get("deploy_mode") or "container"
+    if deploy_mode not in ("container", "static_archive"):
+        return _err("deploy_mode 仅支持 container / static_archive")
+    is_static = deploy_mode == "static_archive"
+    # 镜像/ compose 字段仅容器发布必需；静态服务无镜像概念，留空时回退 name
+    if not is_static:
+        for k in ("image_name", "service_name"):
+            if not isinstance(body.get(k), str) or not body.get(k).strip():
+                return _err(f"{k} 必填")
+    else:
+        site_root = (body.get("site_root") or "").strip()
+        if not site_root.startswith("/"):
+            return _err("静态发布必须配置 site_root（站点根绝对路径，如 /data/1panel/www/sites/example.com/index）")
     name = body["name"].strip()
     if _check_unique("services", pid, name):
         return _err("项目内服务名已存在")
@@ -239,12 +250,19 @@ def create_service(pid):
     if enabled is None:
         return _err("enabled 必须为布尔值")
     fields = dict(project_id=pid, name=name,
-                  image_name=body["image_name"].strip(),
-                  service_name=body["service_name"].strip(),
+                  image_name=(body.get("image_name") or "").strip() or name,
+                  service_name=(body.get("service_name") or "").strip() or name,
                   docker_context=body.get("docker_context", ""),
                   dockerfile=body.get("dockerfile", ""),
                   build_order=lists["build_order"],
                   build_type=body.get("build_type", "maven"),
+                  deploy_mode=deploy_mode,
+                  site_root=(body.get("site_root") or "").strip(),
+                  backup_dir=(body.get("backup_dir") or "").strip(),
+                  static_dist_dir=(body.get("static_dist_dir") or "").strip(),
+                  zip_prefix=(body.get("zip_prefix") or "").strip(),
+                  entry_file=(body.get("entry_file") or "").strip(),
+                  file_mode=(body.get("file_mode") or "").strip(),
                   nacos_groups=lists["nacos_groups"],
                   dubbo_services=lists["dubbo_services"],
                   snailjob_group=body.get("snailjob_group", ""),
@@ -280,8 +298,14 @@ def update_service(pid, sid):
         return _err("name 不能为空")
     allowed = ("name", "image_name", "service_name", "docker_context",
                "dockerfile", "snailjob_group", "health_url",
-               "clear_log_dir", "git_repo", "git_branch", "build_type")
+               "clear_log_dir", "git_repo", "git_branch", "build_type",
+               "deploy_mode", "site_root", "backup_dir", "static_dist_dir",
+               "zip_prefix", "entry_file", "file_mode")
     fields = {k: v for k, v in body.items() if k in allowed}
+    if "deploy_mode" in fields and fields["deploy_mode"] not in ("container", "static_archive"):
+        return _err("deploy_mode 仅支持 container / static_archive")
+    if "name" in fields:
+        fields["name"] = fields["name"].strip()
     for k in _LIST_FIELDS_SERVICE:
         if k in body:
             v = _list_field(body, k)

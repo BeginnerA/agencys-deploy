@@ -1,13 +1,17 @@
-"""Maven 多模块构建 / 前端构建 + Docker 镜像构建推送
+"""Maven 多模块构建 / 前端构建 + Docker 镜像构建推送 / 静态站点 zip 打包
 
 支持两种构建类型（由 projects.yaml 的 build_type 字段决定）：
   maven    - Java 微服务：Maven 多模块构建 → Docker 镜像（默认）
   frontend - Web 前端项目：自定义命令（npm install / npm run build 等）→ Docker 镜像
+
+发布方式 deploy_mode: static_archive 时构建尾部改为把产出目录打包为
+ dist/{zip_prefix}-{version}.zip 供静态策略上传解压，跳过 Docker 构建。
 """
 import os
 import sys
 import time
 import shutil
+import zipfile
 import subprocess
 import argparse
 from pathlib import Path
@@ -367,6 +371,17 @@ def _run_build_steps(proj: dict, project_root: Path, version: str,
         _run_maven_steps(proj, project_root, version, profile, env_vars, config)
 
 
+def _step_env(env_vars: dict, step: dict) -> dict:
+    """步骤级环境变量：build_order 步骤可声明 "env": {KEY: VAL}（JSON 自由字段，
+    无需改表），仅对本步骤命令生效（副本叠加，不污染全局 env_vars）。
+    典型场景：Vue CLI4/webpack4 在 Node17+ 需 NODE_OPTIONS=--openssl-legacy-provider，
+    写在服务配置里才能从任意触发入口（CLI/Web UI/定时计划/Agent）一致生效。"""
+    step_env = dict(env_vars)
+    for k, v in (step.get("env") or {}).items():
+        step_env[str(k)] = str(v)
+    return step_env
+
+
 def _run_maven_steps(proj: dict, project_root: Path, version: str,
                      profile: str, env_vars: dict, config: dict = None):
     """Maven 多模块构建（原有逻辑）"""
@@ -391,8 +406,8 @@ def _run_maven_steps(proj: dict, project_root: Path, version: str,
         ]
         # Windows 下 target 可能被 IDE 增量编译/杀毒等瞬时占用导致 clean 失败或
         # 读取生成文件失败，自动重试自愈（间隔 5 秒 × 3 次，给足 IDE 编译窗口）
-        run(cmd, project_root, env=env_vars, timeout=600, retry_on_clean_failure=True,
-            max_retries=3, retry_delay=5)
+        run(cmd, project_root, env=_step_env(env_vars, step), timeout=600,
+            retry_on_clean_failure=True, max_retries=3, retry_delay=5)
 
 
 def _run_frontend_steps(proj: dict, project_root: Path, version: str,
@@ -414,6 +429,7 @@ def _run_frontend_steps(proj: dict, project_root: Path, version: str,
             log(f"警告: 步骤 [{step_name}] 无 commands，跳过")
             continue
         log(f">>> 前端步骤: {step_name}（{step_path}）")
+        step_env = _step_env(env_vars, step)
         for cmd_template in commands:
             # 支持 ${VERSION} 变量替换
             cmd = cmd_template.replace("${VERSION}", version)
@@ -422,8 +438,35 @@ def _run_frontend_steps(proj: dict, project_root: Path, version: str,
             if parts and parts[0] in ("npm", "pnpm", "yarn"):
                 pm = shutil.which(parts[0])
                 if pm:
+                    # run_shell 用 cmd /c "{cmd}" 包裹：路径含空格时（如 nvm/IDEA 自带
+                    # Node 装在带空格目录）必须给可执行文件再加一层引号，凑齐 cmd 的多引号
+                    # 保留规则，否则 cmd 剥掉外层引号后按空格截断报 "不是内部或外部命令"
+                    if " " in pm:
+                        pm = f'"{pm}"'
                     cmd = pm + (" " + parts[1] if len(parts) > 1 else "")
-            run_shell(cmd, step_path, env=env_vars, timeout=600)
+            run_shell(cmd, step_path, env=step_env, timeout=600)
+
+
+def _make_static_zip(proj: dict, project_root: Path, version: str, config: dict):
+    """静态发布打包：构建产出目录 → dist/{zip_prefix}-{version}.zip（文件直接置于包根）
+
+    zip 名与 deploy_strategies.static_archive 的约定一致；dist 目录解析规则与
+    Deployer.__init__ 相同（deploy.dist_dir 相对路径时基于仓库根）。
+    """
+    src = project_root / (proj.get("static_dist_dir") or "dist")
+    if not src.exists():
+        fail(f"静态构建产出目录不存在: {src}（检查 static_dist_dir 配置与构建命令产出）")
+    prefix = proj.get("zip_prefix") or proj.get("service_name") or proj.get("image_name") or "site"
+    dist_dir = Path(config["deploy"].get("dist_dir", "dist"))
+    if not dist_dir.is_absolute():
+        dist_dir = Path(__file__).resolve().parent.parent / dist_dir
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = dist_dir / f"{prefix}-{version}.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in sorted(src.rglob("*")):
+            if p.is_file():
+                zf.write(p, p.relative_to(src).as_posix())
+    log(f"静态包已生成: {zip_path}（{zip_path.stat().st_size / 1024 / 1024:.1f} MB）")
 
 
 def build_project(project_name: str, version: str, env: str = None):
@@ -432,6 +475,8 @@ def build_project(project_name: str, version: str, env: str = None):
     registry = get_registry_auth(config)
     mode = get_registry_mode(config)
     build_type = proj.get("build_type", "maven")
+    deploy_mode = proj.get("deploy_mode") or "container"
+    is_static = deploy_mode == "static_archive"
     # Maven profile 仅对 maven 类型项目有意义
     profile = get_maven_profile(config, env) if build_type != "frontend" else ""
     project_root = Path(config["deploy"]["project_root"]).expanduser()
@@ -442,7 +487,9 @@ def build_project(project_name: str, version: str, env: str = None):
     # 构建前 Git 准备：切换分支 + 拉取最新代码（配置了才执行，失败不阻断）
     git_prepare(proj, project_root)
 
-    if mode == "push":
+    if is_static:
+        log("静态发布（deploy_mode=static_archive）: 跳过 docker login")
+    elif mode == "push":
         docker_login(registry)
     else:
         log(f"直传模式（{mode}）: 跳过 docker login / docker push")
@@ -451,6 +498,11 @@ def build_project(project_name: str, version: str, env: str = None):
 
     # 按 build_type 执行对应的构建步骤
     _run_build_steps(proj, project_root, version, profile, env_vars, config)
+
+    if is_static:
+        # 静态发布：产出目录打包 zip 即可，无镜像概念，跳过 Docker 构建/推送
+        _make_static_zip(proj, project_root, version, config)
+        return
 
     # Docker 构建（超时 10 分钟，--progress=plain 便于排查）
     if mode == "push":
