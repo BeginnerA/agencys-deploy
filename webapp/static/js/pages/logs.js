@@ -427,6 +427,9 @@
       + `<br>保留策略：日志 ${s.retention_days} 天 / 归档 ${s.archive_days} 天${s.collector_running ? '' : ' · ⚠ 采集器未运行（手动清理仍可用）'}`;
     if (result){
       html += `<div style="color:var(--success);margin-top:6px">本次清理：删除 ${result.deleted_entries || 0} 条索引、归档 ${result.archived_files || 0} 个文件、永久删除 ${result.purged_files || 0} 个归档；数据库 ${fmtMB(result.db_size_before)} → ${fmtMB(result.db_size_after)}</div>`;
+      if (result.needs_full_vacuum){
+        html += `<div class="warn" style="margin-top:4px;line-height:1.7">⚠ 检测到 ${result.freelist_mb_after || ''} MB 空闲页无法增量回收（数据库尚未完成一次性 VACUUM 转换，incremental_vacuum 不生效）。若想真正缩小文件：先下调「日志保留天数」清掉大量旧数据，再停止平台执行 <code>python scripts/db_vacuum.py</code>。</div>`;
+      }
     }
     return html;
   }
@@ -505,6 +508,7 @@
       try {
         const r = await api('/api/logs/maintenance', { method: 'POST' });
         toastSuccess(`清理完成：删除 ${r.deleted_entries || 0} 条、归档 ${r.archived_files || 0} 个文件`);
+        if (r.needs_full_vacuum) toastError('空闲页无法增量回收：数据库未做一次性 VACUUM 转换，详见下方提示');
         const info = document.getElementById('logStorageInfo');
         if (info){
           try {

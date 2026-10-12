@@ -801,12 +801,21 @@ def run_manual_cleanup(db_path: str, log_dir: str) -> dict:
             conn.commit()
             conn.execute("INSERT INTO log_fts(log_fts) VALUES('optimize')")
             conn.commit()
+            # incremental_vacuum 仅在库完成一次性 VACUUM 转换（auto_vacuum 真正生效）
+            # 后才回收空闲页，否则是静默 no-op（freelist 不降、文件不缩）——这正是
+            # 「立即清理点了没变化」的根因。对比前后 freelist 判定是否真正回收。
+            page_size = conn.execute("PRAGMA page_size").fetchone()[0] or 4096
+            freelist_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
             try:
                 # 无参 = 全量回收可回收空闲页（auto_vacuum=INCREMENTAL 的库）
                 conn.execute("PRAGMA incremental_vacuum")
                 conn.commit()
             except sqlite3.OperationalError:
                 pass  # 未转换的旧库不可增量回收，可用 scripts/db_vacuum.py 处理
+            freelist_after = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            # 空闲页可观（>4MB）却几乎没减少 → 增量回收未生效，需一次性完整 VACUUM
+            needs_full_vacuum = (freelist_before * page_size > 4 * 1048576) and \
+                ((freelist_before - freelist_after) * page_size < 1 * 1048576)
             # 当日维护标记：手动已做，自动维护当日跳过
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             conn.execute(
@@ -828,6 +837,8 @@ def run_manual_cleanup(db_path: str, log_dir: str) -> dict:
             "purged_files": files["purged"],
             "db_size_before": size_before,
             "db_size_after": _db_size(),
+            "freelist_mb_after": round(freelist_after * page_size / 1048576, 1),
+            "needs_full_vacuum": bool(needs_full_vacuum),
         }
     finally:
         _manual_cleanup_lock.release()
