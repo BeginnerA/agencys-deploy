@@ -36,7 +36,7 @@
         </div>
         <div class="fab-body" id="fabMsgs"></div>
         <div class="fab-input">
-          <textarea id="fabInput" placeholder="${canManage
+          <textarea id="fabInput" aria-label="向智能运维助手提问（Enter 发送，Shift+Enter 换行）" placeholder="${canManage
             ? '例：把 pay 服务回滚到上一版本，先做计划'
             : '例：pay 服务现在状态如何？'}（Enter 发送 / Shift+Enter 换行）"></textarea>
           <button class="btn primary fab-send" id="fabSend">发送</button>

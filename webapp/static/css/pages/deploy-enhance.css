@@ -5,7 +5,8 @@
   background:var(--bg-panel); color:var(--text-2); border:1px solid var(--border);
   text-decoration:none; transition: all .15s; }
 .sub-tabs .chip:hover { border-color:var(--accent); color:var(--accent); }
-.sub-tabs .chip.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+/* 亮底一律配深字：白字在 --accent(#FF7A45) 上仅 2.59，不达 AA */
+.sub-tabs .chip.active { background:var(--accent); color:var(--on-bright); border-color:var(--accent); }
 
 /* 日历视图（发布窗口） */
 .cal-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:2px; }
@@ -104,12 +105,12 @@
 }
 .preview-label {
   font-size: 10px;
-  color: #fff;
+  color: var(--on-bright);   /* 原本白字在 primary 柱条上只有 2.59 */
   white-space: nowrap;
 }
 .preview-time {
   font-size: 9px;
-  color: rgba(255,255,255,0.7);
+  color: rgba(4,18,31,0.78);   /* 同样由半透白字改半透深字 */
   margin-top: 2px;
 }
 
@@ -133,7 +134,7 @@
 }
 .template-pills .pill.active {
   background: var(--primary, #4f8cff);
-  color: #fff;
+  color: var(--on-bright);   /* 白字在 #00D4FF 上仅 1.77 */
   border-color: var(--primary, #4f8cff);
 }
 

@@ -144,6 +144,7 @@ python webapp/app.py          # 默认 http://127.0.0.1:5678
 - 实时监控：默认 30s 周期 SSH 探测容器 + Nacos 查询实例（`--monitor-interval 0` 关闭）。
 - 页面数据实时推送（SSE 通道 `/api/stream`）：监控轮次完成、告警产生/状态变更、发布任务新建与状态流转、审批单/决策建议更新、服务日志采集轮次有新行时，后端逐帧通知前端，页面收到后去抖重取数据（所有列表页已改为事件驱动，无事件时不发请求）；通道异常自动退回原有定时轮询，顶栏指示灯显示「实时 / 连接中 / 降级轮询」，后台标签页自动释放连接并降频。例外：发布任务日志正文由子进程写文件（跨进程无法事件化），抽屉/日志中心仍保留 2s/3s 增量追尾。
 - 交互无障碍：可点击的非原生元素（筛选 chip、侧栏导航项、任务名链接、搜索下拉项等）自动补 `tabindex/role/aria-label` 并支持 Enter/Space 触发，键盘焦点统一显形（`:focus-visible` 主色焦点环）；抽屉/弹窗/下拉面板/搜索面板共用 Esc 层栈（只关最顶一层），关闭后焦点归还触发元素，确认框初始焦点在「取消」；通知同屏上限 4 条、同文案合并计数、读屏可播报；系统开启「减弱动态效果」时全局停用动画与过渡。
+- 色彩对比与表单可读性：弱化文本与亮色底上的文字统一按 WCAG AA 校正（亮色填充一律用深字 token `--on-bright`，渐变端点提亮），小字对比度达标；表单控件自动关联字段名（`label for`/`aria-label`/`aria-labelledby`，换肤下拉同步镜像到焦点元素）、必填项标 `aria-required`、提示与错误说明经 `aria-describedby` 关联、校验失败置 `aria-invalid` 且错误文本以 `role="alert"` 即时播报。
 - 配置存 `data/platform.db`（权威源）；`config/` 目录为导出产物 + CLI 兼容（`deploy.py --config-source yaml`）。
 - 角色：admin（全部）/ operator（发布回滚）/ viewer（只读）。生产部署建议 `--host 0.0.0.0` + 前置 Nginx 反代 + 环境变量注入 `DASHBOARD_SECRET_KEY`。
 

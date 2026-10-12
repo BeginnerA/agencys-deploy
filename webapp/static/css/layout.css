@@ -13,7 +13,7 @@
 }
 .side-logo .logo-ico{
   width:30px;height:30px;flex-shrink:0;border-radius:8px;display:flex;align-items:center;justify-content:center;
-  background:linear-gradient(135deg,var(--primary),#0066FF);font-size:16px;
+  background:linear-gradient(135deg,var(--primary),#0090FF);color:var(--on-bright);font-size:16px;   /* 亮底配深字：主文字 #E6F1FF 在 #00D4FF 上仅 1.55；渐变末端由 #0066FF 收为 #0090FF（与 .btn.primary 同一端点），因深字在 #0066FF 上只有 3.91、不够 16px 小字的 4.5，改浅后两端最差 5.79 */
   box-shadow:var(--shadow-glow);
 }
 .side-logo .logo-name{font-size:var(--fs-16);font-weight:600;white-space:nowrap}
@@ -41,7 +41,7 @@
 .nav-item .nav-txt{flex:1}
 .nav-badge{
   min-width:18px;height:18px;padding:0 5px;border-radius:var(--r-full);
-  background:var(--danger);color:#fff;font-size:var(--fs-11);line-height:18px;
+  background:var(--danger);color:var(--on-bright);font-size:var(--fs-11);line-height:18px;   /* 白字在 #FF4560 上仅 3.35，11px 角标不达 AA */
   text-align:center;font-family:var(--font-num);
 }
 .side-foot{padding:var(--sp-3);border-top:1px solid var(--border);font-size:var(--fs-11);color:var(--text-3)}
@@ -112,7 +112,7 @@
 #topbar .user-chip:hover{background:var(--bg-hover)}
 .user-avatar{
   width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;
-  background:linear-gradient(135deg,var(--primary),#0066FF);font-size:var(--fs-12);font-weight:600;flex-shrink:0;
+  background:linear-gradient(135deg,var(--primary),#0090FF);color:var(--on-bright);font-size:var(--fs-12);font-weight:600;flex-shrink:0;   /* 同上：头像里的用户名首字母是信息不是装饰 */
 }
 .user-meta{line-height:1.2;text-align:left}
 .user-meta .u-name{font-size:var(--fs-13);color:var(--text-1)}

@@ -3,7 +3,7 @@
 #floatAgentUi .fab-btn{
   position:fixed;right:22px;bottom:22px;width:56px;height:56px;border-radius:var(--r-full);
   border:none;cursor:pointer;font-size:26px;line-height:1;z-index:90;
-  background:linear-gradient(135deg,var(--primary),#4F7CFF);
+  background:linear-gradient(135deg,var(--primary),#4F7CFF);color:var(--on-bright);   /* 26px 属大字（阈值 3.0），深字两端最差 5.09；主文字 #E6F1FF 在 #00D4FF 上只 1.55 */
   box-shadow:0 8px 24px rgba(0,0,0,.4);transition:var(--t-fast)}
 #floatAgentUi .fab-btn:hover{transform:scale(1.06);box-shadow:0 10px 28px rgba(0,212,255,.35)}
 #floatAgentUi .fab-btn:active{transform:scale(.97)}

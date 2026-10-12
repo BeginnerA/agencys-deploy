@@ -244,6 +244,18 @@ function enhanceSelect(sel){
   face.id = pop.dataset.faceId;
   wrap.appendChild(pop);
 
+  // 无障碍属性随原生控件走：换肤后 select 被隐藏、face 才是 Tab 焦点，名字/描述/校验态
+  // 不镜像过去就等于全丢了。用属性观察者而非只在初始化时拷一次——label 关联由
+  // enhanceForms 在本函数之后才补写（同一个任务里的先后不固定），镜像必须能持续跟上。
+  // title 也要镜像：部分页面只给 select 写了 title 当名字（如会话下拉），不镜像则 face 无名字
+  const MIRROR_ATTRS = ['aria-label', 'aria-labelledby', 'aria-describedby', 'aria-required', 'aria-invalid', 'title'];
+  const mirrorA11y = () => MIRROR_ATTRS.forEach(a => {
+    const v = sel.getAttribute(a);
+    if (v) face.setAttribute(a, v); else face.removeAttribute(a);
+  });
+  new MutationObserver(mirrorA11y).observe(sel, { attributes: true, attributeFilter: MIRROR_ATTRS });
+  mirrorA11y();
+
   const syncFace = () => {
     face.classList.toggle('disabled', sel.disabled);
     face.setAttribute('tabindex', sel.disabled ? '-1' : '0');
@@ -293,6 +305,7 @@ function enhanceSelect(sel){
     if (sel.dataset.search){
       const fi = document.createElement('input');
       fi.type = 'text'; fi.className = 'sel-search'; fi.placeholder = '输入关键词筛选…';
+      fi.setAttribute('aria-label', '在本下拉列表的选项中筛选');   // 面板内控件不继承字段 label，需自带名字
       const empty = document.createElement('div');
       empty.className = 'sel-opt sel-empty hidden'; empty.textContent = '无匹配项';
       const optEls = [...pop.querySelectorAll('.sel-opt:not(.sel-empty)')];
@@ -380,10 +393,136 @@ function markKeyboardClickable(el){
   const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
   if (!el.getAttribute('aria-label') && text && text.length <= 40) el.setAttribute('aria-label', text);
 }
+// ---- 表单无障碍增强：label 关联 / 说明与错误提示关联 ----
+// 字段 markup 均由各页模板手写，历史上三种写法并存：<label> 不写 for（占多数）、
+// 配置页族的 .f-label 是 div、<label> 直接把控件包在里面（隐式关联，本就合规）。
+// 实测全站 130 个 .field、111 个裸 label，带 for 的只有 2 个，aria-describedby/invalid/required 为 0。
+// 逐页返工不现实、新页面还会继续写错，故与键盘可达性共用一个 DOM 收口：控件一进文档就补规范关联。
+// 只加属性不改标签名：div.f-label 换成 <label> 会被 components.css 的 .field label{}（特异性 0,1,1，
+// 高于 .f-label 的 0,1,0）覆写，实测 margin/字号/display 全变，是视觉回归。
+const A11Y_CTRL = 'input:not([type="hidden"]),select,textarea';
+let a11ySeq = 0;
+function a11yId(el, prefix){
+  if (!el.id) el.id = prefix + '_' + (++a11ySeq);
+  return el.id;
+}
+function labelById(id){
+  if (!id) return null;
+  try { return document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]'); }
+  catch (e) { return null; }              // id 含引号等畸形字符：当作没有 label
+}
+// 追加（不覆盖）aria-labelledby / aria-describedby 的引用，多次调用可累积
+function a11yRefs(el, attr, ids){
+  const add = (ids || []).filter(Boolean);
+  if (!el || !add.length) return;
+  const cur = (el.getAttribute(attr) || '').split(/\s+/).filter(Boolean);
+  const rest = add.filter(v => !cur.includes(v));
+  if (rest.length) el.setAttribute(attr, cur.concat(rest).join(' '));
+}
+// 无主 label：没写 for、也没把控件包在内部（多选组那种「一个勾选框一个 label」的模板 label 被自然排除）
+// 先取同域直接子级：「作用域」这类写法是一个字段标题 + 内嵌一块子选项（子块里另有一个标题），
+// 全后代扫会得出两个无主 label 而无法判定归属（实测 alerts 规则表单、发布窗口选择器都是这种）
+function looseLabels(scope, ctrl){
+  const ok = l => l.tagName === 'LABEL' && !l.getAttribute('for') && !l.contains(ctrl)
+    && !l.querySelector(A11Y_CTRL) && !l.closest('.sel-pop');
+  const direct = [...scope.children].filter(ok);
+  return direct.length ? direct : [...scope.querySelectorAll('label:not([for])')].filter(ok);
+}
+// .f-label 是 div，名字里不该带星标与问号记号，故按子节点剔除后取纯文本
+function fLabelText(fl){
+  return [...fl.childNodes]
+    .filter(n => !(n.nodeType === 1 && n.classList && (n.classList.contains('req') || n.classList.contains('q'))))
+    .map(n => n.textContent || '').join(' ').replace(/\s+/g, ' ').trim();
+}
+// 归属本字段的说明/错误槽：只在同一个 .field（无则同父元素）内取，避免串到邻字段
+function a11ySlots(scope){
+  return [...scope.querySelectorAll('.f-hint,.f-err,.hint,.field-hint')]
+    .filter(el => !el.closest('.sel-pop'))
+    .map(el => a11yId(el, 'a11y'));
+}
+// 控件是否已从任一渠道拿到名字（自身声明 / 被 label 包住 / 已有 label[for]）
+function hasAnyName(ctrl){
+  return !!(ctrl.getAttribute('aria-label') || ctrl.getAttribute('aria-labelledby')
+    || ctrl.closest('label') || labelById(ctrl.id));
+}
+function enhanceControl(ctrl){
+  if (!ctrl || ctrl.nodeType !== 1) return;
+  if (ctrl.dataset.a11yForm === '1') return;
+  ctrl.dataset.a11yForm = '1';            // 每条只处理一次，整页补扫靠此早退
+  if (ctrl.closest('.sel-pop')) return;    // 下拉面板内的筛选框自成一体，不继承字段 label
+  const field = ctrl.closest('.field');
+  const scope = field || ctrl.parentElement;
+  if (!scope) return;
+  // 1) 无障碍名：自身已声明、被 label 包住、已有 label[for] 的，一律不介入（不抢作者契约）
+  if (!hasAnyName(ctrl)){
+    const fl = field && field.querySelector('.f-label');
+    if (fl){
+      const name = fLabelText(fl);
+      if (name) ctrl.setAttribute('aria-label', name);
+    } else {
+      const owners = looseLabels(scope, ctrl);
+      if (owners.length === 1){
+        const lb = owners[0];
+        // 同域内无主控件只有一个时用原生 for（label 文本被页面改写时名字自动跟随）；
+        // 多个控件共用一个 label（如日期+时间拆栏）或下拉换肤（for 指向的是被隐藏的
+        // select，face 拿不到名字）时改用 aria-labelledby
+        const peers = [...scope.querySelectorAll(A11Y_CTRL)].filter(c => !c.closest('label') && !c.closest('.sel-pop'));
+        if (peers.length === 1 && !ctrl.closest('.sel-wrap')) lb.htmlFor = a11yId(ctrl, 'ctl');
+        else a11yRefs(ctrl, 'aria-labelledby', [a11yId(lb, 'lbl')]);
+      }
+      // owners 多于一个（如分组标题 + 字段标题同域）时无法判定归属，猜错比不猜更糟：
+      // 留给页面自行处理，已登记在 docs/agent-evolution.md 的挂账里
+    }
+  }
+  // 1b) 筛选条写法：「<span>项目</span> <select>」这类同域既无 label 也无 .f-label 的控件，
+  // 只当紧邻的前兄弟是纯文本、不含控件、不是按钮/链接、且不超 20 字时才拿它当名字（全站 8 个筛选下拉皆此模式）
+  // 下拉换肤后 select 已不在原位置，要看 .sel-wrap 这个代理者的前兄弟
+  if (!hasAnyName(ctrl)){
+    const anchor = ctrl.closest('.sel-wrap') || ctrl;
+    const pv = anchor.previousElementSibling;
+    if (pv && !pv.matches('button,a,.btn,label') && !pv.querySelector(A11Y_CTRL)){
+      const t = (pv.textContent || '').replace(/\s+/g, ' ').trim();
+      if (t && t.length <= 20) a11yRefs(ctrl, 'aria-labelledby', [a11yId(pv, 'lbl')]);
+    }
+  }
+  // 2) 必填：星标 * 纯视觉，改由 aria-required 表达（label 文本里已剔除星标，不会重读）
+  if (field && field.querySelector('.req') && !ctrl.hasAttribute('aria-required')) ctrl.setAttribute('aria-required', 'true');
+  // 3) 说明与错误：hint/err 进 aria-describedby，读屏聚焦时连提示一起播
+  a11yRefs(ctrl, 'aria-describedby', a11ySlots(scope));
+}
+// 整组勾选框（通知渠道 / 周期 / 作用域目标）：字段标题属于整组而非单个控件，
+// 而每个控件又已被自己的 label 包住，走不到上面的控件路径，故单独给容器上 role=group
+function enhanceFieldGroup(field){
+  if (field.dataset.a11yGrp === '1') return;
+  field.dataset.a11yGrp = '1';
+  if (field.getAttribute('role')) return;                       // 作者已自行声明语义
+  const loose = [...field.querySelectorAll(A11Y_CTRL)].filter(c => !c.closest('label') && !c.closest('.sel-pop'));
+  if (loose.length) return;                                     // 有独立控件的走控件路径
+  if (!field.querySelector(A11Y_CTRL)) return;                  // 域内无控件（纯展示块）
+  const owners = looseLabels(field, field);
+  if (owners.length === 1){
+    field.setAttribute('role', 'group');
+    field.setAttribute('aria-labelledby', a11yId(owners[0], 'lbl'));
+  } else if (!owners.length){
+    const fl = field.querySelector('.f-label');
+    const name = fl && fLabelText(fl);
+    if (name){ field.setAttribute('role', 'group'); field.setAttribute('aria-label', name); }
+  }
+}
+function enhanceForms(root){
+  if (!root || root.nodeType !== 1) return;
+  if (root.matches && root.matches(A11Y_CTRL)) enhanceControl(root);
+  if (root.matches && root.matches('.field')) enhanceFieldGroup(root);
+  if (!root.querySelectorAll) return;
+  root.querySelectorAll(A11Y_CTRL).forEach(enhanceControl);
+  root.querySelectorAll('.field').forEach(enhanceFieldGroup);
+}
 function scanClickable(root){
   if (!root || root.nodeType !== 1) return;
   markKeyboardClickable(root);
   if (root.querySelectorAll) root.querySelectorAll('*').forEach(markKeyboardClickable);
+  // 键盘可达与表单关联共用这一个入口：两次遍历成本实测在亚毫秒级（见下方 scheduleDeepScan 注释）
+  enhanceForms(root);
 }
 // 补扫：部分页面在 innerHTML 之后还要 await 一个请求才绑 onclick，单靠插入时的
 // 那一次扫描会漏；每次变更突发后 1s 整页重扫一次（已处过的在 role 判定处早退）。

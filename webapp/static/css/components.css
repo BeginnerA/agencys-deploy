@@ -8,7 +8,7 @@
 }
 .btn:hover{border-color:var(--primary);color:var(--primary)}
 .btn:disabled{opacity:.5;cursor:not-allowed}
-.btn.primary{background:linear-gradient(135deg,var(--primary),#0090FF);border-color:transparent;color:#04121F;font-weight:600}
+.btn.primary{background:linear-gradient(135deg,var(--primary),#0090FF);border-color:transparent;color:var(--on-bright);font-weight:600}
 .btn.primary:hover{box-shadow:var(--shadow-glow);filter:brightness(1.1)}
 .btn.danger{border-color:rgba(255,69,96,.5);color:var(--danger)}
 .btn.danger:hover{background:rgba(255,69,96,.12);border-color:var(--danger)}

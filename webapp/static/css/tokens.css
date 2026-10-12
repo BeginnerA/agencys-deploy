@@ -18,7 +18,8 @@
   --accent:#FF7A45;             /* 强调橙（运行中） */
   --text-1:#E6F1FF;             /* 主文字 */
   --text-2:#8FA8C8;             /* 次级文字 */
-  --text-3:#5A7296;             /* 弱化/占位 */
+  --text-3:#859BBB;             /* 弱化/占位（由 #5A7296 提亮：实测在原色号下最深面板上仅 3.2~3.7，11~12px 小字不达 WCAG AA 4.5；新值最差合成底上 4.66仍暗于 --text-2 的 5.42，层级靠字号与亮度拉开） */
+  --on-bright:#04121F;          /* 亮色填充与主文字同语系的专用深字：primary/accent/warning/success/danger 做底时一律用它（白字在这些底上只有 1.7~3.4，不达 AA）；原 .btn.primary 硬编值已收成 token */
 
   /* 字体（规格 §3.2） */
   --font-sans:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;

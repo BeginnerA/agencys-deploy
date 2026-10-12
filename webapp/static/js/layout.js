@@ -7,7 +7,7 @@ function renderTopbar(){
     <button class="tb-btn" id="navToggle" title="折叠导航">☰</button>
     <div class="tb-search">
       <span class="ico">🔍</span>
-      <input id="globalSearch" placeholder="搜索服务 / 任务 #id ...">
+      <input id="globalSearch" placeholder="搜索服务 / 任务 #id ..." aria-label="全局搜索：输入服务名或任务号">
       <div class="drop-panel" id="searchDrop"></div>
     </div>
     <button class="tb-btn" id="refreshBtn" title="手动刷新监控">⟳</button>

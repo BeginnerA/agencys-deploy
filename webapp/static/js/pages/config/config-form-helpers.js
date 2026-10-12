@@ -3,12 +3,16 @@
   'use strict';
 
   // ---- 字段包装：label + 必填星标 + ？提示 + 控件 + 底部解释 + 错误槽 ----
+  // .f-label 用 div 不用 <label>：改成 label 会被 components.css 的 .field label{} 覆写出
+  // 视觉回归；无障碍名由 components.js 的 enhanceForms 按本元素纯文本补 aria-label，
+  // 星标/问号只是视觉记号（必填另有 aria-required），错误槽 role=alert 让读屏在校验
+  // 失败当场播报，不必等用户重新遍历到字段
   function field({label, required, tip, input, hint, full}){
     return `<div class="field ${full ? 'full' : ''}">
-      <div class="f-label">${label}${required ? '<span class="req">*</span>' : ''}${tip ? `<span class="q" title="${esc(tip)}">?</span>` : ''}</div>
+      <div class="f-label">${label}${required ? '<span class="req" aria-hidden="true">*</span>' : ''}${tip ? `<span class="q" title="${esc(tip)}">?</span>` : ''}</div>
       ${input}
       <div class="f-hint">${esc(hint || '')}</div>
-      <div class="f-err" style="display:none"></div>
+      <div class="f-err" role="alert" style="display:none"></div>
     </div>`;
   }
   // 就地校验：标红输入框 + 显示错误；msg 为空则清除
@@ -17,12 +21,17 @@
     if (!el) return;
     const errEl = el.closest('.field') ? el.closest('.field').querySelector('.f-err') : null;
     const face = el.closest('.sel-wrap') ? el.closest('.sel-wrap').querySelector('.sel-face') : null;
+    // aria-invalid 与错误文本一并给出（WCAG 3.3.1）：只标红对读屏等于零信息。
+    // 下拉换肤后 face 才是焦点，它的 aria-invalid/aria-describedby 由 enhanceSelect 的
+    // 属性观察者从 select 镜像，不必在此重复写
     if (msg){
       el.classList.add('err');
+      el.setAttribute('aria-invalid', 'true');
       if (face) face.classList.add('err');
       if (errEl){ errEl.textContent = msg; errEl.style.display = 'block'; }
     }else{
       el.classList.remove('err');
+      el.removeAttribute('aria-invalid');
       if (face) face.classList.remove('err');
       if (errEl){ errEl.textContent = ''; errEl.style.display = 'none'; }
     }
