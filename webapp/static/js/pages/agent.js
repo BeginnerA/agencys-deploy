@@ -481,7 +481,11 @@
         <div id="runsList" class="agent-list-body"></div>
       </div>`);
     document.querySelectorAll('[data-status]').forEach(c => {
-      c.onclick = () => { runStatus = c.dataset.status; loadRuns(); };
+      c.onclick = () => {
+        runStatus = c.dataset.status;
+        document.querySelectorAll('[data-status]').forEach(x => x.classList.toggle('active', x === c));
+        loadRuns();
+      };
     });
     const rf = document.getElementById('runsRefresh');
     if (rf) rf.onclick = loadRuns;
@@ -672,10 +676,18 @@
         <button class="btn sm" id="alertGo">归因分析</button>
       </div>`);
     document.querySelectorAll('[data-scope]').forEach(c => {
-      c.onclick = () => { adviceScope = c.dataset.scope; loadAdvice(); };
+      c.onclick = () => {
+        adviceScope = c.dataset.scope;
+        document.querySelectorAll('[data-scope]').forEach(x => x.classList.toggle('active', x === c));
+        loadAdvice();
+      };
     });
     document.querySelectorAll('[data-astatus]').forEach(c => {
-      c.onclick = () => { adviceStatus = c.dataset.astatus; loadAdvice(); };
+      c.onclick = () => {
+        adviceStatus = c.dataset.astatus;
+        document.querySelectorAll('[data-astatus]').forEach(x => x.classList.toggle('active', x === c));
+        loadAdvice();
+      };
     });
     const rf = document.getElementById('adviceRefresh');
     if (rf) rf.onclick = loadAdvice;

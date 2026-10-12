@@ -70,13 +70,17 @@ def save_advice(db_path: str, scope: str, ref_id: int, title: str,
 
 
 def latest_advice(db_path: str, scope: str, ref_id: int, ttl: int = _ADVICE_TTL):
-    """取最近一条建议；ttl 秒内有记录则复用（未过期），否则返回 None"""
+    """取最近一条建议；终态（dismissed/adopted）永久阻塞重新生成，
+    pending 状态 ttl 秒内有记录则复用（未过期），否则返回 None。"""
     rows = dbm.list_records(db_path, "agent_advice",
                             "scope=? AND ref_id=?", (scope, int(ref_id or 0)),
                             "id DESC")
     if not rows:
         return None
     row = rows[0]
+    # 终态建议永久阻塞同 scope+ref 的重新生成（忽略=不想再看到，采纳=已处理）
+    if row.get("status") in ("dismissed", "adopted"):
+        return row
     now = time.time()
     if row["created_at"] and (now - row["created_at"]) > ttl:
         return None
@@ -132,6 +136,25 @@ def set_advice_status(db_path: str, advice_id: int, status: str,
 
 
 def delete_advice(db_path: str, advice_id: int) -> bool:
+    """删除建议：若为 pending 且有有效触发源（scope+ref_id），转为忽略墓碑记录（永久阻塞重新生成）；
+    已终态记录则物理删除（释放存储）。
+    """
+    rec = dbm.get_record(db_path, "agent_advice", advice_id)
+    if not rec:
+        return False
+    cur_status = rec.get("status") or "pending"
+    # 已终态（dismissed/adopted）直接物理删除，不会被重新触发
+    if cur_status in ("dismissed", "adopted"):
+        return dbm.delete_record(db_path, "agent_advice", advice_id)
+    # pending 有触发源 → 软删为 dismissed 墓碑，保留 scope+ref_id 阻塞重新生成
+    if rec.get("scope") and rec.get("ref_id"):
+        dbm.update_record(db_path, "agent_advice", advice_id, {
+            "status": "dismissed", "status_at": _now(),
+            "status_by": "delete", "title": f"[已删除] {rec.get('title', '')}",
+            "body": "", "evidence": {},
+        })
+        return True
+    # 无触发源（如 precheck ref_id=0）可以安全物理删除
     return dbm.delete_record(db_path, "agent_advice", advice_id)
 
 
