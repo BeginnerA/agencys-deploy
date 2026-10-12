@@ -7,7 +7,7 @@
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=1">
 <link rel="stylesheet" href="/static/css/tokens.css?v=3">
 <link rel="stylesheet" href="/static/css/base.css?v=3">
-<link rel="stylesheet" href="/static/css/layout.css?v=4">
+<link rel="stylesheet" href="/static/css/layout.css?v=5">
 <link rel="stylesheet" href="/static/css/components.css?v=9">
 <link rel="stylesheet" href="/static/css/pages/dashboard.css?v=2">
 <link rel="stylesheet" href="/static/css/pages/devices.css?v=2">
@@ -21,12 +21,14 @@
 <link rel="stylesheet" href="/static/css/responsive.css?v=2">
 </head>
 <body>
+<!-- skip link：键盘用户 Tab 首站可一步跳过侧栏/顶栏直达主内容（WCAG 2.4.1），默认隐、聚焦时显 -->
+<a class="skip-link" href="#content">跳到主内容</a>
 <div id="app">
-  <aside id="sidebar"></aside>
+  <aside id="sidebar" aria-label="侧边导航"></aside>
   <div id="main">
     <header id="topbar"></header>
     <div id="breadcrumb"></div>
-    <main id="content"></main>
+    <main id="content" tabindex="-1"></main>
     <footer id="marqueeBar" class="hidden"></footer>
   </div>
 </div>
@@ -41,10 +43,10 @@
 <script>window.PLATFORM_NAME = '智能运维平台';</script>
 <script src="/static/vendor/echarts.min.js?v=2"></script>
 <script src="/static/js/api.js?v=4"></script>
-<script src="/static/js/components.js?v=6"></script>
+<script src="/static/js/components.js?v=7"></script>
 <script src="/static/js/data.js?v=3"></script>
 <script src="/static/js/layout.js?v=6"></script>
-<script src="/static/js/router.js?v=2"></script>
+<script src="/static/js/router.js?v=3"></script>
 <script src="/static/js/pages/dashboard.js?v=3"></script>
 <script src="/static/js/pages/devices.js?v=4"></script>
 <script src="/static/js/pages/deploy.js?v=3"></script>

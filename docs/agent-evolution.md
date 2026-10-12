@@ -159,6 +159,14 @@ python webapp/app.py
 - **度量假阳性教训（写进方法论）**：`navigate_page` 到「仅 hash 不同」的 URL **不重载页面**，会用旧 `components.js` + 上轮遗留 DOM + 泄漏的内联覆盖变量，误报「fab-btn 白字 1.77」「下拉未命名」——须 `type=reload, ignoreCache=true` 真重载，probe 先清注入变量再测 after、注入旧值测 before。Flask 生产 Jinja 缓存编译结果，改动不生效须置 `TEMPLATES_AUTO_RELOAD`。
 - **刻意留挂账**：`logTaskSel` 仍无名（前兄弟是 1px 装饰分隔 span，且 `logs.js` 正被并行会话占着）；`alertKeyword`/`chatInput` 仅 placeholder 兜底名；`looseLabels` 判为 owners>1 的字段不猜归属；devices `.mon-switch` 空 label 需页面级修改；44px 触控目标尺寸属后续批次。
 
+**前端无障碍第三批（地标 / 跳转链接 / 表格语义）**：前两批解决「看得清、读得懂」，本批解决「跳得快、结构清晰」（WCAG 2.4 Navigable / 1.3.1 Info）。静态审计得三缺口——① 全站无 skip link，键盘用户进主内容需 Tab 跳过整个侧栏+顶栏；② 侧栏是一堆可点 `.nav-item`  div（第一批已纳入键盘）但整个导航区不是 `nav` 地标；③ 12+ 张数据表的 `thead th` 均无 `scope`、表无 caption/名（读屏无法将单元格与列头对应）。
+
+- **skip link**：screen.html `<body>` 首位插 `<a class="skip-link" href="#content">跳到主内容</a>`、`#content` 加 `tabindex=-1`（非原生可聚焦元素需此才接得住跳转焦点）；layout.css `.skip-link` 默认 off-screen（`top:-64px`）、`:focus/:focus-visible` 时才滑入 `top:var(--sp-3)`，亮底配 `--on-bright` 深字、焦点环用 `--text-1`（深色页背景上可见）。踩坑：`transition:top var(--t-fast)` 是误用（`--t-fast` 本身已是完整简写值 `all .15s var(--ease)`，展开成 `top all ...` 非法使 computed transition 退化为 `all`）→改 `transition:var(--t-fast)`。另：`:focus` 在自动化窗口未获系统焦点时不匹配（`document.hasFocus()=false`、`window.focus()` 无效，Chromium 行为），规则经 CSSOM 核实选择器与特异性正确，真实键盘用户 Tab 首站即生效。
+- **地标**：router.js `renderSidebar` 把 `<div class="nav-scroll">` 改 `<nav class="nav-scroll" aria-label="主导航">`（nav 默认块级、CSS 按 `.nav-scroll` 类命中，与 div 等价无视觉回归）；`<aside id="sidebar">` 加 `aria-label="侧边导航"`（complementary 地标多个时需名才可区分）。顶栏 `<header>`/`<main>`/`<footer>` 本就是 banner/main/contentinfo 原生地标。
+- **表格语义集中收口 `enhanceTables`**（接 `scanClickable` 末尾，与前两批同一入口）：列头一律补 `scope=col`（本域 thead 全为列头、无行头，只补未声明的）；表名四级回退——同 `.panel` 标题 → 祖先前序标题（`.panel-title/.section-title/.page-title`）→ 活动页签（`.tab-btn.active`/`.sub-tabs .chip.active`，剔除 emoji 前缀）→ 路由名（`currentRoute.name`），全落空不编造。**表头裸复选框**（`monCheckAll` 无 label 包裹、无前兄弟，走不到控件路径）补 `aria-label=全选`（表头里的复选框＝整列全选开关）。
+- **浏览器量化复测（临时库 + 一次性 UI 服务器，仓库外 `_probe/`）**：6 张表跨 4 条取名路径全绿——config 用户表 5 列头/名“用户管理”（祖先 page-title）、logs 审计 5/“审计日志”（同 panel-title）、alerts 规则 9/“规则管理”（活动页签，📏 已剔除）、到期监控 11/“到期监控”、deploy 任务 9/“任务列表”（sub-tab）、dashboard 健表 14/“服务器状态”（同 panel）；全选复选框 `aria-label=全选`；各页 `dupIds` 为空；alerts/dashboard 路由 **0 console error/warn**；全量 pytest 492 passed。
+- **刻意留挂账**：行内 toggle 复选框（alerts `alert-row-check` / `.mon-switch`、devices `.mon-switch`）包裹空 label，逐行命名需行上下文（哪条告警/服务），属页面级；skip-link 显形不可在无头未聚焦窗口测视觉（机制经 CSSOM 坐实）。
+
 ## 六、Phase 4：MCP Server 与案例库
 
 ### MCP stdio

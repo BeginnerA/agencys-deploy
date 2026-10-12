@@ -91,7 +91,7 @@ function renderSidebar(){
       <div><div class="logo-name">${window.PLATFORM_NAME}</div>
       <div class="logo-sub">DEPLOY CONSOLE</div></div>
     </div>
-    <div class="nav-scroll">${nav}</div>
+    <nav class="nav-scroll" aria-label="主导航">${nav}</nav>
     <div class="side-foot">© 2026 运维平台</div>`;
   sb.querySelectorAll('.nav-item').forEach(item => {
     item.onclick = () => { location.hash = '#/' + item.dataset.path; };

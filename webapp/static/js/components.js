@@ -517,12 +517,65 @@ function enhanceForms(root){
   root.querySelectorAll(A11Y_CTRL).forEach(enhanceControl);
   root.querySelectorAll('.field').forEach(enhanceFieldGroup);
 }
+// 表格语义（WCAG 1.3.1）：数据表列头一律补 scope=col（本项目 thead 全为列头、无行头），
+// 并就近取标题作表名。集中收口不逐页改模板，与前两批同一策略。
+// 表名四级回退：同 panel 的标题 → 祖先前序的标题 → 活动页签 → 路由页名；全落空才留空（不编造）。
+const A11Y_TITLE_SEL = '.panel-title,.section-title,.page-title';
+function titleTextOf(el){ return el ? (el.textContent || '').replace(/\s+/g, ' ').trim() : ''; }
+// 页签文字常带 emoji 前缀（📏 规则管理），只留中英文与数字作表名
+function activeTabName(){
+  const t = document.querySelector('.tab-btn.active') || document.querySelector('.sub-tabs .chip.active');
+  return t ? (t.textContent || '').replace(/[^\u4e00-\u9fa5A-Za-z0-9]+/g, ' ').trim() : '';
+}
+function findTableName(table){
+  const panel = table.closest('.panel');
+  if (panel){ const t = panel.querySelector(A11Y_TITLE_SEL); if (t) return t; }
+  // 标题在 panel 外层前兄弟（「列表」面板紧跟一个 .page-title/.section-title）：逐层向上找最近的前序标题
+  let node = panel || table.parentElement;
+  while (node && node !== document.body){
+    for (let prev = node.previousElementSibling; prev; prev = prev.previousElementSibling){
+      const t = (prev.matches && prev.matches(A11Y_TITLE_SEL)) ? prev
+        : (prev.querySelector ? prev.querySelector(A11Y_TITLE_SEL) : null);
+      if (t) return t;
+    }
+    node = node.parentElement;
+  }
+  return null;
+}
+function enhanceTable(table){
+  if (!table || table.nodeType !== 1) return;
+  if (table.dataset.a11yTbl === '1') return;
+  table.dataset.a11yTbl = '1';
+  table.querySelectorAll('thead th').forEach(th => {         // 只补未声明的，行头/作者已写的不动
+    if (!th.hasAttribute('scope')) th.setAttribute('scope', 'col');
+  });
+  // 表头裸复选框＝整列「全选」开关（如 monCheckAll，无 label 包裹、无前兄弟，走不到控件路径）：补名让读屏知道这格作用
+  table.querySelectorAll('thead th input[type="checkbox"]').forEach(cb => {
+    if (cb.closest('label') || cb.getAttribute('aria-label') || cb.getAttribute('aria-labelledby')) return;
+    cb.setAttribute('aria-label', '全选');
+  });
+  if (table.querySelector('caption') || table.getAttribute('aria-label')
+    || table.getAttribute('aria-labelledby')) return;         // 作者已自行命名，不抢契约
+  const titleEl = findTableName(table);
+  if (titleEl && titleTextOf(titleEl)) a11yRefs(table, 'aria-labelledby', [a11yId(titleEl, 'tbl')]);
+  else {
+    const nm = activeTabName()
+      || (typeof currentRoute !== 'undefined' && currentRoute && currentRoute.name) || '';
+    if (nm) table.setAttribute('aria-label', nm);
+  }
+}
+function enhanceTables(root){
+  if (!root || root.nodeType !== 1) return;
+  if (root.matches && root.matches('table')) enhanceTable(root);
+  if (root.querySelectorAll) root.querySelectorAll('table').forEach(enhanceTable);
+}
 function scanClickable(root){
   if (!root || root.nodeType !== 1) return;
   markKeyboardClickable(root);
   if (root.querySelectorAll) root.querySelectorAll('*').forEach(markKeyboardClickable);
-  // 键盘可达与表单关联共用这一个入口：两次遍历成本实测在亚毫秒级（见下方 scheduleDeepScan 注释）
+  // 键盘可达、表单关联、表格语义共用这一个入口：三次遍历成本实测在亚毫秒级（见下方 scheduleDeepScan 注释）
   enhanceForms(root);
+  enhanceTables(root);
 }
 // 补扫：部分页面在 innerHTML 之后还要 await 一个请求才绑 onclick，单靠插入时的
 // 那一次扫描会漏；每次变更突发后 1s 整页重扫一次（已处过的在 role 判定处早退）。

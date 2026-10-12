@@ -1,6 +1,15 @@
 /* layout.css — 全站布局骨架 */
 #app{display:flex;height:100vh;overflow:hidden}
 
+/* skip link：视觉隐藏，键盘 Tab 首站聚焦时才显形、一步直达主内容（WCAG 2.4.1）；
+   亮底配 --on-bright 深字沿用主题语系；焦点环用 --text-1 使其在深色页背景上可见 */
+.skip-link{
+  position:fixed;left:var(--sp-3);top:-64px;z-index:2000;
+  padding:10px 16px;border-radius:var(--r-ctl);background:var(--primary);color:var(--on-bright);
+  font-size:var(--fs-14);font-weight:600;text-decoration:none;transition:var(--t-fast);
+}
+.skip-link:focus,.skip-link:focus-visible{top:var(--sp-3);outline:2px solid var(--text-1);outline-offset:2px}
+
 /* ---- 侧边导航 ---- */
 #sidebar{
   width:var(--nav-w); flex-shrink:0; display:flex; flex-direction:column;
