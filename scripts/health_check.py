@@ -9,10 +9,19 @@ import paramiko
 from common import load_config, get_project_config, get_ssh_config, connect_ssh, merge_server_ssh, log, as_number
 
 
-def check_http(url: str, timeout: int = 10) -> bool:
+def check_http(url: str, timeout: int = 10, require_health_body: bool = True) -> bool:
+    """HTTP 探活。
+
+    require_health_body=True（默认，容器/Actuator 语义）：200 且 body 为空或含 UP/ok 才健康；
+    require_health_body=False（静态站点语义）：任意 200 即健康——静态首页 index.html 无 UP 体，
+    沿用 Actuator body 判定会把「已成功换入」的静态站点误判为失败（与 monitor 静态探活同源口径）。
+    """
     try:
         resp = requests.get(url, timeout=timeout)
         if resp.status_code == 200:
+            if not require_health_body:
+                # 静态站点：200 即视为在线，不校验响应体内容
+                return True
             # Spring Boot Actuator 会返回 UP；空 body 端点（如静态健康页）视为健康
             body = resp.text
             return (not body.strip()) or "UP" in body or "ok" in body.lower()
@@ -23,9 +32,11 @@ def check_http(url: str, timeout: int = 10) -> bool:
 
 
 def check_tcp_port(host: str, port: int, timeout: int = 5) -> bool:
-    """TCP 端口连通性探测：仅判断服务端口是否在接受连接，不要求任何健康接口。
-    用于未提供检查端点、但暴露了业务端口的服务（比 SSH 容器检查更直接地反映
-    「应用已在监听端口」）。"""
+    """TCP 端口连通性探测（从本机直连 host:port）：仅判断端口是否在接受连接。
+    注意：微服务业务端口通常只在宿主机 localhost/内网暴露，云安全组不对公网放行，
+    从平台机直连公网 IP 必被静默丢包（报 timed out 而非 refused），会造成健康检查
+    假超时误判。发布/回退路径应优先用 check_tcp_port_via_ssh 在服务器内部探测，
+    本函数仅在无 SSH 通道时作为最后兜底。"""
     try:
         sock = socket.create_connection((host, int(port)), timeout=timeout)
         sock.close()
@@ -33,6 +44,40 @@ def check_tcp_port(host: str, port: int, timeout: int = 5) -> bool:
     except (socket.timeout, ConnectionRefusedError, OSError) as e:
         log(f"TCP 端口探测失败 {host}:{port}: {e}")
         return False
+
+
+def check_tcp_port_via_ssh(host: str, port: int, ssh_cfg: dict) -> bool:
+    """经 SSH 在目标服务器内部对 127.0.0.1:port 做 TCP 探测。
+
+    发布链路本就持有 SSH 通道，从服务器内部探测回环端口才是「应用已在监听」的权威口径，
+    且不依赖云安全组对外暴露——规避平台机直连公网业务端口被丢包导致的假超时误回滚。
+    探测机制本身不可用（SSH 连不上 / 无 bash 无 /dev/tcp）返回 None，由调用方回退其他检查；
+    明确 UP/DOWN 返回 True/False。"""
+    try:
+        client = get_ssh_client(host, ssh_cfg)
+    except Exception as e:
+        log(f"内部 TCP 探测无法建立 SSH 通道（回退其他检查）: {e}")
+        return None
+    try:
+        # timeout 兜底避免 hang；bash /dev/tcp 打开回环端口即视为应用已监听
+        cmd = (f"timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{int(port)}' "
+               f"2>/dev/null && echo __UP__ || echo __DOWN__")
+        stdin, stdout, stderr = client.exec_command(cmd, timeout=15)
+        out = stdout.read().decode("utf-8", errors="ignore")
+        if "__UP__" in out:
+            return True
+        if "__DOWN__" in out:
+            log(f"服务器内部 TCP 探测 127.0.0.1:{port} 未通过（应用尚未监听该端口）")
+            return False
+        # 无 bash/无 /dev/tcp：命令未产出判定标记，视为探测机制不可用
+        err = stderr.read().decode("utf-8", errors="ignore").strip()
+        log(f"内部 TCP 探测未获得判定结果（回退其他检查）: {out.strip() or err[:120] or '(无输出)'}")
+        return None
+    except Exception as e:
+        log(f"内部 TCP 探测执行异常（回退其他检查）: {e}")
+        return None
+    finally:
+        client.close()
 
 
 def get_ssh_client(host: str, ssh_cfg: dict) -> paramiko.SSHClient:
@@ -101,10 +146,24 @@ def wait_for_healthy(host: str, project_name: str, version: str = None, ssh_over
         log(f"开始健康检查: {health_url}，超时 {timeout} 秒")
         is_ok = lambda: check_http(health_url)
     elif health_port:
-        # 未配置 health_url 但配了业务端口：退化为 TCP 端口连通检查
-        # （现实项目极少遗留专用检查接口，端口在监听即说明应用已起）
-        log(f"未配置 health_url，改用 TCP 端口连通检查: {host}:{health_port}，超时 {timeout} 秒")
-        is_ok = lambda: check_tcp_port(host, health_port)
+        # 未配置 health_url 但配了业务端口：在服务器内部对回环端口做 TCP 连通检查。
+        # 微服务业务端口常不对公网放行（云安全组只挡外部），从平台机直连公网 IP 必超时
+        # 导致假失败误回滚，故经既有 SSH 通道在 127.0.0.1 本地探测（与 monitor 探活同源口径）。
+        log(f"未配置 health_url，改用服务器内部回环 TCP 端口连通检查: 127.0.0.1:{health_port}，超时 {timeout} 秒")
+
+        def is_ok():
+            verdict = check_tcp_port_via_ssh(host, health_port, ssh_cfg)
+            if verdict is True:
+                return True
+            # verdict False（回环未监听）或 None（探测机制不可用）：回退容器运行状态检查。
+            # 微服务常只在 docker 内部网络监听、未发布到宿主机回环（或无 bash），
+            # 此时回环探 DOWN 并不代表应用异常，误判会触发无谓回滚；容器 Up
+            # 且后续日志无错误关键字（wait_for_healthy 紧接的 check_container_logs）即视为健康。
+            try:
+                return check_container_running(host, service_name, ssh_cfg)
+            except Exception as e:
+                log(f"容器运行状态检查失败（保持轮询直至超时）: {e}")
+                return False
     else:
         # 既无 health_url 也无 health_port：跳过网络检查，退化为容器运行状态检查，避免盲发
         log(f"未配置 health_url/health_port，改用容器运行状态检查: {service_name}，超时 {timeout} 秒")

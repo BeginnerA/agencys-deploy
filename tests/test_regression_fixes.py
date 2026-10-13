@@ -397,6 +397,24 @@ class TestHealthCheckHttp(unittest.TestCase):
                         side_effect=Exception("timeout")):
             self.assertFalse(check_http("http://h/health"))
 
+    def test_static_mode_200_non_up_body_healthy(self):
+        """静态站点语义：200 但 body 无 UP/ok（如 index.html）须判健康（发布/监控同口径）"""
+        html = "<!doctype html><html><head><title>管理端</title></head><body></body></html>"
+        with mock.patch("health_check.requests.get",
+                        return_value=self._fake_resp(200, html)):
+            # 默认 Actuator 语义：无 UP/ok 的非空 body → False（旧行为保持）
+            self.assertFalse(check_http("https://site.example.com/"))
+            # require_health_body=False：200 即 True（修复静态发布误报失败）
+            self.assertTrue(check_http("https://site.example.com/",
+                                        require_health_body=False))
+
+    def test_static_mode_non_200_still_false(self):
+        """静态模式下非 200 依旧判不健康（不误放宽状态码）"""
+        with mock.patch("health_check.requests.get",
+                        return_value=self._fake_resp(503, "<html>down</html>")):
+            self.assertFalse(check_http("https://site.example.com/",
+                                        require_health_body=False))
+
 
 class TestGitTagSuffix(unittest.TestCase):
     """#14 git tag 环境隔离：suffix 非空 → v{version}-{suffix}；留空 → v{version}"""

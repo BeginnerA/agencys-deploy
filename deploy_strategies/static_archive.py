@@ -239,7 +239,8 @@ class StaticArchiveStrategy(DeployStrategy):
             log(f"开始静态站点健康检查: {health_url}，超时 {timeout} 秒")
             deadline = time.time() + timeout
             while time.time() < deadline:
-                if check_http(health_url):
+                # 静态首页 200 即健康（不看响应体），沿用 Actuator body 判定会误报成功换入为失败
+                if check_http(health_url, require_health_body=False):
                     log(f"健康检查通过: {health_url}")
                     return
                 time.sleep(interval)

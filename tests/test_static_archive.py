@@ -232,8 +232,19 @@ class TestPhases(unittest.TestCase):
 
     def test_verify_http_success(self):
         self.d.proj_cfg["health_url"] = "https://example.com/"
-        with mock.patch("health_check.check_http", return_value=True):
+        with mock.patch("health_check.check_http", return_value=True) as ch:
             self.s.verify(FakeRemote())
+        # 静态发布必须走 body 无关模式，否则 index.html（200 无 UP 体）会被误报失败
+        self.assertIn("require_health_body", ch.call_args.kwargs)
+        self.assertFalse(ch.call_args.kwargs["require_health_body"])
+
+    def test_verify_http_static_index_html_passes(self):
+        """端到端回归：真实 200 静态首页（body 无 UP/ok）不得误报为超时失败"""
+        self.d.proj_cfg["health_url"] = "https://dist.test.hongqiu8.com"
+        html = "<!doctype html><html><head><title>安米聊后端管理系统</title></head><body></body></html>"
+        resp = mock.Mock(status_code=200, text=html)
+        with mock.patch("health_check.requests.get", return_value=resp):
+            self.s.verify(FakeRemote())  # 不抛 RuntimeError 即通过
 
     def test_verify_http_timeout_raises(self):
         self.d.proj_cfg["health_url"] = "https://example.com/"
