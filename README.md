@@ -417,3 +417,4 @@ gh release edit v0.1.0 --repo <owner>/<repo> --notes-file dist-portable\_release
 - 发布后若 master 上只追加测试配置/文档（不改包内白名单源码），无需重打包或挪 tag；在 release notes 写明产物基线 commit，避免包内文档比 master 滞后被误认为产物过期。
 - 渠道定位：Gitee 为使用主渠道（仅同步 `master` + tag，未建发行版），下载入口统一在 GitHub Release。
 - 发布前删除陈旧包副本（如 `dist-portable/_preview`）：旧包易被误当发布物。
+- Releases 列表页的时间取的是 release 的 `published_at`：`gh release edit` 与 delete-asset + upload 只推进 `updated_at`，同版本号原地重发后页面仍显示首次发布时间（看起来像旧版，但资产 digest 已是新的）。需要把时间刷成当天只能 `gh release delete v0.1.0 --yes`（不会删 tag）后 `gh release create v0.1.0 --title … --notes-file …` + `gh release upload` 重建；代价是下载计数与 release 编辑历史归零，`/releases/tag/<v>` 与 `/releases/download/...` 直链不变。
