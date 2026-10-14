@@ -413,6 +413,7 @@ gh release edit v0.1.0 --repo <owner>/<repo> --notes-file dist-portable\_release
 
 - **发布资产必须用 ASCII 文件名**（如 `SmartOps-portable-v0.1.0-win-x64.zip`）：中文文件名会被 GitHub 吞成 `-.-`，下载直链失效。
 - 发布前刷新 `dist-portable/_release-notes-v0.1.0.md` 的 SHA256 与打包 commit；上传后核对 GitHub 自算 `digest` 与本地 SHA256 一致，并用免登录直链验证 `302 → 200` 且 `Content-Length` 与本地一致。
-- 发布完整性核验：包内源码逐文件与 `git show HEAD:<path>` blob 比对（`core.autocrlf=true` 下仅 CRLF 行尾差异属预期）。
+- 发布完整性核验：包内源码逐文件与 `git show <打包基线commit>:<path>` 的 blob 比对（不可拿 master HEAD 当基准；`core.autocrlf=true` 下仅 CRLF 行尾差异属预期）。
+- 发布后若 master 上只追加测试配置/文档（不改包内白名单源码），无需重打包或挪 tag；在 release notes 写明产物基线 commit，避免包内文档比 master 滞后被误认为产物过期。
 - 渠道定位：Gitee 为使用主渠道（仅同步 `master` + tag，未建发行版），下载入口统一在 GitHub Release。
 - 发布前删除陈旧包副本（如 `dist-portable/_preview`）：旧包易被误当发布物。
