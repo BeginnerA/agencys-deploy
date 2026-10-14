@@ -371,3 +371,48 @@ python webapp/app.py          # 默认同时启动 AI 建议调度（30s 周期�
 - `sj_job` 备份文件会保存在 `./backups/` 目录，请定期清理。
 - 如果 Nacos 是 2.x 且 Open API 路径不兼容，请根据实际情况调整 `scripts/nacos_manager.py`。
 - 配置文件中的密码仅作占位，生产环境请使用环境变量或密钥管理工具。
+
+## 便携版打包与发布（Windows 免安装）
+
+面向无 Python 环境的机器：一个 zip 解压即用，包内置 Python 3.12.10 embeddable 运行时（3.12 系列最后一个带 embeddable 的版本）与全部第三方依赖（`runtime\python\Lib\site-packages`），免安装、免联网、免 pip。产物目录 `dist-portable/` 已被 `.gitignore` 忽略，不入库。
+
+### 出包
+
+版本号由 `scripts/package_portable.py` 顶部常量 `RELEASE_VERSION` 控制（改版本号只改这一处）：
+
+```powershell
+pytest tests -q                     # 发布门禁：先跑绿用例（仓库根 pytest.ini 已约束 testpaths）
+python scripts/package_portable.py  # 五阶段一键出包，走缓存约 24~30s
+```
+
+五阶段（任一环失败即中止，不可绕过）：
+
+| 阶段 | 做什么 |
+| --- | --- |
+| fetch | 下载 Python embeddable 与 wheel 到 `dist-portable/.cache/`，`pip --target --platform win_amd64` 交叉安装；`--refresh` 强制重下 |
+| assemble | 白名单组装：仅 `agent/ webapp/ scripts/ deploy_strategies/ config/` + `deploy.py deploy_pipeline.py menu.py requirements.txt README.md LICENSE` + `scripts/portable/` 启动器；`data/`、`.venv/`、`.git/`、`dist*/` 永不进包 |
+| leak_check | 三重防线：白名单 + 禁入断言（`*.db`/`secret_key`/`__pycache__`/日志出现即失败）+ 凭据探针（从源 `data/` 全表与 YAML 收集真实值扫包内文本，并做密钥形态识别；命中经公开面判定，泄漏即失败） |
+| smoke | 用包内 Python 真实拉起平台（自动建库、admin 首启强制改密、JWT 登录、页面与静态资源 200），随后清理回出厂态并复检禁入项 |
+| zip | 产物 `dist-portable/智能运维平台-便携版-{版本}.zip`，日志输出文件数与 SHA256 |
+
+调试参数：`--no-zip` 只出文件夹、`--skip-smoke` 跳过冒烟（**禁止用于发布**）、`--clean` 清空 `dist-portable/`。启动器 `启动平台.bat` / `menu.bat` 以 PATH 前置 `runtime\python`，`launcher.py` 从 5678 起自动避让 20 个端口并打开浏览器。
+
+### 发布收口（双远端 + Release）
+
+```powershell
+git tag -f v0.1.0 <commit>                     # tag 必须指向实际打包基线，保证 tag 与包内容同源
+git push origin v0.1.0 --force                 # Gitee
+git push github master; git push github v0.1.0 --force
+
+Copy-Item "dist-portable\智能运维平台-便携版-v0.1.0.zip" `
+          "dist-portable\SmartOps-portable-v0.1.0-win-x64.zip"
+gh release delete-asset v0.1.0 <旧asset> --repo <owner>/<repo> --yes
+gh release upload v0.1.0 "dist-portable\SmartOps-portable-v0.1.0-win-x64.zip" --repo <owner>/<repo> --clobber
+gh release edit v0.1.0 --repo <owner>/<repo> --notes-file dist-portable\_release-notes-v0.1.0.md
+```
+
+- **发布资产必须用 ASCII 文件名**（如 `SmartOps-portable-v0.1.0-win-x64.zip`）：中文文件名会被 GitHub 吞成 `-.-`，下载直链失效。
+- 发布前刷新 `dist-portable/_release-notes-v0.1.0.md` 的 SHA256 与打包 commit；上传后核对 GitHub 自算 `digest` 与本地 SHA256 一致，并用免登录直链验证 `302 → 200` 且 `Content-Length` 与本地一致。
+- 发布完整性核验：包内源码逐文件与 `git show HEAD:<path>` blob 比对（`core.autocrlf=true` 下仅 CRLF 行尾差异属预期）。
+- 渠道定位：Gitee 为使用主渠道（仅同步 `master` + tag，未建发行版），下载入口统一在 GitHub Release。
+- 发布前删除陈旧包副本（如 `dist-portable/_preview`）：旧包易被误当发布物。

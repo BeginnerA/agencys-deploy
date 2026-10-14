@@ -57,7 +57,8 @@ agencys-deploy/
 │   ├── build.py             # Maven 构建 + Docker 构建推送
 │   ├── nacos_manager.py     # Nacos 实例查询、下线、上线、改权重
 │   ├── health_check.py      # HTTP 健康检查 + 容器日志错误关键字扫描
-│   └── snailjob_manager.py  # SnailJob 备份、暂停、恢复、清零计数器
+│   ├── snailjob_manager.py  # SnailJob 备份、暂停、恢复、清零计数器
+│   └── package_portable.py  # Windows 免安装便携包打包（见 10.7）
 ├── deploy.py                # 单服务发布主控脚本
 ├── deploy.sh                # 单服务发布入口脚本
 ├── deploy_pipeline.py       # 多服务流水线发布主控脚本
@@ -703,6 +704,12 @@ python webapp/app.py          # 默认 http://127.0.0.1:5678
 ```
 
 Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`，可直接复制为 `config/` 供 yaml 模式使用。
+
+### 10.7 Windows 免安装便携版
+
+面向没有 Python 环境的机器：一个 zip 解压即用，包内置 Python 3.12.10 embeddable 运行时与全部第三方依赖，免安装/免联网/免 pip；解压后双击 `启动平台.bat` 即拉起 Web 操作台（`launcher.py` 从 5678 起自动避让 20 个端口并打开浏览器，`menu.bat` 为交互式菜单）。
+
+出包与发布完整流程（版本号常量 `RELEASE_VERSION`、五阶段门禁 fetch/assemble/leak_check/smoke/zip、三重防泄漏红线、ASCII 发布资产名与 SHA256 校验、双远端 tag 与 `gh release` 收口）见 README「便携版打包与发布（Windows 免安装）」一节。产物目录 `dist-portable/` 已被 `.gitignore` 忽略，不入库；`--skip-smoke` 仅供调试，禁止用于发布。
 
 ## 十一、Jenkins / Ansible 集成
 
