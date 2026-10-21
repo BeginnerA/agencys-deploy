@@ -11,10 +11,12 @@
     if (currentTab === 'runs') loadRuns();
     else if (currentTab === 'advice') loadAdvice();
     else if (currentTab === 'cases') loadCases();
+    else if (currentTab === 'chat') refreshChatTail();
   }
   let destroyed = false;
   let chatAbort = null;    // 流式对话 AbortController（切页时中止）
   let pendingTools = [];   // 流式对话中未收尾的工具行（tool → tool_result）
+  let chatLastId = 0;      // 当前会话已渲染的最大消息 id（后台回写新消息时据此增量刷新）
   let currentTab = 'chat';   // chat | runs | advice | cases
 
   // ---- 页面状态 ----
@@ -162,6 +164,7 @@
     // 渲染空态并恢复该会话服务端历史（operator+ 可见；viewer 无权限时静默降级为空会话）
     const msgs = document.getElementById('chatMsgs');
     if (!msgs) return;
+    chatLastId = 0;
     msgs.innerHTML = chatEmptyHtml();
     bindSugs(msgs);
     api('/api/agent/sessions/' + encodeURIComponent(sessionId)
@@ -169,8 +172,26 @@
       if (destroyed || !document.getElementById('chatMsgs')) return;
       const list = (data.messages || [])
         .filter(m => ['user','assistant'].includes(m.role));
+      chatLastId = list.reduce((mx, m) => Math.max(mx, m.id || 0), 0);
       if (list.length) renderChatHistory(list);
     }).catch(() => {});
+  }
+  async function refreshChatTail(){
+    // 对话页实时收尾：审批单在后台执行完成/失败时会向发起会话回写一条助手消息，
+    // 收到 agent/tasks 事件后据此拉取；流式回复进行中（chatAbort 非空）不刷新，
+    // 仅当服务端出现更大 id 的新消息才整体重绘，规避无关事件引起的无谓闪烁。
+    if (chatAbort) return;
+    if (!document.getElementById('chatMsgs')) return;
+    let list = [];
+    try{
+      const data = await api('/api/agent/sessions/'
+        + encodeURIComponent(currentSession) + '/messages?limit=40');
+      list = (data.messages || [])
+        .filter(m => ['user','assistant'].includes(m.role));
+    }catch(e){ return; }
+    if (destroyed || !document.getElementById('chatMsgs')) return;
+    const newLastId = list.reduce((mx, m) => Math.max(mx, m.id || 0), 0);
+    if (newLastId > chatLastId){ renderChatHistory(list); chatLastId = newLastId; }
   }
   function bindSugs(msgs){
     msgs.querySelectorAll('[data-sug]').forEach(s => {
@@ -305,11 +326,27 @@
     bindSugs(msgs);
   }
   function bubbleHtml(role, content, extra){
+    const inner = role === 'user'
+      ? esc(content)
+      : `<div class="md-body">${mdToHtml(content)}</div>`;
     return `
       <div class="msg-row ${role === 'user' ? 'user' : ''}">
         <div class="msg-ava">${role === 'user' ? '🧑' : '🤖'}</div>
-        <div class="msg-bubble">${esc(content)}${extra || ''}</div>
+        <div class="msg-bubble">${inner}${extra || ''}</div>
       </div>`;
+  }
+  function renderBubbleMd(bubble, reply){
+    // 流式回复结束后把气泡内的原始 Markdown 文本节点换成渲染后的容器（工具行保留）。
+    if (!bubble) return;
+    const text = (reply || '').trim()
+      || Array.from(bubble.childNodes)
+        .filter(n => n.nodeType === 3).map(n => n.nodeValue).join('').trim();
+    if (!text) return;
+    Array.from(bubble.childNodes).forEach(n => { if (n.nodeType === 3) n.remove(); });
+    const body = document.createElement('div');
+    body.className = 'md-body';
+    body.innerHTML = mdToHtml(text);
+    bubble.appendChild(body);
   }
   function streamBubble(msgs){
     // 创建流式回复气泡容器（含“思考中”占位，首个事件到达时移除）
@@ -422,6 +459,7 @@
       } else if (t === 'done'){
         ended = true;
         clearStreamHint(bubble);
+        renderBubbleMd(bubble, (ev.result || {}).reply || '');
         const runId = (ev.result || {}).plan_run_id;
         if (runId && bubble) attachPlanTip(bubble, runId);
         // 本轮消息已落库：刷新会话下拉条数（新会话从占位变为真实条目）

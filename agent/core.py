@@ -84,7 +84,8 @@ class AgentSession:
         self.session_id = session_id or "default"
         self._tool_ctx = type("ToolCtx", (), {
             "db_path": db_path, "user_id": self.user_id,
-            "username": self.username, "role": self.role})()
+            "username": self.username, "role": self.role,
+            "session_id": self.session_id})()
         self.messages = self._load_history()
 
     # ---------- 会话持久化 ----------

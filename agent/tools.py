@@ -833,7 +833,8 @@ def _plan_operation(ctx, op=None, target=None, env=None, version="",
             op=op, target=target, env=env, version=version or "",
             previous_version=previous_version or "", canary=bool(canary),
             auto_version=bool(auto_version), skip_build=bool(skip_build),
-            no_git_tag=bool(no_git_tag), intent=intent or "")
+            no_git_tag=bool(no_git_tag), intent=intent or "",
+            session_id=getattr(ctx, "session_id", ""))
     except executor_mod.ExecutorError as e:
         raise ToolError(str(e))
     plan = run.get("plan") or {}
@@ -1095,7 +1096,8 @@ def _manage_schedules(ctx, action=None, schedule_id=None, project=None,
         try:
             run = executor_mod.plan_schedule_run(
                 db, {"id": ctx.user_id, "username": ctx.username},
-                sched["id"], intent="Agent 手动执行定时计划")
+                sched["id"], intent="Agent 手动执行定时计划",
+                session_id=getattr(ctx, "session_id", ""))
         except executor_mod.ExecutorError as e:
             raise ToolError(str(e))
         plan = run.get("plan") or {}

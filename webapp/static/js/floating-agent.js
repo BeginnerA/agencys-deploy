@@ -107,9 +107,11 @@
       if (list.length){
         box.innerHTML = list.map(m => {
           const isU = m.role === 'user';
+          const inner = isU ? esc(m.content || '')
+            : `<div class="md-body">${mdToHtml(m.content || '')}</div>`;
           return `<div class="msg-row ${isU ? 'user' : ''}">
             <div class="msg-ava">${isU ? '🧑' : '🤖'}</div>
-            <div class="msg-bubble">${esc(m.content || '')}</div></div>`;
+            <div class="msg-bubble">${inner}</div></div>`;
         }).join('');
         scrollToBottom();
       }
@@ -144,7 +146,14 @@
     row.innerHTML = `<div class="msg-ava">${role === 'user' ? '🧑' : '🤖'}</div>
       <div class="msg-bubble"></div>`;
     const bub = row.querySelector('.msg-bubble');
-    bub.appendChild(document.createTextNode(content || ''));
+    if (role === 'user'){
+      bub.appendChild(document.createTextNode(content || ''));
+    }else{
+      const body = document.createElement('div');
+      body.className = 'md-body';
+      body.innerHTML = mdToHtml(content || '');
+      bub.appendChild(body);
+    }
     box.appendChild(row);
     scrollToBottom();
     return bub;
@@ -191,6 +200,19 @@
     bubble.appendChild(document.createTextNode(text));
     scrollToBottom();
     return true;
+  }
+  function renderBubbleMd(bubble, reply){
+    // 流式结束后把气泡内原始 Markdown 文本节点换成渲染容器（工具行保留）。
+    if (!bubble) return;
+    const text = (reply || '').trim()
+      || Array.from(bubble.childNodes)
+        .filter(n => n.nodeType === 3).map(n => n.nodeValue).join('').trim();
+    if (!text) return;
+    Array.from(bubble.childNodes).forEach(n => { if (n.nodeType === 3) n.remove(); });
+    const body = document.createElement('div');
+    body.className = 'md-body';
+    body.innerHTML = mdToHtml(text);
+    bubble.appendChild(body);
   }
   function appendErr(bubble, msg, hint){
     if (!bubble) return;
@@ -247,6 +269,7 @@
       } else if (t === 'done'){
         ended = true;
         clearHint(bubble);
+        renderBubbleMd(bubble, (ev.result || {}).reply || '');
         const runId = (ev.result || {}).plan_run_id;
         if (runId) attachPlanTip(bubble, runId);
       } else if (t === 'error'){

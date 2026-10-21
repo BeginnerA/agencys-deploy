@@ -698,6 +698,35 @@ class TestExecutor(AgentBase):
         self.assertEqual(rec["status"], "success")
         self.assertIn("任务 #", rec["summary"])
 
+    def test_terminal_replies_to_originating_session(self):
+        from agent.executor import (decide_run, plan_operation,
+                                    sync_executing_runs)
+        run = plan_operation(self.db, USER, op="deploy", target="auth",
+                             env="prod", version="1.2.0",
+                             intent="发布 auth", session_id="sess-abc")
+        self.assertEqual(run["session_id"], "sess-abc")
+
+        def _sess_msgs():
+            return dbm.list_records(
+                self.db, "agent_messages",
+                "session_id=? AND role='assistant'", ("sess-abc",))
+        self.assertEqual(len(_sess_msgs()), 0)
+        with mock.patch("agent.executor.task_manager.submit_task"), \
+                mock.patch("agent.executor._watch_run"):
+            r2 = decide_run(self.db, run["id"], USER, action="approve")
+        task = dbm.get_task(self.db, r2["task_id"])
+        dbm.update_task(self.db, task["id"], status="success",
+                        finished_at=int(time.time()))
+        self.assertEqual(sync_executing_runs(self.db), 1)
+        msgs = _sess_msgs()
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("执行完成", msgs[0]["content"])
+        self.assertIn("成功", msgs[0]["content"])
+        self.assertEqual(int(msgs[0]["created_by"]), int(USER["id"]))
+        # 再次 sync 不重复回写（CAS 仅收敛一次）
+        self.assertEqual(sync_executing_runs(self.db), 0)
+        self.assertEqual(len(_sess_msgs()), 1)
+
 
 class TestAdvisor(AgentBase):
     def _alert(self, severity="P1", subject="订单服务连接超时"):

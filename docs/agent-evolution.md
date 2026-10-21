@@ -95,12 +95,14 @@ python webapp/app.py
 ## 五、Phase 3：发布执行 Agent
 
 ```
-对话/工具 plan_operation → agent_runs(awaiting_approval) → 人工审批(Web/对话 decide_run)
+对话/工具 plan_operation → agent_runs(awaiting_approval, 记发起会话 session_id) → 人工审批(Web/对话 decide_run)
     ├─ approve → create_task + task_manager.submit_task（复用平台通道）
-    │            后台 _watch_run 轮询任务终态 → 回写 status/summary → 完成闭环
+    │            后台 _watch_run 轮询任务终态 → 回写 status/summary + 向发起会话回写一条助手消息 → 完成闭环
     ├─ reject   → 关闭审批单（记审批人与意见）
     └─ 执行中    → 进程重启后 scheduler 轮询 sync_executing_runs 收敛状态
 ```
+
+终态回写会话：`_watch_run`（后台线程）与 `sync_executing_runs`（调度器）共用 `_finalize_terminal`，以 `WHERE status='executing'` 条件更新作 CAS，仅一方赢得收敛后发布 agent 事件并回写消息，杜绝双发/重复；无 session_id 的审批单（Web 直接创建/建议采纳）仅收敛状态不回写会话。前端对话页监听 agent/tasks 事件，按最大消息 id 增量重绘，实时呈现执行结果。
 
 对话审批 `decide_run`（operator/admin）与 Web 审批单页同等效力：用户在对话中明确指示批准/驳回后，先核对 pending_approvals/run_detail 再执行；决策者身份（ctx 用户）落审计（`agent_approve`/`agent_reject` + `via:agent`）；含发布窗口告警时必须用户已确认风险并显式 `force_window=true`。安全红线不变：LLM 不得未经用户明确指示自行调用 decide_run。
 

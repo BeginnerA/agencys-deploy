@@ -42,7 +42,7 @@ class McpSession:
         self.db_path = db_path
         self.ctx = type("ToolCtx", (), {
             "db_path": db_path, "user_id": 0, "username": "mcp",
-            "role": role})()
+            "role": role, "session_id": ""})()
 
     # ---------- JSON-RPC 分发 ----------
 

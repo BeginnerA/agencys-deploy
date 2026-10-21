@@ -39,6 +39,30 @@
 .msg-bubble .plan-tip{margin-top:8px;padding-top:8px;border-top:1px dashed var(--border-strong);
   display:flex;align-items:center;gap:8px;font-size:var(--fs-12)}
 .msg-bubble .plan-tip .btn{padding:2px 10px}
+/* AI 回复 Markdown 渲染容器（覆盖气泡的 pre-wrap，交由块级元素控制间距） */
+.msg-bubble .md-body{white-space:normal}
+.msg-bubble .md-body > :first-child{margin-top:0}
+.msg-bubble .md-body > :last-child{margin-bottom:0}
+.msg-bubble .md-body p{margin:0 0 8px}
+.msg-bubble .md-body h1,.msg-bubble .md-body h2,.msg-bubble .md-body h3,
+.msg-bubble .md-body h4,.msg-bubble .md-body h5,.msg-bubble .md-body h6{
+  margin:10px 0 6px;font-weight:600;line-height:1.4}
+.msg-bubble .md-body h1{font-size:var(--fs-16)}
+.msg-bubble .md-body h2{font-size:var(--fs-14)}
+.msg-bubble .md-body h3{font-size:var(--fs-13)}
+.msg-bubble .md-body h4,.msg-bubble .md-body h5,.msg-bubble .md-body h6{font-size:var(--fs-13)}
+.msg-bubble .md-body ul,.msg-bubble .md-body ol{margin:0 0 8px;padding-left:20px}
+.msg-bubble .md-body li{margin:2px 0}
+.msg-bubble .md-body code{background:rgba(255,255,255,.08);padding:1px 5px;border-radius:4px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}
+.msg-bubble .md-body pre{background:rgba(0,0,0,.28);padding:10px 12px;border-radius:6px;
+  overflow:auto;margin:0 0 8px;white-space:pre}
+.msg-bubble .md-body pre code{background:none;padding:0;font-size:var(--fs-12)}
+.msg-bubble .md-body a{color:var(--primary);text-decoration:underline}
+.msg-bubble .md-body blockquote{margin:0 0 8px;padding:2px 0 2px 10px;
+  border-left:3px solid var(--border-strong);color:var(--text-2)}
+.msg-bubble .md-body hr{border:none;border-top:1px solid var(--border);margin:10px 0}
+.msg-bubble .md-body strong{color:var(--text-1);font-weight:600}
 .msg-time{align-self:flex-end;font-size:var(--fs-11);color:var(--text-3);margin-top:2px}
 /* 流式对话：思考占位 / 工具调用行 / 错误行 */
 .stream-hint{color:var(--text-3);font-size:var(--fs-12)}

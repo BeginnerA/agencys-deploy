@@ -360,6 +360,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     previous_version TEXT DEFAULT '',
     intent TEXT DEFAULT '',
     plan TEXT DEFAULT '{}',
+    session_id TEXT DEFAULT '',
     status TEXT NOT NULL DEFAULT 'awaiting_approval',
     task_id INTEGER DEFAULT 0,
     force_window INTEGER DEFAULT 0,
@@ -660,6 +661,10 @@ def _migrate(conn):
         )""")
         conn.execute("CREATE INDEX idx_agent_session_meta_user "
                      "ON agent_session_meta(user_id, session_id)")
+    # agent_runs 补 session_id 列（发起审批单的对话会话，供执行终态回写会话消息）
+    run_cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_runs)")}
+    if "session_id" not in run_cols:
+        conn.execute("ALTER TABLE agent_runs ADD COLUMN session_id TEXT DEFAULT ''")
 
 
 def _serialize(table: str, fields: dict) -> dict:

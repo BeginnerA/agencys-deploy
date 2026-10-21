@@ -215,6 +215,51 @@ function esc(s){
     .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
+// 轻量 Markdown → HTML（对话/建议等 AI 回复渲染用，自包含、离线可用）。
+// 先整体转义再按行解析，杜绝 XSS；链接仅放行 http/https/站内路径。
+// 支持：围栏代码块、行内代码、# 标题、无序/有序列表、引用、分隔线、粗体/斜体/删除线、链接、段落换行。
+function mdToHtml(src){
+  const e = (s) => String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const inline = (s) => {
+    s = s.replace(/`([^`]+)`/g, (m, c) => '<code>' + c + '</code>');
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*\w])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    s = s.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]*)\)/g,
+      (m, t, u) => '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + t + '</a>');
+    return s;
+  };
+  const lines = e(src).replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  let inCode = false, codeBuf = [], listType = null, para = [];
+  const flushPara = () => { if (para.length){ out.push('<p>' + para.join('<br>') + '</p>'); para = []; } };
+  const closeList = () => { if (listType){ out.push(listType === 'ul' ? '</ul>' : '</ol>'); listType = null; } };
+  for (const line of lines){
+    if (/^\s*```/.test(line)){
+      if (inCode){ out.push('<pre><code>' + codeBuf.join('\n') + '</code></pre>'); codeBuf = []; inCode = false; }
+      else { flushPara(); closeList(); inCode = true; }
+      continue;
+    }
+    if (inCode){ codeBuf.push(line); continue; }
+    const h = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (h){ flushPara(); closeList(); const lv = h[1].length; out.push('<h' + lv + '>' + inline(h[2]) + '</h' + lv + '>'); continue; }
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)){ flushPara(); closeList(); out.push('<hr>'); continue; }
+    const bq = /^\s*&gt;\s?(.*)$/.exec(line);   // '>' 已被转义为 &gt;
+    if (bq){ flushPara(); closeList(); out.push('<blockquote>' + inline(bq[1]) + '</blockquote>'); continue; }
+    const ul = /^\s*[-*+]\s+(.*)$/.exec(line);
+    if (ul){ flushPara(); if (listType !== 'ul'){ closeList(); out.push('<ul>'); listType = 'ul'; } out.push('<li>' + inline(ul[1]) + '</li>'); continue; }
+    const ol = /^\s*\d+\.\s+(.*)$/.exec(line);
+    if (ol){ flushPara(); if (listType !== 'ol'){ closeList(); out.push('<ol>'); listType = 'ol'; } out.push('<li>' + inline(ol[1]) + '</li>'); continue; }
+    if (/^\s*$/.test(line)){ flushPara(); closeList(); continue; }
+    closeList(); para.push(inline(line));
+  }
+  if (inCode && codeBuf.length) out.push('<pre><code>' + codeBuf.join('\n') + '</code></pre>');
+  flushPara(); closeList();
+  return out.join('\n');
+}
+
 // ---- 自绘下拉：原生 select 换肤 ----
 // 原生 select 的弹出面板由浏览器/系统渲染，不受 CSS 背景与 color-scheme 完全控制（旧版 Chromium/部分浏览器仍为白底）；
 // 这里把 select 隐藏保留（.value/onchange 逻辑不变），外层自绘 按钮面 + 深色选项面板。

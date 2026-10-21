@@ -12,6 +12,7 @@ import threading
 import time
 
 from webapp import db as dbm
+from webapp import events
 from webapp.deploy_scheduler import check_release_window
 from webapp import task_manager
 
@@ -204,7 +205,8 @@ def plan_operation(db_path: str, user: dict, op: str, target: str = "",
                    project_code: str = "", env: str = "", version: str = "",
                    previous_version: str = "", canary: bool = False,
                    auto_version: bool = False, skip_build: bool = False,
-                   no_git_tag: bool = False, intent: str = "") -> dict:
+                   no_git_tag: bool = False, intent: str = "",
+                   session_id: str = "") -> dict:
     """生成一次发布/回滚/重启的操作计划，落库 awaiting_approval；返回 run 记录"""
     try:
         args = _normalize_args(
@@ -245,6 +247,7 @@ def plan_operation(db_path: str, user: dict, op: str, target: str = "",
         name=args["name"], env=args["env"], version=args["version"],
         previous_version=args["previous_version"],
         intent=intent or "", plan=plan,
+        session_id=(session_id or "")[:64],
         status="awaiting_approval",
         created_by=int(user.get("id", 0)),
         created_by_name=user.get("username", ""),
@@ -253,7 +256,7 @@ def plan_operation(db_path: str, user: dict, op: str, target: str = "",
 
 
 def plan_schedule_run(db_path: str, user: dict, schedule_id: int,
-                      intent: str = "") -> dict:
+                      intent: str = "", session_id: str = "") -> dict:
     """生成「定时计划立即执行」审批单（kind=schedule_run）
 
     与 Web 端 run_schedule 等效，但 Agent 通道必须经人工审批；
@@ -295,6 +298,7 @@ def plan_schedule_run(db_path: str, user: dict, schedule_id: int,
         name=sched["name"], env=sched["env"], version=sched["version"],
         previous_version=sched["previous_version"],
         intent=intent or "", plan=plan,
+        session_id=(session_id or "")[:64],
         status="awaiting_approval",
         created_by=int(user.get("id", 0)),
         created_by_name=user.get("username", ""),
@@ -428,16 +432,16 @@ def _watch_run(db_path: str, run_id: int):
                 return
             if task["status"] in ("success", "failed"):
                 summary = _summarize_task(task)
-                dbm.update_record(db_path, "agent_runs", run_id, dict(
-                    status="success" if task["status"] == "success" else "failed",
-                    summary=summary,
-                    executed_at=_now()))
+                st = "success" if task["status"] == "success" else "failed"
+                _finalize_terminal(db_path, run, st, summary)
                 return
         except Exception:
             pass
         time.sleep(_WATCH_INTERVAL)
-    dbm.update_record(db_path, "agent_runs", run_id, dict(
-        status="failed", summary="等待任务终态超时，请到大屏任务列表确认实际结果"))
+    _timeout_summary = "等待任务终态超时，请到大屏任务列表确认实际结果"
+    _to_run = dbm.get_record(db_path, "agent_runs", run_id)
+    if _to_run:
+        _finalize_terminal(db_path, _to_run, "failed", _timeout_summary)
 
 
 def _summarize_task(task: dict) -> str:
@@ -464,6 +468,67 @@ def _summarize_task(task: dict) -> str:
     picks = [ln for ln in lines if any(k in ln for k in keys)][-8:]
     tail = "\n".join(picks) if picks else lines[-5].strip() if lines else ""
     return head + ("\n" + tail if tail else "")
+
+
+_OP_LABEL = {"deploy": "发布", "rollback": "回滚", "restart": "重启",
+             "schedule_run": "定时计划执行"}
+
+
+def _post_terminal_to_session(db_path: str, run: dict, status: str,
+                              summary: str) -> None:
+    """审批单到达终态后把执行结果回复到发起它的对话会话。
+
+    无 session_id（如 Web 端直接创建/建议采纳生成）则跳过；必须在
+    update_record(status) 之前调用，确保前端收到 agent 事件时消息已落库。
+    created_by 取审批单发起人（会话归属者），否则消息不会出现在其会话视图。"""
+    sid = (run.get("session_id") or "").strip()
+    if not sid:
+        return
+    plan = run.get("plan") or {}
+    op_label = _OP_LABEL.get(plan.get("op"), plan.get("op") or "操作")
+    ok = status == "success"
+    lines = [f"{op_label}审批单 #{run['id']} 执行{'完成' if ok else '结束'}："
+             f"{'✅ 成功' if ok else '❌ 失败'}"]
+    head = (f"- 目标: {run.get('name') or '-'}"
+            + (f"（{run.get('env')}）" if run.get('env') else "")
+            + (f" 版本 {run.get('version')}" if run.get('version') else ""))
+    lines.append(head)
+    lines.append(f"- 关联任务: #{run.get('task_id') or 0}")
+    if summary:
+        lines.append("")
+        lines.append(summary[:1500])
+    try:
+        dbm.create_record(db_path, "agent_messages", dict(
+            session_id=sid[:64], role="assistant",
+            content="\n".join(lines)[:8000],
+            created_by=int(run.get("created_by") or 0),
+            created_at=int(time.time())))
+    except Exception:
+        pass  # 回写失败不阻断状态收敛
+
+
+def _finalize_terminal(db_path: str, run: dict, st: str, summary: str) -> bool:
+    """审批单终态收敛（_watch_run 与 sync_executing_runs 共用）。
+
+    以 `WHERE status='executing'` 条件更新作为 CAS：后台轮询线程与调度器
+    可能同时观察到同一 executing 单，只有一方 rowcount>0 能赢得收敛，
+    由其发布 agent 事件并回写会话消息，避免双发事件/重复消息。"""
+    run_id = run["id"]
+    conn = dbm.get_conn(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE agent_runs SET status=?, summary=?, executed_at=? "
+            "WHERE id=? AND status='executing'",
+            (st, summary, _now(), run_id))
+        conn.commit()
+        won = cur.rowcount > 0
+    finally:
+        conn.close()
+    if not won:
+        return False
+    _post_terminal_to_session(db_path, run, st, summary)
+    events.publish("agent", {"table": "agent_runs", "id": run_id, "status": st})
+    return True
 
 
 def decide_run(db_path: str, run_id: int, decider: dict, action: str,
@@ -511,10 +576,9 @@ def sync_executing_runs(db_path: str) -> int:
     for run in runs:
         task = dbm.get_task(db_path, run.get("task_id") or 0) if run.get("task_id") else None
         if task and task["status"] in ("success", "failed"):
-            dbm.update_record(db_path, "agent_runs", run["id"], dict(
-                status="success" if task["status"] == "success" else "failed",
-                summary=_summarize_task(task), executed_at=_now()))
-            synced += 1
+            st = "success" if task["status"] == "success" else "failed"
+            if _finalize_terminal(db_path, run, st, _summarize_task(task)):
+                synced += 1
     return synced
 
 
