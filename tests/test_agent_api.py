@@ -468,6 +468,25 @@ class AgentApiBase(unittest.TestCase):
             json={"action": "maybe"})
         self.assertEqual(resp.status_code, 400)
 
+    def test_run_delete(self):
+        run = self._plan_run()
+        # viewer 无删除权
+        resp = self.client.delete(f"/api/agent/runs/{run['id']}",
+                                  headers=self.viewer_headers)
+        self.assertEqual(resp.status_code, 403)
+        # admin 删除成功，记录从列表消失
+        resp = self.client.delete(f"/api/agent/runs/{run['id']}",
+                                  headers=self.headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["ok"])
+        self.assertIsNone(dbm.get_record(self.db_path, "agent_runs", run["id"]))
+        rows = self.client.get("/api/agent/runs",
+                               headers=self.headers).get_json()["runs"]
+        self.assertNotIn(run["id"], [r["id"] for r in rows])
+        # 删除不存在的审批单 → 404
+        resp = self.client.delete("/api/agent/runs/99999", headers=self.headers)
+        self.assertEqual(resp.status_code, 404)
+
     # ---------- 建议 ----------
 
     def test_alert_analyze_and_advice_list(self):

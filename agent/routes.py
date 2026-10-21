@@ -254,6 +254,22 @@ def run_to_case(run_id):
     return jsonify({"case_id": case_id}), 201
 
 
+@agent_bp.route("/agent/runs/<int:run_id>", methods=["DELETE"])
+@require_auth
+@require_role("admin")
+def run_delete(run_id):
+    """删除审批单记录（仅清理审批列表，关联任务与审计保留）"""
+    db_path = current_app.config["DB_PATH"]
+    try:
+        run = executor_mod.delete_run(db_path, run_id)
+    except executor_mod.ExecutorError:
+        return jsonify({"error": "审批单不存在"}), 404
+    audit("agent_delete_run", "agent_run", run_id,
+          {"name": run.get("name"), "env": run.get("env"),
+           "status": run.get("status"), "task_id": run.get("task_id")})
+    return jsonify({"ok": True})
+
+
 # ---------- 建议（Phase 2） ----------
 
 @agent_bp.route("/agent/advice")

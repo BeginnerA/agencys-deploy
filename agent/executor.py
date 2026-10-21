@@ -346,6 +346,15 @@ def list_runs(db_path: str, status: str = "", project_id: int = 0,
     return rows[:max(1, min(limit, 200))]
 
 
+def delete_run(db_path: str, run_id: int) -> dict:
+    """物理删除审批单记录（仅清理审批列表，关联的任务/审计记录保留）。
+
+    不存在则抛 ExecutorError；返回被删除记录的快照供审计。"""
+    run = get_run(db_path, run_id)
+    dbm.delete_record(db_path, "agent_runs", run_id)
+    return run
+
+
 def _submit_task(db_path: str, run: dict) -> int:
     """按计划创建平台任务并提交执行（复用 deploy_routes.create_task 的参数语义）
 

@@ -516,6 +516,9 @@
         actions.push(`<button class="btn sm primary" data-act="approve" data-id="${r.id}">通过</button>`);
         actions.push(`<button class="btn sm danger" data-act="reject" data-id="${r.id}">驳回</button>`);
       }
+      if (role === 'admin'){
+        actions.push(`<button class="btn sm danger" data-delrun="${r.id}" title="删除审批单记录（不影响已执行任务）">删除</button>`);
+      }
       const title = `${OP_LABEL[plan.op] || plan.op || '操作'} · ${esc(r.name || r.intent || '#')}`
         + (r.env ? `（${esc(r.env)}）` : '');
       return `
@@ -539,6 +542,25 @@
     // 操作绑定
     box.querySelectorAll('[data-act]').forEach(b => {
       b.onclick = (ev) => { ev.stopPropagation(); onRunDecision(Number(b.dataset.id), b.dataset.act); };
+    });
+    box.querySelectorAll('[data-delrun]').forEach(b => {
+      b.onclick = async (ev) => {
+        ev.stopPropagation();
+        const id = Number(b.dataset.delrun);
+        const run = getRun(id);
+        const executing = run && run.status === 'executing';
+        const yes = await confirmDialog(
+          executing
+            ? `审批单 #${id} 正在执行中，删除仅移除审批记录，已提交的任务会继续执行且不可恢复。确认删除？`
+            : `确认删除审批单 #${id}？删除后不可恢复（不影响已执行任务与审计）。`,
+          '删除审批单');
+        if (!yes) return;
+        try{
+          await api(`/api/agent/runs/${id}`, {method:'DELETE'});
+          toastSuccess(`审批单 #${id} 已删除`);
+          loadRuns();
+        }catch(e){ toastError('删除失败：' + (e.message || '')); }
+      };
     });
     box.querySelectorAll('[data-open]').forEach(item => {
       item.onclick = () => openRunDetail(Number(item.dataset.open));
@@ -573,14 +595,22 @@
         onClose: () => {}
       });
       const doApprove = async () => {
+        const okBtn = document.getElementById('decOk');
+        if (okBtn && okBtn.disabled) return; // 防重复提交
         const note = (document.getElementById('decNote') || {}).value || '';
         const force = !!(document.getElementById('decForce') || {}).checked;
+        if (okBtn) { okBtn.disabled = true; okBtn.textContent = '提交中…'; }
         try{
           await api(`/api/agent/runs/${id}/decision`, {method:'POST',
             body: JSON.stringify({action:'approve', note:note, force_window:force})});
           toastSuccess(`审批单 #${id} 已通过，任务进入执行队列`);
+          const dr = document.getElementById('drawerRoot'); // 关闭抽屉，否则遮罩残留看似“页面无变化”
+          if (dr) { dr.classList.add('hidden'); dr.innerHTML = ''; }
           loadRuns();
-        }catch(e){ toastError('审批失败：' + (e.message || '')); }
+        }catch(e){
+          toastError('审批失败：' + (e.message || ''));
+          if (okBtn) { okBtn.disabled = false; okBtn.textContent = '确认通过并提交执行'; }
+        }
       };
       const ok = document.getElementById('decOk');
       const can = document.getElementById('decCancel');
