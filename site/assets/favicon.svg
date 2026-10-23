@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="智能运维平台">
+  <rect width="32" height="32" rx="7" fill="#071512"/>
+  <path d="M16 4.2 26.4 10v12L16 27.8 5.6 22V10Z" fill="none" stroke="#5cecc0" stroke-width="1.4"/>
+  <path d="M10.6 19.6 16 11.2l5.4 8.4" fill="none" stroke="#b9f27c" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M16 11.2v9.4" fill="none" stroke="#5cecc0" stroke-width="1.8" stroke-linecap="round"/>
+  <circle cx="16" cy="22.2" r="1.4" fill="#b9f27c"/>
+</svg>

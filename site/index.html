@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>智能运维平台 SmartOps — 一条命令完成滚动发布</title>
+<meta name="description" content="本地部署的多服务器发布与运维控制台：滚动发布、监控大屏、六路告警、AI 运维助手、日志与配置管理。Windows 便携版免费下载。">
+<meta name="theme-color" content="#06100e">
+<meta property="og:title" content="智能运维平台 SmartOps — 一条命令完成滚动发布">
+<meta property="og:description" content="构建、发布、探活、回滚、监控与告警，收进一个本地控制台。">
+<meta property="og:type" content="website">
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<style>
+  :root{
+    --bg:#06100e;
+    --bg-2:#081512;
+    --panel:#0b1a17;
+    --panel-2:#0e211c;
+    --line:rgba(126,255,218,.12);
+    --line-2:rgba(126,255,218,.24);
+    --text:#e8f3ee;
+    --text-2:#a6bab2;
+    --text-3:#839a91;
+    --mint:#5cecc0;
+    --mint-dim:#2cae8b;
+    --lime:#b9f27c;
+    --amber:#ffc069;
+    --red:#ff8585;
+    --ink:#03110d;
+    --mono:ui-monospace,"SFMono-Regular","Cascadia Code",Consolas,"Liberation Mono",monospace;
+    --sans:"PingFang SC","HarmonyOS Sans SC","Microsoft YaHei","Noto Sans SC",sans-serif;
+    --max:1200px;
+    --r:8px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:16px;line-height:1.7;overflow-x:hidden}
+  body::before{
+    content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
+    background-image:linear-gradient(rgba(92,236,192,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(92,236,192,.035) 1px,transparent 1px);
+    background-size:88px 88px;
+    -webkit-mask-image:radial-gradient(ellipse 90% 65% at 55% 0%,#000 20%,transparent 78%);
+    mask-image:radial-gradient(ellipse 90% 65% at 55% 0%,#000 20%,transparent 78%);
+  }
+  ::selection{background:var(--mint);color:var(--ink)}
+  a{color:inherit;text-decoration:none}
+  img{max-width:100%;display:block}
+  button{font:inherit;color:inherit;cursor:pointer}
+  [hidden]{display:none!important}
+  :focus-visible{outline:2px solid var(--lime);outline-offset:3px;border-radius:2px}
+  .skip-link{position:absolute;left:16px;top:-60px;z-index:100;background:var(--mint);color:var(--ink);padding:10px 16px;border-radius:4px;font-weight:600;transition:top .2s}
+  .skip-link:focus{top:12px}
+  .site-head,main,footer{position:relative;z-index:1}
+  .wrap{max-width:var(--max);margin:0 auto;padding:0 clamp(20px,4vw,40px)}
+  .mono{font-family:var(--mono)}
+  .muted{color:var(--text-3)}
+
+  /* ---------- header ---------- */
+  .site-head{position:sticky;top:0;z-index:60;border-bottom:1px solid var(--line);background:rgba(6,16,14,.82);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+  .head-inner{display:flex;align-items:center;gap:30px;min-height:66px;max-width:var(--max);margin:0 auto;padding:0 clamp(20px,4vw,40px)}
+  .brand{display:flex;align-items:center;gap:11px;flex:0 0 auto}
+  .brand svg{width:32px;height:32px}
+  .brand-text{display:flex;flex-direction:column;line-height:1.15}
+  .brand-text strong{font-size:15px;letter-spacing:.01em;font-weight:650}
+  .brand-text small{font:9px/1.4 var(--mono);letter-spacing:.22em;color:var(--text-3);margin-top:3px}
+  .nav{display:flex;align-items:center;gap:clamp(16px,2.4vw,30px);margin-left:auto}
+  .nav a{font-size:13px;color:var(--text-2);white-space:nowrap;transition:color .18s}
+  .nav a:hover{color:var(--mint)}
+  .head-cta{display:flex;align-items:center;gap:12px;flex:0 0 auto}
+  .head-cta .ghost-link{font:11px var(--mono);letter-spacing:.04em;color:var(--text-2);display:inline-flex;align-items:center;gap:6px}
+  .head-cta .ghost-link:hover{color:var(--mint)}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:9px;padding:12px 19px;border-radius:6px;border:1px solid transparent;font-size:14px;font-weight:600;line-height:1.3;transition:background .18s,border-color .18s,color .18s,transform .18s}
+  .btn svg{width:15px;height:15px;flex:0 0 auto}
+  .btn-primary{background:var(--mint);color:var(--ink);border-color:var(--mint)}
+  .btn-primary:hover{background:var(--lime);border-color:var(--lime)}
+  .btn-ghost{background:transparent;color:var(--text);border-color:var(--line-2)}
+  .btn-ghost:hover{border-color:var(--mint);color:var(--mint)}
+  .btn-sm{padding:9px 14px;font-size:12.5px}
+  .nav-toggle{display:none;align-items:center;gap:8px;background:none;border:1px solid var(--line-2);border-radius:5px;padding:8px 11px;font:11px var(--mono);letter-spacing:.08em;color:var(--text-2)}
+  .nav-toggle i{display:block;width:14px;height:8px;border-top:1px solid currentColor;border-bottom:1px solid currentColor}
+  .mobile-nav{display:none;position:absolute;top:100%;left:0;right:0;background:#081512;border-bottom:1px solid var(--line-2);padding:10px 20px 18px;box-shadow:0 30px 40px rgba(0,0,0,.35)}
+  .mobile-nav a{display:flex;align-items:center;justify-content:space-between;padding:12px 2px;border-bottom:1px solid var(--line);font-size:14px;color:var(--text-2)}
+  .mobile-nav a span{font:10px var(--mono);color:var(--text-3)}
+  .mobile-nav a:last-child{border-bottom:0}
+  .site-head.open .mobile-nav{display:block}
+
+  /* ---------- hero ---------- */
+  .hero{position:relative;overflow:hidden;border-bottom:1px solid var(--line)}
+  .hero::before{content:"";position:absolute;inset:-20% -10% auto 35%;height:760px;pointer-events:none;background:radial-gradient(ellipse at 55% 32%,rgba(92,236,192,.13),transparent 62%)}
+  .hero::after{content:"";position:absolute;right:clamp(18px,4vw,58px);top:120px;bottom:80px;width:1px;background:linear-gradient(var(--line-2),transparent);pointer-events:none}
+  .hero-grid{display:grid;grid-template-columns:minmax(0,1.02fr) minmax(0,.98fr);align-items:center;gap:clamp(32px,5vw,66px);padding-top:clamp(56px,8vw,100px);padding-bottom:clamp(48px,7vw,86px)}
+  .eyebrow{display:inline-flex;align-items:center;gap:10px;font:10px var(--mono);letter-spacing:.2em;color:var(--mint);text-transform:uppercase;margin-bottom:22px}
+  .eyebrow::before{content:"";width:22px;height:1px;background:var(--mint)}
+  .eyebrow .dot{width:5px;height:5px;border-radius:50%;background:var(--lime);box-shadow:0 0 10px rgba(185,242,124,.6)}
+  .hero h1{margin:0;font-size:clamp(40px,5.7vw,70px);line-height:1.05;font-weight:650;letter-spacing:-.045em;text-wrap:balance}
+  .hero h1 .accent{color:var(--mint);position:relative;display:inline-block}
+  .hero h1 .accent::after{content:"";position:absolute;left:0;right:0;bottom:.06em;height:2px;background:linear-gradient(90deg,var(--mint),rgba(185,242,124,.15))}
+  .hero-lead{max-width:54ch;margin:26px 0 0;font-size:clamp(15px,1.4vw,17px);line-height:1.9;color:var(--text-2)}
+  .hero-lead b{color:var(--text);font-weight:500}
+  .hero-actions{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:32px}
+  .hero-meta{display:flex;flex-wrap:wrap;align-items:center;gap:10px 18px;margin-top:24px;font:10.5px var(--mono);letter-spacing:.06em;color:var(--text-3)}
+  .hero-meta span{display:inline-flex;align-items:center;gap:7px}
+  .hero-meta i{width:4px;height:4px;border-radius:50%;background:var(--mint-dim);display:block}
+  .hero-note{margin-top:34px;padding-left:14px;border-left:1px solid var(--line-2);font-size:12.5px;color:var(--text-3);line-height:1.8}
+  .hero-note b{color:var(--text-2);font-weight:500}
+
+  .run-card{position:relative;width:100%;max-width:520px;justify-self:end;border:1px solid var(--line-2);border-radius:10px;background:linear-gradient(165deg,rgba(14,32,27,.97),rgba(6,16,14,.98));box-shadow:0 34px 90px rgba(0,0,0,.48);overflow:hidden}
+  .run-card::before,.run-card::after{content:"";position:absolute;width:14px;height:14px;border-color:var(--mint);border-style:solid;opacity:.55;pointer-events:none}
+  .run-card::before{left:9px;top:9px;border-width:1px 0 0 1px}
+  .run-card::after{right:9px;bottom:9px;border-width:0 1px 1px 0}
+  .run-head{display:flex;align-items:center;gap:10px;padding:13px 18px;border-bottom:1px solid var(--line);font:10px var(--mono);letter-spacing:.1em;color:var(--text-3)}
+  .run-head b{color:var(--text-2);font-weight:500}
+  .run-demo{margin-left:auto;border:1px solid var(--line);border-radius:3px;padding:3px 7px;font-size:8.5px;letter-spacing:.12em;color:var(--text-3);white-space:nowrap}
+  .run-live{display:inline-flex;align-items:center;gap:5px;color:var(--lime);font-size:9.5px}
+  .run-live i{width:5px;height:5px;border-radius:50%;background:var(--lime);animation:pulse 1.8s infinite}
+  @keyframes pulse{0%,100%{opacity:.45;box-shadow:0 0 0 0 rgba(185,242,124,.35)}50%{opacity:1;box-shadow:0 0 0 4px rgba(185,242,124,0)}}
+  .run-body{padding:20px 20px 18px}
+  .run-target{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}
+  .run-target div{display:flex;flex-direction:column;gap:2px}
+  .run-target small{font:8.5px var(--mono);letter-spacing:.14em;color:var(--text-3)}
+  .run-target strong{font-size:17px;font-weight:600;letter-spacing:-.01em}
+  .run-arrow{color:var(--mint);font-size:16px;padding-bottom:2px}
+  .run-ver{margin-left:auto;font:10px var(--mono);color:var(--mint);border:1px solid rgba(92,236,192,.28);background:rgba(92,236,192,.06);border-radius:3px;padding:4px 8px}
+  .run-progress{height:2px;background:rgba(126,255,218,.1);margin:18px 0 4px;overflow:hidden}
+  .run-progress span{display:block;height:100%;width:64%;background:linear-gradient(90deg,var(--mint),var(--lime));box-shadow:0 0 10px rgba(92,236,192,.45)}
+  .run-steps{list-style:none;margin:8px 0 0;padding:0;position:relative}
+  .run-steps::before{content:"";position:absolute;left:12px;top:17px;bottom:17px;width:1px;background:var(--line)}
+  .run-step{position:relative;display:grid;grid-template-columns:25px minmax(0,1fr) auto;gap:11px;align-items:center;padding:7px 0}
+  .run-node{width:25px;height:25px;border-radius:50%;border:1px solid var(--line-2);background:#0a1815;display:grid;place-items:center;font:8px var(--mono);color:var(--text-3);z-index:1}
+  .run-step.done .run-node{background:rgba(92,236,192,.12);border-color:rgba(92,236,192,.55);color:var(--mint)}
+  .run-step.active .run-node{border-color:var(--lime);color:var(--lime);box-shadow:0 0 0 4px rgba(185,242,124,.08)}
+  .run-step div{display:flex;align-items:baseline;gap:8px;min-width:0}
+  .run-step b{font-size:12px;font-weight:500;white-space:nowrap}
+  .run-step small{font:9.5px var(--mono);color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .run-step em{font:9px var(--mono);font-style:normal;color:var(--text-3);letter-spacing:.04em;white-space:nowrap}
+  .run-step.done em{color:var(--mint-dim)}
+  .run-step.active em{color:var(--lime)}
+  .run-step.pending{opacity:.58}
+  .run-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:15px;padding-top:13px;border-top:1px solid var(--line);font:9px var(--mono);letter-spacing:.05em;color:var(--text-3)}
+  .run-foot .guard{display:inline-flex;align-items:center;gap:6px;color:var(--amber)}
+  .run-foot .guard svg{width:12px;height:12px}
+  .ruler{height:12px;border-top:1px solid var(--line);background:repeating-linear-gradient(90deg,var(--line-2) 0 1px,transparent 1px 28px);opacity:.55;margin-bottom:-1px}
+
+  /* ---------- facts ---------- */
+  .facts{display:grid;grid-template-columns:repeat(4,1fr);border-bottom:1px solid var(--line)}
+  .fact{padding:24px 28px;border-right:1px solid var(--line);display:flex;align-items:baseline;gap:12px}
+  .fact:first-child{padding-left:0}
+  .fact:last-child{border-right:0;padding-right:0}
+  .fact strong{font:500 clamp(25px,2.8vw,34px)/1 var(--mono);color:var(--text);letter-spacing:-.03em}
+  .fact span{font-size:12px;color:var(--text-3);line-height:1.5}
+  .fact span b{display:block;color:var(--text-2);font-weight:500;font-size:12.5px}
+  .fact em{font-style:normal;color:var(--mint)}
+
+  /* ---------- sections ---------- */
+  .section{padding:clamp(64px,8vw,112px) 0;border-bottom:1px solid var(--line);scroll-margin-top:80px}
+  .section-head{max-width:730px;margin-bottom:clamp(32px,5vw,56px)}
+  .kicker{display:inline-flex;align-items:center;gap:12px;font:10px var(--mono);letter-spacing:.2em;color:var(--mint);text-transform:uppercase}
+  .kicker::before{content:"";width:28px;height:1px;background:var(--mint)}
+  .kicker span{color:var(--text-3)}
+  h2{margin:16px 0 0;font-size:clamp(29px,3.8vw,45px);line-height:1.16;letter-spacing:-.04em;font-weight:650;text-wrap:balance}
+  .lead{margin:18px 0 0;max-width:66ch;font-size:15.5px;line-height:1.85;color:var(--text-2)}
+  .lead strong{color:var(--text);font-weight:500}
+  .section-head.split{display:flex;align-items:flex-end;justify-content:space-between;gap:32px;max-width:none}
+  .section-head.split .txt{max-width:700px}
+  .section-head.split .side{flex:0 0 auto;padding-bottom:6px}
+
+  /* ---------- pipeline ---------- */
+  .pipe-grid{display:grid;grid-template-columns:minmax(0,.78fr) minmax(0,1.22fr);gap:clamp(32px,5vw,70px);align-items:start}
+  .pipe-copy{position:sticky;top:100px}
+  .pipe-copy .lead{max-width:44ch}
+  .pipe-points{list-style:none;margin:28px 0 0;padding:0;display:grid;gap:12px}
+  .pipe-points li{display:flex;gap:10px;align-items:flex-start;font-size:13.5px;color:var(--text-2)}
+  .pipe-points svg{width:15px;height:15px;color:var(--mint);flex:0 0 auto;margin-top:4px}
+  .pipe-card{border:1px solid var(--line-2);border-radius:var(--r);background:linear-gradient(180deg,rgba(14,32,27,.65),rgba(8,21,18,.55));overflow:hidden}
+  .cmd{display:flex;align-items:center;gap:10px;padding:13px 16px;border-bottom:1px solid var(--line);background:rgba(4,12,10,.6);min-width:0}
+  .cmd .prompt{color:var(--mint);font:11px var(--mono);flex:0 0 auto}
+  .cmd code{font:11.5px/1.6 var(--mono);color:var(--text-2);white-space:nowrap;overflow-x:auto;flex:1;scrollbar-width:thin;padding-bottom:1px}
+  .copy-btn{border:1px solid var(--line);background:transparent;color:var(--text-3);border-radius:3px;font:9.5px var(--mono);padding:4px 8px;letter-spacing:.06em;flex:0 0 auto;transition:color .18s,border-color .18s}
+  .copy-btn:hover{color:var(--mint);border-color:var(--line-2)}
+  .pipe-steps{list-style:none;margin:0;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));padding:34px 20px 26px;position:relative}
+  .pipe-steps::before{content:"";position:absolute;left:9%;right:9%;top:51px;height:1px;background:linear-gradient(90deg,var(--line-2),rgba(185,242,124,.42),var(--line))}
+  .pipe-step{position:relative;text-align:center;padding:0 5px}
+  .pipe-step .n{position:relative;z-index:1;width:34px;height:34px;margin:0 auto 15px;border-radius:50%;border:1px solid var(--line-2);background:#0a1815;display:grid;place-items:center;font:9.5px var(--mono);color:var(--text-3)}
+  .pipe-step.done .n{background:rgba(92,236,192,.1);border-color:rgba(92,236,192,.45);color:var(--mint)}
+  .pipe-step.current .n{border-color:var(--lime);color:var(--lime);box-shadow:0 0 0 4px rgba(185,242,124,.07)}
+  .pipe-step b{display:block;font-size:12.5px;font-weight:500;white-space:nowrap}
+  .pipe-step small{display:block;margin-top:4px;font:9px/1.6 var(--mono);color:var(--text-3)}
+  .pipe-out{display:flex;flex-wrap:wrap;gap:8px;padding:0 20px 22px}
+  .chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:3px;padding:5px 9px;font:9.5px var(--mono);letter-spacing:.04em;color:var(--text-3)}
+  .chip::before{content:"";width:4px;height:4px;border-radius:50%;background:var(--mint-dim)}
+  .pipe-card .foot{padding:12px 20px;border-top:1px solid var(--line);font:9.5px var(--mono);color:var(--text-3);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;letter-spacing:.04em}
+  .pipe-card .foot b{color:var(--mint);font-weight:500}
+
+  /* ---------- capabilities ---------- */
+  .cap-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line)}
+  .cap{background:var(--bg);padding:clamp(22px,2.6vw,30px);position:relative;transition:background .2s}
+  .cap:hover{background:#091915}
+  .cap-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:22px}
+  .cap-ico{width:30px;height:30px;color:var(--mint)}
+  .cap-ico svg{width:30px;height:30px;stroke:currentColor;fill:none;stroke-width:1.4}
+  .cap-idx{font:9px var(--mono);letter-spacing:.1em;color:var(--text-3)}
+  .cap h3{margin:0 0 10px;font-size:16px;font-weight:550;letter-spacing:-.01em}
+  .cap p{margin:0;font-size:13px;line-height:1.8;color:var(--text-2)}
+  .cap p b{color:var(--text);font-weight:500}
+  .cap .tagline{display:inline-block;margin-top:16px;font:9px var(--mono);letter-spacing:.08em;color:var(--text-3);border-top:1px solid var(--line);padding-top:10px}
+
+  /* ---------- console gallery ---------- */
+  .shot-tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:thin;margin-bottom:22px}
+  .shot-tab{position:relative;flex:0 0 auto;border:0;background:none;padding:12px 18px;font:11px var(--mono);letter-spacing:.08em;color:var(--text-3);transition:color .18s;white-space:nowrap}
+  .shot-tab::after{content:"";position:absolute;left:14px;right:14px;bottom:-1px;height:2px;background:transparent}
+  .shot-tab:hover{color:var(--text-2)}
+  .shot-tab[aria-selected="true"]{color:var(--text)}
+  .shot-tab[aria-selected="true"]::after{background:var(--mint)}
+  .shot-tab .n{color:var(--mint);margin-right:7px;font-size:9px}
+  .demo-note{display:inline-flex;align-items:center;gap:7px;font:9px var(--mono);letter-spacing:.1em;color:var(--text-3);white-space:nowrap}
+  .demo-note::before{content:"";width:5px;height:5px;border-radius:50%;background:var(--amber);opacity:.8}
+  .shot-frame{border:1px solid var(--line-2);border-radius:10px;overflow:hidden;background:#071411;box-shadow:0 30px 80px rgba(0,0,0,.35)}
+  .shot-bar{display:flex;align-items:center;gap:12px;height:40px;padding:0 15px;border-bottom:1px solid var(--line);background:#091814}
+  .shot-dots{display:flex;gap:5px;flex:0 0 auto}
+  .shot-dots i{width:7px;height:7px;border-radius:50%;background:#243b35;display:block}
+  .shot-dots i:first-child{background:#3c5a51}
+  .shot-url{font:9.5px var(--mono);letter-spacing:.03em;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:rgba(126,255,218,.04);border:1px solid var(--line);border-radius:3px;padding:3px 10px;flex:1;max-width:380px}
+  .shot-state{margin-left:auto;font:8.5px var(--mono);letter-spacing:.1em;color:var(--mint-dim);white-space:nowrap}
+  .shot-stage{position:relative;background:#06100e}
+  .shot-panel{margin:0}
+  .shot-panel img{width:100%;height:auto;aspect-ratio:1500/937;object-fit:cover;background:#071411}
+  .shot-caption{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:26px;padding:18px 20px 20px;border-top:1px solid var(--line);align-items:start}
+  .shot-caption strong{display:block;font-size:14px;font-weight:550;margin-bottom:4px}
+  .shot-caption span{font-size:12.5px;line-height:1.75;color:var(--text-3)}
+  .shot-caption .meta{display:flex;flex-wrap:wrap;gap:7px;justify-content:flex-end;align-content:flex-start}
+  .shot-caption .meta i{font:9px var(--mono);letter-spacing:.04em;color:var(--text-3);border:1px solid var(--line);border-radius:3px;padding:4px 7px;font-style:normal}
+
+  /* ---------- agent ---------- */
+  .agent-grid{display:grid;grid-template-columns:minmax(0,.82fr) minmax(0,1.18fr);gap:clamp(32px,5vw,66px);align-items:center}
+  .flow{list-style:none;margin:28px 0 0;padding:0;display:grid;gap:0}
+  .flow li{position:relative;display:grid;grid-template-columns:34px minmax(0,1fr);gap:14px;padding-bottom:18px}
+  .flow li:last-child{padding-bottom:0}
+  .flow li::before{content:"";position:absolute;left:16px;top:34px;bottom:0;width:1px;background:var(--line)}
+  .flow li:last-child::before{display:none}
+  .flow .n{width:33px;height:33px;border:1px solid var(--line-2);border-radius:50%;display:grid;place-items:center;font:9px var(--mono);color:var(--mint);background:#0a1815}
+  .flow b{display:block;font-size:13.5px;font-weight:550;margin-top:4px}
+  .flow span{display:block;font-size:12px;color:var(--text-3);line-height:1.7;margin-top:2px}
+  .agent-tags{display:flex;flex-wrap:wrap;gap:7px;margin-top:24px}
+  .agent-note{margin-top:18px;font-size:12px;line-height:1.8;color:var(--text-3)}
+  .agent-note b{color:var(--text-2);font-weight:500}
+  .agent-shot{border:1px solid var(--line-2);border-radius:8px;overflow:hidden;background:#071411}
+  .agent-shot img{width:100%;height:auto;aspect-ratio:1500/937;object-fit:cover}
+  .agent-shot figcaption{display:flex;justify-content:space-between;gap:12px;padding:11px 14px;border-top:1px solid var(--line);font-size:11px;color:var(--text-3);line-height:1.6}
+  .agent-shot figcaption span:last-child{font:8.5px var(--mono);letter-spacing:.1em;color:var(--amber);white-space:nowrap}
+
+  /* ---------- local ---------- */
+  .local-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,.92fr);gap:clamp(32px,5vw,70px);align-items:start}
+  .local-cards{display:grid;gap:1px;background:var(--line);border:1px solid var(--line);margin-top:30px}
+  .local-card{background:var(--bg);padding:20px 22px;display:grid;grid-template-columns:28px minmax(0,1fr);gap:14px}
+  .local-card svg{width:22px;height:22px;color:var(--mint);stroke:currentColor;fill:none;stroke-width:1.4;margin-top:2px}
+  .local-card b{display:block;font-size:13.5px;font-weight:550;margin-bottom:3px}
+  .local-card span{display:block;font-size:12px;line-height:1.75;color:var(--text-3)}
+  .machine{border:1px solid var(--line-2);border-radius:8px;background:linear-gradient(180deg,rgba(12,29,24,.8),rgba(7,17,15,.9));overflow:hidden}
+  .machine-top{display:flex;align-items:center;gap:9px;padding:12px 15px;border-bottom:1px solid var(--line);font:9.5px var(--mono);letter-spacing:.06em;color:var(--text-3)}
+  .machine-top .led{width:6px;height:6px;border-radius:50%;background:var(--lime);box-shadow:0 0 8px rgba(185,242,124,.55)}
+  .machine-top b{color:var(--text-2);font-weight:500;letter-spacing:.03em}
+  .machine-top span:last-child{margin-left:auto;color:var(--text-3)}
+  .specs{display:grid}
+  .spec{display:grid;grid-template-columns:94px minmax(0,1fr);gap:16px;padding:14px 16px;border-bottom:1px solid var(--line);font-size:12px}
+  .spec:last-child{border-bottom:0}
+  .spec dt{color:var(--text-3);font:9.5px var(--mono);letter-spacing:.06em;padding-top:2px}
+  .spec dd{margin:0;color:var(--text-2);line-height:1.7}
+  .spec dd b{color:var(--text);font-weight:500}
+  .machine-foot{padding:11px 16px;border-top:1px solid var(--line);font:9px var(--mono);letter-spacing:.03em;color:var(--text-3);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .machine-foot em{font-style:normal;color:var(--mint-dim)}
+
+  /* ---------- download ---------- */
+  .download{padding-top:clamp(56px,7vw,92px)}
+  .dl-card{position:relative;border:1px solid var(--line-2);border-radius:12px;background:radial-gradient(ellipse at 12% 10%,rgba(92,236,192,.09),transparent 52%),linear-gradient(160deg,#0b1c18,#071310);overflow:hidden}
+  .dl-card::before,.dl-card::after{content:"";position:absolute;width:18px;height:18px;border-color:rgba(92,236,192,.55);border-style:solid;pointer-events:none}
+  .dl-card::before{left:10px;top:10px;border-width:1px 0 0 1px}
+  .dl-card::after{right:10px;bottom:10px;border-width:0 1px 1px 0}
+  .dl-head{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;padding:clamp(26px,4vw,42px) clamp(24px,4vw,46px) 0}
+  .dl-head h2{margin-top:14px;font-size:clamp(28px,3.6vw,42px)}
+  .ver{border-left:1px solid var(--line-2);padding-left:18px;margin-bottom:4px;flex:0 0 auto}
+  .ver span{display:block;font:9px var(--mono);letter-spacing:.14em;color:var(--text-3);margin-bottom:3px}
+  .ver strong{font:400 24px/1 var(--mono);color:var(--mint);letter-spacing:-.02em}
+  .dl-grid{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr);gap:clamp(30px,5vw,60px);padding:clamp(24px,4vw,42px) clamp(24px,4vw,46px) clamp(28px,4vw,44px)}
+  .dl-main h3{margin:0;font-size:18px;font-weight:550;letter-spacing:-.01em}
+  .dl-meta{margin:7px 0 0;font:10.5px var(--mono);letter-spacing:.06em;color:var(--text-3)}
+  .dl-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:24px}
+  .dl-actions .btn{padding:13px 20px}
+  .dl-note{margin:16px 0 0;font-size:12px;line-height:1.8;color:var(--text-3);max-width:46ch}
+  .dl-links{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-top:18px;font:10px var(--mono);letter-spacing:.04em;color:var(--text-3)}
+  .dl-links a{border-bottom:1px solid var(--line-2);padding-bottom:2px;transition:color .18s,border-color .18s}
+  .dl-links a:hover{color:var(--mint);border-color:var(--mint)}
+  .dl-links i{font-style:normal;color:rgba(131,154,145,.5)}
+  .quick{list-style:none;margin:0;padding:0;border-top:1px solid var(--line)}
+  .quick li{display:grid;grid-template-columns:30px minmax(0,1fr);gap:12px;padding:14px 0;border-bottom:1px solid var(--line)}
+  .quick .n{font:10px var(--mono);color:var(--mint);padding-top:2px}
+  .quick b{display:block;font-size:13px;font-weight:550;margin-bottom:2px}
+  .quick span{display:block;font-size:11.5px;line-height:1.7;color:var(--text-3)}
+  .quick code{font:10.5px var(--mono);color:var(--text-2);background:rgba(126,255,218,.05);padding:1px 5px;border-radius:2px}
+  .dl-foot{display:flex;flex-wrap:wrap;gap:8px 18px;justify-content:space-between;padding:14px clamp(24px,4vw,46px);border-top:1px solid var(--line);font:9px var(--mono);letter-spacing:.04em;color:var(--text-3)}
+  .dl-foot b{color:var(--mint);font-weight:500}
+
+  /* ---------- faq ---------- */
+  .faq-wrap{display:grid;grid-template-columns:minmax(0,.62fr) minmax(0,1.38fr);gap:clamp(32px,5vw,72px);align-items:start}
+  .faq-side .lead{max-width:36ch}
+  .faq-side .mini{margin-top:24px;padding:14px 16px;border:1px solid var(--line);border-left:2px solid var(--mint-dim);font-size:11.5px;line-height:1.8;color:var(--text-3);max-width:32ch}
+  .faq-list{border-top:1px solid var(--line-2)}
+  .faq-item{border-bottom:1px solid var(--line)}
+  .faq-item summary{list-style:none;display:flex;align-items:center;gap:16px;padding:18px 2px;cursor:pointer;font-size:14px;font-weight:500;line-height:1.6}
+  .faq-item summary::-webkit-details-marker{display:none}
+  .faq-item summary::after{content:"";width:9px;height:9px;border-right:1px solid var(--text-3);border-bottom:1px solid var(--text-3);transform:rotate(45deg);margin-left:auto;flex:0 0 auto;transition:transform .2s,border-color .2s}
+  .faq-item[open] summary::after{transform:rotate(-135deg);border-color:var(--mint)}
+  .faq-item summary:hover{color:var(--mint)}
+  .faq-item .a{padding:0 28px 20px 2px;font-size:12.5px;line-height:1.85;color:var(--text-3);max-width:64ch}
+  .faq-item .a code{font:10.5px var(--mono);background:rgba(126,255,218,.05);padding:1px 5px;border-radius:2px;color:var(--text-2)}
+
+  /* ---------- footer ---------- */
+  footer{border-top:1px solid var(--line);background:#050d0b}
+  .foot-main{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,.8fr);gap:40px;padding:44px 0 34px;align-items:start}
+  .foot-brand{display:flex;gap:12px;align-items:flex-start}
+  .foot-brand svg{width:34px;height:34px;margin-top:2px}
+  .foot-brand b{display:block;font-size:14px;font-weight:600;letter-spacing:.01em}
+  .foot-brand span{display:block;margin-top:4px;font:9px var(--mono);letter-spacing:.16em;color:var(--text-3)}
+  .foot-brand p{margin:12px 0 0;font-size:12px;line-height:1.8;color:var(--text-3);max-width:42ch}
+  .foot-links{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 26px;justify-self:end;min-width:300px}
+  .foot-links a{font:11px var(--mono);color:var(--text-2);padding:5px 0;border-bottom:1px solid transparent;transition:color .18s,border-color .18s;display:inline-flex;justify-content:space-between;gap:12px}
+  .foot-links a span{color:var(--text-3);font-size:9px}
+  .foot-links a:hover{color:var(--mint);border-color:var(--line)}
+  .foot-note{border-top:1px solid var(--line);padding:16px 0 22px;display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px 24px;font:9px var(--mono);letter-spacing:.03em;color:var(--text-3)}
+  .foot-note b{color:var(--text-2);font-weight:400}
+
+  /* ---------- responsive ---------- */
+  @media (max-width:1100px){
+    .hero-grid{gap:38px}
+    .hero h1{font-size:clamp(40px,5.4vw,60px)}
+    .cap{padding:24px}
+    .pipe-grid{gap:38px}
+  }
+  @media (max-width:960px){
+    .nav{display:none}
+    .nav-toggle{display:inline-flex;margin-left:auto}
+    .head-cta{margin-left:0}
+    .hero-grid{grid-template-columns:1fr;gap:42px;padding-top:56px}
+    .hero-copy{max-width:660px}
+    .run-card{max-width:640px;justify-self:start}
+    .hero::after{display:none}
+    .facts{grid-template-columns:repeat(2,1fr)}
+    .fact{padding:20px 22px}
+    .fact:first-child{padding-left:22px}
+    .fact:nth-child(2){border-right:0}
+    .fact:nth-child(3),.fact:nth-child(4){border-top:1px solid var(--line)}
+    .fact:nth-child(3){padding-left:22px}
+    .fact:last-child{padding-right:22px}
+    .pipe-grid{grid-template-columns:1fr}
+    .pipe-copy{position:static}
+    .pipe-copy .lead{max-width:60ch}
+    .cap-grid{grid-template-columns:repeat(2,1fr)}
+    .agent-grid,.local-grid{grid-template-columns:1fr}
+    .agent-shot{max-width:720px}
+    .dl-grid{grid-template-columns:1fr}
+    .faq-wrap{grid-template-columns:1fr}
+    .faq-side .lead{max-width:60ch}
+    .foot-main{grid-template-columns:1fr}
+    .foot-links{justify-self:start;min-width:0;width:100%;max-width:420px}
+  }
+  @media (max-width:760px){
+    .pipe-steps{grid-template-columns:repeat(3,1fr);gap:26px 0;padding:28px 18px 20px}
+    .pipe-steps::before{display:none}
+    .shot-caption{grid-template-columns:1fr;gap:10px}
+    .shot-caption .meta{justify-content:flex-start}
+    .section-head.split{display:block}
+    .section-head.split .side{padding-top:14px}
+  }
+  @media (max-width:620px){
+    .head-inner{min-height:60px;gap:14px}
+    .head-cta .ghost-link{display:none}
+    .head-cta .btn{display:none}
+    .brand-text strong{font-size:14px}
+    .hero h1{font-size:clamp(37px,11vw,48px)}
+    .hero-lead{font-size:14.5px}
+    .hero-actions .btn{flex:1 1 100%}
+    .hero-actions{gap:9px}
+    .hero-meta{font-size:9.5px;gap:8px 12px}
+    .hero-note{font-size:11.5px;margin-top:26px}
+    .run-body{padding:17px 15px}
+    .run-target strong{font-size:15px}
+    .run-step{grid-template-columns:24px minmax(0,1fr) auto;gap:9px}
+    .run-step div{display:block}
+    .run-step small{display:block;margin-top:1px}
+    .run-step b{font-size:11.5px}
+    .run-step em{font-size:8.5px}
+    .fact{display:block;padding:17px 18px}
+    .fact:first-child,.fact:nth-child(3){padding-left:18px}
+    .fact:last-child{padding-right:18px}
+    .fact strong{display:block;margin-bottom:6px}
+    .fact span b{display:inline;font-size:12px}
+    .fact span{font-size:10.5px}
+    .cap-grid{grid-template-columns:1fr}
+    .cap{padding:22px}
+    .shot-tab{padding:11px 12px;font-size:10px}
+    .shot-url{display:none}
+    .shot-state{margin-left:auto}
+    .shot-caption{padding:14px 15px 16px}
+    .shot-caption strong{font-size:13px}
+    .shot-caption span{font-size:11.5px}
+    .shot-caption .meta i{font-size:8px}
+    .dl-head{display:block}
+    .ver{border-left:0;padding-left:0;margin-top:18px}
+    .dl-main h3{font-size:16px}
+    .dl-actions .btn{flex:1 1 100%}
+    .foot-links{grid-template-columns:1fr 1fr;gap:8px 18px}
+    .foot-note{font-size:8px}
+    .flow li{padding-bottom:15px}
+    .spec{grid-template-columns:82px minmax(0,1fr);gap:12px}
+    .section{padding:58px 0}
+  }
+  @media (max-width:400px){
+    .wrap{padding:0 17px}
+    .head-inner{padding:0 17px}
+    .brand-text small{letter-spacing:.16em}
+    .hero h1{font-size:35px}
+    .hero-meta span{font-size:9px}
+    .run-head{font-size:8.5px;padding:11px 13px}
+    .run-demo{font-size:7.5px;padding:2px 5px}
+    .run-step div{gap:0}
+    .pipe-steps{grid-template-columns:repeat(2,1fr)}
+    .dl-head,.dl-grid,.dl-foot{padding-left:19px;padding-right:19px}
+    .foot-links{grid-template-columns:1fr}
+    .foot-brand p{font-size:11px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto}
+    *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}
+  }
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">跳到主要内容</a>
+
+<header class="site-head" id="top">
+  <div class="head-inner">
+    <a class="brand" href="#top" aria-label="智能运维平台首页">
+      <svg viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M16 3.4 27.5 9.8v12.4L16 28.6 4.5 22.2V9.8Z" fill="none" stroke="#5cecc0" stroke-width="1.3"/>
+        <path d="M10.2 19.9 16 10.8l5.8 9.1" fill="none" stroke="#b9f27c" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M16 10.8v9.5" fill="none" stroke="#5cecc0" stroke-width="1.7" stroke-linecap="round"/>
+        <circle cx="16" cy="22.6" r="1.3" fill="#b9f27c"/>
+      </svg>
+      <span class="brand-text"><strong>智能运维平台</strong><small>SMARTOPS</small></span>
+    </a>
+    <nav class="nav" aria-label="主导航">
+      <a href="#pipeline">发布链</a>
+      <a href="#capabilities">能力</a>
+      <a href="#console">界面</a>
+      <a href="#agent">智能助手</a>
+      <a href="#local">本地部署</a>
+      <a href="#download">下载</a>
+    </nav>
+    <div class="head-cta">
+      <a class="ghost-link" href="https://github.com/BeginnerA/agencys-deploy" target="_blank" rel="noopener">GITHUB ↗</a>
+      <a class="btn btn-primary btn-sm" href="https://github.com/BeginnerA/agencys-deploy/releases/tag/v0.1.0" target="_blank" rel="noopener">下载 v0.1.0</a>
+    </div>
+    <button class="nav-toggle" id="navToggle" aria-expanded="false" aria-controls="mobileNav"><i aria-hidden="true"></i>菜单</button>
+  </div>
+  <div class="mobile-nav" id="mobileNav" hidden>
+    <a href="#pipeline">发布链 <span>01</span></a>
+    <a href="#capabilities">能力 <span>02</span></a>
+    <a href="#console">界面 <span>03</span></a>
+    <a href="#agent">智能助手 <span>04</span></a>
+    <a href="#local">本地部署 <span>05</span></a>
+    <a href="#download">下载 <span>06</span></a>
+    <a href="https://github.com/BeginnerA/agencys-deploy" target="_blank" rel="noopener">GitHub 仓库 <span>↗</span></a>
+  </div>
+</header>
+
+<main id="main">
+  <!-- HERO -->
+  <section class="hero" aria-labelledby="heroTitle">
+    <div class="wrap">
+      <div class="hero-grid">
+        <div class="hero-copy">
+          <div class="eyebrow"><span class="dot" aria-hidden="true"></span>SMARTOPS / DEPLOY CONSOLE</div>
+          <h1 id="heroTitle">把一次发布，<br>收进<span class="accent">一条命令</span>。</h1>
+          <p class="hero-lead">从构建、镜像、滚动发布，到健康检查与 Nacos 上下线——<b>一条链路跑完</b>。发布失败自动回滚，任务、日志与审计记录完整留下。</p>
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="#download">下载 Windows 便携版
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m0 0 3.2-3.2M8 10 4.8 6.8M3 12.5h10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </a>
+            <a class="btn btn-ghost" href="#console">看看控制台
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10m0 0L9 4m4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </a>
+          </div>
+          <div class="hero-meta" aria-label="版本与运行信息">
+            <span><i aria-hidden="true"></i>v0.1.0 已发布</span>
+            <span><i aria-hidden="true"></i>Windows 10 / 11 x64</span>
+            <span><i aria-hidden="true"></i>约 19 MB · 解压即用</span>
+            <span><i aria-hidden="true"></i>Apache-2.0</span>
+          </div>
+          <p class="hero-note"><b>发布之外，它也是监控台。</b>服务器资源、响应时间、告警与日志在同一套项目模型里，排障不用换工具。</p>
+        </div>
+
+        <div class="run-card" aria-label="发布流程界面示意，合成演示数据">
+          <div class="run-head">
+            <span>RUN <b>#70</b></span>
+            <span class="run-live"><i aria-hidden="true"></i>进行中</span>
+            <span class="run-demo">界面示意 · 合成数据</span>
+          </div>
+          <div class="run-body">
+            <div class="run-target">
+              <div><small>服务</small><strong>mall-order</strong></div>
+              <span class="run-arrow" aria-hidden="true">→</span>
+              <div><small>环境</small><strong>生产</strong></div>
+              <span class="run-ver">v2.8.4</span>
+            </div>
+            <div class="run-progress" aria-hidden="true"><span></span></div>
+            <ol class="run-steps" aria-label="发布步骤示例">
+              <li class="run-step done"><span class="run-node" aria-hidden="true">01</span><div><b>拉取源码</b><small>git fetch --tags</small></div><em>完成</em></li>
+              <li class="run-step done"><span class="run-node" aria-hidden="true">02</span><div><b>构建镜像</b><small>mvn -Pprod package</small></div><em>31s</em></li>
+              <li class="run-step done"><span class="run-node" aria-hidden="true">03</span><div><b>推送镜像</b><small>registry.demo.local</small></div><em>12s</em></li>
+              <li class="run-step active"><span class="run-node" aria-hidden="true">04</span><div><b>滚动发布</b><small>3 / 3 实例</small></div><em>进行中</em></li>
+              <li class="run-step pending"><span class="run-node" aria-hidden="true">05</span><div><b>健康检查</b><small>HTTP · TCP 探活</small></div><em>等待</em></li>
+              <li class="run-step pending"><span class="run-node" aria-hidden="true">06</span><div><b>Nacos 上下线</b><small>权重与实例管理</small></div><em>等待</em></li>
+            </ol>
+            <div class="run-foot">
+              <span class="guard"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2 3.5 3.7v4.1c0 2.7 1.9 4.6 4.5 5.7 2.6-1.1 4.5-3 4.5-5.7V3.7L8 2Z" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="m5.8 7.8 1.5 1.5 2.9-2.9" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>失败自动回滚</span>
+              <span>已用时 01:26 / 预计 02:16</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="facts" aria-label="产品关键数字">
+        <div class="fact"><strong>49</strong><span><b>个 Agent 工具</b>发布、日志、监控与配置</span></div>
+        <div class="fact"><strong>06</strong><span><b>路告警通道</b>企微 / 飞书 / 钉钉 / 邮件等</span></div>
+        <div class="fact"><strong>03</strong><span><b>级权限模型</b>管理员 / 操作员 / 只读</span></div>
+        <div class="fact"><strong>100<em>%</em></strong><span><b>数据留在本机</b>无必填云服务</span></div>
+      </div>
+    </div>
+    <div class="ruler" aria-hidden="true"></div>
+  </section>
+
+  <!-- PIPELINE -->
+  <section class="section" id="pipeline" aria-labelledby="pipelineTitle">
+    <div class="wrap">
+      <div class="pipe-grid">
+        <div class="pipe-copy">
+          <div class="kicker">01 / <span>PIPELINE</span></div>
+          <h2 id="pipelineTitle">一条发布链，<br>六个检查点。</h2>
+          <p class="lead">服务或整条流水线排进队列后，平台按顺序完成构建、发布与探活，再处理注册中心上下线。任何一步失败，都能按版本回滚。</p>
+          <ul class="pipe-points">
+            <li><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8.2 3.1 3.1L13 4.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>多服务流水线、金丝雀灰度、定时计划与发布窗口</li>
+            <li><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8.2 3.1 3.1L13 4.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>部署快照与版本对比，知道上一次到底改了什么</li>
+            <li><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8.2 3.1 3.1L13 4.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>服务依赖拓扑，发布前看清上下游影响</li>
+          </ul>
+        </div>
+        <div class="pipe-card">
+          <div class="cmd">
+            <span class="prompt" aria-hidden="true">$</span>
+            <code id="deployCmd">./deploy.sh --project mall --env prod --version v2.8.4</code>
+            <button class="copy-btn" id="copyCmd" type="button" aria-label="复制发布命令">复制</button>
+          </div>
+          <ol class="pipe-steps" aria-label="发布链六个检查点">
+            <li class="pipe-step done"><span class="n" aria-hidden="true">01</span><b>拉取源码</b><small>git fetch</small></li>
+            <li class="pipe-step done"><span class="n" aria-hidden="true">02</span><b>构建镜像</b><small>Maven + Docker</small></li>
+            <li class="pipe-step done"><span class="n" aria-hidden="true">03</span><b>推送镜像</b><small>Registry / 直传</small></li>
+            <li class="pipe-step current"><span class="n" aria-hidden="true">04</span><b>滚动发布</b><small>逐台替换实例</small></li>
+            <li class="pipe-step"><span class="n" aria-hidden="true">05</span><b>健康检查</b><small>HTTP · TCP</small></li>
+            <li class="pipe-step"><span class="n" aria-hidden="true">06</span><b>Nacos 上下线</b><small>权重与实例</small></li>
+          </ol>
+          <div class="pipe-out">
+            <span class="chip">失败自动回滚</span>
+            <span class="chip">发布窗口拦截</span>
+            <span class="chip">每步任务可追溯</span>
+            <span class="chip">整条流水线排队</span>
+          </div>
+          <div class="foot"><span>配置：项目 → 服务 → 环境 → 服务器</span><span><b>一条命令</b> · 全程留痕</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CAPABILITIES -->
+  <section class="section" id="capabilities" aria-labelledby="capTitle">
+    <div class="wrap">
+      <div class="section-head">
+        <div class="kicker">02 / <span>CAPABILITIES</span></div>
+        <h2 id="capTitle">发布之外的日常，也在同一个控制台。</h2>
+        <p class="lead">监控、告警、日志和配置不是四个独立工具。它们共享<strong>项目、环境、服务</strong>模型，排障时不需要在标签页之间拼线索。</p>
+      </div>
+      <div class="cap-grid">
+        <article class="cap">
+          <div class="cap-top">
+            <span class="cap-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 14v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"/></svg></span>
+            <span class="cap-idx">01</span>
+          </div>
+          <h3>滚动发布与灰度</h3>
+          <p>服务发布、多服务流水线、<b>金丝雀灰度</b>、定时计划与发布窗口。运行中可暂停、终止或回滚。</p>
+          <span class="tagline">ROLLING / CANARY / SCHEDULE</span>
+        </article>
+        <article class="cap">
+          <div class="cap-top">
+            <span class="cap-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M7 13l3-3 2.5 2.5L17 8"/><path d="M7 18v2m10-2v2"/></svg></span>
+            <span class="cap-idx">02</span>
+          </div>
+          <h3>监控大屏</h3>
+          <p>SSH 采集 CPU、内存、磁盘、网络、TCP、Docker 存储与 <b>SSL 到期</b>；响应时间保留历史趋势。</p>
+          <span class="tagline">SSH PROBE / SSE PUSH</span>
+        </article>
+        <article class="cap">
+          <div class="cap-top">
+            <span class="cap-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3a5 5 0 0 0-5 5v3L5 15h14l-2-4V8a5 5 0 0 0-5-5Z"/><path d="M10 18a2 2 0 0 0 4 0"/></svg></span>
+            <span class="cap-idx">03</span>
+          </div>
+          <h3>告警与静默</h3>
+          <p>指标、服务状态、日志关键词三类规则；<b>六路通知</b>；确认、解决、升级与静默窗口。</p>
+          <span class="tagline">RULE / SILENCE / ESCALATE</span>
+        </article>
+        <article class="cap">
+          <div class="cap-top">
+            <span class="cap-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3.5 6 6v6c0 4 2.6 6.6 6 8 3.4-1.4 6-4 6-8V6l-6-2.5Z"/><path d="m9 12 2 2 4-4"/></svg></span>
+            <span class="cap-idx">04</span>
+          </div>
+          <h3>智能运维助手</h3>
+          <p>自然语言生成发布计划，<b>人工审批</b>后复用任务通道执行。49 个工具，支持 Web、CLI 与 MCP。</p>
+          <span class="tagline">PLAN / APPROVE / AUDIT</span>
+        </article>
+        <article class="cap">
+          <div class="cap-top">
+            <span class="cap-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 3h9l5 5v13H5z"/><path d="M14 3v5h5M8 12h8M8 16h8"/></svg></span>
+            <span class="cap-idx">05</span>
+          </div>
+          <h3>日志与配置</h3>
+          <p>增量采集、关键词检索、上下文查看；项目、服务、环境、服务器与流水线统一配置。</p>
+          <span class="tagline">FTS / CONTEXT / IMPORT</span>
+        </article>
+        <article class="cap">
+          <div class="cap-top">
+            <span class="cap-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v2"/></svg></span>
+            <span class="cap-idx">06</span>
+          </div>
+          <h3>权限与审计</h3>
+          <p>管理员、操作员、只读三级权限，JWT 会话；关键操作写入审计，配置可导入导出。</p>
+          <span class="tagline">RBAC / JWT / AUDIT</span>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- CONSOLE -->
+  <section class="section" id="console" aria-labelledby="consoleTitle">
+    <div class="wrap">
+      <div class="section-head split">
+        <div class="txt">
+          <div class="kicker">03 / <span>CONSOLE</span></div>
+          <h2 id="consoleTitle">先看清，再动手。</h2>
+          <p class="lead">四个最常用的工作面：监控、项目、发布、告警。下面的界面来自<strong>合成演示环境</strong>，不对应任何真实服务器。</p>
+        </div>
+        <div class="side"><span class="demo-note">DEMO DATA / 合成数据</span></div>
+      </div>
+
+      <div class="shot-tabs" role="tablist" aria-label="控制台界面预览">
+        <button class="shot-tab" role="tab" id="tab-dashboard" aria-controls="panel-dashboard" aria-selected="true" tabindex="0" data-url="127.0.0.1:5678/screen#/dashboard"><span class="n">01</span>监控中心</button>
+        <button class="shot-tab" role="tab" id="tab-projects" aria-controls="panel-projects" aria-selected="false" tabindex="-1" data-url="127.0.0.1:5678/screen#/devices"><span class="n">02</span>项目总览</button>
+        <button class="shot-tab" role="tab" id="tab-deploy" aria-controls="panel-deploy" aria-selected="false" tabindex="-1" data-url="127.0.0.1:5678/screen#/deploy"><span class="n">03</span>发布中心</button>
+        <button class="shot-tab" role="tab" id="tab-alerts" aria-controls="panel-alerts" aria-selected="false" tabindex="-1" data-url="127.0.0.1:5678/screen#/alerts"><span class="n">04</span>告警中心</button>
+      </div>
+
+      <div class="shot-frame">
+        <div class="shot-bar" aria-hidden="true">
+          <span class="shot-dots"><i></i><i></i><i></i></span>
+          <span class="shot-url" id="shotUrl">127.0.0.1:5678/screen#/dashboard</span>
+          <span class="shot-state">LOCAL / READY</span>
+        </div>
+        <div class="shot-stage">
+          <figure class="shot-panel" role="tabpanel" id="panel-dashboard" aria-labelledby="tab-dashboard" data-panel>
+            <img src="assets/dashboard.webp" width="1500" height="937" alt="监控中心界面：4 个项目、14 个服务、3 条活跃告警，雷达健康指数、近 7 日发布趋势与最近发布列表">
+            <figcaption class="shot-caption">
+              <div><strong>监控中心</strong><span>项目、服务、环境、服务器与发布成功率一屏汇总；健康指数、近 7 / 30 日趋势、服务器资源和响应时间并排。</span></div>
+              <div class="meta"><i>KPI 汇总</i><i>健康指数</i><i>发布趋势</i><i>事件驱动刷新</i></div>
+            </figcaption>
+          </figure>
+          <figure class="shot-panel" role="tabpanel" id="panel-projects" aria-labelledby="tab-projects" data-panel hidden>
+            <img src="assets/projects.webp" width="1500" height="937" alt="项目总览界面：云屿商城生产环境的服务卡片墙与服务器列表，卡片展示版本、实例、端口和健康状态">
+            <figcaption class="shot-caption">
+              <div><strong>项目总览</strong><span>按项目与环境切换服务卡片，直接发布、回滚、重启或查看实时日志；下方是同环境的服务器连通状态。</span></div>
+              <div class="meta"><i>服务卡片墙</i><i>环境切换</i><i>服务器状态</i><i>快速操作</i></div>
+            </figcaption>
+          </figure>
+          <figure class="shot-panel" role="tabpanel" id="panel-deploy" aria-labelledby="tab-deploy" data-panel hidden>
+            <img src="assets/deploy.webp" width="1500" height="937" alt="发布中心界面：任务列表按编号展示服务、操作类型、环境、版本、状态、启动时间与耗时">
+            <figcaption class="shot-caption">
+              <div><strong>发布中心</strong><span>服务与流水线任务统一排队；版本、环境、状态、耗时和日志都可追溯，运行中的任务可以终止或回滚。</span></div>
+              <div class="meta"><i>任务队列</i><i>发布 / 回滚 / 重启</i><i>增量日志</i><i>终止与重跑</i></div>
+            </figcaption>
+          </figure>
+          <figure class="shot-panel" role="tabpanel" id="panel-alerts" aria-labelledby="tab-alerts" data-panel hidden>
+            <img src="assets/alerts.webp" width="1500" height="937" alt="告警中心界面：3 条活跃、1 条已确认、2 条已解决告警，展示级别、通知次数、首次与最近出现时间">
+            <figcaption class="shot-caption">
+              <div><strong>告警中心</strong><span>活跃、已确认、已解决一眼分清；规则、静默窗口和到期监控在同一处管理，通知记录可回看。</span></div>
+              <div class="meta"><i>三级状态</i><i>通知次数</i><i>确认与升级</i><i>静默窗口</i></div>
+            </figcaption>
+          </figure>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- AGENT -->
+  <section class="section" id="agent" aria-labelledby="agentTitle">
+    <div class="wrap">
+      <div class="agent-grid">
+        <div>
+          <div class="kicker">04 / <span>AGENT</span></div>
+          <h2 id="agentTitle">先出计划，<br>人工点头，再动生产。</h2>
+          <p class="lead">在对话里描述目标，Agent 会结合服务状态、发布窗口与依赖生成计划；<strong>审批通过才创建任务</strong>。模型不可用时，规则引擎仍会给出归因与建议。</p>
+          <ol class="flow">
+            <li><span class="n" aria-hidden="true">01</span><div><b>计划</b><span>读取项目、环境、服务与当前状态，生成可审阅的步骤与风险说明。</span></div></li>
+            <li><span class="n" aria-hidden="true">02</span><div><b>审批</b><span>操作员或管理员在 Web 审批单中确认；对话中的决策同样落入审计。</span></div></li>
+            <li><span class="n" aria-hidden="true">03</span><div><b>执行</b><span>复用平台原有的发布任务通道，不绕过发布窗口与回滚策略。</span></div></li>
+            <li><span class="n" aria-hidden="true">04</span><div><b>留痕</b><span>计划、审批人、任务结果与建议状态全部可追溯，案例可沉淀复用。</span></div></li>
+          </ol>
+          <div class="agent-tags">
+            <span class="chip">49 个运维工具</span>
+            <span class="chip">Web / CLI / MCP</span>
+            <span class="chip">六渠道巡检日报</span>
+          </div>
+          <p class="agent-note"><b>模型是可选项。</b>支持任意 OpenAI 兼容网关；不配置也不影响发布、监控和告警。</p>
+        </div>
+        <figure class="agent-shot">
+          <img src="assets/agent.webp" width="1500" height="937" alt="智能助手决策建议界面：三条由规则引擎生成的发布前检查、告警归因和失败归因建议">
+          <figcaption><span>决策建议：规则引擎优先给出归因，LLM 可选润色</span><span>DEMO DATA</span></figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- LOCAL -->
+  <section class="section" id="local" aria-labelledby="localTitle">
+    <div class="wrap">
+      <div class="local-grid">
+        <div>
+          <div class="kicker">05 / <span>LOCAL FIRST</span></div>
+          <h2 id="localTitle">它住在你的机器里。</h2>
+          <p class="lead">Flask + SQLite 单机运行，SSH 直连目标服务器。项目配置、环境凭据和日志只保存在本机 <code>data/platform.db</code>，不经过第三方 SaaS。</p>
+          <div class="local-cards">
+            <div class="local-card">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v6c0 1.7 3.1 3 7 3s7-1.3 7-3V5M5 11v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg>
+              <div><b>单文件数据库</b><span>备份、迁移、导入导出都在本机完成，数据库不需要额外的服务进程。</span></div>
+            </div>
+            <div class="local-card">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4 2.9 7.5 7 9 4.1-1.5 7-5 7-9V6l-7-3Z"/><path d="M9.5 12h5M12 9.5v5"/></svg>
+              <div><b>凭据不出内网</b><span>平台不做云托管；SSH 由 paramiko 直连目标服务器，通知走你配置的渠道。</span></div>
+            </div>
+            <div class="local-card">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+              <div><b>Windows 解压即用</b><span>便携包内置 Python 3.12 运行时，不需要 pip、虚拟环境或开发工具链。</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="machine">
+          <div class="machine-top"><span class="led" aria-hidden="true"></span><b>LOCAL NODE</b><span>127.0.0.1:5678</span></div>
+          <dl class="specs">
+            <div class="spec"><dt>运行环境</dt><dd><b>Python 3.9+</b>，或 Windows 10 / 11 x64 便携版</dd></div>
+            <div class="spec"><dt>镜像构建</dt><dd>需要 git / Maven / Docker，可在构建机或发布机执行</dd></div>
+            <div class="spec"><dt>目标服务器</dt><dd>Linux + SSH；容器发布需 Docker，静态站点可直接打包发布</dd></div>
+            <div class="spec"><dt>数据存储</dt><dd>SQLite 单文件，首次启动自动建库</dd></div>
+            <div class="spec"><dt>许可</dt><dd>Apache-2.0，可自部署与二次修改</dd></div>
+          </dl>
+          <div class="machine-foot"><span>首次登录后强制修改管理员密码</span><em>LOCAL ONLY</em></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- DOWNLOAD -->
+  <section class="section download" id="download" aria-labelledby="downloadTitle">
+    <div class="wrap">
+      <div class="dl-card">
+        <div class="dl-head">
+          <div>
+            <div class="kicker">06 / <span>DOWNLOAD</span></div>
+            <h2 id="downloadTitle">下载，解压，开始发布。</h2>
+          </div>
+          <div class="ver"><span>RELEASE</span><strong>v0.1.0</strong></div>
+        </div>
+        <div class="dl-grid">
+          <div class="dl-main">
+            <h3>智能运维平台 · Windows 便携版</h3>
+            <p class="dl-meta">WINDOWS 10 / 11 · X64　·　约 19 MB　·　解压后约 45 MB</p>
+            <div class="dl-actions">
+              <a class="btn btn-primary" href="https://github.com/BeginnerA/agencys-deploy/releases/download/v0.1.0/SmartOps-portable-v0.1.0-win-x64.zip" target="_blank" rel="noopener">下载便携版 zip
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m0 0 3.2-3.2M8 10 4.8 6.8M3 12.5h10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </a>
+              <a class="btn btn-ghost" href="https://github.com/BeginnerA/agencys-deploy" target="_blank" rel="noopener">GitHub 仓库
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h7v7M13 3 5 11M3.5 5.5V13h7.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </a>
+            </div>
+            <p class="dl-note">内置 Python 3.12 运行时与全部依赖。无需 pip、无需安装开发环境。构建镜像时仍需本机具备 git / Maven / Docker。</p>
+            <div class="dl-links">
+              <a href="https://gitee.com/agencys/agencys-deploy" target="_blank" rel="noopener">Gitee 镜像</a><i>·</i>
+              <a href="https://github.com/BeginnerA/agencys-deploy/releases/tag/v0.1.0" target="_blank" rel="noopener">Release 说明</a><i>·</i>
+              <a href="https://github.com/BeginnerA/agencys-deploy/blob/main/LICENSE" target="_blank" rel="noopener">Apache-2.0</a><i>·</i>
+              <span>校验与更新以 Release 页为准</span>
+            </div>
+          </div>
+          <ol class="quick">
+            <li><span class="n" aria-hidden="true">01</span><div><b>解压到任意目录</b><span>下载 zip 后解压，不需要管理员权限。</span></div></li>
+            <li><span class="n" aria-hidden="true">02</span><div><b>双击「启动平台.bat」</b><span>首次启动自动建库，约几秒完成；控制台日志留在本机。</span></div></li>
+            <li><span class="n" aria-hidden="true">03</span><div><b>浏览器自动打开</b><span>也可以手动访问 <code>127.0.0.1:5678</code>；登录后强制修改初始密码。</span></div></li>
+          </ol>
+        </div>
+        <div class="dl-foot">
+          <span><b>无需云服务</b> · SSH 直连 · 数据本地存放</span>
+          <span>AI 助手可选配任意 OpenAI 兼容网关</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ -->
+  <section class="section" id="faq" aria-labelledby="faqTitle">
+    <div class="wrap">
+      <div class="faq-wrap">
+        <div class="faq-side">
+          <div class="kicker">07 / <span>FAQ</span></div>
+          <h2 id="faqTitle">下载之前，<br>先确认几件事。</h2>
+          <p class="lead">它面向的是一台到几十台服务器的自建环境，不是替代云厂商的整套 PaaS。</p>
+          <p class="mini">界面截图全部来自合成演示数据。展示页本身不收集任何运行数据。</p>
+        </div>
+        <div class="faq-list">
+          <details class="faq-item">
+            <summary>和直接用 Jenkins 或发布脚本有什么区别？</summary>
+            <div class="a">平台不是替代 CI。构建可以继续交给 Jenkins；它补上的是发布前后的整条操作链：配置、任务、日志、回滚、监控、告警与审批在同一个项目模型里。适合没有专职平台团队、但需要可追溯发布的小团队。</div>
+          </details>
+          <details class="faq-item">
+            <summary>一定要装 Docker 吗？</summary>
+            <div class="a">平台自身不需要 Docker。容器发布需要构建机或目标机具备 Docker；也支持静态站点包发布。SSH 连接使用纯 Python 的 paramiko，不需要本机安装 ssh 客户端。</div>
+          </details>
+          <details class="faq-item">
+            <summary>能部署到 Linux 服务器吗？</summary>
+            <div class="a">平台本体是 Python 3.9+ / Flask 应用，可以运行在 Linux。当前提供的便携包是 Windows x64 版本；被发布的目标服务器通常是 Linux，通过 SSH 连接。</div>
+          </details>
+          <details class="faq-item">
+            <summary>服务器密码和数据会离开本机吗？</summary>
+            <div class="a">平台不会主动上传配置。项目、环境、连接信息与日志存放在本机 <code>data/platform.db</code>。除非你主动配置外部 LLM 网关，否则运行链路不依赖第三方 SaaS。请像保护普通生产凭据一样保护这个数据库文件。</div>
+          </details>
+          <details class="faq-item">
+            <summary>AI 助手必须配置模型吗？</summary>
+            <div class="a">不必。未配置 LLM 网关时会自动降级为规则引擎，发布、监控、告警与审批流程都不受影响。配置任意 OpenAI 兼容网关后，才会启用对话式编排和模型润色。</div>
+          </details>
+          <details class="faq-item">
+            <summary>开源协议是什么？可以二次修改吗？</summary>
+            <div class="a">Apache-2.0。可以自部署、修改和分发，保留许可与版权声明即可。</div>
+          </details>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-main">
+      <div class="foot-brand">
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M16 3.4 27.5 9.8v12.4L16 28.6 4.5 22.2V9.8Z" fill="none" stroke="#5cecc0" stroke-width="1.3"/>
+          <path d="M10.2 19.9 16 10.8l5.8 9.1" fill="none" stroke="#b9f27c" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M16 10.8v9.5" fill="none" stroke="#5cecc0" stroke-width="1.7" stroke-linecap="round"/>
+          <circle cx="16" cy="22.6" r="1.3" fill="#b9f27c"/>
+        </svg>
+        <div>
+          <b>智能运维平台</b>
+          <span>SMARTOPS / DEPLOY CONSOLE</span>
+          <p>本地优先的多服务器发布与运维控制台。发布、监控、告警、日志与 AI 助手，共用一套项目模型。</p>
+        </div>
+      </div>
+      <div class="foot-links">
+        <a href="#pipeline">发布链 <span>01</span></a>
+        <a href="#capabilities">能力 <span>02</span></a>
+        <a href="#console">界面 <span>03</span></a>
+        <a href="#agent">智能助手 <span>04</span></a>
+        <a href="#local">本地部署 <span>05</span></a>
+        <a href="#download">下载 <span>06</span></a>
+        <a href="https://github.com/BeginnerA/agencys-deploy" target="_blank" rel="noopener">GitHub <span>↗</span></a>
+        <a href="https://gitee.com/agencys/agencys-deploy" target="_blank" rel="noopener">Gitee <span>↗</span></a>
+      </div>
+    </div>
+    <div class="foot-note">
+      <span>© 2026 智能运维平台 · Apache-2.0</span>
+      <span><b>界面截图来自合成演示数据</b>，不包含真实服务器、项目或凭据信息。</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function(){
+  "use strict";
+
+  var head = document.querySelector('.site-head');
+  var toggle = document.getElementById('navToggle');
+  var mobileNav = document.getElementById('mobileNav');
+
+  function closeMenu(){
+    if (!head || !toggle || !mobileNav) return;
+    head.classList.remove('open');
+    toggle.setAttribute('aria-expanded','false');
+    mobileNav.hidden = true;
+  }
+  if (toggle && mobileNav && head){
+    toggle.addEventListener('click', function(){
+      var open = !head.classList.contains('open');
+      head.classList.toggle('open', open);
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      mobileNav.hidden = !open;
+    });
+    mobileNav.addEventListener('click', function(e){
+      if (e.target.closest('a')) closeMenu();
+    });
+    document.addEventListener('keydown', function(e){
+      if (e.key === 'Escape') closeMenu();
+    });
+    window.addEventListener('hashchange', closeMenu);
+  }
+
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.shot-tab'));
+  var panels = Array.prototype.slice.call(document.querySelectorAll('[data-panel]'));
+  var shotUrl = document.getElementById('shotUrl');
+
+  function activateTab(tab, focus){
+    if (!tab || !tab.getAttribute('aria-controls')) return;
+    tabs.forEach(function(t){
+      var selected = t === tab;
+      t.setAttribute('aria-selected', selected ? 'true' : 'false');
+      t.tabIndex = selected ? 0 : -1;
+    });
+    panels.forEach(function(p){ p.hidden = p.id !== tab.getAttribute('aria-controls'); });
+    if (shotUrl && tab.dataset.url) shotUrl.textContent = tab.dataset.url;
+    if (focus) tab.focus();
+  }
+
+  tabs.forEach(function(tab, i){
+    tab.addEventListener('click', function(){ activateTab(tab, false); });
+    tab.addEventListener('keydown', function(e){
+      var idx = i;
+      if (e.key === 'ArrowRight') idx = (i + 1) % tabs.length;
+      else if (e.key === 'ArrowLeft') idx = (i - 1 + tabs.length) % tabs.length;
+      else if (e.key === 'Home') idx = 0;
+      else if (e.key === 'End') idx = tabs.length - 1;
+      else return;
+      e.preventDefault();
+      activateTab(tabs[idx], true);
+    });
+  });
+
+  var copyBtn = document.getElementById('copyCmd');
+  var cmd = document.getElementById('deployCmd');
+  if (copyBtn && cmd){
+    var flashCopy = function(label){
+      copyBtn.textContent = label;
+      setTimeout(function(){ copyBtn.textContent = '复制'; }, 1600);
+    };
+    var fallbackCopy = function(text){
+      var field = document.createElement('textarea');
+      field.value = text;
+      field.setAttribute('readonly', '');
+      field.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0';
+      document.body.appendChild(field);
+      field.select();
+      field.setSelectionRange(0, text.length);
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch(e){ ok = false; }
+      document.body.removeChild(field);
+      return ok;
+    };
+    copyBtn.addEventListener('click', function(){
+      var text = cmd.textContent.trim();
+      if (navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(function(){
+          flashCopy('已复制');
+        }).catch(function(){
+          flashCopy(fallbackCopy(text) ? '已复制' : '复制失败');
+        });
+      } else {
+        flashCopy(fallbackCopy(text) ? '已复制' : '复制失败');
+      }
+    });
+  }
+})();
+</script>
+</body>
+</html>
