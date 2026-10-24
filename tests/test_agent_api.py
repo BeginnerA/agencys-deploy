@@ -20,7 +20,8 @@ class AgentApiBase(unittest.TestCase):
         self.db_path = os.path.join(self.tmp, "test.db")
         dbm.init_db(self.db_path)
         from webapp import create_app
-        self.app = create_app()
+        # 目录靠 create_app 注入：裸调用会让工厂在默认落点上跑一遍迁移/引导
+        self.app = create_app(data_dir=self.tmp)
         self.app.config["DB_PATH"] = self.db_path
         self.app.config["TESTING"] = True
         with self.app.app_context():
@@ -817,7 +818,7 @@ class AgentApiBase(unittest.TestCase):
         tmp_dir = os.path.join(self.tmp, "decisions")
         os.makedirs(tmp_dir, exist_ok=True)
 
-        def fake_path(task_id):
+        def fake_path(task_id, data_dir=None):
             return os.path.join(tmp_dir, f"canary_decision_{task_id}.json")
 
         tid = self._make_task(version="1.2.0", status="running")
@@ -849,7 +850,7 @@ class AgentApiBase(unittest.TestCase):
         tmp_dir = os.path.join(self.tmp, "dec2")
         os.makedirs(tmp_dir, exist_ok=True)
 
-        def fake_path(task_id):
+        def fake_path(task_id, data_dir=None):
             return os.path.join(tmp_dir, f"canary_decision_{task_id}.json")
 
         with mock.patch("deploy.canary_decision_path", side_effect=fake_path):

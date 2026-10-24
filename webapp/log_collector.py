@@ -861,7 +861,12 @@ def init_collector(app) -> None:
     log_dir = app.config.get("LOG_DIR") or str(
         Path(app.root_path).parent / "data" / "logs")
     mon_interval = app.config.get("MONITOR_INTERVAL", 60)
-    log_interval = mon_interval * 2  # 日志采集频率为监控的一半，减少 SSH 连接数
+    try:
+        mon_interval = int(mon_interval or 0)
+    except (TypeError, ValueError):
+        mon_interval = 0
+    # 监控关闭（0）时采集器仍需独立运行；固定 120s，避免 wait(0) 忙循环
+    log_interval = mon_interval * 2 if mon_interval > 0 else 120
     _collector = LogCollector(app.config["DB_PATH"], log_dir, interval=log_interval,
                               ssh_func=_ssh_exec, monitor=get_monitor())
     _collector.start()

@@ -32,6 +32,16 @@ pipeline {
             }
         }
 
+        // 质量门禁：语法/静态 + Python 单测 + 前端无头用例，任一失败即中止发布（不进入 Deploy）
+        // 不加 --strict：CI 镜像若没装 node/ruff，该步记 SKIP 而非 FAIL，
+        // 避免因构建机环境缺工具而阻断一次正常的发布
+        stage('Quality gate') {
+            steps {
+                sh 'pip install -r requirements-dev.txt || true'
+                sh 'python scripts/quality_gate.py'
+            }
+        }
+
         stage('Deploy') {
             steps {
                 script {

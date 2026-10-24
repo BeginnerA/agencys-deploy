@@ -100,12 +100,17 @@ class AgentSession:
             pass  # 消息落库失败不阻断对话
 
     def _load_history(self) -> list:
-        """恢复最近对话（user/assistant 对，最多 16 条；不恢复 tool 消息避免上下文错位）"""
+        """恢复当前用户最近对话（user/assistant 对，最多 16 条；不恢复 tool 消息避免上下文错位）
+
+        session_id 可能被多用户复用（默认 "default"），必须同时按 created_by 过滤，
+        否则会把其他用户的对话带入当前上下文。
+        """
         try:
             rows = dbm.list_records(
                 self.db_path, "agent_messages",
-                "session_id=? AND role IN ('user','assistant')",
-                (self.session_id[:64],), "id DESC")[:16]
+                "session_id=? AND created_by=? "
+                "AND role IN ('user','assistant')",
+                (self.session_id[:64], self.user_id), "id DESC")[:16]
         except Exception:
             return []
         rows.reverse()

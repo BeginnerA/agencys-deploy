@@ -60,7 +60,8 @@
 
 ```bash
 cd agencys-deploy
-pip install -r requirements.txt
+pip install -r requirements.txt        # 运行依赖
+pip install -r requirements-dev.txt    # 开发/CI 依赖（pytest、ruff），可选
 ```
 
 ### 2. 填写配置
@@ -141,12 +142,14 @@ python webapp/app.py          # 默认 http://127.0.0.1:5678
 - 首次启动自动导入 `config/` 旧配置（原 11 个服务 + 4 条流水线 + prod/test 环境），创建默认管理员 `admin/admin`（首次登录强制改密）。
 - 大屏主页：服务状态卡片墙（在线/异常/发布中/未部署 + 镜像版本 + Nacos 实例数）、发布趋势/成功率图表、实时任务日志；点击卡片直接发布/回滚。
 - 「管理」抽屉（admin）：项目管理、服务/环境/服务器/流水线 CRUD、用户与角色、YAML 导入导出。
-- 实时监控：默认 30s 周期 SSH 探测容器 + Nacos 查询实例（`--monitor-interval 0` 关闭）。
+- 实时监控：周期默认读取 `DASHBOARD_MONITOR_INTERVAL`（30s），可用 `--monitor-interval N` 覆盖；`0` 仅关闭实时探测与告警引擎，发布调度、日志采集、SSL 到期探测、AI 建议调度仍独立运行。
+- 后台服务周期独立：发布调度 `--deploy-interval`（默认 30s，或 `DASHBOARD_DEPLOY_INTERVAL`）、AI 建议 `--agent-interval`（默认 30s，或 `DASHBOARD_AGENT_INTERVAL`，`0` 单独关闭）；监控关闭时日志采集回退为 120s 独立轮询。
 - 页面数据实时推送（SSE 通道 `/api/stream`）：监控轮次完成、告警产生/状态变更、发布任务新建与状态流转、审批单/决策建议更新、服务日志采集轮次有新行时，后端逐帧通知前端，页面收到后去抖重取数据（所有列表页已改为事件驱动，无事件时不发请求）；通道异常自动退回原有定时轮询，顶栏指示灯显示「实时 / 连接中 / 降级轮询」，后台标签页自动释放连接并降频。例外：发布任务日志正文由子进程写文件（跨进程无法事件化），抽屉/日志中心仍保留 2s/3s 增量追尾。
 - 交互无障碍：可点击的非原生元素（筛选 chip、侧栏导航项、任务名链接、搜索下拉项等）自动补 `tabindex/role/aria-label` 并支持 Enter/Space 触发，键盘焦点统一显形（`:focus-visible` 主色焦点环）；抽屉/弹窗/下拉面板/搜索面板共用 Esc 层栈（只关最顶一层），关闭后焦点归还触发元素，确认框初始焦点在「取消」；通知同屏上限 4 条、同文案合并计数、读屏可播报；系统开启「减弱动态效果」时全局停用动画与过渡。
 - 色彩对比与表单可读性：弱化文本与亮色底上的文字统一按 WCAG AA 校正（亮色填充一律用深字 token `--on-bright`，渐变端点提亮），小字对比度达标；表单控件自动关联字段名（`label for`/`aria-label`/`aria-labelledby`，换肤下拉同步镜像到焦点元素）、必填项标 `aria-required`、提示与错误说明经 `aria-describedby` 关联、校验失败置 `aria-invalid` 且错误文本以 `role="alert"` 即时播报。
 - 导航地标与表格语义：页面首部提供“跳到主内容” skip link（键盘 Tab 首站可见、点击直达，默认隐藏）；侧栏导航包为 `<nav aria-label=主导航>`、`<aside>`/`<header>`/`<main>`/`<footer>` 构成页地标；数据表列头自动补 `scope=col`（读屏可将单元格对上列头）、表名就近取面板标题/页签（无标题回退到页签名）。
 - 配置存 `data/platform.db`（权威源）；`config/` 目录为导出产物 + CLI 兼容（`deploy.py --config-source yaml`）。
+- 数据目录可整体外置：`python webapp/app.py --data-dir /srv/deploy-a --config-dir /srv/cfg-a [--log-dir /var/log/deploy-a]`，同一份代码即可跑多套互不干扰的实例（库、密钥、导出物、任务日志全部跟随 `--data-dir`）；不传参数时保持项目内 `data/`、`config/` 的默认落点。
 - 角色：admin（全部）/ operator（发布回滚）/ viewer（只读）。生产部署建议 `--host 0.0.0.0` + 前置 Nginx 反代 + 环境变量注入 `DASHBOARD_SECRET_KEY`。
 
 **首次发版**（服务器上没有旧版本）时，`--previous-version` 可以省略：
@@ -364,6 +367,33 @@ python webapp/app.py          # 默认同时启动 AI 建议调度（30s 周期�
 ```
 
 零新增 Python 依赖（requests 直连）；未配置网关时自动降级纯规则，核心发布/监控功能不受影响；审批永远人工，viewer 全链路只读。完整说明见 [docs/agent-evolution.md](docs/agent-evolution.md)。
+
+## 开发与质量门禁
+
+一条命令跑完全部自检：
+
+```bash
+python scripts/quality_gate.py            # 语法 → 静态检查 → Python 单测 → 前端
+python scripts/quality_gate.py --quick    # 跳过 Python 单测（只跑语法/静态/前端，改动非逻辑时最快）
+python scripts/quality_gate.py --only js  # 只跑前端（compile|lint|pytest|js）
+python scripts/quality_gate.py --strict   # 工具缺失（ruff/node）也判 FAIL
+```
+
+四步的含义与口径：
+
+- **compile**：`ast.parse` 逐个解析全部 Python 源码与 `tests/`，语法错误当场失败；纯只读（不在源码树落 `__pycache__`、不执行任何模块代码），成本 <1s。
+- **lint**：装了 `ruff` 才跑（配置见 `ruff.toml`，只选 F/E4/E7/E9/W6 这类真错误规则；风格类规则刻意没开，历史长行未清理前开了就是噪音）。没装记 SKIP，`--strict` 下记 FAIL。
+- **pytest**：`tests/` 全量用例，见下方测试隔离约定。
+- **js**：`node --check` 逐个语法校验 `webapp/static/js/**`，再跑 `tests/js/*_test.js` 无头用例（不依赖浏览器）。没装 node 记 SKIP。
+
+测试隔离约定（写新用例时请遵守，否则等于给真实环境埋雷）：
+
+- 用例只用临时目录与临时库：`create_app(data_dir=..., config_dir=..., log_dir=...)`，任务日志用 `webapp.task_manager.set_log_dir(tmp)`；不要改 `webapp.DATA_DIR` 全局，也不要让用例碰仓库 `data/`（里面是真实库）。
+- `tests/conftest.py` 有会话级护栏：它把 `webapp.DATA_DIR` / `webapp.CONFIG_DIR` 指到 pytest 临时目录，所以漏传目录的 `create_app()` 最坏也只污染临时目录（护栏前，这类裸调用会在真实 `data/platform.db` 上跑迁移、并把 `data/export/config/` 覆盖成用例造的假配置）。护栏不覆盖 `task_manager.LOG_DIR`——它由每次 `create_app` 改写，所以读日志目录的用例必须自己 `mock.patch.object(task_manager, "LOG_DIR", tmp)`，别依赖它的当前值。
+- 禁止真实副作用：不发起 SSH/HTTP/构建，子进程用 stub（参考 `tests/test_task_log_isolation.py` 里 `mock.patch.object(task_manager, "build_cli", ...)`），导出用 `mock.patch("webapp.exporter.export_all", ...)`。RED 阶段的失败必须"失败在校验上"，不能失败成"真的写了生产目录"。
+- `webapp/app.py` 在 import 时不建 app（惰性 `get_app()`），所以只 import 工具函数的脚本不会再触发首启引导。
+
+`jenkins/Jenkinsfile` 在 Deploy 前加了 **Quality gate** stage：门禁任一 FAIL 直接中止，不进入发布；CI 镜像未装 node/ruff 时该步记 SKIP，不会误伤发布。
 
 ## 注意事项
 

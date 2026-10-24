@@ -665,11 +665,17 @@ def save_case_from_advice(db_path: str, advice_id: int,
 
 # ---------- 调度器联动 ----------
 
-def canary_waiting_files() -> list:
-    """列出 data/ 下处于 waiting 的灰度决策文件 [(task_id, data)]"""
+def canary_waiting_files(db_path: str = None) -> list:
+    """列出数据目录下处于 waiting 的灰度决策文件 [(task_id, data)]
+
+    数据目录取 db_path 所在目录（平台把 DB 与决策文件放在同一个 data_dir），
+    省略 db_path 时回退模块 DATA_DIR —— 回退路径固定读仓库 data/，
+    注入其它 data_dir 的实例（测试/多实例）会扫不到自己的决策文件。
+    """
+    data_dir = Path(db_path).resolve().parent if db_path else DATA_DIR
     out = []
     try:
-        for p in DATA_DIR.glob("canary_decision_*.json"):
+        for p in data_dir.glob("canary_decision_*.json"):
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
             except (OSError, ValueError):
@@ -697,7 +703,7 @@ def sweep(db_path: str, actor: dict = None) -> dict:
     except Exception as e:
         result["errors"].append(f"sync: {e}")
     # 1) 灰度决策等待中的任务 → 生成建议
-    for task_id, file_data in canary_waiting_files():
+    for task_id, file_data in canary_waiting_files(db_path):
         try:
             if latest_advice(db_path, "canary", task_id, ttl=300):
                 continue

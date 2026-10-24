@@ -205,10 +205,62 @@ class TestDeployScheduler(unittest.TestCase):
         due = scheduler._find_due_schedules()
         self.assertEqual(len(due), 1)
         # 执行周期处理：应跳过（不创建任务）
-        scheduler._process_due(due)
+        scheduler._process_due()
         # once 计划被 _update_next_run 禁用（block 跳过执行但仍推进状态）
         rec = dbm.get_record(self.db, "deploy_schedules", sid)
         self.assertEqual(rec["enabled"], 0)
+
+    def _cron_schedule(self, name="cron", extra=None):
+        now = int(time.time())
+        return dbm.create_record(self.db, "deploy_schedules", dict(
+            project_id=self.proj_id, type="cron", name=name,
+            ref_type="project", ref_id=self.svc_id, env="prod",
+            version="1.0.0", previous_version="",
+            extra=extra if extra is not None else [],
+            schedule_at=0, cron_expr="0 2 * * *",
+            enabled=1, last_run_at=0, next_run_at=now - 1,
+            created_by=1, created_at=now))
+
+    def test_extra_list_not_decoded_twice(self):
+        """db 层已反序列化 extra；调度器不得再次 json.loads（否则 TypeError 丢任务）"""
+        from webapp.deploy_scheduler import DeployScheduler
+        sid = self._cron_schedule(extra=["--skip-build"])
+        scheduler = DeployScheduler(self.db)
+        with mock.patch("webapp.task_manager.submit_task") as submit:
+            scheduler._process_due()
+        submit.assert_called_once()
+        tasks = dbm.list_records(self.db, "tasks", "name=?", ("cron",))
+        self.assertEqual(len(tasks), 1)
+        self.assertIn("--skip-build", tasks[0]["extra"])
+        rec = dbm.get_record(self.db, "deploy_schedules", sid)
+        self.assertGreater(rec["next_run_at"], int(time.time()))
+
+    def test_submit_failure_does_not_advance_next_run(self):
+        """提交失败时保留 next_run_at/enabled，等待下轮重试"""
+        from webapp.deploy_scheduler import DeployScheduler
+        now = int(time.time())
+        sid = self._cron_schedule(name="retry")
+        before = dbm.get_record(self.db, "deploy_schedules", sid)
+        scheduler = DeployScheduler(self.db)
+        with mock.patch("webapp.task_manager.submit_task",
+                        side_effect=RuntimeError("queue down")):
+            scheduler._process_due()
+        after = dbm.get_record(self.db, "deploy_schedules", sid)
+        self.assertEqual(after["enabled"], 1)
+        self.assertEqual(after["next_run_at"], before["next_run_at"])
+        self.assertEqual(after["last_run_at"], 0)
+
+    def test_stale_due_list_not_processed_after_lock(self):
+        """拿到锁后重新取到期列表：排队期间被禁用的计划不得执行"""
+        from webapp.deploy_scheduler import DeployScheduler
+        sid = self._cron_schedule(name="stale")
+        scheduler = DeployScheduler(self.db)
+        stale = scheduler._find_due_schedules()
+        self.assertEqual(len(stale), 1)
+        dbm.update_record(self.db, "deploy_schedules", sid, {"enabled": 0})
+        with mock.patch("webapp.task_manager.submit_task") as submit:
+            scheduler._process_due()
+        submit.assert_not_called()
 
 
 class TestDeployEnhanceAPI(unittest.TestCase):
@@ -219,7 +271,8 @@ class TestDeployEnhanceAPI(unittest.TestCase):
         self.db_path = os.path.join(self.tmp, "test.db")
         dbm.init_db(self.db_path)
         from webapp import create_app
-        self.app = create_app()
+        # 目录靠 create_app 注入：裸调用会让工厂在默认落点上跑一遍迁移/引导
+        self.app = create_app(data_dir=self.tmp)
         self.app.config["DB_PATH"] = self.db_path
         self.app.config["TESTING"] = True
         # 创建测试数据
@@ -340,7 +393,7 @@ class TestDeployEnhanceAPI(unittest.TestCase):
         tmp_dir = os.path.join(self.tmp, "decisions")
         os.makedirs(tmp_dir, exist_ok=True)
 
-        def fake_path(task_id):
+        def fake_path(task_id, data_dir=None):
             return os.path.join(tmp_dir, f"canary_decision_{task_id}.json")
 
         with mock.patch("deploy.canary_decision_path", side_effect=fake_path):
@@ -516,7 +569,7 @@ class TestCanaryAutoAdvance(unittest.TestCase):
         from deploy import wait_canary_decision
         tmp_dir = tempfile.mkdtemp()
 
-        def fake_path(task_id):
+        def fake_path(task_id, data_dir=None):
             return os.path.join(tmp_dir, f"canary_decision_{task_id}.json")
 
         with mock.patch("deploy.canary_decision_path", side_effect=fake_path):
@@ -540,7 +593,7 @@ class TestCanaryAutoAdvance(unittest.TestCase):
         from deploy import read_canary_decision, canary_decision_path
         tmp_dir = tempfile.mkdtemp()
 
-        def fake_path(task_id):
+        def fake_path(task_id, data_dir=None):
             return os.path.join(tmp_dir, f"canary_decision_{task_id}.json")
 
         with mock.patch("deploy.canary_decision_path", side_effect=fake_path):

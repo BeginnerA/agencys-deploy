@@ -30,7 +30,10 @@ from common import (
 )
 from build import build_project
 from snailjob_manager import clear_summary
-from deploy import Deployer, get_current_remote_version, bump_patch_version
+from deploy import (
+    Deployer, get_current_remote_version, bump_patch_version,
+    platform_db_path, runtime_config_dir,
+)
 
 
 def _resolve_source_db(args) -> bool:
@@ -40,7 +43,7 @@ def _resolve_source_db(args) -> bool:
     if args.config_source == "db":
         return True
     import sqlite3
-    db_path = Path(__file__).resolve().parent / "data" / "platform.db"
+    db_path = platform_db_path()
     if not db_path.exists():
         return False
     try:
@@ -57,11 +60,11 @@ def _resolve_source_db(args) -> bool:
 
 
 def _switch_to_db_config(args) -> None:
-    """db 模式：导出运行时 YAML 到 data/runtime/ 并覆盖 common 配置目录（按流水线查项目）"""
+    """db 模式：导出运行时 YAML 到实例 data/runtime/ 并覆盖 common 配置目录（按流水线查项目）"""
     from webapp.exporter import export_runtime
-    db_path = Path(__file__).resolve().parent / "data" / "platform.db"
+    db_path = platform_db_path()
     if not db_path.exists():
-        fail("data/platform.db 不存在，请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
+        fail(f"{db_path} 不存在，请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
     import sqlite3
     if args.project_id is None:
         try:
@@ -73,7 +76,7 @@ def _switch_to_db_config(args) -> None:
             finally:
                 conn.close()
         except sqlite3.Error as e:
-            fail(f"data/platform.db 不可用（{e}），请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
+            fail(f"{db_path} 不可用（{e}），请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
         if not row:
             fail(f"db 模式未找到流水线 {args.pipeline}，请先检查 Dashboard 配置")
         args.project_id = row[0]
@@ -87,16 +90,16 @@ def _switch_to_db_config(args) -> None:
             finally:
                 conn.close()
         except sqlite3.Error as e:
-            fail(f"data/platform.db 不可用（{e}），请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
+            fail(f"{db_path} 不可用（{e}），请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
         if not row:
             fail(f"db 模式未找到项目 ID {args.project_id}，请检查 Dashboard 配置")
-    tmp = Path(__file__).resolve().parent / "data" / "runtime" / f"p{args.project_id}" / (args.env or "prod")
+    tmp = runtime_config_dir(args.project_id, args.env)
     try:
         export_runtime(str(db_path), args.project_id, args.env or "", tmp)
     except ValueError as e:
         fail(f"{e}（可使用 yaml 模式或先配置环境）")
     except sqlite3.Error as e:
-        fail(f"data/platform.db 读取失败（{e}），库文件可能损坏或未初始化（可使用 yaml 模式）")
+        fail(f"{db_path} 读取失败（{e}），库文件可能损坏或未初始化（可使用 yaml 模式）")
     # 模块级变量覆盖：必须用 `import common`（与顶部 from common import ... 是同一模块实例）；
     # scripts/common 目录无 __init__.py，`import scripts.common` 会是第二个模块实例，覆盖无效
     import common as common_mod
@@ -328,25 +331,28 @@ def run_stage(
 
     log(f"\n========== 进入 stage [{stage_name}] parallel={parallel} ==========")
 
-    # 解析每个服务的版本号（支持服务级覆盖）
+    # 解析每个服务的版本号与服务器清单（支持服务级覆盖）。
+    # 必须以元组携带 servers_file：循环变量在循环结束后仍指向最后一个服务，
+    # 若在后续循环里再从 svc 取值，所有服务都会误用最后一台服务的清单。
     service_versions = []
     for svc in services:
         name = svc["name"]
         svc_version = svc.get("version", version)
         svc_previous = svc.get("previous_version", previous_version)
-        service_versions.append((name, svc_version, svc_previous))
+        servers_file = svc.get("servers_file") or default_servers_file
+        service_versions.append((name, svc_version, svc_previous, servers_file))
 
     # 如果流水线不要求 build_first，且未跳过构建，则在本 stage 部署前顺序构建
     if not skip_build:
-        build_services([(name, svc_version) for name, svc_version, _ in service_versions], env=env)
+        build_services([(name, svc_version)
+                        for name, svc_version, _, _ in service_versions], env=env)
 
     results = []
 
     if parallel:
         with ThreadPoolExecutor(max_workers=len(services)) as executor:
             futures = {}
-            for name, svc_version, svc_previous in service_versions:
-                servers_file = svc.get("servers_file") or default_servers_file
+            for name, svc_version, svc_previous, servers_file in service_versions:
                 futures[
                     executor.submit(
                         deploy_one_service,
@@ -370,8 +376,7 @@ def run_stage(
                     ok = False
                 results.append((name, ok))
     else:
-        for name, svc_version, svc_previous in service_versions:
-            servers_file = svc.get("servers_file") or default_servers_file
+        for name, svc_version, svc_previous, servers_file in service_versions:
             ok = deploy_one_service(
                 name, svc_version, svc_previous, servers_file, config, skip_snailjob, env, canary
             )

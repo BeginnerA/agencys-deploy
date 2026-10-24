@@ -13,11 +13,33 @@ from . import db as dbm
 from .db import update_task
 
 DEPLOY_ROOT = Path(__file__).resolve().parent.parent
-LOG_DIR = DEPLOY_ROOT / "data" / "logs"
+_DEFAULT_LOG_DIR = DEPLOY_ROOT / "data" / "logs"
+# 生效日志目录（生产单实例：root/data/logs）。由 set_log_dir() 在 create_app 时写入，
+# 调用点也可显式传 log_dir（来自 app.config["LOG_DIR"]）——见 _log_root()。
+# 用模块全局而非私有变量：既有测试直接 patch 本名，patch/restore 语义保持不变。
+LOG_DIR = _DEFAULT_LOG_DIR
 
 _executor = ThreadPoolExecutor(max_workers=1)
 # 排队期 task_id -> Future（占位，支持队列内取消）；运行期被 Popen 覆盖
 _task_registry = {}
+
+
+def set_log_dir(path) -> None:
+    """配置任务日志目录（应用工厂在 create_app 时调用）；传 None 回到默认值。
+
+    后台线程（发布调度器 / Agent 执行器）没有 app 上下文，只能经模块配置取目录；
+    有 app 上下文的调用点应显式传 log_dir，避免同进程多实例共用一份全局配置。
+    """
+    global LOG_DIR
+    if path is None:
+        LOG_DIR = _DEFAULT_LOG_DIR
+        return
+    LOG_DIR = Path(path)
+
+
+def _log_root(log_dir=None) -> Path:
+    """生效日志目录：显式参数优先，其次模块配置 LOG_DIR"""
+    return Path(log_dir) if log_dir is not None else Path(LOG_DIR)
 
 
 class _RestartHandle:
@@ -96,8 +118,9 @@ def backfill_existing_auto_versions(db_path: str):
             "[platform] 历史自动版本任务回填完成，处理 %d 条", count)
 
 
-def submit_task(db_path: str, task: dict, extra_args: list = None):
-    fut = _executor.submit(_run_task, db_path, task, extra_args or [])
+def submit_task(db_path: str, task: dict, extra_args: list = None, log_dir=None):
+    """排队执行任务；log_dir 省略时取模块配置（由 create_app 写入）"""
+    fut = _executor.submit(_run_task, db_path, task, extra_args or [], log_dir)
     # 登记 Future 占位：kill_task 在排队窗口期（Popen 之前）也能取消。
     # setdefault 防微秒级竞态：若 _run_task 已抢先注册 Popen，占位不得覆盖它
     _task_registry.setdefault(task["id"], fut)
@@ -154,9 +177,11 @@ def _save_deploy_snapshot(db_path, task_id: int, log_file: str):
         pass
 
 
-def _run_task(db_path, task, extra_args):
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = LOG_DIR / f"task_{task['id']}.log"
+def _run_task(db_path, task, extra_args, log_dir=None):
+    # 落点目录：显式参数（提交方 app.config）优先，否则模块配置
+    log_root = _log_root(log_dir)
+    log_root.mkdir(parents=True, exist_ok=True)
+    log_file = log_root / f"task_{task['id']}.log"
     try:
         update_task(db_path, task["id"], status="running", log_file=str(log_file),
                     started_at=time.time())  # 启动时刻才计 started_at（排除排队时长）
@@ -178,6 +203,9 @@ def _run_task(db_path, task, extra_args):
         env_map = dict(os.environ)
         # 注入任务 ID：deploy.py 灰度决策（非终端子进程）依赖它定位决策文件
         env_map["PLATFORM_TASK_ID"] = str(task["id"])
+        # 注入数据目录（= 实例 DB 所在目录）：子进程的灰度决策文件必须与
+        # Web 端扫描的目录一致，否则多实例/隔离目录下会一直等不到人工决策
+        env_map["PLATFORM_DATA_DIR"] = str(Path(db_path).resolve().parent)
         with open(log_file, "w", encoding="utf-8") as f:
             # 日志开头记录实际命令行，便于核对参数（如 --skip-build）是否生效
             f.write("[platform] 执行命令: " + " ".join(cmd) + "\n")
@@ -208,12 +236,14 @@ def _run_task(db_path, task, extra_args):
             pass
 
 
-def tail_log(log_file: str, offset: int = 0, max_chars: int = 8000, tail: bool = False) -> tuple:
-    """返回 (文本, 新 offset, 是否截断)；offset 为已读字符数；log_file 必须位于 LOG_DIR（防御纵深）
+def tail_log(log_file: str, offset: int = 0, max_chars: int = 8000, tail: bool = False,
+             log_dir=None) -> tuple:
+    """返回 (文本, 新 offset, 是否截断)；offset 为已读字符数；log_file 必须位于生效日志目录（防御纵深）
 
     tail=True 且 offset=0 且日志较大时，直接返回尾部 max_chars 字符，
     避免前端打开运行中任务时从头逐块追赶导致长时间卡顿。
     已结束任务应传 tail=False 以返回完整日志。
+    log_dir 省略时取模块配置（create_app 写入），有 app 上下文的调用点应显式传入。
     """
     if not log_file:
         return "", 0, False
@@ -221,7 +251,7 @@ def tail_log(log_file: str, offset: int = 0, max_chars: int = 8000, tail: bool =
         resolved = Path(log_file).resolve()
     except OSError:
         return "", 0, False
-    if not resolved.is_relative_to(LOG_DIR.resolve()):
+    if not resolved.is_relative_to(_log_root(log_dir).resolve()):
         return "", 0, False
     if not resolved.exists():
         return "", 0, False

@@ -216,11 +216,12 @@ function esc(s){
 }
 
 // 轻量 Markdown → HTML（对话/建议等 AI 回复渲染用，自包含、离线可用）。
-// 先整体转义再按行解析，杜绝 XSS；链接仅放行 http/https/站内路径。
+// 先整体转义再按行解析；转义覆盖引号，链接 URL 无法逃出 href 属性；仅放行 http/https/站内路径。
 // 支持：围栏代码块、行内代码、# 标题、无序/有序列表、引用、分隔线、粗体/斜体/删除线、链接、段落换行。
 function mdToHtml(src){
   const e = (s) => String(s == null ? '' : s)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
   const inline = (s) => {
     s = s.replace(/`([^`]+)`/g, (m, c) => '<code>' + c + '</code>');
     s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
@@ -307,7 +308,13 @@ function enhanceSelect(sel){
     val.textContent = sel.selectedOptions.length ? sel.selectedOptions[0].text : '';
   };
   let popEscLayer = null;               // 面板展开期间的 Esc 层（多层覆盖时只关最顶）
+  let activeEl = null;                  // 键盘高亮项（↑↓ 移动，Enter 选择）
+  let kbMove = null;                    // 面板内导航回调（face 保持焦点时复用）
+  let kbChoose = null;                  // 面板内选择回调（Enter 触发）
   const closePop = () => {
+    activeEl = null;
+    kbMove = null;
+    kbChoose = null;
     pop.classList.add('hidden');
     face.classList.remove('open');
     face.setAttribute('aria-expanded', 'false');
@@ -332,10 +339,13 @@ function enhanceSelect(sel){
     });
     pop.innerHTML = '';
     let searchEl = null;
+    const optionEls = [];
     [...sel.options].forEach(o => {
       const d = document.createElement('div');
       d.className = 'sel-opt' + (o.selected ? ' on' : '');
       d.textContent = o.text;
+      d.setAttribute('role', 'option');
+      d.setAttribute('aria-selected', o.selected ? 'true' : 'false');
       // 检索键：显示文本 + option.title（会话下拉里存的是末条消息摘要），供 data-search 客户端过滤
       d.dataset.k = ((o.text || '') + ' ' + (o.title || '')).toLowerCase();
       d.onclick = () => {
@@ -344,8 +354,36 @@ function enhanceSelect(sel){
         syncFace();   // 立即同步面板文本（勿依赖异步的 MutationObserver）
         closePop();
       };
+      optionEls.push(d);
       pop.appendChild(d);
     });
+    // 键盘高亮（↑↓ 在可见项间循环，Enter 等同点击）
+    const setActive = (el) => {
+      optionEls.forEach(d => d.classList.remove('kb-active'));
+      activeEl = el || null;
+      if (activeEl){
+        activeEl.classList.add('kb-active');
+        if (typeof activeEl.scrollIntoView === 'function'){
+          activeEl.scrollIntoView({block: 'nearest'});
+        }
+      }
+    };
+    const moveActive = (delta) => {
+      const vis = optionEls.filter(d => !d.classList.contains('hidden'));
+      if (!vis.length){ setActive(null); return; }
+      let i = vis.indexOf(activeEl);
+      i = i < 0 ? (delta > 0 ? 0 : vis.length - 1)
+                : (i + delta + vis.length) % vis.length;
+      setActive(vis[i]);
+    };
+    const chooseActive = () => { if (activeEl) activeEl.onclick(); };
+    kbMove = moveActive;
+    kbChoose = chooseActive;
+    // 可搜索下拉展开后焦点在筛选框，先不预高亮（首次 ↑↓ 再落到首/末项）；
+    // 普通下拉焦点仍在 face 上，预高亮当前值便于直接 Enter 确认。
+    if (!sel.dataset.search){
+      setActive(optionEls.find(d => d.classList.contains('on')) || optionEls[0] || null);
+    }
     // 可搜索模式：面板顶部挂筛选框，即时隐藏不匹配项（无需再放独立搜索输入框）
     if (sel.dataset.search){
       const fi = document.createElement('input');
@@ -363,10 +401,17 @@ function enhanceSelect(sel){
           if (hit) shown++;
         });
         empty.classList.toggle('hidden', shown !== 0);
+        // 过滤结果变了，旧高亮可能已不可见：重置到首个可见项
+        setActive(optEls.find(d => !d.classList.contains('hidden')) || null);
       };
       // 拦截冒泡：点/键筛选框不应触发 face 的开合切换或外部关闭
       fi.onclick = e => e.stopPropagation();
-      fi.onkeydown = e => { if (e.key === 'Escape'){ e.stopPropagation(); closePop(); } };
+      fi.onkeydown = e => {
+        if (e.key === 'Escape'){ e.stopPropagation(); closePop(); }
+        else if (e.key === 'ArrowDown'){ e.preventDefault(); moveActive(1); }
+        else if (e.key === 'ArrowUp'){ e.preventDefault(); moveActive(-1); }
+        else if (e.key === 'Enter'){ e.preventDefault(); chooseActive(); }
+      };
       pop.insertBefore(fi, pop.firstChild);
       pop.appendChild(empty);
       searchEl = fi;
@@ -401,8 +446,16 @@ function enhanceSelect(sel){
   };
   face.onclick = e => { e.stopPropagation(); pop.classList.contains('hidden') ? openPop() : closePop(); };
   face.addEventListener('keydown', e => {
-    if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown'){ e.preventDefault(); openPop(); }
-    else if (e.key === 'Escape') closePop();
+    if (pop.classList.contains('hidden')){
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown'){ e.preventDefault(); openPop(); }
+      else if (e.key === 'Escape') closePop();
+      return;
+    }
+    // 面板已展开：face 仍持有焦点（可搜索模式下焦点在筛选框，走那边的处理）
+    if (e.key === 'Escape'){ e.preventDefault(); closePop(); }
+    else if (e.key === 'ArrowDown'){ e.preventDefault(); if (kbMove) kbMove(1); }
+    else if (e.key === 'ArrowUp'){ e.preventDefault(); if (kbMove) kbMove(-1); }
+    else if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); if (kbChoose) kbChoose(); }
   });
   // 代码动态重建 option（如发布抽屉 dpType 联动）时同步面板文本
   new MutationObserver(syncFace).observe(sel, { childList: true, subtree: true });

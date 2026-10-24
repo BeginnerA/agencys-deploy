@@ -34,7 +34,8 @@ class TestRestartAPI(unittest.TestCase):
         self.db_path = os.path.join(self.tmp, "test.db")
         dbm.init_db(self.db_path)
         from webapp import create_app
-        self.app = create_app()
+        # 目录靠 create_app 注入：裸调用会让工厂在默认落点上跑一遍迁移/引导
+        self.app = create_app(data_dir=self.tmp)
         self.app.config["DB_PATH"] = self.db_path
         self.app.config["TESTING"] = True
         with self.app.app_context():

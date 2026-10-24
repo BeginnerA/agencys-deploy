@@ -4,7 +4,7 @@ from flask import Blueprint, request, jsonify, current_app, g
 from .. import db as dbm
 from ..auth import require_auth, require_role, audit
 from ..task_manager import submit_task, tail_log, kill_task
-from ..deploy_scheduler import check_release_window
+from ..deploy_scheduler import check_deploy_window
 
 deploy_bp = Blueprint("deploy", __name__)
 
@@ -97,8 +97,9 @@ def create_task():
         extra.append("--rollback")
     if canary:
         extra.append("--canary")
-    # 发布窗口检查
-    window = check_release_window(current_app.config["DB_PATH"], project_id)
+    # 发布窗口检查：按本次发布的环境/服务/服务器完整作用域匹配
+    window = check_deploy_window(current_app.config["DB_PATH"], project_id,
+                                 env=env, ref_type=type_, ref_id=ref_id)
     if window and window["block_level"] == "block":
         return jsonify({"error": f"当前处于封网窗口 '{window['name']}'，禁止发布"}), 403
     if window and window["block_level"] == "warn":
@@ -113,7 +114,9 @@ def create_task():
                               action='rollback' if rollback else
                               ('restart' if type_ == "restart" else 'deploy'))
     task = dbm.get_task(current_app.config["DB_PATH"], task_id)
-    submit_task(current_app.config["DB_PATH"], task, extra)
+    # 显式传本实例日志目录：同进程可能存在其它 app（测试），不依赖模块全局
+    submit_task(current_app.config["DB_PATH"], task, extra,
+                log_dir=current_app.config.get("LOG_DIR"))
     if type_ == "restart":
         audit("restart", "service", ref_id, {"name": rec["name"], "env": env})
     else:
@@ -164,7 +167,9 @@ def task_log(task_id):
     # 仅运行中/等待中的任务使用尾部截断（避免打开时从头逐块追赶导致卡顿）；
     # 已结束任务始终返回完整日志
     tail = task["status"] in ("running", "pending")
-    text, new_offset, truncated = tail_log(task.get("log_file", ""), offset, tail=tail)
+    text, new_offset, truncated = tail_log(task.get("log_file", ""), offset,
+                                           tail=tail,
+                                           log_dir=current_app.config.get("LOG_DIR"))
     return jsonify({"log": text, "offset": new_offset, "status": task["status"], "truncated": truncated})
 
 

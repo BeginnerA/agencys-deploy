@@ -2,6 +2,7 @@
 """Agent 模块单元测试：Schema/记忆/LLM 网关/工具注册表/审批执行/建议引擎/MCP"""
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -41,6 +42,10 @@ class AgentBase(unittest.TestCase):
             nacos_ip="", remark="", enabled=1))
         dbm.create_record(self.db, "env_servers", dict(
             env_id=self.env_id, server_id=self.server_id, order_no=0))
+
+    def tearDown(self):
+        # 夹具目录含 test.db 与用例自造的日志，跑完即弃
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def make_task(self, type_="project", version="1.1.0",
                   previous_version="1.0.0", status="pending",
@@ -365,11 +370,13 @@ class TestTools(AgentBase):
     def test_logs_context_and_search_link(self):
         # search_logs 结果带 id（logs_context 的入参来源，链路闭环）
         from agent import tools as tools_mod
+        from webapp import task_manager
         now = int(time.time())
         # 造日志文件与索引行：line_offset 定位第 2 行（0 基）报错行
-        root = os.path.dirname(os.path.dirname(
-            os.path.abspath(tools_mod.__file__)))
-        collect = os.path.join(root, "data", "logs", "collect")
+        # 日志根取本用例自己的临时目录：logs_context 读的是 task_manager.LOG_DIR
+        # （生产口径），既不能写仓库 data/logs/collect（真实采集目录），也不能
+        # 依赖它的当前值——同会话里任何 create_app(log_dir=…) 都会改掉这个模块全局。
+        collect = os.path.join(self.tmp, "collect")
         os.makedirs(collect, exist_ok=True)
         fname = f"ut_ctx_{now}_{os.getpid()}.log"
         fpath = os.path.join(collect, fname)
@@ -384,32 +391,33 @@ class TestTools(AgentBase):
             file_path=fpath, line_offset=offset, line_count=1,
             content="line2 ERROR boom", keywords="[]"))
         try:
-            out = json.loads(tools_mod.execute_tool(
-                "viewer", "search_logs",
-                {"service": "hqb-auth", "minutes": 60},
-                self._ctx("viewer")))
-            self.assertEqual(out["count"], 1)
-            self.assertEqual(out["rows"][0]["id"], entry_id)
-            # 上下文：2 前 + 目标 + 2 后，定位与行内容准确
-            ctx_out = json.loads(tools_mod.execute_tool(
-                "viewer", "logs_context", {"id": entry_id, "lines": 2},
-                self._ctx("viewer")))
-            self.assertEqual(ctx_out["target_line"], 2)
-            self.assertEqual(len(ctx_out["lines"]), 5)
-            self.assertIn("ERROR boom", "\n".join(ctx_out["lines"]))
-            self.assertNotIn("\r", "\n".join(ctx_out["lines"]))
-            # id 不存在
-            miss = json.loads(tools_mod.execute_tool(
-                "viewer", "logs_context", {"id": 99999},
-                self._ctx("viewer")))
-            self.assertIn("error", miss)
-            # 路径防护：file_path 指向 collect 目录外直接拒绝
-            dbm.update_record(self.db, "log_entries", entry_id,
-                              {"file_path": os.path.join(root, "README.md")})
-            evil = json.loads(tools_mod.execute_tool(
-                "viewer", "logs_context", {"id": entry_id},
-                self._ctx("viewer")))
-            self.assertIn("非法", evil["error"])
+            with mock.patch.object(task_manager, "LOG_DIR", self.tmp):
+                out = json.loads(tools_mod.execute_tool(
+                    "viewer", "search_logs",
+                    {"service": "hqb-auth", "minutes": 60},
+                    self._ctx("viewer")))
+                self.assertEqual(out["count"], 1)
+                self.assertEqual(out["rows"][0]["id"], entry_id)
+                # 上下文：2 前 + 目标 + 2 后，定位与行内容准确
+                ctx_out = json.loads(tools_mod.execute_tool(
+                    "viewer", "logs_context", {"id": entry_id, "lines": 2},
+                    self._ctx("viewer")))
+                self.assertEqual(ctx_out["target_line"], 2)
+                self.assertEqual(len(ctx_out["lines"]), 5)
+                self.assertIn("ERROR boom", "\n".join(ctx_out["lines"]))
+                self.assertNotIn("\r", "\n".join(ctx_out["lines"]))
+                # id 不存在
+                miss = json.loads(tools_mod.execute_tool(
+                    "viewer", "logs_context", {"id": 99999},
+                    self._ctx("viewer")))
+                self.assertIn("error", miss)
+                # 路径防护：file_path 指向 collect 目录外直接拒绝
+                dbm.update_record(self.db, "log_entries", entry_id,
+                                  {"file_path": os.path.join(self.tmp, "outside.log")})
+                evil = json.loads(tools_mod.execute_tool(
+                    "viewer", "logs_context", {"id": entry_id},
+                    self._ctx("viewer")))
+                self.assertIn("非法", evil["error"])
         finally:
             if os.path.exists(fpath):
                 os.remove(fpath)
@@ -683,6 +691,55 @@ class TestExecutor(AgentBase):
         self.assertEqual(task["action"], "rollback")
         self.assertIn("--rollback", task["extra"])
 
+    def test_concurrent_approve_submits_only_once(self):
+        """两个并发审批同时通过：只能提交一次发布任务"""
+        import threading
+        from agent import executor
+        run = self._plan()
+        real_get_run = executor.get_run
+        barrier = threading.Barrier(2)
+        state = {"get": 0, "submit": 0}
+        lock = threading.Lock()
+
+        def gated_get_run(db_path, run_id):
+            rec = real_get_run(db_path, run_id)
+            with lock:
+                n = state["get"]
+                state["get"] += 1
+            if n < 2:
+                barrier.wait(timeout=5)
+            return rec
+
+        def fake_submit(db_path, run_obj):
+            with lock:
+                state["submit"] += 1
+            time.sleep(0.2)
+            return 4242
+
+        results = []
+
+        def approve():
+            try:
+                r = executor.decide_run(self.db, run["id"], USER,
+                                        action="approve")
+                results.append(r["status"])
+            except executor.ExecutorError:
+                results.append("error")
+
+        threads = [threading.Thread(target=approve) for _ in range(2)]
+        with mock.patch.object(executor, "get_run",
+                               side_effect=gated_get_run), \
+                mock.patch.object(executor, "_submit_task",
+                                  side_effect=fake_submit), \
+                mock.patch.object(executor, "_watch_run"):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+        self.assertEqual(state["submit"], 1,
+                         "并发审批不得重复提交任务")
+        self.assertEqual(sorted(results), ["error", "executing"])
+
     def test_sync_executing_runs(self):
         from agent.executor import decide_run, sync_executing_runs
         run = self._plan()
@@ -837,6 +894,24 @@ class TestScheduler(AgentBase):
             self.assertFalse(start_scheduler(self.db, interval=3600))
         finally:
             stop_scheduler()
+
+
+class TestHistoryIsolation(AgentBase):
+    def test_history_scoped_by_user(self):
+        """同一 session_id 下不得读取其他用户的历史消息"""
+        from agent import core as core_mod
+        dbm.create_record(self.db, "agent_messages", dict(
+            session_id="default", role="user", content="他人的机密提问",
+            created_by=2, created_at=int(time.time())))
+        dbm.create_record(self.db, "agent_messages", dict(
+            session_id="default", role="assistant", content="他人的回答",
+            created_by=2, created_at=int(time.time())))
+        dbm.create_record(self.db, "agent_messages", dict(
+            session_id="default", role="user", content="我的提问",
+            created_by=USER["id"], created_at=int(time.time())))
+        session = core_mod.AgentSession(self.db, USER, session_id="default")
+        self.assertEqual([m["content"] for m in session.messages],
+                         ["我的提问"])
 
 
 class TestCoreLoop(AgentBase):

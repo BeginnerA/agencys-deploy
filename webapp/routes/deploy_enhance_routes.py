@@ -7,12 +7,18 @@ import yaml
 from flask import Blueprint, request, jsonify, current_app, g
 
 from .. import db as dbm
+from .. import alert_spec
 from ..auth import require_auth, require_role, audit
-from ..deploy_scheduler import check_release_window
+from ..deploy_scheduler import check_deploy_window, check_release_window
 
 deploy_enhance_bp = Blueprint("deploy_enhance", __name__)
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent.parent / "config"
+
+
+def _config_dir() -> Path:
+    """配置文件来源目录：实例注入的 app.config['CONFIG_DIR'] 优先，回退仓库 config/"""
+    return Path(current_app.config.get("CONFIG_DIR") or CONFIG_DIR)
 
 
 def _json_body():
@@ -23,6 +29,10 @@ def _json_body():
 
 def _db_path():
     return current_app.config["DB_PATH"]
+
+
+def _log_dir():
+    return current_app.config.get("LOG_DIR")
 
 
 def _clear_default_canary(conn, project_id: int, exclude_id: int = None):
@@ -199,8 +209,11 @@ def run_schedule(sid):
         return jsonify({"error": "计划不存在"}), 404
     body = request.get_json(silent=True)
     force_window = isinstance(body, dict) and body.get("force_window") is True
-    # 窗口检查
-    window = check_release_window(_db_path(), rec["project_id"])
+    # 窗口检查：按计划的环境/服务完整作用域匹配
+    window = check_deploy_window(_db_path(), rec["project_id"],
+                                 env=rec.get("env") or "",
+                                 ref_type=rec.get("ref_type") or "",
+                                 ref_id=rec.get("ref_id") or 0)
     if window and window["block_level"] == "block":
         return jsonify({"error": f"当前处于封网窗口 '{window['name']}'，禁止发布"}), 403
     # 创建任务
@@ -229,27 +242,16 @@ def run_schedule(sid):
         g.user["id"], extra=extra)
     from .. import task_manager
     task = dbm.get_task(_db_path(), task_id)
-    task_manager.submit_task(_db_path(), task, extra)
+    task_manager.submit_task(_db_path(), task, extra, log_dir=_log_dir())
     audit("run_schedule", "deploy_schedule", sid, {"task_id": task_id})
     return jsonify({"task_id": task_id, "status": "pending"}), 201
 
 
 # ========== 发布窗口 ==========
 
-_VALID_SCOPE_TYPES = ("all", "project", "env", "server", "service")
-
-
-def _validate_scope(scope) -> str:
-    """校验 scope 结构，返回错误信息或空字符串"""
-    if not isinstance(scope, dict):
-        return "scope 格式错误"
-    if scope.get("type") not in _VALID_SCOPE_TYPES:
-        return "scope type 非法"
-    if not isinstance(scope.get("ids"), list):
-        return "scope.ids 需为列表"
-    if "env_ids" in scope and not isinstance(scope["env_ids"], list):
-        return "scope.env_ids 需为列表"
-    return ""
+# scope 结构校验与告警规则/Agent 工具同源（webapp.alert_spec），
+# 这里用别名而非副本：历史上"对齐"的复制品正是口径漂移的来源
+_validate_scope = alert_spec.validate_scope
 
 
 @deploy_enhance_bp.route("/deploy/windows", methods=["GET"])
@@ -449,8 +451,10 @@ def delete_canary_config(cid):
 def get_canary_decision(task_id):
     """读取灰度决策状态：none=无请求 / waiting=等待决策 / continue|stop|rollback=已决策
     等待中时附带 AI 建议（Phase 2：advisor 规则/LLM 产出的 agent_advice 记录）"""
-    from deploy import read_canary_decision
-    data = read_canary_decision(task_id)
+    from deploy import read_canary_decision, data_dir_for_db
+    # 读侧同样按实例数据目录定位：漏传 data_dir 时 deploy 会回退到
+    # PLATFORM_DATA_DIR/仓库 data/，注入实例的 waiting 文件就永远读不到
+    data = read_canary_decision(task_id, data_dir_for_db(_db_path()))
     if data.get("state") == "waiting":
         try:
             # 同模块内惰性导入，避免 agent 未装配时影响原接口
@@ -476,11 +480,14 @@ def post_canary_decision(task_id):
     action = body.get("action") if body else None
     if action not in ("continue", "stop", "rollback"):
         return jsonify({"error": "action 必须为 continue/stop/rollback"}), 400
-    from deploy import read_canary_decision, canary_decision_path
-    cur = read_canary_decision(task_id)
+    from deploy import (read_canary_decision, canary_decision_path,
+                        data_dir_for_db)
+    # 决策文件按实例数据目录（与 DB 同目录）定位，不依赖仓库 data/
+    data_dir = data_dir_for_db(_db_path())
+    cur = read_canary_decision(task_id, data_dir)
     if cur.get("state") != "waiting":
         return jsonify({"error": "当前无等待中的灰度决策"}), 404
-    path = canary_decision_path(task_id)
+    path = canary_decision_path(task_id, data_dir)
     cur["state"] = action
     cur["updated_at"] = int(time.time())
     try:
@@ -788,13 +795,13 @@ def webhook():
         service_name, env, version, "", 0, action="deploy")
     from .. import task_manager
     task = dbm.get_task(_db_path(), task_id)
-    task_manager.submit_task(_db_path(), task, [])
+    task_manager.submit_task(_db_path(), task, [], log_dir=_log_dir())
     return jsonify({"task_id": task_id, "status": "pending"}), 201
 
 
 def _get_webhook_token() -> str:
-    """从 config/deploy.yaml 读取 webhook_token"""
-    config_file = CONFIG_DIR / "deploy.yaml"
+    """从实例配置目录的 deploy.yaml 读取 webhook_token"""
+    config_file = _config_dir() / "deploy.yaml"
     if not config_file.exists():
         return ""
     try:

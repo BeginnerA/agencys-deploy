@@ -19,6 +19,7 @@
   let state = 'init';               // init | connecting | online | degraded
   let ctrl = null, retryTimer = null, attempt = 0, started = false;
   let capped = false;               // 上一轮被服务端拒接（收不到 hello）
+  let hadHello = false;             // 是否已成功建立过一次流（用于重连后补拉）
   let lastEventTs = 0;
   const binds = {};                 // id -> {topic, fn, fallbackMs, timer, lastRun, trail, dead}
   const watchers = [];              // 状态变化订阅（顶栏指示灯用）
@@ -98,7 +99,12 @@
     if (!frame || typeof frame.type !== 'string') return;
     // 只有真正收到 hello 才算通道打开（复位退避）：仅凭 HTTP 200 复位会让
     // 「服务端拒接但返回 200 + error 帧」变成 1s 一次的紧循环重连（实测风暴）
-    if (frame.type === 'hello'){ capped = false; attempt = 0; return; }
+    if (frame.type === 'hello'){
+      const resumed = hadHello;   // 重连成功：断线期间的事件已丢失，必须全量补拉
+      capped = false; attempt = 0; hadHello = true;
+      if (resumed) dispatch('resync');
+      return;
+    }
     if (frame.type === 'error'){ capped = true; throw new Error('stream_capped'); }
     if (frame.type === 'event') dispatch(frame.topic);
     else if (frame.type === 'bye') throw new Error('stream_closed');  // 交给外层重连
@@ -175,6 +181,8 @@
                  timer: null, lastRun: 0, trail: null, dead: false};
     if (!started) window.liveStart();
     else syncFallback();
+    // 绑定即先刷新一次：不依赖页面手动首拉，也避免通道在线时空等首个事件
+    run(binds[id]);
     return function off(){ unbind(binds[id]); };
   };
   window.liveStart = function(){

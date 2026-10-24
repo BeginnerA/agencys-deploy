@@ -29,17 +29,55 @@ from notify import send_notify
 from deploy_strategies import create_strategy
 
 
+# ---------- 实例数据目录：CLI 与 Web 子进程共用的落点解析 ----------
+
+def instance_data_dir(data_dir=None) -> Path:
+    """实例数据目录：显式参数 > PLATFORM_DATA_DIR（平台随任务注入）> 项目内 data/
+
+    平台支持把运行数据放到任意 data_dir（多实例 / 测试隔离），发布子进程必须跟随，
+    否则会出现「灰度决策文件跟着实例走、库与运行时导出物仍写仓库 data/」的半注入状态：
+    第二套实例发布的其实是第一套实例的配置，属于静默错发。
+    """
+    if data_dir is not None:
+        return Path(data_dir)
+    env_dir = os.environ.get("PLATFORM_DATA_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return Path(__file__).resolve().parent / "data"
+
+
+def platform_db_path(data_dir=None) -> Path:
+    """平台权威库位置（与实例数据目录同层，由 PLATFORM_DATA_DIR 决定）"""
+    return instance_data_dir(data_dir) / "platform.db"
+
+
+def runtime_config_dir(project_id, env, data_dir=None) -> Path:
+    """db 模式下由库派生的运行时 YAML 落点（每项目每环境一份，可并发不互踩）"""
+    return (instance_data_dir(data_dir) / "runtime" / f"p{project_id}"
+            / (env or "prod"))
+
+
 # ---------- 灰度 Web 决策：deploy.py 子进程 ↔ Web 决策 API 的文件协议 ----------
 
-def canary_decision_path(task_id: int) -> Path:
-    """灰度决策文件：Web 子进程写请求、Web 决策 API 写结果，均落盘于 data/ 目录"""
-    return Path(__file__).resolve().parent / "data" / f"canary_decision_{int(task_id)}.json"
+def _canary_data_dir(data_dir=None) -> Path:
+    """决策文件目录 = 实例数据目录（保留旧名，语义见 instance_data_dir）"""
+    return instance_data_dir(data_dir)
 
 
-def read_canary_decision(task_id: int) -> dict:
+def data_dir_for_db(db_path: str) -> Path:
+    """实例数据目录（运行时文件与 platform.db 同目录）——Web/Agent 侧定位决策文件用"""
+    return Path(db_path).resolve().parent
+
+
+def canary_decision_path(task_id: int, data_dir=None) -> Path:
+    """灰度决策文件：Web 子进程写请求、Web 决策 API 写结果，均落盘于数据目录"""
+    return _canary_data_dir(data_dir) / f"canary_decision_{int(task_id)}.json"
+
+
+def read_canary_decision(task_id: int, data_dir=None) -> dict:
     """读取灰度决策文件；文件不存在或损坏返回 {"state": "none"}"""
     try:
-        with open(canary_decision_path(task_id), "r", encoding="utf-8") as f:
+        with open(canary_decision_path(task_id, data_dir), "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {"state": "none"}
     except (OSError, ValueError):
@@ -140,7 +178,7 @@ def _resolve_config_source(args) -> str:
     """auto 模式：DB 中存在该项目（任一服务匹配）→ db，否则 yaml"""
     if args.config_source != "auto":
         return args.config_source
-    db_path = Path(__file__).resolve().parent / "data" / "platform.db"
+    db_path = platform_db_path()
     if not db_path.exists():
         return "yaml"
     try:
@@ -158,11 +196,11 @@ def _resolve_config_source(args) -> str:
 
 
 def _switch_to_db_config(args) -> None:
-    """db 模式：导出运行时 YAML 到 data/runtime/ 并覆盖 common 配置目录"""
+    """db 模式：导出运行时 YAML 到 <数据目录>/runtime/ 并覆盖 common 配置目录"""
     from webapp.exporter import export_runtime
-    db_path = Path(__file__).resolve().parent / "data" / "platform.db"
+    db_path = platform_db_path()
     if not db_path.exists():
-        fail("data/platform.db 不存在，请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
+        fail(f"{db_path} 不存在，请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
     import sqlite3
     if args.project_id is None:
         try:
@@ -174,7 +212,7 @@ def _switch_to_db_config(args) -> None:
             finally:
                 conn.close()
         except sqlite3.Error as e:
-            fail(f"data/platform.db 不可用（{e}），请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
+            fail(f"{db_path} 不可用（{e}），请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
         if not row:
             fail(f"db 模式未找到服务 {args.project}，请先检查 Dashboard 配置")
         args.project_id = row[0]
@@ -188,16 +226,16 @@ def _switch_to_db_config(args) -> None:
             finally:
                 conn.close()
         except sqlite3.Error as e:
-            fail(f"data/platform.db 不可用（{e}），请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
+            fail(f"{db_path} 不可用（{e}），请先通过 Web Dashboard 初始化配置（或使用 yaml 模式）")
         if not row:
             fail(f"db 模式未找到项目 ID {args.project_id}，请检查 Dashboard 配置")
-    tmp = Path(__file__).resolve().parent / "data" / "runtime" / f"p{args.project_id}" / (args.env or "prod")
+    tmp = runtime_config_dir(args.project_id, args.env)
     try:
         export_runtime(str(db_path), args.project_id, args.env or "", tmp)
     except ValueError as e:
         fail(f"{e}（可使用 yaml 模式或先配置环境）")
     except sqlite3.Error as e:
-        fail(f"data/platform.db 读取失败（{e}），库文件可能损坏或未初始化（可使用 yaml 模式）")
+        fail(f"{db_path} 读取失败（{e}），库文件可能损坏或未初始化（可使用 yaml 模式）")
     # 模块级变量覆盖：必须用 `import common`（与顶部 from common import ... 是同一模块实例）；
     # scripts/common 目录无 __init__.py，`import scripts.common` 会是第二个模块实例，覆盖无效
     import common as common_mod
@@ -951,7 +989,7 @@ class Deployer:
             try:
                 from webapp.deploy_scheduler import compute_canary_batches
                 import sqlite3, json as _json
-                _db = Path(__file__).resolve().parent / "data" / "platform.db"
+                _db = platform_db_path()
                 _conn = sqlite3.connect(str(_db))
                 _conn.row_factory = sqlite3.Row
                 try:
@@ -1024,7 +1062,9 @@ class Deployer:
                                 success_all = False
                                 break
                             elif decision == "stop":
-                                log("已停止发布剩余服务器，首台保持新版本")
+                                # 仅部分服务器发布，属于未完成发布：不得按成功打标签/发通知
+                                log("已停止发布剩余服务器，首台保持新版本（本次发布未完成）")
+                                success_all = False
                                 break
                             # continue → 继续发布剩余服务器
                 except Exception as e:
@@ -1115,7 +1155,18 @@ class Deployer:
                     )
                 self.strategy.rollback(server)
                 container_rolled_back = True  # 回滚执行成功即标记
-                self.strategy.verify(server, srv)
+                try:
+                    self.strategy.verify(server, srv)
+                except Exception as ve:
+                    # 容器已切回旧版本但健康检查未通过：回滚不算成功，必须如实上报
+                    log(f"[{host}] 回滚后健康检查失败: {ve}")
+                    if snapshotted:
+                        try:
+                            self.nacos_online(nacos_ip, weight=1.0)
+                        except Exception:
+                            pass
+                    log(f"========== {host} 回滚失败（健康检查未通过） ==========")
+                    return host, False
                 # 容器回滚成功 + 健康检查通过
                 if snapshotted:
                     # 回滚前服务在 Nacos 有注册，需要恢复上线并等待健康

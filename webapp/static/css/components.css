@@ -157,6 +157,7 @@ input[type="datetime-local"]:focus,textarea:focus{border-color:var(--primary);bo
 .sel-opt{padding:7px 10px;font-size:var(--fs-12);color:var(--text-1);border-radius:4px;cursor:pointer;white-space:nowrap}
 .sel-opt:hover{background:var(--bg-hover)}
 .sel-opt.on{color:var(--primary)}
+.sel-opt.kb-active{background:var(--bg-hover);outline:1px solid var(--primary);outline-offset:-1px}
 /* 可搜索下拉（data-search）：面板顶部筛选框 + 无匹配空态 */
 .sel-search{width:100%;box-sizing:border-box;margin:2px 0 6px;padding:6px 10px;font-size:var(--fs-12);
   position:sticky;top:0;z-index:1;

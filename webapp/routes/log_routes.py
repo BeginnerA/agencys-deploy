@@ -112,9 +112,10 @@ def log_context():
             return jsonify({"error": "日志条目不存在"}), 404
 
         file_path = entry["file_path"]
-        # 路径遍历防护：确保文件在预期的日志目录内
-        log_base = os.path.realpath(
-            os.path.join(current_app.root_path, "..", "data", "logs", "collect"))
+        # 路径遍历防护：确保文件在本实例日志目录的 collect/ 内
+        # （根目录取 app.config['LOG_DIR']，与采集器写入点同源；
+        #  root_path 推导出来的仓库 data/ 只对新部署的实例误判为"非法路径"）
+        log_base = os.path.realpath(os.path.join(_log_dir(), "collect"))
         real_path = os.path.realpath(file_path)
         if not real_path.startswith(log_base + os.sep):
             return jsonify({"error": "非法日志文件路径"}), 403

@@ -17,12 +17,12 @@ CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 DEV_SECRET_KEY = "platform-dev-key"
 
 
-def _resolve_secret_key(app) -> str:
-    """优先环境变量；否则用 data/secret_key 持久化随机密钥；读写失败才回退开发密钥"""
+def _resolve_secret_key(app, data_dir: Path) -> str:
+    """优先环境变量；否则用 <data_dir>/secret_key 持久化随机密钥；读写失败才回退开发密钥"""
     key = os.environ.get("DASHBOARD_SECRET_KEY")
     if key:
         return key
-    key_file = DATA_DIR / "secret_key"
+    key_file = data_dir / "secret_key"
     try:
         if not key_file.exists():
             try:
@@ -35,7 +35,8 @@ def _resolve_secret_key(app) -> str:
         return key_file.read_text().strip()
     except OSError:
         app.logger.warning(
-            "[platform] 无法读写 data/secret_key，回退内置开发密钥——生产环境请设置 DASHBOARD_SECRET_KEY")
+            "[platform] 无法读写 %s，回退内置开发密钥——生产环境请设置 DASHBOARD_SECRET_KEY",
+            key_file)
         return DEV_SECRET_KEY
 
 
@@ -62,23 +63,45 @@ def _ensure_admin(app) -> bool:
 
 
 def _onboarding(app) -> None:
-    """空库时自动导入 config/ 旧 YAML，确保存在默认 admin（幂等，可自愈并发残留）"""
+    """空库时自动导入 app.config['CONFIG_DIR'] 旧 YAML，确保存在默认 admin（幂等，可自愈并发残留）"""
     from .importer import import_from_config
-    results = import_from_config(app.config["DB_PATH"], CONFIG_DIR)
+    results = import_from_config(app.config["DB_PATH"], Path(app.config["CONFIG_DIR"]))
     ok = sum(1 for _, (success, _) in results.items() if success)
     app.logger.warning("[onboarding] 导入完成 %d/%d 文件: %s", ok, len(results), results)
     _ensure_admin(app)
 
 
-def create_app():
+def create_app(data_dir=None, config_dir=None, log_dir=None):
+    """应用工厂。
+
+    三个目录参数为测试/多实例隔离而设：
+      - data_dir：DB、secret_key、导出物、日志的根（默认模块 DATA_DIR）
+      - config_dir：首启引导与 /api/config/import 的 YAML 来源（默认模块 CONFIG_DIR）
+      - log_dir：任务/采集日志目录（默认 data_dir/logs）
+
+    缺省行为与原实现一致（读模块 DATA_DIR / CONFIG_DIR），因此生产启动无需传参；
+    传入时不改写 DATA_DIR / CONFIG_DIR 这两个模块全局，避免测试之间互相污染。
+    唯一的例外是 `task_manager.LOG_DIR`：日志目录同时被无 app 上下文的后台线程
+    （发布调度器 / 采集器 / Agent）读取，只能由 set_log_dir() 同步一次，
+    因此注入 log_dir 时它会随之改变（这是有意的单实例约定）。
+    """
     app = Flask(__name__)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    app.config["SECRET_KEY"] = _resolve_secret_key(app)
-    app.config["DB_PATH"] = str(DATA_DIR / "platform.db")
-    # 日志目录（采集/归档/手动清理共用；独立成配置便于测试隔离）
-    app.config["LOG_DIR"] = str(DATA_DIR / "logs")
+    data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
+    config_dir = Path(config_dir) if config_dir is not None else CONFIG_DIR
+    log_dir = Path(log_dir) if log_dir is not None else data_dir / "logs"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    app.config["DATA_DIR"] = str(data_dir)
+    app.config["CONFIG_DIR"] = str(config_dir)
+    app.config["SECRET_KEY"] = _resolve_secret_key(app, data_dir)
+    app.config["DB_PATH"] = str(data_dir / "platform.db")
+    # 日志目录（任务执行/采集/归档/手动清理共用；独立成配置便于测试隔离）
+    app.config["LOG_DIR"] = str(log_dir)
     app.config["MONITOR_INTERVAL"] = int(os.environ.get("DASHBOARD_MONITOR_INTERVAL", "30"))
     init_db(app.config["DB_PATH"])
+    # 任务日志落点交给执行器模块：后台线程（调度器/Agent）无 app 上下文，
+    # 只能从这里取得目录，否则会把日志写进仓库默认 data/logs
+    from .task_manager import set_log_dir
+    set_log_dir(log_dir)
     # 历史自动版本任务回填：从日志解析实际版本号写入 DB（幂等，仅处理 version 为空的记录）
     from .task_manager import backfill_existing_auto_versions
     backfill_existing_auto_versions(app.config["DB_PATH"])

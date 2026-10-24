@@ -169,7 +169,9 @@
     bindSugs(msgs);
     api('/api/agent/sessions/' + encodeURIComponent(sessionId)
         + '/messages?limit=40').then(data => {
-      if (destroyed || !document.getElementById('chatMsgs')) return;
+      // 会话可能已切换/页面已销毁：旧会话的响应不得覆盖当前消息区
+      if (destroyed || sessionId !== currentSession
+          || !document.getElementById('chatMsgs')) return;
       const list = (data.messages || [])
         .filter(m => ['user','assistant'].includes(m.role));
       chatLastId = list.reduce((mx, m) => Math.max(mx, m.id || 0), 0);
@@ -182,14 +184,16 @@
     // 仅当服务端出现更大 id 的新消息才整体重绘，规避无关事件引起的无谓闪烁。
     if (chatAbort) return;
     if (!document.getElementById('chatMsgs')) return;
+    const sid = currentSession;   // 快照：响应回来时用户可能已切换会话
     let list = [];
     try{
       const data = await api('/api/agent/sessions/'
-        + encodeURIComponent(currentSession) + '/messages?limit=40');
+        + encodeURIComponent(sid) + '/messages?limit=40');
       list = (data.messages || [])
         .filter(m => ['user','assistant'].includes(m.role));
     }catch(e){ return; }
-    if (destroyed || !document.getElementById('chatMsgs')) return;
+    if (destroyed || chatAbort || sid !== currentSession
+        || !document.getElementById('chatMsgs')) return;
     const newLastId = list.reduce((mx, m) => Math.max(mx, m.id || 0), 0);
     if (newLastId > chatLastId){ renderChatHistory(list); chatLastId = newLastId; }
   }

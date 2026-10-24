@@ -20,13 +20,11 @@ class TestLogRoutes(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
         cls.db = os.path.join(cls.tmp, "test.db")
-        import webapp
-        cls._orig_data_dir = webapp.DATA_DIR
-        webapp.DATA_DIR = Path(cls.tmp)
-        cls.app = create_app()
+        # 目录靠 create_app 注入：改写 webapp.DATA_DIR 会污染同进程其它测试模块
+        cls.app = create_app(data_dir=Path(cls.tmp))
         cls.app.config["DB_PATH"] = cls.db
         dbm.init_db(cls.db)
-        # 在测试 DB 中直接创建 admin 用户（create_app 的 admin 建在原始 platform.db 中）
+        # 在测试 DB 中直接创建 admin 用户（create_app 的 admin 建在注入目录的 platform.db 中）
         dbm.create_record(cls.db, "users", dict(
             username="admin",
             password_hash=generate_password_hash("admin"),
@@ -46,8 +44,6 @@ class TestLogRoutes(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        import webapp
-        webapp.DATA_DIR = cls._orig_data_dir
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def _auth_headers(self):

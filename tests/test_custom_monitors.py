@@ -8,10 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import webapp as webapp_pkg
-
 _TMP = tempfile.mkdtemp(prefix="custom_monitors_test_")
-webapp_pkg.DATA_DIR = Path(_TMP)
 
 from webapp import create_app
 
@@ -21,8 +18,8 @@ class TestCustomMonitorRoutes(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        webapp_pkg.DATA_DIR = Path(_TMP)
-        cls.app = create_app()
+        # 目录靠 create_app 注入：改写 webapp.DATA_DIR 会污染同进程其它测试模块
+        cls.app = create_app(data_dir=Path(_TMP))
         cls.c = cls.app.test_client()
         token = cls._login(cls.c, "admin", "admin")
         r = cls.c.post("/api/auth/password", json={

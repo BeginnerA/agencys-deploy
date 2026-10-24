@@ -13,7 +13,7 @@ import time
 
 from webapp import db as dbm
 from webapp import events
-from webapp.deploy_scheduler import check_release_window
+from webapp.deploy_scheduler import check_deploy_window
 from webapp import task_manager
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
@@ -188,9 +188,14 @@ def _normalize_args(op: str, project_code: str = "", target: str = "",
                 flags=norm_flags)
 
 
-def _window_warning(db_path: str, project_id: int):
-    """返回 (warn: bool, 描述)；block 级窗口直接抛错拒绝"""
-    window = check_release_window(db_path, project_id)
+def _window_warning(db_path: str, project_id: int, env: str = "",
+                    ref_type: str = "", ref_id: int = 0):
+    """返回 (warn: bool, 描述)；block 级窗口直接抛错拒绝
+
+    按目标环境/服务/服务器完整作用域匹配，避免 env/server/service
+    级窗口只在 project 维度漏判。"""
+    window = check_deploy_window(db_path, project_id, env=env,
+                                 ref_type=ref_type, ref_id=ref_id)
     if not window:
         return False, ""
     if window["block_level"] == "block":
@@ -217,7 +222,9 @@ def plan_operation(db_path: str, user: dict, op: str, target: str = "",
                        no_git_tag=no_git_tag))
     except ExecutorError as e:
         raise ExecutorError(str(e)) from e
-    warn, window_text = _window_warning(db_path, args["project_id"])
+    warn, window_text = _window_warning(
+        db_path, args["project_id"], env=args["env"],
+        ref_type=args["ref_type"], ref_id=args["ref_id"])
     servers = _env_servers(db_path, args["project_id"], args["env"])
     svc_names = [args["name"]]
     if args["kind"] == "service":
@@ -268,7 +275,9 @@ def plan_schedule_run(db_path: str, user: dict, schedule_id: int,
     sched = dbm.get_record(db_path, "deploy_schedules", schedule_id)
     if not sched:
         raise ExecutorError(f"定时计划不存在: #{schedule_id}")
-    warn, window_text = _window_warning(db_path, sched["project_id"])
+    warn, window_text = _window_warning(
+        db_path, sched["project_id"], env=sched.get("env") or "",
+        ref_type=sched.get("ref_type") or "", ref_id=sched.get("ref_id") or 0)
     # 任务名解析与 run_schedule 对齐：服务级计划显示服务名
     target_name = sched["name"]
     if sched.get("ref_type") == "service" and sched.get("ref_id"):
@@ -531,6 +540,71 @@ def _finalize_terminal(db_path: str, run: dict, st: str, summary: str) -> bool:
     return True
 
 
+def _claim_for_execution(db_path: str, run_id: int, decider: dict,
+                         note: str, force_window: int) -> bool:
+    """原子领取审批单（awaiting_approval → executing，task_id 暂空）。
+
+    只有条件更新命中一行的调用方获得执行权，防止并发审批各自提交一次任务。
+    """
+    conn = dbm.get_conn(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE agent_runs SET status='executing', task_id=NULL, "
+            "force_window=?, decided_by=?, decided_by_name=?, "
+            "decided_at=?, decision_note=? "
+            "WHERE id=? AND status='awaiting_approval'",
+            (force_window, int(decider.get("id", 0)),
+             decider.get("username", ""), _now(), note or "", run_id))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def _release_claim(db_path: str, run_id: int, note: str) -> bool:
+    """提交失败时释放领取（仅限尚未关联任务的 executing 记录）"""
+    conn = dbm.get_conn(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE agent_runs SET status='awaiting_approval', "
+            "task_id=NULL, decision_note=? "
+            "WHERE id=? AND status='executing' AND task_id IS NULL",
+            (note or "", run_id))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def _attach_task(db_path: str, run_id: int, task_id: int) -> bool:
+    conn = dbm.get_conn(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE agent_runs SET task_id=? WHERE id=? AND status='executing'",
+            (task_id, run_id))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def _reject_atomic(db_path: str, run_id: int, decider: dict,
+                   note: str) -> bool:
+    """原子驳回：与审批领取竞争时只有一方成功"""
+    conn = dbm.get_conn(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE agent_runs SET status='rejected', decided_by=?, "
+            "decided_by_name=?, decided_at=?, decision_note=? "
+            "WHERE id=? AND status='awaiting_approval'",
+            (int(decider.get("id", 0)), decider.get("username", ""),
+             _now(), note or "", run_id))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def decide_run(db_path: str, run_id: int, decider: dict, action: str,
                note: str = "", force_window: bool = False) -> dict:
     """审批：approve → 提交任务并后台同步；reject → 关闭审批单"""
@@ -539,31 +613,37 @@ def decide_run(db_path: str, run_id: int, decider: dict, action: str,
         raise ExecutorError(f"审批单状态为 {run['status']}，不可重复审批")
     plan = run.get("plan") or {}
     if action == "reject":
-        dbm.update_record(db_path, "agent_runs", run_id, dict(
-            status="rejected", decided_by=int(decider.get("id", 0)),
-            decided_by_name=decider.get("username", ""),
-            decided_at=_now(), decision_note=note or ""))
+        if not _reject_atomic(db_path, run_id, decider, note):
+            raise ExecutorError("审批单已被其他操作处理，请刷新后重试")
         return get_run(db_path, run_id)
     if action != "approve":
         raise ExecutorError(f"非法审批动作: {action}")
     if plan.get("window_warning") and not force_window:
         raise ExecutorError(
             "当前存在发布窗口告警，审批必须显式确认（force_window=true）")
+    # 计划生成后可能新增窗口：审批前按完整作用域重新校验（封网直接拒绝）
+    window = check_deploy_window(
+        db_path, run["project_id"], env=run.get("env") or "",
+        ref_type=run.get("ref_type") or "", ref_id=run.get("ref_id") or 0)
+    if window and window["block_level"] == "block":
+        raise ExecutorError(
+            f"当前处于封网窗口「{window['name']}」，禁止发布")
+    if window and window["block_level"] == "warn" \
+            and not (force_window or plan.get("window_warning")):
+        raise ExecutorError(
+            "计划生成后出现发布窗口告警，审批必须显式确认（force_window=true）")
     # 审批确认的 force_window 先写回 run 快照，供 _submit_task 组装 --force-window
     run["force_window"] = 1 if force_window else run.get("force_window", 0)
+    if not _claim_for_execution(db_path, run_id, decider, note,
+                                run["force_window"]):
+        raise ExecutorError("审批单已被其他操作处理，请刷新后重试")
     try:
         task_id = _submit_task(db_path, run)
     except Exception as e:
-        # 提交失败（如任务队列异常）：审批单保留待处理并给出可读原因
-        dbm.update_record(db_path, "agent_runs", run_id, dict(
-            decision_note=f"审批通过但提交失败: {e}"))
+        # 提交失败（如任务队列异常）：释放领取并保留待处理，给出可读原因
+        _release_claim(db_path, run_id, f"审批通过但提交失败: {e}")
         raise ExecutorError(f"提交任务失败: {e}") from e
-    dbm.update_record(db_path, "agent_runs", run_id, dict(
-        status="executing", task_id=task_id,
-        force_window=run["force_window"],
-        decided_by=int(decider.get("id", 0)),
-        decided_by_name=decider.get("username", ""),
-        decided_at=_now(), decision_note=note or ""))
+    _attach_task(db_path, run_id, task_id)
     threading.Thread(target=_watch_run, args=(db_path, run_id),
                      daemon=True).start()
     return get_run(db_path, run_id)
@@ -652,13 +732,16 @@ def advice_to_action(db_path: str, advice_id: int, user: dict) -> dict:
         task_id = int(task.get("id") or 0)
         if not task_id:
             raise ExecutorError("建议证据缺少任务 ID，无法写入灰度决策")
-        from deploy import read_canary_decision, canary_decision_path
-        cur = read_canary_decision(task_id)
+        from deploy import (read_canary_decision, canary_decision_path,
+                            data_dir_for_db)
+        # 决策文件按实例数据目录（与 DB 同目录）定位，不依赖仓库 data/
+        data_dir = data_dir_for_db(db_path)
+        cur = read_canary_decision(task_id, data_dir)
         if cur.get("state") != "waiting":
             raise ExecutorError(
                 f"任务 #{task_id} 当前无等待中的灰度决策（state={cur.get('state')}），"
                 "决策可能已被处理或任务已结束")
-        path = canary_decision_path(task_id)
+        path = canary_decision_path(task_id, data_dir)
         cur["state"] = decision
         cur["updated_at"] = _now()
         try:

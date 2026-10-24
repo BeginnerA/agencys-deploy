@@ -39,6 +39,17 @@ pip install -r requirements.txt
 
 `requirements.txt` 包含 `PyYAML`、`requests`、`PyMySQL`、`paramiko`。
 
+改代码或跑 CI 时再装开发依赖（`pytest`、`ruff`）：
+
+```bash
+pip install -r requirements-dev.txt
+python scripts/quality_gate.py     # 语法 + 静态检查 + 单测 + 前端无头用例
+```
+
+发布流水线（`jenkins/Jenkinsfile`）已在 Deploy 前加同名门禁 stage，任一 FAIL 即中止发布。工具缺失（未装 ruff/node）记 SKIP，加 `--strict` 可强制 FAIL。
+
+测试隔离：`tests/conftest.py` 在会话开始把 `webapp.DATA_DIR` / `webapp.CONFIG_DIR` 重定向到 pytest 临时目录，所以即使某个用例漏传目录，`create_app()` 也不会去真实 `data/` 上跑迁移或写导出物。写用例时仍应显式传 `create_app(data_dir=...)`；涉及任务/采集日志目录的用例要自己 `mock.patch.object(task_manager, "LOG_DIR", tmp)`——那个全局每次 `create_app` 都会被改写，不能依赖它的当前值。
+
 ## 三、目录结构
 
 ```
@@ -682,28 +693,34 @@ python webapp/app.py          # 默认 http://127.0.0.1:5678
 - 首次启动自动导入 `config/` 旧配置（原 11 个服务 + 4 条流水线 + prod/test 环境），创建默认管理员 `admin/admin`（首次登录强制改密）。
 - 大屏主页：服务状态卡片墙（在线/异常/发布中/未部署 + 镜像版本 + Nacos 实例数）、发布趋势/成功率图表、实时任务日志；点击卡片直接发布/回滚。
 - 「管理」抽屉（admin）：项目管理、服务/环境/服务器/流水线 CRUD、用户与角色、YAML 导入导出。
-- 实时监控：默认 30s 周期 SSH 探测容器 + Nacos 查询实例（`--monitor-interval 0` 关闭）。为降低被监控服务器负载：同一服务器被多个环境绑定时整轮只探测 1 次（服务名取并集，环境视图从结果切片）；`docker stats` 仅对配置服务容器采样；CPU 使用率由 `/proc/stat` 累计值跨轮差分计算（不在被监控服务器上做 `sleep` 采样）；扩展指标（swap/网络/磁盘 IO/TCP/docker df）每 3 轮采集 1 次，节流轮复用上一轮缓存且不写快照（数据库写放大 3× → 1×）。
+- 实时监控：周期默认读取 `DASHBOARD_MONITOR_INTERVAL`（30s），可用 `--monitor-interval N` 覆盖；`0` 仅关闭实时探测与告警引擎，发布调度、日志采集、SSL 到期探测、AI 建议调度仍独立运行。为降低被监控服务器负载：同一服务器被多个环境绑定时整轮只探测 1 次（服务名取并集，环境视图从结果切片）；`docker stats` 仅对配置服务容器采样；CPU 使用率由 `/proc/stat` 累计值跨轮差分计算（不在被监控服务器上做 `sleep` 采样）；扩展指标（swap/网络/磁盘 IO/TCP/docker df）每 3 轮采集 1 次，节流轮复用上一轮缓存且不写快照（数据库写放大 3× → 1×）。
+- 后台服务周期独立：发布调度 `--deploy-interval`（默认 30s，或 `DASHBOARD_DEPLOY_INTERVAL`）、AI 建议 `--agent-interval`（默认 30s，或 `DASHBOARD_AGENT_INTERVAL`，`0` 单独关闭）；监控关闭时日志采集回退为 120s 独立轮询。
 - 日志采集：周期为监控的 2 倍；按主机聚合为单条 SSH 批量拉取（`@@LOGCUT` 分段标记），同名环境跨项目去重，避免重复追加与重复索引。
 - 数据库维护：新库自动启用 `auto_vacuum=INCREMENTAL`，采集器每日执行 FTS optimize + 增量空间回收；存量库执行 `python scripts/db_vacuum.py` 一次性 VACUUM 回收空洞（需先停止平台）。也可在「日志监控 → 服务日志 → ⚙ 保留设置」抽屉（admin）查看存储概况并点「立即清理」手动执行同套策略（删过期索引行、归档过期文件、回收空闲页；与每日自动维护同一实现）。
 - 配置存 `data/platform.db`（权威源）；`config/` 目录为导出产物 + CLI 兼容（`deploy.py --config-source yaml`）。
-- 角色：admin（全部）/ operator（发布回滚）/ viewer（只读）。
-- 默认仅监听 `127.0.0.1`；对外提供服务时用 `--host 0.0.0.0`，建议前置 Nginx 等反代，生产务必注入 `DASHBOARD_SECRET_KEY`。
+- 数据目录外置（多实例）：`python webapp/app.py --data-dir /srv/deploy-a [--config-dir /srv/cfg-a] [--log-dir /var/log/deploy-a]`。`--data-dir` 决定库文件、`secret_key`、配置导出物（`<data-dir>/export/config/`）与日志默认位置；灰度决策文件（`canary_decision_<任务ID>.json`）也写在它下面。同机跑第二套实例时必须显式指定，否则两套实例争用同一个 `data/platform.db`。不传参时与历史行为一致（项目内 `data/`、`config/`）。
+- 平台拉起发布子进程时会注入两个环境变量：`PLATFORM_TASK_ID`（当前任务 ID）与 `PLATFORM_DATA_DIR`（实例数据目录）。发布脚本据此把灰度决策文件、db 模式的库文件与运行时配置目录都定位到本实例；手工在命令行跑 `deploy.py --canary` 时两个变量都不存在，回落到项目内 `data/`，属正常行为。
+- `DASHBOARD_SECRET_KEY` 未设置时，密钥持久化在 `<data-dir>/secret_key`（按实例隔离，重启不掉登录态）；该目录不可写时回退内置开发密钥并在启动日志告警——生产务必显式注入。
+- 角色：admin（全部）/ operator（发布回滚）/ viewer（只读）。生产部署建议 `--host 0.0.0.0` + 前置 Nginx 等反代，环境变量注入 `DASHBOARD_SECRET_KEY`。
+
 - 发布任务通过子进程调用 `deploy.py` / `deploy_pipeline.py`（`--config-source db --project-id <ID>`），行为与命令行一致；任务串行后台执行、日志实时查看。
 
 ### 10.6 配置来源与 CLI 兼容（--config-source）
 
 平台数据库 `data/platform.db` 是配置权威源，CLI 默认自动识别：
 
-- `--config-source auto`（默认）：`data/platform.db` 中存在该项目（服务/流水线名匹配）则从数据库生成运行时配置，否则回退 `config/` 文件。
+- `--config-source auto`（默认）：库中存在该项目（服务/流水线名匹配）则从数据库生成运行时配置，否则回退 `config/` 文件。
 - `--config-source yaml`：强制使用 `config/` 目录（Jenkins / 脚本场景不受影响）。
 - `--config-source db`：强制数据库，需搭配 `--project-id <项目ID>`；找不到项目/环境时明确报错。
+
+库文件与运行时导出目录（`<data-dir>/runtime/p<项目ID>/<环境>/`）按「`PLATFORM_DATA_DIR` 环境变量 > 项目内 `data/`」解析，所以 Dashboard 拉起的多实例发布任务读写的是本实例的库，不会串到仓库 `data/`；报错信息里也会打印实际路径。
 
 ```bash
 ./deploy.sh --project xxx --project-id 1 --env test --auto-version
 ./pipeline.sh --pipeline xxx --project-id 1 --env test --auto-version
 ```
 
-Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`，可直接复制为 `config/` 供 yaml 模式使用。
+Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`（`--data-dir` 实例为 `<data-dir>/export/config/`），可直接复制为 `config/` 供 yaml 模式使用。
 
 ### 10.7 Windows 免安装便携版
 

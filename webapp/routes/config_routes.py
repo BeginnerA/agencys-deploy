@@ -7,11 +7,25 @@ from flask import Blueprint, request, jsonify, current_app
 
 from .. import db as dbm
 from ..auth import require_auth, require_role, audit
+from ..redaction import (redact_secrets, strip_masked_secrets,
+                         preserve_masked_secrets)
 
 config_bp = Blueprint("config", __name__)
 
 DEPLOY_ROOT = Path(__file__).resolve().parent.parent.parent
+# 默认目录（单实例部署）；实例注入了 app.config["CONFIG_DIR" / "DATA_DIR"] 时以注入为准
 CONFIG_DIR = DEPLOY_ROOT / "config"
+DATA_DIR = DEPLOY_ROOT / "data"
+
+
+def _config_dir() -> Path:
+    """YAML 导入来源目录：app 注入优先，回退仓库 config/"""
+    return Path(current_app.config.get("CONFIG_DIR") or CONFIG_DIR)
+
+
+def _data_dir() -> Path:
+    """运行数据目录（导出产物落点）：app 注入优先，回退仓库 data/"""
+    return Path(current_app.config.get("DATA_DIR") or DATA_DIR)
 
 REQUIRED_ENV = ("name",)
 REQUIRED_PIPELINE = ("name",)
@@ -85,22 +99,17 @@ def _service_in_pipeline(project_id, service_id) -> bool:
     return False
 
 
-def _mask_ssh_password(rec: dict) -> dict:
-    """只读接口脱敏：ssh_password 非空时遮蔽（保持 NULL/空串语义，凭据不回显）"""
-    out = dict(rec)
-    if out.get("ssh_password"):
-        out["ssh_password"] = "***"
-    return out
-
-
-def _mask_env_ssh(env: dict) -> dict:
-    """环境列表脱敏：ssh JSON 字段中的 password 非空时遮蔽"""
-    out = dict(env)
-    ssh = out.get("ssh") or {}
-    if isinstance(ssh, dict) and ssh.get("password"):
-        ssh = dict(ssh)
-        ssh["password"] = "***"
-        out["ssh"] = ssh
+def _env_blocks(body, *, preserve_from=None) -> dict:
+    """取环境的六个配置块；新建剥离 *** 占位符，更新沿用未回填的旧密码"""
+    out = {}
+    for k in ("registry", "nacos", "mysql_snailjob", "ssh", "build", "deploy"):
+        if k not in body:
+            continue
+        block = body[k]
+        if preserve_from is None:
+            out[k] = strip_masked_secrets(block)
+        else:
+            out[k] = preserve_masked_secrets(block, preserve_from.get(k) or {})
     return out
 
 
@@ -356,7 +365,7 @@ def delete_service(pid, sid):
 @config_bp.route("/projects/<int:pid>/environments", methods=["GET"])
 @require_auth
 def list_environments(pid):
-    return _ok([_mask_env_ssh(e)
+    return _ok([redact_secrets(e)
                 for e in dbm.list_environments(current_app.config["DB_PATH"], pid)])
 
 
@@ -388,24 +397,21 @@ def create_environment(pid):
     for k in ("registry", "nacos", "mysql_snailjob", "ssh", "build", "deploy"):
         if k in body and not isinstance(body[k], dict):
             return _err(f"{k} 必须为对象")
+    blocks = _env_blocks(body)
     fields = dict(project_id=pid, name=name,
                   is_default=1 if is_default else 0,
-                  registry=body.get("registry", {}),
-                  nacos=body.get("nacos", {}),
-                  mysql_snailjob=body.get("mysql_snailjob", {}),
-                  ssh=body.get("ssh", {}),
-                  build=body.get("build", {}),
-                  deploy=body.get("deploy", {}),
+                  registry=blocks.get("registry", {}),
+                  nacos=blocks.get("nacos", {}),
+                  mysql_snailjob=blocks.get("mysql_snailjob", {}),
+                  ssh=blocks.get("ssh", {}),
+                  build=blocks.get("build", {}),
+                  deploy=blocks.get("deploy", {}),
                   docker_compose_path=body.get("docker_compose_path", ""),
                   maven_profile=body.get("maven_profile", ""),
                   monitor_enabled=1 if monitor_enabled else 0)
-    if is_default:
-        # 保持默认环境唯一（与 update_environment 对齐）：新建默认环境时取消其它默认
-        for e in dbm.list_environments(current_app.config["DB_PATH"], pid):
-            if e["is_default"]:
-                dbm.update_record(current_app.config["DB_PATH"], "environments",
-                                  e["id"], {"is_default": 0})
-    eid = dbm.create_record(current_app.config["DB_PATH"], "environments", fields)
+    # 新建与默认切换同事务：创建失败不会先取消旧默认
+    eid = dbm.save_environment(current_app.config["DB_PATH"], pid, fields,
+                               make_default=is_default)
     audit("create_environment", "environment", eid, {"name": name})
     return _ok({"id": eid}), 201
 
@@ -416,7 +422,7 @@ def get_environment(pid, eid):
     rec, err = _owned_or_404("environments", eid, pid)
     if err:
         return err
-    return _ok(rec)
+    return _ok(redact_secrets(rec))
 
 
 @config_bp.route("/projects/<int:pid>/environments/<int:eid>", methods=["PUT"])
@@ -429,16 +435,14 @@ def update_environment(pid, eid):
     body = _json_body()
     if body is None:
         return _err("请求体必须为 JSON 对象")
+    # 先完成全部校验，再进入单事务写入：任何校验失败都不得改动其它默认环境
+    make_default = False
     if "is_default" in body:
         is_default = _bool_field(body, "is_default")
         if is_default is None:
             return _err("is_default 必须为布尔值")
-        if is_default and not rec["is_default"]:
-            # 取消其它默认环境
-            for e in dbm.list_environments(current_app.config["DB_PATH"], pid):
-                if e["is_default"]:
-                    dbm.update_record(current_app.config["DB_PATH"], "environments",
-                                      e["id"], {"is_default": 0})
+        make_default = bool(is_default) and not rec["is_default"]
+    monitor_enabled = None
     if "monitor_enabled" in body:
         monitor_enabled = _bool_field(body, "monitor_enabled")
         if monitor_enabled is None:
@@ -446,19 +450,29 @@ def update_environment(pid, eid):
     for k in ("registry", "nacos", "mysql_snailjob", "ssh", "build", "deploy"):
         if k in body and not isinstance(body[k], dict):
             return _err(f"{k} 必须为对象")
-    if "name" in body and (not isinstance(body["name"], str)
-                            or not body["name"].strip()):
-        return _err("name 不能为空")
-    allowed = ("name", "registry", "nacos", "mysql_snailjob",
+    new_name = None
+    if "name" in body:
+        if not isinstance(body["name"], str) or not body["name"].strip():
+            return _err("name 不能为空")
+        new_name = body["name"].strip()
+        if not _SAFE_NAME.match(new_name):
+            return _err("环境名仅允许字母数字 _ -（导出时用作文件名）")
+        if _check_unique("environments", pid, new_name, exclude_id=eid):
+            return _err("项目内环境名已存在")
+    allowed = ("registry", "nacos", "mysql_snailjob",
                "ssh", "build", "deploy", "docker_compose_path",
                "maven_profile")
     fields = {k: v for k, v in body.items() if k in allowed}
+    fields.update(_env_blocks(body, preserve_from=rec))
+    if new_name is not None:
+        fields["name"] = new_name
     if "is_default" in body:
         fields["is_default"] = 1 if _bool_field(body, "is_default") else 0
     if "monitor_enabled" in body:
-        fields["monitor_enabled"] = 1 if _bool_field(body, "monitor_enabled") else 0
-    if fields:
-        dbm.update_record(current_app.config["DB_PATH"], "environments", eid, fields)
+        fields["monitor_enabled"] = 1 if monitor_enabled else 0
+    if fields or make_default:
+        dbm.save_environment(current_app.config["DB_PATH"], pid, fields,
+                             env_id=eid, make_default=make_default)
     audit("update_environment", "environment", eid, {"name": rec["name"]})
     return _ok()
 
@@ -484,7 +498,7 @@ def delete_environment(pid, eid):
 def env_servers(eid):
     if not dbm.get_record(current_app.config["DB_PATH"], "environments", eid):
         return _err("环境不存在", 404)
-    return _ok([_mask_ssh_password(s)
+    return _ok([redact_secrets(s)
                 for s in dbm.list_env_servers(current_app.config["DB_PATH"], eid)])
 
 
@@ -554,7 +568,7 @@ def list_servers():
     conn_status = mon.get_servers_status() if mon else {}
     out = []
     for s in dbm.list_records(current_app.config["DB_PATH"], "servers"):
-        s = _mask_ssh_password(s)
+        s = redact_secrets(s)
         st = conn_status.get(s["host"])
         s["conn"] = {"ok": st["ok"], "ts": st["ts"], "error": st["error"]} if st else None
         out.append(s)
@@ -809,7 +823,7 @@ def delete_pipeline(pid, plid):
 @require_role("admin")
 def config_import():
     from ..importer import import_from_config
-    results = import_from_config(current_app.config["DB_PATH"], CONFIG_DIR)
+    results = import_from_config(current_app.config["DB_PATH"], _config_dir())
     # results 值为 (ok, message) 元组，转可序列化结构
     summary = {k: {"ok": ok, "message": msg}
                for k, (ok, msg) in results.items()}
@@ -822,7 +836,7 @@ def config_import():
 @require_role("admin")
 def config_export():
     from ..exporter import export_all
-    target = DEPLOY_ROOT / "data" / "export" / "config"
+    target = _data_dir() / "export" / "config"
     written = export_all(current_app.config["DB_PATH"], target)
     audit("export_config", "config", 0, {"files": written})
     return _ok({"files": written, "dir": str(target)})

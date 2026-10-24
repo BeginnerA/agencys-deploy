@@ -853,6 +853,53 @@ def get_pipeline_by_name(db_path: str, project_id: int, name: str):
     return rows[0] if rows else None
 
 
+def save_environment(db_path: str, project_id: int, fields: dict,
+                     env_id: int = None, make_default: bool = False) -> int:
+    """新建/更新环境，并在同一事务内切换「默认环境」标记。
+
+    env_id=None 表示新建，否则更新（须属于 project_id）。
+    make_default=True 时清除同项目其它默认并置目标为默认。
+    任一步失败整体回滚，避免出现「旧默认已取消、新默认未写入」的中间态。
+    """
+    fields = _serialize("environments", dict(fields or {}))
+    conn = get_conn(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if env_id is None:
+            fields.setdefault("project_id", project_id)
+            fields.setdefault("is_default", 1 if make_default else 0)
+            cols = ", ".join(fields.keys())
+            marks = ", ".join("?" * len(fields))
+            cur = conn.execute(
+                f"INSERT INTO environments ({cols}) VALUES ({marks})",
+                tuple(fields.values()))
+            eid = cur.lastrowid
+        else:
+            row = conn.execute(
+                "SELECT id FROM environments WHERE id=? AND project_id=?",
+                (env_id, project_id)).fetchone()
+            if not row:
+                raise ValueError("环境不存在或不属于该项目")
+            if fields:
+                sets = ", ".join(f"{k}=?" for k in fields)
+                conn.execute(f"UPDATE environments SET {sets} WHERE id=?",
+                             tuple(fields.values()) + (env_id,))
+            eid = env_id
+        if make_default:
+            conn.execute(
+                "UPDATE environments SET is_default=0 "
+                "WHERE project_id=? AND id<>?", (project_id, eid))
+            conn.execute("UPDATE environments SET is_default=1 WHERE id=?",
+                         (eid,))
+        conn.commit()
+        return eid
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_env_by_name(db_path: str, project_id: int, name: str):
     rows = list_records(db_path, "environments", "project_id=? AND name=?",
                         (project_id, name))

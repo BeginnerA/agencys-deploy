@@ -12,6 +12,7 @@
   let tasks = [];
   let currentId = null;
   let offset = 0;         // 当前日志拉取偏移
+  let fetchGen = 0;       // 拉取代次：停止/切换后让在途请求的结果失效（防旧增量回填）
   let destroyed = false;  // 路由切换后丢弃 in-flight 回调，防操作已销毁 DOM
   let auditPage = 1;
   let auditTotal = 0;
@@ -41,7 +42,8 @@
                      server:'服务器', pipeline:'流水线', config:'配置', task:'任务'};
 
   function logBox(){ return document.getElementById('logBox'); }
-  function stopTail(){ if (timer){ clearInterval(timer); timer = null; } }
+  // 停止追尾并作废在途请求：即使响应随后返回，也不得再写 DOM / 推进 offset
+  function stopTail(){ if (timer){ clearInterval(timer); timer = null; } fetchGen++; }
   async function loadProjects(){
     projects = await api('/api/projects').catch(() => []);
   }
@@ -68,6 +70,7 @@
   // 全量拉取：offset 循环直至任务终态/无新日志或 1000 轮（防死循环）
   async function fetchFull(){
     stopTail();
+    const myGen = ++fetchGen;   // 本次全量拉取的代次
     const id = currentId; // 快照：切换任务后丢弃在途回调，防日志串台
     if (!id){ if (logBox()) logBox().textContent = '请选择任务'; return; }
     if (logBox()) logBox().textContent = '加载中...';
@@ -77,9 +80,9 @@
     let truncated = false;
     try{
       for (let i = 0; i < 1000; i++){
-        if (destroyed || !logBox() || currentId !== id) return;
+        if (destroyed || myGen !== fetchGen || !logBox() || currentId !== id) return;
         const d = await api(`/api/tasks/${id}/log?offset=${off}`);
-        if (destroyed || !logBox() || currentId !== id) return;
+        if (destroyed || myGen !== fetchGen || !logBox() || currentId !== id) return;
         if (off === 0 && d.truncated) truncated = true;
         if (d.log) text += d.log;
         off = d.offset;
@@ -90,11 +93,11 @@
         if (!d.log && ['running','pending'].includes(d.status)) break;
       }
     }catch(e){
-      if (destroyed || !logBox()) return;
+      if (destroyed || myGen !== fetchGen || !logBox()) return;
       logBox().textContent = '日志加载失败：' + (e.message || e);
       return;
     }
-    if (destroyed || !logBox() || currentId !== id) return;
+    if (destroyed || myGen !== fetchGen || !logBox() || currentId !== id) return;
     offset = off; // 校验通过后才提交偏移，供追尾继续
     logBox().textContent = (truncated ? '── 日志较长，仅显示最近输出 ──\n' : '') + (text || '（无日志输出）');
     logBox().scrollTop = logBox().scrollHeight;
@@ -104,12 +107,13 @@
   // 追尾：3s 增量拉取，终态自动停止
   function startTail(){
     stopTail();
+    const myGen = fetchGen;   // 绑定本轮追尾；stopTail/重新全量刷新后旧回调自动失效
     timer = setInterval(async () => {
       try{
-        if (destroyed || !logBox()){ stopTail(); return; }
+        if (destroyed || myGen !== fetchGen || !logBox()){ stopTail(); return; }
         const id = currentId; // 快照：切任务后丢弃在途回调
         const d = await api(`/api/tasks/${id}/log?offset=${offset}`);
-        if (destroyed || !logBox() || currentId !== id) return;
+        if (destroyed || myGen !== fetchGen || !logBox() || currentId !== id) return;
         if (d.log){ logBox().textContent += d.log; logBox().scrollTop = logBox().scrollHeight; }
         offset = d.offset;
         if (['success','failed','killed'].includes(d.status)){

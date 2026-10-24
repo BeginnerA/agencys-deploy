@@ -7,22 +7,15 @@ from datetime import datetime, timedelta
 from flask import Blueprint, current_app, g, jsonify, request
 
 from .. import db as dbm
+from .. import alert_spec
 from ..auth import audit, require_auth, require_role
 
 alert_bp = Blueprint("alert", __name__)
 
-SEVERITIES = ("P0", "P1", "P2", "P3")
+# 枚举唯一来源：webapp.alert_spec（渠道清单再上溯到 alert_channels 的实现）
+SEVERITIES = alert_spec.SEVERITIES
 STATUSES = ("firing", "acked", "resolved")
-CHANNELS = ("email", "wecom", "webhook", "sms_aliyun", "feishu", "dingtalk")
-
-_HHMM = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
-
-
-def _valid_scope(scope) -> bool:
-    """静默窗口/规则 scope 结构校验：{rules,envs,servers} 均为列表"""
-    return (isinstance(scope, dict)
-            and all(isinstance(scope.get(k), list)
-                    for k in ("rules", "envs", "servers")))
+CHANNELS = alert_spec.CHANNELS
 
 
 def _project_alert_filter(project_id=0):
@@ -481,79 +474,16 @@ def list_rules():
 
 
 def _validate_rule(body, partial=False) -> str:
-    """规则校验；返回错误信息，空串=通过。partial=True 仅校验已出现的字段（局部更新）"""
-    def has(k):
-        return True if not partial else k in body
+    """规则校验：委托 webapp.alert_spec（与 Agent 工具同一口径）
 
-    if has("name") and not (body.get("name") or "").strip():
-        return "规则名称必填"
-    if has("metric_type") and body.get("metric_type") not in (
-            "metric", "status", "log_keyword", "custom_monitor"):
-        return "metric_type 非法"
-    if has("metric"):
-        if body.get("metric_type") == "metric" and body.get("metric") not in (
-                "cpu", "mem", "disk", "load"):
-            return "metric 非法"
-        if body.get("metric_type") == "status" and body.get("metric") not in (
-                "service_down", "task_failed"):
-            return "metric 非法"
-        if body.get("metric_type") == "log_keyword":
-            kw_raw = (body.get("metric") or "").strip()
-            if not kw_raw:
-                return "日志关键词不能为空"
-            keywords = [k.strip() for k in kw_raw.split(",") if k.strip()]
-            if not keywords:
-                return "日志关键词不能为空"
-            if any(len(k) > 100 for k in keywords):
-                return "单个关键词长度不能超过 100"
-    if has("exclude_keyword"):
-        ex_raw = (body.get("exclude_keyword") or "").strip()
-        if ex_raw:
-            ex_keywords = [k.strip() for k in ex_raw.split(",") if k.strip()]
-            if any(len(k) > 100 for k in ex_keywords):
-                return "单个排除关键词长度不能超过 100"
-    if has("severity") and body.get("severity") not in SEVERITIES:
-        return "severity 非法"
-    if has("compare") and body.get("compare") not in ("<", "<=", ">", ">="):
-        return "compare 非法"
-    if has("threshold"):
-        try:
-            float(body.get("threshold", 0))
-        except (TypeError, ValueError):
-            return "threshold 必须为数字"
-    if has("duration_seconds"):
-        try:
-            duration = int(body.get("duration_seconds", 0))
-        except (TypeError, ValueError):
-            return "duration_seconds 非法"
-        if body.get("metric_type") == "metric" and duration > 1200:
-            return "duration_seconds 不能超过 1200 秒（滑动窗口上限 20 分钟）"
-    if has("escalation_interval"):
-        try:
-            int(body.get("escalation_interval", 30))
-        except (TypeError, ValueError):
-            return "escalation_interval 必须为数字"
-    if has("scope"):
-        scope = body.get("scope") or {}
-        if not isinstance(scope, dict):
-            return "scope 格式错误"
-        valid_types = ("all", "project", "env", "server", "service")
-        if scope.get("type") not in valid_types:
-            return "scope type 非法"
-        if not isinstance(scope.get("ids"), list):
-            return "scope.ids 需为列表"
-        if "env_ids" in scope and not isinstance(scope["env_ids"], list):
-            return "scope.env_ids 需为列表"
-        mt = body.get("metric_type")
-        if mt == "metric" and scope.get("type") == "service":
-            return "指标规则不能选择服务作用域"
-        if mt in ("status", "log_keyword") and scope.get("type") == "server":
-            return "状态/日志规则不能选择服务器作用域"
-    if has("channels"):
-        channels = body.get("channels") or []
-        if channels and not set(channels) <= set(CHANNELS):
-            return "channels 包含非法渠道"
-    return ""
+    返回错误信息，空串=通过；partial=True 仅校验已出现的字段（局部更新）。
+    """
+    return alert_spec.validate_alert_rule(body, partial)
+
+
+def _validate_silence(body, partial=False) -> str:
+    """静默窗口校验：委托 webapp.alert_spec（与 Agent 工具同一口径）"""
+    return alert_spec.validate_silence(body, partial)
 
 
 @alert_bp.route("/alerts/rules", methods=["POST"])
@@ -662,33 +592,27 @@ def list_silences():
 @require_role("admin", "operator")
 def create_silence():
     body = request.get_json(silent=True) or {}
-    name = (body.get("name") or "").strip()
-    if not name:
-        return jsonify({"error": "窗口名称必填"}), 400
-    wtype = body.get("type", "one_time")
-    if wtype not in ("one_time", "recurring"):
-        return jsonify({"error": "type 非法"}), 400
-    start_at = body.get("start_at", "")
-    end_at = body.get("end_at", "")
-    if wtype == "one_time":
-        try:
-            float(start_at); float(end_at)
-        except (TypeError, ValueError):
-            return jsonify({"error": "一次性窗口需 epoch 秒 start_at/end_at"}), 400
-    elif wtype == "recurring":
-        if not (_HHMM.match(str(start_at)) and _HHMM.match(str(end_at))):
-            return jsonify({"error": "周期窗口需 HH:MM 格式 start_at/end_at"}), 400
-    scope = body.get("scope") or {"rules": [], "envs": [], "servers": []}
-    if not _valid_scope(scope):
-        return jsonify({"error": "scope 需为 {rules,envs,servers} 列表结构"}), 400
+    # 补齐缺省值后交给共享口径（webapp.alert_spec）校验：与 Agent 工具同一结论
+    merged = {
+        "name": body.get("name", ""),
+        "type": body.get("type", "one_time"),
+        "start_at": body.get("start_at", ""),
+        "end_at": body.get("end_at", ""),
+        "weekdays": body.get("weekdays") or [],
+        "scope": body.get("scope") or {"rules": [], "envs": [], "servers": []},
+    }
+    err = _validate_silence(merged)
+    if err:
+        return jsonify({"error": err}), 400
     now = int(time.time())
     wid = dbm.create_record(current_app.config["DB_PATH"], "silence_windows", dict(
-        name=name, type=wtype, start_at=str(start_at), end_at=str(end_at),
-        weekdays=body.get("weekdays") or [],
-        scope=scope,
+        name=merged["name"].strip(), type=merged["type"],
+        start_at=str(merged["start_at"]), end_at=str(merged["end_at"]),
+        weekdays=merged["weekdays"],
+        scope=merged["scope"],
         enabled=1 if body.get("enabled", True) else 0,
         remark=body.get("remark", ""), created_at=now))
-    audit("create_silence", "silence", wid, {"name": name})
+    audit("create_silence", "silence", wid, {"name": merged["name"].strip()})
     return jsonify({"id": wid})
 
 
@@ -701,27 +625,25 @@ def update_silence(silence_id):
     if not old:
         return jsonify({"error": "窗口不存在"}), 404
     body = request.get_json(silent=True) or {}
-    wtype = body.get("type", old["type"])
-    if wtype not in ("one_time", "recurring"):
-        return jsonify({"error": "type 非法"}), 400
-    start_at = str(body.get("start_at", old["start_at"]))
-    end_at = str(body.get("end_at", old["end_at"]))
-    if wtype == "one_time":
-        try:
-            float(start_at); float(end_at)
-        except (TypeError, ValueError):
-            return jsonify({"error": "一次性窗口需 epoch 秒 start_at/end_at"}), 400
-    elif wtype == "recurring":
-        if not (_HHMM.match(str(start_at)) and _HHMM.match(str(end_at))):
-            return jsonify({"error": "周期窗口需 HH:MM 格式 start_at/end_at"}), 400
-    if "scope" in body and not _valid_scope(body["scope"]):
-        return jsonify({"error": "scope 需为 {rules,envs,servers} 列表结构"}), 400
-    # 局部更新：未提供的字段保持原值，避免 PUT 部分提交静默重置配置
+    # 局部更新：未提供的字段保持原值，避免 PUT 部分提交静默重置配置；
+    # 合并后的整体交给共享口径复校验（改 type 却带旧格式时间会被拦住）
+    merged = {
+        "name": body.get("name", old["name"]),
+        "type": body.get("type", old["type"]),
+        "start_at": body.get("start_at", old["start_at"]),
+        "end_at": body.get("end_at", old["end_at"]),
+        "weekdays": body.get("weekdays", old["weekdays"]),
+        "scope": body.get("scope", old["scope"]),
+    }
+    err = _validate_silence(merged)
+    if err:
+        return jsonify({"error": err}), 400
     dbm.update_record(db, "silence_windows", silence_id, dict(
-        name=(body.get("name") or old["name"]).strip(),
-        type=wtype, start_at=start_at, end_at=end_at,
-        weekdays=body.get("weekdays", old["weekdays"]),
-        scope=body.get("scope", old["scope"]),
+        name=(merged["name"] or "").strip(),
+        type=merged["type"], start_at=str(merged["start_at"]),
+        end_at=str(merged["end_at"]),
+        weekdays=merged["weekdays"],
+        scope=merged["scope"],
         enabled=1 if body.get("enabled", old["enabled"]) else 0,
         remark=body.get("remark", old["remark"])))
     audit("update_silence", "silence", silence_id)

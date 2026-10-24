@@ -18,6 +18,7 @@
   let envFilter = 'all';
   let svcFilter = 'all';
   let filterOptions = {};  // {project_code: {envs: [], services: []}}
+  let detailSeq = 0;       // 详情抽屉代次：切到别的告警后丢弃在途响应，防串数据
 
   // 批量操作状态
   let selectedIds = new Set();
@@ -217,7 +218,9 @@
 
   async function loadFilterOptions(){
     try {
-      filterOptions = await api('/api/alerts/filter-options').catch(() => ({}));
+      const data = await api('/api/alerts/filter-options').catch(() => ({}));
+      if (destroyed) return;
+      filterOptions = data;
       populateEnvOptions();
       populateSvcOptions();
     } catch(e) { /* 不阻塞 */ }
@@ -270,7 +273,9 @@
 
   async function loadProjectsForFilter(){
     try {
-      projects = await api('/api/projects').catch(() => []);
+      const list = await api('/api/projects').catch(() => []);
+      if (destroyed) return;
+      projects = list;
       const sel = document.getElementById('alertProjSel');
       if (!sel) return;
       sel.innerHTML = '<option value="all">全部项目</option>' +
@@ -589,6 +594,7 @@
       renderStatsChart(data);
     } catch(e) {
       console.warn('loadStats failed', e);
+      if (destroyed) return;
       if (container) {
         container.innerHTML = `<div class="panel"><div class="error-state"><div class="e-ico">⚠️</div>
           <div class="muted">统计数据加载失败</div>
@@ -1423,6 +1429,7 @@
   async function openAlertDetail(alertId) {
     const alert = alerts.find(a => a.id === alertId);
     if (!alert) return;
+    const seq = ++detailSeq;   // 同一时刻只允许最新打开的详情写 DOM
     const target = parseTarget(alert.target_info);
     const sevCls = (alert.severity || 'P2').toLowerCase();
     const stLabel = ST_LABEL[alert.status] || alert.status;
@@ -1465,6 +1472,7 @@
     // 加载投递历史
     try {
       const events = await api(`/api/alerts/${alertId}/events`);
+      if (destroyed || seq !== detailSeq) return;
       const el = document.getElementById('alertEventsList');
       if (!el) return;
       if (!events.length) {
@@ -1484,6 +1492,7 @@
       }).join('');
     } catch(e) {
       console.warn('openAlertDetail events load failed', e);
+      if (destroyed || seq !== detailSeq) return;
       const el = document.getElementById('alertEventsList');
       if (el) {
         const msg = e.message || '未知错误';
@@ -1503,8 +1512,10 @@
     const section = document.getElementById('alertLogCtxSection');
     const el = document.getElementById('alertLogCtxList');
     if (!section || !el) return;
+    const seq = detailSeq;
     try {
       const data = await api(`/api/alerts/${alertId}/logs?lines=100`);
+      if (destroyed || seq !== detailSeq) return;
       if (!data.available) {
         // 非日志告警：不渲染该区块
         if (data.reason === 'not_log_alert') { section.remove(); return; }
@@ -1519,6 +1530,7 @@
       renderLogCtx(el, data);
     } catch(e) {
       console.warn('loadAlertLogCtx failed', e);
+      if (destroyed || seq !== detailSeq) return;
       el.innerHTML = `<div style="padding:12px;text-align:center">
         <div class="muted" style="color:var(--danger)">加载失败：${esc(e.message || '未知错误')}</div>
         <button class="btn sm ghost" id="logCtxRetryBtn" style="margin-top:8px">重试</button>
@@ -1610,6 +1622,7 @@
       monitorConfig = cfg || {};
       if (monitorViewMode === 'timeline') {
         try { monitorTimeline = await api('/api/alerts/monitors/timeline?days=90') || []; } catch(e) {}
+        if (destroyed) return;
       }
       renderMonitorsTab();
     } catch(e) {

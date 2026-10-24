@@ -11,9 +11,14 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 
 from webapp import db as dbm
+from webapp import alert_spec
+from webapp import task_manager
 from webapp.deploy_scheduler import check_release_window
+from webapp.redaction import (redact_secrets, strip_masked_secrets,
+                              preserve_masked_secrets)
 
 from . import memory as memory_mod
 from . import advisor as advisor_mod
@@ -377,9 +382,10 @@ def _logs_context(ctx, id=None, lines=5, **kw) -> dict:
         raise ToolError(f"日志条目不存在: id={id}")
     file_path = entry.get("file_path") or ""
     offset = entry.get("line_offset") or 0
-    # 路径遍历防护：日志文件必须落在 data/logs/collect 目录内（与 Web 端一致）
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    log_base = os.path.realpath(os.path.join(root, "data", "logs", "collect"))
+    # 路径遍历防护：日志文件必须落在本实例日志目录的 collect/ 子目录内
+    # （目录来自 task_manager.LOG_DIR，与 Web 端 create_app(log_dir=…) 同源；
+    #  写死仓库 data/ 会让第二套实例读不到自己的日志、却可能读到别人的）
+    log_base = os.path.realpath(str(Path(task_manager.LOG_DIR) / "collect"))
     real_path = os.path.realpath(file_path)
     if not real_path.startswith(log_base + os.sep):
         raise ToolError("非法日志文件路径")
@@ -951,17 +957,9 @@ def _validate_cron(cron_expr: str) -> int:
         raise ToolError(f"cron 表达式无效: {e}")
 
 
-def _validate_window_scope(scope) -> str:
-    """校验窗口 scope 结构（与 deploy_enhance_routes._validate_scope 对齐）"""
-    if not isinstance(scope, dict):
-        return "scope 格式错误"
-    if scope.get("type") not in ("all", "project", "env", "server", "service"):
-        return "scope type 非法"
-    if not isinstance(scope.get("ids"), list):
-        return "scope.ids 需为列表"
-    if "env_ids" in scope and not isinstance(scope["env_ids"], list):
-        return "scope.env_ids 需为列表"
-    return ""
+# 窗口 scope 结构校验：直接别名，与发布窗口 API 用同一个函数对象
+# （写成"对齐"的副本正是历史上口径漂移的来源）
+_validate_window_scope = alert_spec.validate_scope
 
 
 def _validate_canary_steps(steps) -> list:
@@ -1519,22 +1517,19 @@ def _manage_services(ctx, action=None, project=None, service_id=None,
 
 
 def _mask_ssh(secret: str) -> str:
-    """SSH 口令脱敏：非空遮蔽为 ***（与 Web 端 _mask_ssh_password 一致，凭据不回显）"""
+    """SSH 口令脱敏：非空遮蔽为 ***（与 Web 端脱敏约定一致，凭据不回显）"""
     return "***" if secret else ""
 
 
 def _env_out(e: dict, server_count: int = 0) -> dict:
-    ssh = dict(e.get("ssh") or {})
-    if ssh.get("password"):
-        ssh["password"] = "***"
     return {"id": e["id"], "name": e["name"],
             "project_id": e["project_id"],
             "is_default": bool(e.get("is_default")),
             "monitor_enabled": bool(e.get("monitor_enabled", 1)),
             "servers": server_count,
-            "registry": e.get("registry") or {},
-            "nacos": e.get("nacos") or {},
-            "ssh": ssh,
+            "registry": redact_secrets(e.get("registry") or {}),
+            "nacos": redact_secrets(e.get("nacos") or {}),
+            "ssh": redact_secrets(e.get("ssh") or {}),
             "build": e.get("build") or {},
             "deploy": e.get("deploy") or {},
             "docker_compose_path": e.get("docker_compose_path", ""),
@@ -1599,6 +1594,7 @@ def _manage_environments(ctx, action=None, project=None,
                 blocks[k] = _jsonish(v, k)
                 if not isinstance(blocks[k], dict):
                     raise ToolError(f"{k} 必须为对象")
+                blocks[k] = strip_masked_secrets(blocks[k])
         eid = dbm.create_record(db, "environments", dict(
             project_id=proj["id"], name=name,
             is_default=1 if is_default else 0,
@@ -1674,7 +1670,9 @@ def _manage_environments(ctx, action=None, project=None,
                 obj = _jsonish(v, k)
                 if not isinstance(obj, dict):
                     raise ToolError(f"{k} 必须为对象")
-                fields[k] = json.dumps(obj, ensure_ascii=False)
+                fields[k] = json.dumps(
+                    preserve_masked_secrets(obj, env_obj.get(k) or {}),
+                    ensure_ascii=False)
         if docker_compose_path:
             fields["docker_compose_path"] = docker_compose_path.strip()
         if maven_profile:
@@ -2074,12 +2072,15 @@ def _canary_decision(ctx, task_id=None, action=None, **kw) -> dict:
         task_id = int(task_id)
     except (TypeError, ValueError):
         raise ToolError("缺少 task_id（整数）")
-    from deploy import read_canary_decision, canary_decision_path
-    cur = read_canary_decision(task_id)
+    from deploy import (read_canary_decision, canary_decision_path,
+                        data_dir_for_db)
+    # 决策文件按实例数据目录（与 DB 同目录）定位，不依赖仓库 data/
+    data_dir = data_dir_for_db(ctx.db_path)
+    cur = read_canary_decision(task_id, data_dir)
     if cur.get("state") != "waiting":
         raise ToolError(f"任务 #{task_id} 当前无等待中的灰度决策"
                         f"（state={cur.get('state')}）")
-    path = canary_decision_path(task_id)
+    path = canary_decision_path(task_id, data_dir)
     cur["state"] = action
     cur["updated_at"] = int(time.time())
     try:
@@ -2147,17 +2148,15 @@ def _set_alert_status(ctx, alert_id=None, action=None, note="", **kw) -> dict:
 
 # ---------- 告警规则与静默窗口管理 ----------
 
-_RULE_METRICS = {"metric": ("cpu", "mem", "disk", "load"),
-                 "status": ("service_down", "task_failed")}
-_SEVERITIES = ("P0", "P1", "P2", "P3")
-_ALERT_CHANNELS = ("email", "wecom", "webhook", "sms_aliyun", "feishu",
-                   "dingtalk")
+# 枚举与规则口径来自 webapp.alert_spec（与 Web 路由同一实现，避免镜像漂移）
+_RULE_METRICS = alert_spec.RULE_METRICS
+_SEVERITIES = alert_spec.SEVERITIES
+_ALERT_CHANNELS = alert_spec.CHANNELS
 _SCOPE_TABLES = {"project": "projects", "env": "environments",
                  "server": "servers", "service": "services"}
 _SCOPE_TIPS = {"project": "list_projects", "env": "list_environments",
                "server": "manage_servers(action=list)",
                "service": "list_services"}
-_HHMM_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
 
 
 def _check_scope_ids(db, scope) -> str:
@@ -2176,80 +2175,18 @@ def _check_scope_ids(db, scope) -> str:
 
 
 def _validate_alert_rule(db, body, partial=False) -> str:
-    """规则校验（镜像 alert_routes._validate_rule，含跨字段约束）；空串=通过
+    """规则校验：口径来自 webapp.alert_spec，附加 Agent 专属的 scope id 存在性检查
 
-    partial=True 仅校验已出现的字段（局部更新前的形态检查）。
+    空串=通过。id 存在性只在工具侧校验：对话里的 id 来自模型输出（可能幻觉），
+    Web 表单的 id 由下拉选择产生，无需再查库。
     """
-    def has(k):
-        return True if not partial else k in body
-
-    if has("name") and not (body.get("name") or "").strip():
-        return "规则名称必填"
-    if has("metric_type") and body.get("metric_type") not in (
-            "metric", "status", "log_keyword", "custom_monitor"):
-        return "metric_type 非法"
-    if has("metric"):
-        mt = body.get("metric_type")
-        if mt == "metric" and body.get("metric") not in _RULE_METRICS["metric"]:
-            return "metric 型规则的 metric 必须为 cpu/mem/disk/load"
-        if mt == "status" and body.get("metric") not in _RULE_METRICS["status"]:
-            return "status 型规则的 metric 必须为 service_down/task_failed"
-        if mt == "log_keyword":
-            kws = [k.strip() for k in (body.get("metric") or "").split(",")
-                   if k.strip()]
-            if not kws:
-                return "日志关键词不能为空"
-            if any(len(k) > 100 for k in kws):
-                return "单个关键词长度不能超过 100"
-    if has("exclude_keyword"):
-        for k in (body.get("exclude_keyword") or "").split(","):
-            if k.strip() and len(k.strip()) > 100:
-                return "单个排除关键词长度不能超过 100"
-    if has("severity") and body.get("severity") not in _SEVERITIES:
-        return "severity 必须为 P0/P1/P2/P3"
-    if has("compare") and body.get("compare") not in ("<", "<=", ">", ">="):
-        return "compare 必须为 < <= > >="
-    if has("threshold"):
-        try:
-            float(body.get("threshold", 0))
-        except (TypeError, ValueError):
-            return "threshold 必须为数字"
-    if has("duration_seconds"):
-        try:
-            duration = int(body.get("duration_seconds", 0))
-        except (TypeError, ValueError):
-            return "duration_seconds 非法"
-        if body.get("metric_type") == "metric" and duration > 1200:
-            return "duration_seconds 不能超过 1200（滑动窗口上限 20 分钟）"
-    if has("escalation_interval"):
-        try:
-            int(body.get("escalation_interval", 30))
-        except (TypeError, ValueError):
-            return "escalation_interval 必须为数字"
-    if has("scope"):
-        scope = body.get("scope") or {}
-        if not isinstance(scope, dict):
-            return "scope 格式错误"
-        if scope.get("type") not in ("all", "project", "env", "server", "service"):
-            return "scope type 非法"
-        if not isinstance(scope.get("ids"), list):
-            return "scope.ids 需为列表"
-        if "env_ids" in scope and not isinstance(scope["env_ids"], list):
-            return "scope.env_ids 需为列表"
-        mt = body.get("metric_type")
-        if mt == "metric" and scope.get("type") == "service":
-            return "指标规则不能选择服务作用域"
-        if mt in ("status", "log_keyword") and scope.get("type") == "server":
-            return "状态/日志规则不能选择服务器作用域"
-        err = _check_scope_ids(db, scope)
-        if err:
-            return err
-    if has("channels"):
-        channels = body.get("channels") or []
-        if not isinstance(channels, list):
-            return "channels 需为列表"
-        if channels and not set(channels) <= set(_ALERT_CHANNELS):
-            return "channels 包含非法渠道"
+    err = alert_spec.validate_alert_rule(body, partial)
+    if err:
+        return err
+    if (not partial or "scope" in body) and body.get("scope") is not None:
+        scope_err = _check_scope_ids(db, body.get("scope") or {})
+        if scope_err:
+            return scope_err
     return ""
 
 
@@ -2398,31 +2335,12 @@ def _check_silence_scope_ids(db, scope) -> str:
 
 
 def _validate_silence(db, body) -> str:
-    """静默窗口校验（镜像 alert_routes 创建/更新校验）；空串=通过"""
-    if not (body.get("name") or "").strip():
-        return "窗口名称必填"
-    wtype = body.get("type")
-    if wtype not in ("one_time", "recurring"):
-        return "type 必须为 one_time 或 recurring"
-    start_at, end_at = str(body.get("start_at", "")), str(body.get("end_at", ""))
-    if wtype == "one_time":
-        try:
-            float(start_at); float(end_at)
-        except (TypeError, ValueError):
-            return "一次性窗口需 epoch 秒 start_at/end_at"
-    elif not (_HHMM_RE.match(start_at) and _HHMM_RE.match(end_at)):
-        return "周期窗口需 HH:MM 格式 start_at/end_at"
-    scope = body.get("scope")
-    if not isinstance(scope, dict) or not all(
-            isinstance(scope.get(k), list) for k in ("rules", "envs", "servers")):
-        return "scope 需为 {rules,envs,servers} 列表结构"
-    err = _check_silence_scope_ids(db, scope)
+    """静默窗口校验：形状/时间格式委托 webapp.alert_spec（与 Web 端同一口径），
+    Agent 侧再补一层 scope id 存在性检查（防对话幻觉引用不存在的对象）"""
+    err = alert_spec.validate_silence(body)
     if err:
         return err
-    if body.get("weekdays") is not None and not isinstance(
-            body.get("weekdays"), list):
-        return "weekdays 需为列表"
-    return ""
+    return _check_silence_scope_ids(db, body.get("scope") or {})
 
 
 def _silence_out(w) -> dict:
@@ -2538,8 +2456,9 @@ def _manage_log_storage(ctx, action="status", log_retention_days=None,
     status 存储概况 / settings 保留期调整 / cleanup 手动清理（与每日自动维护同一逻辑）"""
     _require_admin(ctx, "日志存储治理")
     db = ctx.db_path
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    log_dir = os.path.join(root, "data", "logs")
+    # 与 Web 端同一个日志根（create_app(log_dir=…) 写入 task_manager.LOG_DIR）；
+    # 写死仓库 data/logs 会让统计与清理落到别的实例的目录
+    log_dir = str(task_manager.LOG_DIR)
 
     def _settings_map(conn) -> dict:
         out = {}
@@ -3081,22 +3000,24 @@ def _manage_config_backup(ctx, action=None, **kw) -> dict:
     export 把 DB 配置全量导出为 YAML；import 从 config/ 目录回灌 DB。"""
     _require_admin(ctx, "配置导入导出")
     db = ctx.db_path
-    from pathlib import Path
-    root = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from deploy import data_dir_for_db
     if action == "export":
         from webapp.exporter import export_all
-        target = root / "data" / "export" / "config"
+        # 与 Web「管理 → 导出配置」同一落点：本实例的数据目录（--data-dir 感知）
+        target = data_dir_for_db(db) / "export" / "config"
         written = export_all(db, target)
         dbm.create_audit(db, ctx.user_id, ctx.username,
                          "agent_export_config", "config", 0,
                          {"files": written, "via": "agent"})
         return {"ok": True, "files": written, "dir": str(target),
                 "count": len(written),
-                "hint": "已导出到 data/export/config/（单项目时兼容名可直接"
-                        "复制为 config/；多项目按 code 加后缀）"}
+                "hint": "已导出到本实例数据目录的 export/config/（默认 data/export/config/；"
+                        "单项目时兼容名可直接复制为 config/，多项目按 code 加后缀）"}
     if action == "import":
         from webapp.importer import import_from_config
-        config_dir = root / "config"
+        # Agent 侧无 app 上下文，取不到 create_app(config_dir=…) 的注入值，
+        # 固定用仓库 config/（CLI 兼容目录）；自定义配置目录请用 Web 端导入
+        config_dir = Path(__file__).resolve().parent.parent / "config"
         results = import_from_config(db, config_dir)
         summary = {k: {"ok": ok, "message": msg}
                    for k, (ok, msg) in results.items()}
@@ -3439,9 +3360,9 @@ _spec("refresh_monitor",
               {}, "write", _refresh_monitor),
 _spec("manage_config_backup",
               "平台配置导入/导出（仅 admin，与 Web /config/export|import "
-              "同等效力）：action=export 把 DB 配置全量导出为 YAML 到 "
-              "data/export/config/（备份/迁移）；action=import 从 config/ 目录"
-              "逐文件回灌 DB（逐文件结果见 results）",
+              "同等效力）：action=export 把 DB 配置全量导出为 YAML 到本实例"
+              "数据目录的 export/config/（默认 data/export/config/，备份/迁移）；"
+              "action=import 从 config/ 目录逐文件回灌 DB（逐文件结果见 results）",
               {"action": str_req}, "write", _manage_config_backup),
 _spec("send_digest",
               "立即聚合并推送一次巡检日报（服务健康/告警/近24h发布/待审审批单"
