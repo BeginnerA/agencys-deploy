@@ -71,9 +71,9 @@ ALTER TABLE services ADD COLUMN runtime_config TEXT DEFAULT '{}'
 - `readiness.type` 取 `http` / `tcp` / `process`；`process` 表示只判定 `systemctl is-active`
 - `env_files` 只记录路径引用，内容由 unit 的 `EnvironmentFile=` 加载，平台不读取、不入库、
   不在日志回显（沿用凭据脱敏的既有约束）
-- `artifact_pattern` 是 Maven 构建后在 `target/` 定位可执行 jar 的 glob（默认
-  `target/*.jar`，但需排除 `*-sources.jar` 与 `*-original.jar`；Spring Boot 项目推荐
-  `target/*-exec.jar` 或 `target/*.jar` 中最先命中的 repackaged 产物，见 6.1）
+- `artifact_pattern` 是 Maven 构建后在 `target/` 定位可执行 jar 的 glob，缺省 `target/*.jar`；
+  命中歧义时的裁决规则是确定性的（见 6.1），排除 `*-sources.jar` / `*-javadoc.jar` /
+  `*-original.jar`，不使用人工优先级表
 - 校验在 `config_routes` 写入时执行：必填项、路径为绝对路径、`port` 范围、`readiness.timeout` 为正数
 
 ### 3.3 远端目录约定：不可变发布 + 符号链接原子切换
@@ -225,6 +225,11 @@ systemd 单元首次接入是这套设计里**唯一会写目标机系统配置*
   增加 `runtime_config`，写入前做 JSON 结构与必填项校验。
 - `webapp/importer.py` / `webapp/exporter.py`：`runtime_config` 的 YAML 往返（导出时与
   `deploy_mode` 一样仅在非默认时输出，保持配置文件可读）。
+- **导入语义（必须保持）**：`importer` 按服务名匹配——存在则 `UPDATE`、不存在才 `INSERT`，
+  不删行、不重置 `enabled`、不清空未出现在 YAML 里的既有字段。`runtime_config` 是整列覆盖式
+  JSON，一旦某服务开始从 YAML 管理该字段，YAML 就是它的完整真相：因此导入前对将变为 `{}` 的
+  非空 `runtime_config` 给出警告并计入导入报告，避免一次不完整的导入静默抹掉 JVM 参数。
+  `service_host_state` 是运行时观测数据，**不参与导入**，也不作为发布决策的唯一依据（见 3.4）。
 - `static/js/config-service-form.js`：`deploy_mode` 增加"纯 Java 进程（systemd）"选项，选中后显示
   `runtime_config` 字段组、隐藏镜像/compose/站点字段；容器与静态分支保持不变。
 - `static/js/devices.js` / `deploy_schedules.js`：按 `deploy_mode` 控制文案与入口
@@ -245,6 +250,9 @@ systemd 单元首次接入是这套设计里**唯一会写目标机系统配置*
   且桩化的 `docker` 调用计数为 0。
 - 流水线测试：混合流水线（container + jar）在 `--auto-version` 下各自走对版本推导。
 - 前端：`node --check` 与既有无头 JS 用例通过；表单在三种 `deploy_mode` 下字段显隐正确。
+- 非回归保护：`container` / `static_archive` 的任务创建、灰度决策（`canary_decision_<task_id>.json`）、
+  失败回滚链路保持现有语义——灰度中途失败只回滚已变更主机、缺回滚版本时告警跳过而非静默成功；
+  这三条链路各留一组针对性回归用例，改动编排层（尤其 4.1 的 `target_modified` 改名）后必须逐条通过。
 - `scripts/quality_gate.py` 全绿。
 
 验收标准：
@@ -267,3 +275,26 @@ systemd 单元首次接入是这套设计里**唯一会写目标机系统配置*
    只需换构建产物来源与启动命令。
 3. 后期：WAR/Tomcat 容器实例托管、Windows 服务。
 4. 独立扩展：Kubernetes/Helm 作为另一种编排后端，与本机进程发布不是同一抽象，不塞进策略层。
+
+## 11. 实施里程碑（建议按此顺序拆实施计划）
+
+首期内外部依赖是链式的，拆成 5 个可独立验收的里程碑，每个里程碑结束都要跑一次
+`scripts/quality_gate.py` 且既有容器/静态用例零倒退：
+
+1. **M1 数据与契约**：`services.runtime_config` 迁移 + 校验、`service_host_state` 建表与读写、
+   `dist/` 产物与 `.sha256` 契约、importer/exporter 往返。纯本地，可完整离线测试。
+2. **M2 策略适配器**：`deploy_strategies/jar_service.py` 五阶段 + `@register` + 能力标志、
+   `config_routes` 校验改为注册表驱动。全部通过记录命令的假 `RemoteServer` 验证。
+3. **M3 编排去 Docker 化**：`build.py` 产物分支、`deploy_pipeline.py` 版本推导按策略分发、
+   4.1 的 `target_modified` 改名与兼容别名。这一步风险最高，因为动到共享代码，
+   以现有容器/静态回归用例为闸门。
+4. **M4 单元接入与发布闭环**：unit 生成 + admin 逐次确认 + 审计落库 + 失败处置状态机 +
+   灰度/滚动/回滚全链路。
+5. **M5 观测与界面**：`monitor.py` 进程指标、`log_collector.py` 的 journal 分支、前端表单与
+   每主机版本视图。
+
+## 12. 遗留决策（实施前需与使用方确认，不阻塞设计定稿）
+
+- **fat jar 判定方式**：设计选择了"命中歧义时取体积最大者"这一确定性规则（见 6.1），
+  而非维护 Spring Boot / 普通 jar 的人工优先级表。若你的项目普遍用 `classifier=exec`
+  产出可执行包，可改为按 `artifact_pattern` 严格匹配、命中多个即报错，二选一需要在 M1 定稿。
