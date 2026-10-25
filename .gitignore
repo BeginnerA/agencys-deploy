@@ -36,3 +36,6 @@ Thumbs.db
 
 # ---- 头脑风暴视觉伴侣会话 ----
 .superpowers/
+
+# ---- 本地 git worktree ----
+.worktrees/
