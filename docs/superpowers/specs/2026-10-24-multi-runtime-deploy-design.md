@@ -225,16 +225,18 @@ systemd 单元首次接入是这套设计里**唯一会写目标机系统配置*
   增加 `runtime_config`，写入前做 JSON 结构与必填项校验。
 - `webapp/importer.py` / `webapp/exporter.py`：`runtime_config` 的 YAML 往返（导出时与
   `deploy_mode` 一样仅在非默认时输出，保持配置文件可读）。
-- **导入语义（必须保持）**：`importer` 按服务名匹配——存在则 `UPDATE`、不存在才 `INSERT`，
-  不删行、不重置 `enabled`、不清空未出现在 YAML 里的既有字段。`runtime_config` 是整列覆盖式
-  JSON，一旦某服务开始从 YAML 管理该字段，YAML 就是它的完整真相：因此导入前对将变为 `{}` 的
-  非空 `runtime_config` 给出警告并计入导入报告，避免一次不完整的导入静默抹掉 JVM 参数。
+- **导入语义（必须保持）**：`services` 导入是 insert-only——服务名已存在时整条 `continue` 跳过，
+  不更新任何字段，因此也不会清空既有 `runtime_config`；新服务的 `runtime_config` 从 YAML 写入，
+  缺省 `{}`。若将来要支持"导入即更新"，属于独立决策，需显式开关（避免导入静默覆盖线上配置）。
   `service_host_state` 是运行时观测数据，**不参与导入**，也不作为发布决策的唯一依据（见 3.4）。
-- `static/js/config-service-form.js`：`deploy_mode` 增加"纯 Java 进程（systemd）"选项，选中后显示
-  `runtime_config` 字段组、隐藏镜像/compose/站点字段；容器与静态分支保持不变。
-- `static/js/devices.js` / `deploy_schedules.js`：按 `deploy_mode` 控制文案与入口
-  （重启/回滚/金丝雀可用性由策略能力标志驱动，不再由前端硬判）。
-- 服务列表与详情页增加运行时方式徽标；回滚页展示 `service_host_state` 的每主机版本视图。
+- `webapp/static/js/pages/config/config-service-form.js`：`deploy_mode` 增加"纯 Java 进程（systemd）"
+  选项，选中后显示 `runtime_config` 字段组，隐藏站点与 Docker 上下文字段；镜像短名（产物命名回退）
+  与 Git 仓库降为可选；容器与静态分支保持不变。
+- `webapp/static/js/pages/devices.js` / `webapp/static/js/pages/deploy_schedules.js`：按
+  `deploy_mode` 控制文案与入口。首期 jar 的重启/回滚/金丝雀能力与容器一致，
+  前端不新增能力查询接口；后续引入无重启能力的运行时（如仅构建产物）时再暴露能力标志。
+- 服务列表与详情页增加运行时方式徽标；`service_host_state` 本期只回写数据，
+  回滚页的每主机版本视图随 M5 观测面一起提供。
 
 ## 9. 测试与验收
 
@@ -269,8 +271,9 @@ systemd 单元首次接入是这套设计里**唯一会写目标机系统配置*
 
 ## 10. 分期
 
-1. 首期（本设计）：Java 可执行 JAR + systemd，含编排层去 Docker 化（构建分支、流水线版本推导、
-   监控与日志分支）。
+1. 首期（本设计）：Java 可执行 JAR + systemd，含编排层去 Docker 化（构建分支、流水线版本推导）。
+   监控中心的进程指标、`journalctl` 日志采集与每主机版本视图属于独立可验收的观测面，
+   放在 M5 单独实施（不阻塞发布链路；发布失败时的 journal 尾部取证已在发布链路内完成）。
 2. 次期：Go/Rust 单二进制、Node/Python 进程——它们与 Jar 共用 `process_service` 适配器形态，
    只需换构建产物来源与启动命令。
 3. 后期：WAR/Tomcat 容器实例托管、Windows 服务。
@@ -290,8 +293,8 @@ systemd 单元首次接入是这套设计里**唯一会写目标机系统配置*
    以现有容器/静态回归用例为闸门。
 4. **M4 单元接入与发布闭环**：unit 生成 + admin 逐次确认 + 审计落库 + 失败处置状态机 +
    灰度/滚动/回滚全链路。
-5. **M5 观测与界面**：`monitor.py` 进程指标、`log_collector.py` 的 journal 分支、前端表单与
-   每主机版本视图。
+5. **M5 观测面**：`monitor.py` 进程指标、`log_collector.py` 的 journal 分支、每主机版本视图
+   （配置表单随 M2/M4 的发布闭环一起交付，不拖到 M5）。
 
 ## 12. 遗留决策（实施前需与使用方确认，不阻塞设计定稿）
 
