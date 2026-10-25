@@ -104,3 +104,8 @@ def create_strategy(deploy_mode: str, deployer):
     if cls is None:
         raise ValueError(f"未知 deploy_mode: {deploy_mode!r}（可选: {sorted(_REGISTRY)}）")
     return cls(deployer)
+
+
+def registered_modes() -> list:
+    """已注册的发布方式（路由校验与前端选项读取同一来源，新增策略无需改两处）"""
+    return sorted(_REGISTRY)

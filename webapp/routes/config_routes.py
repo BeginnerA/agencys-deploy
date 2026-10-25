@@ -230,19 +230,27 @@ def create_service(pid):
         return _err("请求体必须为 JSON 对象")
     if not isinstance(body.get("name"), str) or not body.get("name").strip():
         return _err("name 必填")
+    from deploy_strategies.base import registered_modes
+    from deploy_strategies.jar_config import validate_runtime_config
+
     deploy_mode = body.get("deploy_mode") or "container"
-    if deploy_mode not in ("container", "static_archive"):
-        return _err("deploy_mode 仅支持 container / static_archive")
+    if deploy_mode not in registered_modes():
+        return _err(f"deploy_mode 仅支持 {' / '.join(registered_modes())}")
     is_static = deploy_mode == "static_archive"
-    # 镜像/ compose 字段仅容器发布必需；静态服务无镜像概念，留空时回退 name
-    if not is_static:
+    is_jar = deploy_mode == "jar_service"
+    # 镜像/ compose 字段仅容器发布必需；静态与进程发布无镜像概念，留空时回退 name
+    if not is_static and not is_jar:
         for k in ("image_name", "service_name"):
             if not isinstance(body.get(k), str) or not body.get(k).strip():
                 return _err(f"{k} 必填")
-    else:
+    elif is_static:
         site_root = (body.get("site_root") or "").strip()
         if not site_root.startswith("/"):
             return _err("静态发布必须配置 site_root（站点根绝对路径，如 /data/1panel/www/sites/example.com/index）")
+    else:
+        errs = validate_runtime_config(body.get("runtime_config"), deploy_mode)
+        if errs:
+            return _err("；".join(errs))
     name = body["name"].strip()
     if _check_unique("services", pid, name):
         return _err("项目内服务名已存在")
@@ -266,6 +274,7 @@ def create_service(pid):
                   build_order=lists["build_order"],
                   build_type=body.get("build_type", "maven"),
                   deploy_mode=deploy_mode,
+                  runtime_config=body.get("runtime_config") or {},
                   site_root=(body.get("site_root") or "").strip(),
                   backup_dir=(body.get("backup_dir") or "").strip(),
                   static_dist_dir=(body.get("static_dist_dir") or "").strip(),
@@ -308,11 +317,22 @@ def update_service(pid, sid):
     allowed = ("name", "image_name", "service_name", "docker_context",
                "dockerfile", "snailjob_group", "health_url",
                "clear_log_dir", "git_repo", "git_branch", "build_type",
-               "deploy_mode", "site_root", "backup_dir", "static_dist_dir",
-               "zip_prefix", "entry_file", "file_mode")
+               "deploy_mode", "runtime_config", "site_root", "backup_dir",
+               "static_dist_dir", "zip_prefix", "entry_file", "file_mode")
     fields = {k: v for k, v in body.items() if k in allowed}
-    if "deploy_mode" in fields and fields["deploy_mode"] not in ("container", "static_archive"):
-        return _err("deploy_mode 仅支持 container / static_archive")
+    mode = fields.get("deploy_mode") or rec.get("deploy_mode") or "container"
+    if "deploy_mode" in fields:
+        from deploy_strategies.base import registered_modes
+        if fields["deploy_mode"] not in registered_modes():
+            return _err(f"deploy_mode 仅支持 {' / '.join(registered_modes())}")
+    # 切到 jar_service 或修改运行时配置都要校验：用「即将生效的值」而不是只看本次提交，
+    # 否则从 container 切 jar 且不传 runtime_config 时会绕过 app_home 必填检查
+    if mode == "jar_service":
+        from deploy_strategies.jar_config import validate_runtime_config
+        errs = validate_runtime_config(
+            fields.get("runtime_config", rec.get("runtime_config")), mode)
+        if errs:
+            return _err("；".join(errs))
     if "name" in fields:
         fields["name"] = fields["name"].strip()
     for k in _LIST_FIELDS_SERVICE:
