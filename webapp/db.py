@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS services (
     git_branch TEXT DEFAULT '',
     git_pull_before_build INTEGER DEFAULT 0,
     git_tag_enabled INTEGER DEFAULT 1,
+    -- 运行时专属配置（jar_service 等新策略使用；静态发布的标量列保持原样不做迁移）
+    runtime_config TEXT DEFAULT '{}',
     enabled INTEGER DEFAULT 1,
     UNIQUE(project_id, name)
 );
@@ -272,6 +274,20 @@ CREATE TABLE IF NOT EXISTS deployment_snapshots (
     env_vars_hash TEXT DEFAULT '',
     deployed_at INTEGER NOT NULL
 );
+-- 每主机当前版本缓存：权威状态在目标机的 CURRENT 链接与 .deploy_version，
+-- 本表只用于页面展示与回滚目标选择，不作为发布决策的唯一依据
+CREATE TABLE IF NOT EXISTS service_host_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    env TEXT NOT NULL DEFAULT '',
+    service TEXT NOT NULL,
+    host TEXT NOT NULL,
+    current_version TEXT DEFAULT '',
+    previous_version TEXT DEFAULT '',
+    last_task_id INTEGER DEFAULT 0,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(project_id, env, service, host)
+);
 CREATE TABLE IF NOT EXISTS canary_configs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id INTEGER NOT NULL REFERENCES projects(id),
@@ -451,7 +467,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_session_meta_user
 
 # JSON 字段（读写时自动序列化/反序列化）
 JSON_FIELDS = {
-    "services": {"build_order", "nacos_groups", "dubbo_services", "log_error_keywords"},
+    "services": {"build_order", "nacos_groups", "dubbo_services",
+                 "log_error_keywords", "runtime_config"},
     "environments": {"registry", "nacos", "mysql_snailjob", "ssh", "build", "deploy"},
     "pipelines": {"stages"},
     "alert_rules": {"scope", "channels"},
@@ -478,6 +495,7 @@ TABLES = frozenset(("projects", "services", "environments", "servers",
                     "log_entries", "log_scan_state", "scheduler_locks",
                     "deploy_schedules", "release_windows",
                     "service_dependencies", "deployment_snapshots",
+                    "service_host_state",
                     "canary_configs",
                     "response_time_history", "monitor_snapshots",
                     "custom_monitors", "renewal_logs",
@@ -665,6 +683,11 @@ def _migrate(conn):
     run_cols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_runs)")}
     if "session_id" not in run_cols:
         conn.execute("ALTER TABLE agent_runs ADD COLUMN session_id TEXT DEFAULT ''")
+    # services 补 runtime_config 列：新发布方式（jar_service）的策略专属配置收敛为一个
+    # JSON 列，避免继续为每种方式加标量列；存量行补默认空对象，策略侧按缺省值兜底
+    srv_cols_now = {r["name"] for r in conn.execute("PRAGMA table_info(services)")}
+    if "runtime_config" not in srv_cols_now:
+        conn.execute("ALTER TABLE services ADD COLUMN runtime_config TEXT DEFAULT '{}'")
 
 
 def _serialize(table: str, fields: dict) -> dict:
@@ -1265,5 +1288,45 @@ def batch_update_monitors(db_path: str, ids: list, fields: dict) -> int:
             vals + tuple(ids))
         conn.commit()
         return cur.rowcount
+    finally:
+        conn.close()
+
+
+def upsert_host_state(db_path: str, project_id: int, env: str, service: str,
+                      host: str, current_version: str,
+                      previous_version: str, last_task_id: int = 0) -> None:
+    """回写单台主机的当前/上一版本（发布或回滚成功后调用，失败不抛给调用方）"""
+    conn = get_conn(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO service_host_state "
+            "(project_id, env, service, host, current_version, previous_version, "
+            " last_task_id, updated_at) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(project_id, env, service, host) DO UPDATE SET "
+            "current_version=excluded.current_version, "
+            "previous_version=excluded.previous_version, "
+            "last_task_id=excluded.last_task_id, updated_at=excluded.updated_at",
+            (project_id, env or "", service, host, current_version or "",
+             previous_version or "", int(last_task_id or 0), int(time.time())))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_host_state(db_path: str, project_id: int, env: str = None,
+                    service: str = None) -> list:
+    """按项目/环境/服务查询主机版本缓存（参数为空表示不过滤）"""
+    sql = "SELECT * FROM service_host_state WHERE project_id=?"
+    params = [project_id]
+    if env is not None:
+        sql += " AND env=?"
+        params.append(env)
+    if service is not None:
+        sql += " AND service=?"
+        params.append(service)
+    sql += " ORDER BY host"
+    conn = get_conn(db_path)
+    try:
+        return [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
     finally:
         conn.close()
