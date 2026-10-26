@@ -87,14 +87,16 @@
     wall.innerHTML = services.map(s => {
       const st = svcStatus[s.name] || {};
       const isStatic = (s.deploy_mode || 'container') === 'static_archive';
+      const isJar = s.deploy_mode === 'jar_service';
+      const modeBadge = isStatic ? '🗂️ 静态站点' : (isJar ? '☕ Java 进程' : '');
       const run = running.find(r =>
         (r.type === 'project' && r.name === s.name && r.env === state.currentEnv) ||
         (r.type === 'restart' && r.ref_id === s.id && r.env === state.currentEnv));
-      // 静态站点无镜像/容器版本可采，在线版本取最近一次成功发布任务的版本
+      // 静态站点/纯 Java 进程无镜像/容器版本可采，在线版本取最近一次成功发布任务的版本
       // （平台是线上 .deploy_version 的唯一写入方，tasksCache 按 id DESC 故 find 即最新）
-      const lastOk = isStatic ? tasksCache.find(t =>
+      const lastOk = (isStatic || isJar) ? tasksCache.find(t =>
         t.name === s.name && t.env === state.currentEnv && t.status === 'success' && t.version) : null;
-      const ver = isStatic ? ((lastOk && lastOk.version) || '—') : (st.version || '—');
+      const ver = (isStatic || isJar) ? ((lastOk && lastOk.version) || '—') : (st.version || '—');
       const inst = st.instances !== undefined && st.instances !== -1 ? st.instances : '—';
       const ts = st.ts ? fmtTime(st.ts) : '';
       const dotCls = dotClass(st, run, isStatic);
@@ -109,10 +111,14 @@
       return `<div class="svc-card ${run ? 'publishing' : ''}" data-id="${s.id}">
         <div class="svc-head"><span class="dot ${dotCls}"></span><b class="ellipsis">${esc(s.name)}</b>
           ${s.enabled ? '' : '<span class="weak" style="font-size:11px">(停用)</span>'}
-          ${isStatic ? `<span class="weak" style="margin-left:${upTxt ? '8' : 'auto'};font-size:11px">🗂️ 静态站点</span>` : ''}
+          ${modeBadge ? `<span class="weak" style="margin-left:${upTxt ? '8' : 'auto'};font-size:11px">${modeBadge}</span>` : ''}
           ${upTxt ? '<span class="weak" style="margin-left:auto;font-size:11px">⏱'+upTxt+'</span>' : ''}</div>
         <div class="svc-meta">
-          ${isStatic ? `
+          ${isJar ? `
+          <div><span class="weak">版本</span> <span class="num">${esc(ver)}</span>
+               <span class="weak" style="margin-left:10px">状态</span> <span class="weak" style="font-size:11px">${run ? '发布中' : '未知'}</span></div>
+          <div><span class="weak">应用根</span> <span class="num ellipsis" style="display:inline-block;max-width:78%;vertical-align:bottom" title="${esc((s.runtime_config || {}).app_home || '')}">${esc((s.runtime_config || {}).app_home || '未配置')}</span></div>
+          <div><span class="weak">端口</span> <span class="num">${(s.runtime_config || {}).port || s.health_port || '-'}</span></div>` : isStatic ? `
           <div><span class="weak">版本</span> <span class="num">${esc(ver)}</span>
                <span class="weak" style="margin-left:10px">状态</span> ${svcLabel(st, run, isStatic)}</div>
           <div><span class="weak">站点根</span> <span class="num ellipsis" style="display:inline-block;max-width:78%;vertical-align:bottom" title="${esc(s.site_root || '')}">${esc(s.site_root || '未配置')}</span></div>
@@ -131,7 +137,7 @@
           ${canDeploy() ? `<button class="btn sm primary" data-pub="${s.id}">发布</button>
           <button class="btn sm ghost" data-roll="${s.id}">回滚</button>
           ${isStatic ? '' : `<button class="btn sm ghost" data-restart="${s.id}">⭯ 重启</button>`}` : '<span class="weak" style="font-size:11px">只读账号</span>'}
-          <button class="svc-log-btn" data-svc="${esc(s.name)}" data-static="${isStatic ? 1 : 0}" title="${isStatic ? '查看发布日志' : '查看实时日志'}">📋 日志</button>
+          ${isJar ? '' : `<button class="svc-log-btn" data-svc="${esc(s.name)}" data-static="${isStatic ? 1 : 0}" title="${isStatic ? '查看发布日志' : '查看实时日志'}">📋 日志</button>`}
         </div>
       </div>`;
     }).join('') || emptyState('📭', '该项目暂无服务');
