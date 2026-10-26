@@ -955,17 +955,17 @@ class Deployer:
         except Exception as e:
             log(f"[{host}] 发布异常: {e}")
             if self.target_modified and self.previous_version:
-                # 目标状态已被修改（如旧容器已停止/删除），且有回滚版本，回滚到旧版本
+                # 目标状态已被修改（如旧容器已停止/删除、旧单元已停止），且有回滚版本，回滚到旧版本
                 try:
                     self.strategy.rollback(server)
                 except Exception as re:
-                    log(f"[{host}] 容器回滚也失败: {re}")
+                    log(f"[{host}] 回滚也失败: {re}")
             elif self.target_modified and not self.previous_version:
                 # 首次发版：无回滚版本，目标已替换为新版本但启动失败，只能保留现状等待人工处理
-                log(f"[{host}] 首次发版无回滚版本（--previous-version 未指定），容器保持新版本，请人工排查")
+                log(f"[{host}] 首次发版无回滚版本（--previous-version 未指定），目标保持新版本，请人工排查")
             else:
-                # 目标状态未被修改（如镜像传输失败），旧容器仍在运行，无需回滚容器
-                log(f"[{host}] 容器未被修改（旧容器仍在运行），跳过容器回滚")
+                # 目标状态未被修改（如镜像传输失败、产物未切换），旧版本仍在运行，无需回滚
+                log(f"[{host}] 目标未被修改（旧版本仍在运行），跳过回滚")
             # 无论目标是否回滚，都必须恢复 Nacos 上线（无 Nacos 能力的发布方式自动跳过）
             try:
                 if self.strategy.supports_nacos:
@@ -975,9 +975,9 @@ class Deployer:
             if self.target_modified and self.previous_version:
                 status = "已回滚"
             elif self.target_modified:
-                status = "无回滚版本，容器保持新版本"
+                status = "无回滚版本，目标保持新版本"
             else:
-                status = "旧容器仍在运行"
+                status = "旧版本仍在运行"
             log(f"========== {host} 发布失败（{status}）==========\n")
             return False
         finally:
@@ -990,14 +990,14 @@ class Deployer:
             try:
                 current = self.strategy.query_current_version()
             except Exception as e:
-                log(f"自动查询回滚版本失败（{e}），本次发布失败时将跳过容器回滚")
+                log(f"自动查询回滚版本失败（{e}），本次发布失败时将跳过回滚")
                 current = None
             if current:
                 self.previous_version = current
                 self.prev_image = self._make_image(current)
                 log(f"自动回滚兜底：未指定回滚版本，当前线上版本 {current} 将作为失败回滚目标")
             else:
-                log("未指定回滚版本且未发现运行中容器（首次发版），发布失败时将跳过容器回滚")
+                log("未指定回滚版本且未发现运行中的容器/已发布版本（首次发版），发布失败时将跳过回滚")
         # prev_image 仅供容器策略回滚使用；无 previous_version 保持空跳过回滚
         send_notify(self.config, "start", project=self.project, version=self.version,
                     previous_version=self.previous_version, env=self.env)
@@ -1159,7 +1159,7 @@ class Deployer:
     def rollback_all(self, servers: list, skip_snailjob: bool = False):
         """全量回滚：将所有服务器从当前版本回滚到 previous_version
 
-        流程与 run() 类似，但跳过构建，各服务器并行执行：Nacos 下线 → 回滚容器 → 健康检查 → Nacos 上线。
+        流程与 run() 类似，但跳过构建，各服务器并行执行：Nacos 下线 → 回滚目标 → 健康检查 → Nacos 上线。
         某台失败不阻断后续服务器（尽量多回滚），最终汇总结果。
         """
         if not self.previous_version:
@@ -1182,10 +1182,10 @@ class Deployer:
         else:
             log(">>> 步骤 1/3: 无需暂停 SnailJob")
 
-        log(">>> 步骤 2/3: 并行回滚所有服务器（各服务器独立 SSH 连接，传输+容器回滚并行）")
+        log(">>> 步骤 2/3: 并行回滚所有服务器（各服务器独立 SSH 连接，传输+回滚并行）")
 
         def _rollback_one(srv: dict) -> tuple:
-            """单台回滚：Nacos 下线 → 回滚容器 → 健康检查 → Nacos 上线，返回 (host, ok)"""
+            """单台回滚：Nacos 下线 → 回滚目标 → 健康检查 → Nacos 上线，返回 (host, ok)"""
             host = srv["ip"]
             log(f"\n========== 开始回滚 {host} ==========")
             ssh_cfg = merge_server_ssh(self.ssh_cfg, srv)
@@ -1213,7 +1213,7 @@ class Deployer:
                 try:
                     self.strategy.verify(server, srv)
                 except Exception as ve:
-                    # 容器已切回旧版本但健康检查未通过：回滚不算成功，必须如实上报
+                    # 目标已切回旧版本但健康检查未通过：回滚不算成功，必须如实上报
                     log(f"[{host}] 回滚后健康检查失败: {ve}")
                     if snapshotted:
                         try:
@@ -1222,14 +1222,14 @@ class Deployer:
                             pass
                     log(f"========== {host} 回滚失败（健康检查未通过） ==========")
                     return host, False
-                # 容器回滚成功 + 健康检查通过
+                # 回滚成功 + 健康检查通过
                 if snapshotted:
                     # 回滚前服务在 Nacos 有注册，需要恢复上线并等待健康
                     try:
                         self.nacos_online(nacos_ip, weight=1.0)
                     except Exception as ne:
-                        # 容器已回滚成功，仅 Nacos 上线失败，记为警告而非失败
-                        log(f"[{host}] 警告: 容器回滚成功，但 Nacos 上线异常: {ne}")
+                        # 目标已回滚成功，仅 Nacos 上线失败，记为警告而非失败
+                        log(f"[{host}] 警告: 回滚成功，但 Nacos 上线异常: {ne}")
                 elif self.strategy.supports_nacos:
                     # 回滚前服务就未在 Nacos 注册，尝试上线但不等待健康
                     try:
@@ -1242,17 +1242,17 @@ class Deployer:
             except Exception as e:
                 log(f"[{host}] 回滚异常: {e}")
                 if container_rolled_back:
-                    # 容器已成功回滚到目标版本，仅 Nacos 等后续步骤失败
-                    log(f"[{host}] 警告: 容器已回滚到 {self.previous_version}，但后续步骤异常: {e}")
+                    # 目标已成功回滚到旧版本，仅 Nacos 等后续步骤失败
+                    log(f"[{host}] 警告: 已回滚到 {self.previous_version}，但后续步骤异常: {e}")
                     if snapshotted:
                         try:
                             self.nacos_online(nacos_ip, weight=1.0)
                         except Exception:
                             pass
                     self._record_host_state(host, self.previous_version, self.version)
-                    log(f"========== {host} 回滚成功（容器已回滚，Nacos 待恢复） ==========")
+                    log(f"========== {host} 回滚成功（目标已回滚，Nacos 待恢复） ==========")
                     return host, True
-                # 容器未成功回滚
+                # 目标未成功回滚
                 if snapshotted:
                     try:
                         self.nacos_online(nacos_ip, weight=1.0)

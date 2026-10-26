@@ -327,7 +327,8 @@ _RESTART_HEALTH_INTERVAL = 5.0
 
 def _run_restart(db_path: str, task: dict, log_file: str,
                  handle: "_RestartHandle") -> str:
-    """执行服务重启：并发对每台服务器 docker restart + 健康检查。
+    """执行服务重启：按发布方式并发重启每台服务器（容器走 docker restart，
+    jar_service 走 systemctl restart）并做健康检查。
 
     返回 "success" / "failed"。日志逐行写入 log_file（每台一行 + 汇总行）。
     复用 monitor 的 SSH 连接池（同进程），凭据合并语义与监控探测一致。
@@ -445,7 +446,10 @@ def _run_restart(db_path: str, task: dict, log_file: str,
                     f"{skip_count} 台跳过 → 任务失败\n")
             return "failed"
         if ok_count == 0:
-            f.write(f"[platform] 汇总：全部 {skip_count} 台未找到容器 → 任务失败\n")
+            if deploy_mode == "jar_service":
+                f.write(f"[platform] 汇总：全部 {len(servers)} 台单元重启失败 → 任务失败\n")
+            else:
+                f.write(f"[platform] 汇总：全部 {skip_count} 台未找到容器 → 任务失败\n")
             return "failed"
         f.write(f"[platform] 汇总：{ok_count} 台成功，{skip_count} 台跳过 → 任务成功\n")
         return "success"
