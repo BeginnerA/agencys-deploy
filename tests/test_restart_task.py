@@ -1,6 +1,7 @@
 # tests/test_restart_task.py
 """服务重启任务测试：路由创建 + task_manager 基建 + 执行器 + 分发"""
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -423,3 +424,51 @@ class TestDeploySnapshot(unittest.TestCase):
         from webapp.task_manager import _save_deploy_snapshot
         _save_deploy_snapshot(self.db, task_id, log)
         self.assertEqual(self._snapshots(), [])
+
+
+class JarRestartTest(unittest.TestCase):
+    """重启任务按 deploy_mode 分流：进程服务走 systemctl，不触 docker"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "test.db")
+        dbm.init_db(self.db)
+        self.proj_id = dbm.create_record(self.db, "projects", dict(
+            name="p1", code="p1", description="", git_org="", created_at=1))
+        self.svc_id = dbm.create_record(self.db, "services", dict(
+            project_id=self.proj_id, name="auth", image_name="auth",
+            service_name="", deploy_mode="jar_service",
+            runtime_config={"app_home": "/opt/auth", "unit_name": "hqb-auth",
+                            "readiness": {"type": "process"}},
+            health_port=0, health_url="", enabled=1))
+        self.env_id = _make_env(self.db, self.proj_id)
+        sid = dbm.create_record(self.db, "servers", dict(
+            host="10.0.0.1", ssh_port=22, ssh_user="", ssh_password="",
+            nacos_ip="", remark="", enabled=1))
+        dbm.create_record(self.db, "env_servers", dict(
+            env_id=self.env_id, server_id=sid, order_no=0))
+        self.log_file = os.path.join(self.tmp, "task_1.log")
+        from webapp.task_manager import _RestartHandle
+        self.handle = _RestartHandle()
+        self.task = dict(id=1, project_id=self.proj_id, ref_id=self.svc_id,
+                         env="prod", type="restart")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_job_uses_systemctl(self):
+        from webapp.task_manager import _run_restart
+        calls = []
+
+        def fake_multi(host, port, ssh_cfg, cmds, timeout=10):
+            calls.append((host, list(cmds)))
+            return ["active\n"] * len(cmds)
+
+        with mock.patch("webapp.monitor._ssh_exec_multi", fake_multi):
+            status = _run_restart(self.db, self.task, self.log_file, self.handle)
+        self.assertEqual(status, "success")
+        joined = "\n".join(c for _, cmds in calls for c in cmds)
+        self.assertIn("systemctl restart hqb-auth", joined)
+        self.assertNotIn("docker restart", joined)
+        with open(self.log_file, encoding="utf-8") as f:
+            self.assertIn("单元 hqb-auth", f.read())

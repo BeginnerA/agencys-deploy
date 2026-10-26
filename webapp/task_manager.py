@@ -344,8 +344,19 @@ def _run_restart(db_path: str, task: dict, log_file: str,
         if not rec:
             f.write("[platform] 服务记录不存在，重启中止\n")
             return "failed"
-        svc_name = rec.get("service_name") or ""
-        if not svc_name:
+        deploy_mode = rec.get("deploy_mode") or "container"
+        if deploy_mode == "jar_service":
+            from deploy_strategies.jar_config import parse_runtime_config
+            cfg = parse_runtime_config(rec.get("runtime_config"))
+            if not cfg["app_home"]:
+                f.write("[platform] jar_service 未配置 runtime_config.app_home，重启中止\n")
+                return "failed"
+            unit = cfg["unit_name"] or rec.get("image_name") or rec["name"]
+            svc_name = ""
+        else:
+            unit = ""
+            svc_name = rec.get("service_name") or ""
+        if deploy_mode != "jar_service" and not svc_name:
             f.write(f"[platform] 服务「{rec['name']}」未配置容器名（service_name），重启中止\n")
             return "failed"
         if not env_obj:
@@ -355,7 +366,9 @@ def _run_restart(db_path: str, task: dict, log_file: str,
         if not servers:
             f.write("[platform] 环境未绑定服务器，重启中止\n")
             return "failed"
-        f.write(f"[platform] 重启服务「{rec['name']}」（容器名 {svc_name}），"
+        target_desc = (f"单元 {unit}" if deploy_mode == "jar_service"
+                       else f"容器名 {svc_name}")
+        f.write(f"[platform] 重启服务「{rec['name']}」（{target_desc}），"
                 f"环境「{task['env']}」，共 {len(servers)} 台服务器\n")
         f.flush()
         env_ssh = env_obj.get("ssh") or {}
@@ -375,16 +388,24 @@ def _run_restart(db_path: str, task: dict, log_file: str,
                 # （无论运行/停止）即命中 → docker restart 将其拉起，日志「重启成功」
                 # 与行为一致；docker restart 成功时 stdout 为容器名，失败时
                 # stderr 返回错误文本（_ssh_exec_multi 返回 out or err）
-                outs = monitor_mod._ssh_exec_multi(host, port, ssh_cfg, [
-                    "docker ps -a --format '{{.Names}}' | grep -Fx " + shlex.quote(svc_name),
-                    "docker restart " + shlex.quote(svc_name),
-                ], timeout=60)
+                if deploy_mode == "jar_service":
+                    out = monitor_mod._ssh_exec_multi(host, port, ssh_cfg, [
+                        f"systemctl restart {shlex.quote(unit)} 2>&1; "
+                        f"systemctl is-active {shlex.quote(unit)}",
+                    ], timeout=60)[0].strip().splitlines()
+                    if not out or out[-1].strip() != "active":
+                        return host, "failed", f"systemctl 重启失败: {' | '.join(out[-2:])}"
+                else:
+                    outs = monitor_mod._ssh_exec_multi(host, port, ssh_cfg, [
+                        "docker ps -a --format '{{.Names}}' | grep -Fx " + shlex.quote(svc_name),
+                        "docker restart " + shlex.quote(svc_name),
+                    ], timeout=60)
+                    if not outs[0].strip():
+                        return host, "skipped", "容器不存在，跳过"
+                    if outs[1].strip() != svc_name:
+                        return host, "failed", f"docker restart 失败: {outs[1].strip() or '无输出'}"
             except Exception as exc:
                 return host, "failed", f"SSH/执行失败: {exc}"
-            if not outs[0].strip():
-                return host, "skipped", "容器不存在，跳过"
-            if outs[1].strip() != svc_name:
-                return host, "failed", f"docker restart 失败: {outs[1].strip() or '无输出'}"
             if handle.cancel.is_set():
                 return host, "cancelled", "任务已终止，跳过"
             if health_port <= 0:
