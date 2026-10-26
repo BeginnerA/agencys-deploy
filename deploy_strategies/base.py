@@ -6,9 +6,11 @@
 @register，不改 Deployer 核心（与 Nacos「未配置返回空列表让遍历零次」同构的
 能力标志跳过哲学）。
 
-一致性约定（全策略统一）：switch/rollback 执行前先把 deployer.container_modified
+一致性约定（全策略统一）：switch/rollback 执行前先把 deployer.target_modified
 置 True——语义是"目标状态已被修改，失败时编排层必须尝试回滚"；未置位的阶段
 （check/transfer 失败）编排层保持旧版本原状仅恢复 Nacos 上线。
+字段原名 container_modified（容器专属语义），现统一为 target_modified，
+container_modified 保留为 Deployer 上的读写兼容别名，既有策略无需同步改名。
 """
 import sys
 from pathlib import Path
@@ -78,7 +80,7 @@ class DeployStrategy:
         return self.d.prefetch_images(servers)
 
     def switch(self, server):
-        """原子切换到 self.d.version；开始造成变更前置位 container_modified"""
+        """原子切换到 self.d.version；开始造成变更前置位 target_modified"""
         raise NotImplementedError
 
     def verify(self, server, server_entry: dict = None):
@@ -88,6 +90,14 @@ class DeployStrategy:
     def rollback(self, server):
         """切回 self.d.previous_version；无回滚版本时告警跳过（与既有语义一致）"""
         raise NotImplementedError
+
+    def rollback_source_missing(self, server) -> bool:
+        """回滚源预检：True = 该主机没有目标版本产物，显式回滚应直接判失败
+
+        默认 False（容器/静态由各自 rollback 内部处理缺源）；进程模式产物是本机目录，
+        缺目录时「跳过回滚但任务成功」会误导操作者，因此在编排层提前拦截。
+        """
+        return False
 
 
 def register(cls):

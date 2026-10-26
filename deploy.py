@@ -487,6 +487,28 @@ class Deployer:
     # 直传模式传输优化默认值（类级：__init__ 按 deploy 配置覆盖；测试可绕过 __init__ 构造）
     upload_streams = 4        # 镜像包并行上传通道数（1 = 传统单流上传）
     image_compress_level = 6  # docker save 导出 gzip 压缩级别（1-9）
+
+    @property
+    def target_modified(self):
+        """目标状态是否已被修改：失败时编排层据此决定是否回滚
+
+        原字段名 container_modified 在 Jar/静态场景语义误导，统一为 target_modified；
+        container_modified 保留为读写别名，既有策略与测试无需同步改名。
+        """
+        return getattr(self, "_target_modified", False)
+
+    @target_modified.setter
+    def target_modified(self, value):
+        self._target_modified = bool(value)
+
+    @property
+    def container_modified(self):
+        return self.target_modified
+
+    @container_modified.setter
+    def container_modified(self, value):
+        self.target_modified = value
+
     def __init__(self, project: str, version: str, previous_version: str = None, config: dict = None, env: str = None, canary: bool = False):
         self.project = project
         self.version = version
@@ -663,7 +685,7 @@ class Deployer:
         else:
             server.exec(f"docker pull {self.full_image}", timeout=120)
         # 镜像就绪后容器已可替换，标记为已修改
-        self.container_modified = True
+        self.target_modified = True
         # 停止并删除旧容器
         server.exec(f"docker compose -f {self.compose_path} stop {self.service_name}", timeout=60)
         server.exec(f"docker compose -f {self.compose_path} rm -f {self.service_name}", timeout=30)
@@ -878,6 +900,31 @@ class Deployer:
             return server_entry["nacos_ip"]
         return server_entry["ip"] if server_entry else ""
 
+    def _record_host_state(self, host: str, current: str, previous: str = ""):
+        """把每主机当前版本写入缓存表；失败只告警，绝不影响发布终态
+
+        注意 self.project 是「服务名」（projects.yaml 的 key 即服务名），不是项目 code。
+        项目 ID 优先取 CLI 的 --project-id；流水线在进程内直接 new Deployer，不会走
+        deploy.py main()，此时用平台注入的 PLATFORM_TASK_ID 回查任务记录拿 project_id。
+        两者都没有（手工 yaml 模式）时静默跳过。
+        """
+        try:
+            # 解析也放在 try 内：PLATFORM_TASK_ID 被外部污染（非数字）时同样只告警
+            task_id = int(os.environ.get("PLATFORM_TASK_ID") or 0)
+            project_id = int(getattr(self, "project_id", 0) or 0)
+            from webapp import db as dbm
+            db_path = str(platform_db_path())
+            if not project_id and task_id:
+                task = dbm.get_record(db_path, "tasks", task_id)
+                project_id = int((task or {}).get("project_id") or 0)
+            if not project_id:
+                return
+            dbm.upsert_host_state(
+                db_path, project_id, self.env or "",
+                self.project, host, current, previous or "", task_id)
+        except Exception as e:
+            log(f"[{host}] 主机版本状态回写失败（不影响发布）: {e}")
+
     def deploy_server(self, host: str, server_entry: dict = None, is_canary: bool = False) -> bool:
         log(f"\n========== 开始发布 {host} ==========")
         ssh_cfg = merge_server_ssh(self.ssh_cfg, server_entry) if server_entry else self.ssh_cfg
@@ -885,7 +932,8 @@ class Deployer:
         nacos_ip = self._nacos_ip(server_entry)
         if self.nacos_groups() and nacos_ip != host:
             log(f"Nacos 使用内网 IP: {nacos_ip}（SSH 外网 IP: {host}）")
-        self.container_modified = False  # 跟踪目标状态是否已被修改（容器：docker pull 成功后置 True）
+        # 跟踪目标状态是否已被修改（各策略在造成变更前自行置 True）
+        self.target_modified = False
         try:
             self.strategy.check(server)
             self.strategy.prepare(server)
@@ -901,31 +949,32 @@ class Deployer:
             if is_canary and wait_sec > 0:
                 log(f"首台灰度观察 {wait_sec} 秒，请观察业务指标...")
                 time.sleep(wait_sec)
+            self._record_host_state(host, self.version, self.previous_version)
             log(f"========== {host} 发布成功 ==========\n")
             return True
         except Exception as e:
             log(f"[{host}] 发布异常: {e}")
-            if self.container_modified and self.previous_version:
-                # 容器已被修改（旧容器已停止/删除），且有回滚版本，回滚到旧版本
+            if self.target_modified and self.previous_version:
+                # 目标状态已被修改（如旧容器已停止/删除），且有回滚版本，回滚到旧版本
                 try:
                     self.strategy.rollback(server)
                 except Exception as re:
                     log(f"[{host}] 容器回滚也失败: {re}")
-            elif self.container_modified and not self.previous_version:
-                # 首次发版：无回滚版本，容器已替换为新版本但启动失败，只能保留现状等待人工处理
+            elif self.target_modified and not self.previous_version:
+                # 首次发版：无回滚版本，目标已替换为新版本但启动失败，只能保留现状等待人工处理
                 log(f"[{host}] 首次发版无回滚版本（--previous-version 未指定），容器保持新版本，请人工排查")
             else:
-                # 容器未被修改（如镜像传输失败），旧容器仍在运行，无需回滚容器
+                # 目标状态未被修改（如镜像传输失败），旧容器仍在运行，无需回滚容器
                 log(f"[{host}] 容器未被修改（旧容器仍在运行），跳过容器回滚")
-            # 无论容器是否回滚，都必须恢复 Nacos 上线（无 Nacos 能力的发布方式自动跳过）
+            # 无论目标是否回滚，都必须恢复 Nacos 上线（无 Nacos 能力的发布方式自动跳过）
             try:
                 if self.strategy.supports_nacos:
                     self.nacos_online(nacos_ip, weight=1.0)
             except Exception as ne:
                 log(f"[{host}] Nacos 恢复上线失败: {ne}")
-            if self.container_modified and self.previous_version:
+            if self.target_modified and self.previous_version:
                 status = "已回滚"
-            elif self.container_modified:
+            elif self.target_modified:
                 status = "无回滚版本，容器保持新版本"
             else:
                 status = "旧容器仍在运行"
@@ -1145,6 +1194,12 @@ class Deployer:
             snapshotted = False
             container_rolled_back = False
             try:
+                # 显式回滚前置检查：进程模式无 releases/{version} 时 rollback 会「跳过」，
+                # 直接返回成功会误导操作者，这里在 Nacos 下线前即判该主机回滚失败
+                if self.strategy.rollback_source_missing(server):
+                    log(f"[{host}] 回滚源缺失（releases/{self.previous_version} 不存在），"
+                        f"该主机回滚失败；请先重传该版本产物或显式跳过此主机")
+                    return host, False
                 if self.strategy.supports_nacos:
                     self.nacos_offline(nacos_ip)
                     # 记录回滚前 Nacos 是否确实有该服务的实例（用于后续判断是否需要等待 Nacos 上线）
@@ -1181,6 +1236,7 @@ class Deployer:
                         self.nacos_online(nacos_ip, weight=1.0)
                     except Exception:
                         pass
+                self._record_host_state(host, self.previous_version, self.version)
                 log(f"========== {host} 回滚成功 ==========")
                 return host, True
             except Exception as e:
@@ -1193,6 +1249,7 @@ class Deployer:
                             self.nacos_online(nacos_ip, weight=1.0)
                         except Exception:
                             pass
+                    self._record_host_state(host, self.previous_version, self.version)
                     log(f"========== {host} 回滚成功（容器已回滚，Nacos 待恢复） ==========")
                     return host, True
                 # 容器未成功回滚
@@ -1346,6 +1403,8 @@ def main():
         f"命名空间: {nacos_conf.get('namespace') or 'public'}")
 
     deployer = Deployer(args.project, args.version, args.previous_version, config, env=args.env, canary=args.canary)
+    # 主机版本状态回写所需项目 ID：db 模式在导出运行时配置时已确定，yaml 模式为 None
+    deployer.project_id = args.project_id or 0
     deployer._no_git_tag = args.no_git_tag
     deployer._skip_git_push = args.skip_git_push
     if args.rollback:

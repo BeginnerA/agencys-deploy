@@ -204,7 +204,7 @@ class StaticArchiveStrategy(DeployStrategy):
     def switch(self, server):
         """原子换入新版本：解压校验 → 新包落 backup → 两次同盘 rename 切换 → 权限归一 + 版本标记"""
         # 语义约定：自此之后站点状态已被修改，失败时编排层必须尝试回滚
-        self.d.container_modified = True
+        self.d.target_modified = True
         ver = self.d.version
         remote_zip = f"{self.tmp_dir}/{self.zip_name(ver)}"
         entry = self._extract_and_locate(server, remote_zip)

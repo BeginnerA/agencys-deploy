@@ -206,7 +206,7 @@ class JarServiceStrategy(DeployStrategy):
         换链接开始即视为目标状态已变更（编排层据此在后续失败时回滚）；
         链接用「临时名 + mv -Tf」替换，避免 ln -sfn 在目录已存在时的嵌套行为。
         """
-        self.d.container_modified = True  # Task 8 统一改名为 target_modified
+        self.d.target_modified = True
         ver = self.d.version
         target = f"{self.jars_dir}/{ver}"
         tmp = f"{self.app_home}/.CURRENT.tmp"
@@ -273,3 +273,42 @@ class JarServiceStrategy(DeployStrategy):
                 log(f"[{server.host}] {self.unit}.service 最近日志:\n{out.rstrip()}")
         except Exception as e:
             log(f"[{server.host}] 读取 journal 失败: {e}")
+
+    # ---------- 阶段 5：回滚 ----------
+
+    def rollback(self, server):
+        """链接指回 previous_version 并重启；本机没有该版本目录时告警跳过
+
+        产物按版本不可变保存，回滚只需换链接 + 重启，无需重传；目标版本目录缺失
+        说明该主机从未发过该版本（或产物被清理），此处保持现状由编排层/人工介入。
+        """
+        ver = self.d.previous_version
+        if not ver:
+            log(f"[{server.host}] 未指定回滚版本（--previous-version），跳过回滚，服务保持现状")
+            return
+        target = f"{self.jars_dir}/{ver}"
+        if not server.try_exec(f"test -d {shlex.quote(target)}", timeout=15):
+            log(f"[{server.host}] 无回滚源（{target} 不存在），跳过回滚")
+            return
+        tmp = f"{self.app_home}/.CURRENT.tmp"
+        self.d.target_modified = True
+        server.exec(f"systemctl stop {shlex.quote(self.unit)}.service || true",
+                    timeout=self.cfg["stop_timeout"] + 30)
+        server.exec(
+            f"ln -sfn {shlex.quote(target)} {shlex.quote(tmp)} && "
+            f"mv -Tf {shlex.quote(tmp)} {shlex.quote(self.curr_link)}",
+            timeout=60)
+        server.exec(f"systemctl restart {shlex.quote(self.unit)}.service",
+                    timeout=self.cfg["start_timeout"] + 30)
+        server.exec(
+            f"echo {shlex.quote(ver)} > {shlex.quote(self.app_home + '/.deploy_version')}",
+            timeout=15)
+        log(f"[{server.host}] 已回滚 CURRENT -> releases/{ver}")
+
+    def rollback_source_missing(self, server) -> bool:
+        """显式回滚前置检查：本机缺少 previous_version 产物目录即判定该主机回滚失败"""
+        ver = self.d.previous_version
+        if not ver:
+            return False  # 无目标版本属于「跳过回滚」，由 rollback 自己说明
+        return not server.try_exec(
+            f"test -d {shlex.quote(self.jars_dir + '/' + ver)}", timeout=15)

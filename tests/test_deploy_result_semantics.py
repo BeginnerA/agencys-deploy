@@ -97,5 +97,51 @@ class TestRollbackHealthSemantics(unittest.TestCase):
             "success", [c.args[1] for c in notify.call_args_list if len(c.args) > 1])
 
 
+class TargetModifiedAliasTest(unittest.TestCase):
+    def test_alias_is_bidirectional(self):
+        from deploy import Deployer
+        d = Deployer.__new__(Deployer)
+        d.target_modified = True
+        self.assertTrue(d.container_modified)
+        d.container_modified = False
+        self.assertFalse(d.target_modified)
+
+    def test_default_false_for_bare_instance(self):
+        from deploy import Deployer
+        d = Deployer.__new__(Deployer)
+        self.assertFalse(d.container_modified)
+
+
+class RollbackSourceMissingTest(unittest.TestCase):
+    """显式回滚：目标产物缺失必须在 Nacos 下线前判失败（且仍关闭连接）"""
+
+    def setUp(self):
+        self.deployer = Deployer.__new__(Deployer)
+        self.deployer.project = "app"
+        self.deployer.version = "2.0.0"
+        self.deployer.previous_version = "1.0.0"
+        self.deployer.env = "prod"
+        self.deployer.config = {}
+        self.deployer.proj_cfg = {}
+        self.deployer.ssh_cfg = {}
+        self.deployer.service_name = "app"
+
+    def test_missing_source_fails_before_nacos_offline(self):
+        strategy = mock.Mock()
+        strategy.supports_nacos = True
+        strategy.rollback_source_missing.return_value = True
+        self.deployer._strategy = strategy
+        server = mock.Mock()
+        with mock.patch("deploy.log"), \
+                mock.patch("deploy.send_notify"), \
+                mock.patch.object(self.deployer, "nacos_offline") as offline, \
+                mock.patch("deploy.RemoteServer", return_value=server):
+            ok = self.deployer.rollback_all([{"ip": "10.0.0.1"}])
+        self.assertFalse(ok, "回滚源缺失属于回滚失败，不能上报成功")
+        offline.assert_not_called()
+        strategy.rollback.assert_not_called()
+        server.close.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

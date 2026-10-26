@@ -392,5 +392,101 @@ class TestVerifyPhase(unittest.TestCase):
         ch.assert_called_once_with("10.0.0.1", 9000)
 
 
+class TestRollback(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.d = make_jar_deployer(self.tmp, previous_version="1.0.30")
+        self.s = self.d.strategy
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_relinks_previous_version_and_restarts(self):
+        server = FakeRemote(try_exec_ok={"test -d": True})
+        self.s.rollback(server)
+        joined = "\n".join(server.exec_calls)
+        self.assertIn(f"ln -sfn {APP_HOME}/releases/1.0.30 {APP_HOME}/.CURRENT.tmp", joined)
+        self.assertIn("systemctl restart", joined)
+        self.assertIn(f"echo 1.0.30 > {APP_HOME}/.deploy_version", joined)
+
+    def test_missing_previous_release_skips_without_touching(self):
+        server = FakeRemote(try_exec_ok={"test -d": False})
+        with mock.patch("deploy_strategies.jar_service.log"):
+            self.s.rollback(server)
+        self.assertNotIn("systemctl", "\n".join(server.exec_calls))
+
+    def test_without_previous_version_skips(self):
+        self.d.previous_version = None
+        server = FakeRemote()
+        self.s.rollback(server)
+        self.assertEqual(server.exec_calls, [])
+
+    def test_source_missing_probe(self):
+        self.assertTrue(self.s.rollback_source_missing(
+            FakeRemote(try_exec_ok={"test -d": False})))
+        self.assertFalse(self.s.rollback_source_missing(
+            FakeRemote(try_exec_ok={"test -d": True})))
+
+
+class TestNacosOrchestration(unittest.TestCase):
+    """jar_service 发布必须与容器一样经过 Nacos 下线/上线（阶段方法打桩，只验编排）"""
+
+    def test_jar_publish_offlines_then_onlines(self):
+        d = make_jar_deployer(tempfile.mkdtemp())
+        d.nacos.configured = True
+        d.nacos.group = "DEFAULT_GROUP"
+        d.proj_cfg["nacos_groups"] = ["DEFAULT_GROUP"]
+        s = d.strategy
+        with mock.patch.object(deploy_mod, "RemoteServer", return_value=FakeRemote()), \
+                mock.patch.object(deploy_mod.Deployer, "nacos_offline") as off, \
+                mock.patch.object(deploy_mod.Deployer, "nacos_online") as on, \
+                mock.patch.object(d, "_record_host_state"), \
+                mock.patch.object(s, "check"), mock.patch.object(s, "prepare"), \
+                mock.patch.object(s, "transfer"), mock.patch.object(s, "switch"), \
+                mock.patch.object(s, "verify"):
+            ok = d.deploy_server("10.0.0.1", {"ip": "10.0.0.1"})
+        self.assertTrue(ok)
+        off.assert_called_once_with("10.0.0.1")
+        on.assert_called_once_with("10.0.0.1", weight=1.0)
+
+
+class HostStateWritebackTest(unittest.TestCase):
+    """发布成功后回写每主机版本：显式 project_id 时不依赖任务记录"""
+
+    def test_writes_current_and_previous_version(self):
+        from webapp import db as dbm
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        db_path = os.path.join(tmp, "t.db")
+        dbm.init_db(db_path)
+        pid = dbm.create_record(db_path, "projects", dict(
+            name="平台", code="plat", description="", git_org="", created_at=1))
+        d = make_jar_deployer(tempfile.mkdtemp())
+        d.project_id = pid
+        with mock.patch.object(deploy_mod, "platform_db_path", return_value=db_path):
+            d._record_host_state("10.0.0.1", "1.0.31", "1.0.30")
+        rows = dbm.list_host_state(db_path, pid, "test", "auth")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["current_version"], "1.0.31")
+        self.assertEqual(rows[0]["previous_version"], "1.0.30")
+
+    def test_writeback_failure_is_swallowed(self):
+        """回写失败只告警：绝不允许异常冒泡改变发布终态"""
+        d = make_jar_deployer(tempfile.mkdtemp())
+        d.project_id = 7
+        with mock.patch.object(deploy_mod, "platform_db_path",
+                               side_effect=OSError("no db")), \
+                mock.patch("deploy.log") as log_mock:
+            d._record_host_state("10.0.0.1", "1.0.31", "1.0.30")
+        self.assertTrue(any("回写失败" in str(c) for c in log_mock.call_args_list))
+
+    def test_invalid_task_id_is_swallowed(self):
+        """平台注入的 PLATFORM_TASK_ID 非数字时也不得抛错"""
+        d = make_jar_deployer(tempfile.mkdtemp())
+        with mock.patch.dict(os.environ, {"PLATFORM_TASK_ID": "not-a-number"}), \
+                mock.patch("deploy.log"):
+            d._record_host_state("10.0.0.1", "1.0.31")
+
+
 if __name__ == "__main__":
     unittest.main()
