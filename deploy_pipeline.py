@@ -31,8 +31,7 @@ from common import (
 from build import build_project
 from snailjob_manager import clear_summary
 from deploy import (
-    Deployer, get_current_remote_version, bump_patch_version,
-    platform_db_path, runtime_config_dir,
+    Deployer, platform_db_path, runtime_config_dir,
 )
 
 
@@ -129,10 +128,14 @@ def auto_fill_versions(pipeline_cfg: dict, config: dict, env: str = None):
         name = svc["name"]
         if svc.get("version") or svc.get("previous_version"):
             continue  # 服务级显式版本优先
-        current = get_current_remote_version(name, config, env=env)
+        # 版本语义下沉策略层：容器=semver patch，静态=日期号，Jar=semver；
+        # 流水线混布多种发布方式时不能统一按 docker ps 推断
+        probe = Deployer(name, None, None, config, env=env)
+        current = probe.strategy.query_current_version()
         if current is None:
-            fail(f"[{name}] 服务器上未发现运行中的容器（首次发版），请在 pipelines.yaml 中为该服务显式配置 version")
-        svc["version"] = bump_patch_version(current)
+            fail(f"[{name}] 服务器上未发现运行中的容器/已发布产物（首次发版），"
+                 f"请在 pipelines.yaml 中为该服务显式配置 version")
+        svc["version"] = probe.strategy.next_version(current)
         svc["previous_version"] = current
         log(f"[{name}] 自动版本: 当前线上 {current} → 新版本 {svc['version']}")
 

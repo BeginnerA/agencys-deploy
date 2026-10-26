@@ -47,5 +47,41 @@ class TestRunStageRouting(unittest.TestCase):
         self._assert_routing(self._run(parallel=True))
 
 
+class AutoFillVersionsStrategyTest(unittest.TestCase):
+    def test_mixed_pipeline_uses_each_strategy_semantics(self):
+        import deploy_pipeline as dp
+        pipeline = {"stages": [
+            {"services": [{"name": "web-api"}, {"name": "creator-web"}]},
+        ]}
+        probes = {
+            "web-api": mock.Mock(current="1.0.29", next="1.0.30"),
+            "creator-web": mock.Mock(current="20261012", next="20261013"),
+        }
+
+        def fake_deployer(name, *a, **kw):
+            d = mock.Mock()
+            d.strategy.query_current_version.return_value = probes[name].current
+            d.strategy.next_version.side_effect = lambda cur, n=name: probes[n].next
+            return d
+
+        with mock.patch.object(dp, "Deployer", side_effect=fake_deployer), \
+                mock.patch.object(dp, "log"):
+            dp.auto_fill_versions(pipeline, {}, env="test")
+
+        svcs = {s["name"]: s for s in pipeline["stages"][0]["services"]}
+        self.assertEqual(svcs["web-api"]["version"], "1.0.30")
+        self.assertEqual(svcs["web-api"]["previous_version"], "1.0.29")
+        self.assertEqual(svcs["creator-web"]["version"], "20261013")
+        self.assertEqual(svcs["creator-web"]["previous_version"], "20261012")
+
+    def test_explicit_service_version_wins(self):
+        import deploy_pipeline as dp
+        pipeline = {"stages": [{"services": [
+            {"name": "svc", "version": "9.9.9", "previous_version": "9.9.8"}]}]}
+        with mock.patch.object(dp, "Deployer") as dep, mock.patch.object(dp, "log"):
+            dp.auto_fill_versions(pipeline, {}, env="test")
+        dep.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
