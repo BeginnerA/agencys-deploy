@@ -197,3 +197,79 @@ class JarServiceStrategy(DeployStrategy):
         log(f"jar 预传输完成：成功 {len(servers) - len(failures)} 台" +
             (f"，失败 {len(failures)} 台: {failures}（滚动阶段自动重试）" if failures else "，全部就绪"))
         return failures
+
+    # ---------- 阶段 4/5：切换与就绪验证 ----------
+
+    def switch(self, server):
+        """停机 → 原子换链接 → 启动 → 写版本标记
+
+        换链接开始即视为目标状态已变更（编排层据此在后续失败时回滚）；
+        链接用「临时名 + mv -Tf」替换，避免 ln -sfn 在目录已存在时的嵌套行为。
+        """
+        self.d.container_modified = True  # Task 8 统一改名为 target_modified
+        ver = self.d.version
+        target = f"{self.jars_dir}/{ver}"
+        tmp = f"{self.app_home}/.CURRENT.tmp"
+        server.exec(f"systemctl stop {shlex.quote(self.unit)}.service || true",
+                    timeout=self.cfg["stop_timeout"] + 30)
+        server.exec(
+            f"ln -sfn {shlex.quote(target)} {shlex.quote(tmp)} && "
+            f"mv -Tf {shlex.quote(tmp)} {shlex.quote(self.curr_link)}",
+            timeout=60)
+        server.exec(f"systemctl start {shlex.quote(self.unit)}.service",
+                    timeout=self.cfg["start_timeout"] + 30)
+        server.exec(
+            f"echo {shlex.quote(ver)} > {shlex.quote(self.app_home + '/.deploy_version')} && "
+            f"chmod 0644 {shlex.quote(self.app_home + '/.deploy_version')}",
+            timeout=15)
+        log(f"[{server.host}] 已切换 CURRENT -> releases/{ver} 并启动 {self.unit}.service")
+
+    def verify(self, server, server_entry: dict = None):
+        """进程存活 + 就绪探测；失败先抓 journal 尾部再抛错，避免只剩一句「超时」"""
+        try:
+            server.exec(f"systemctl is-active --quiet {shlex.quote(self.unit)}.service",
+                        timeout=15)
+        except Exception as e:
+            self._dump_journal(server)
+            raise RuntimeError(
+                f"[{server.host}] 单元 {self.unit}.service 未处于 active 状态") from e
+        rt = self.cfg["readiness"]
+        if rt["type"] == "process":
+            return
+        deadline = time.time() + rt["timeout"]
+        if rt["type"] == "http":
+            from health_check import check_http
+            url = f"http://{server.host}:{self.cfg['port']}{rt['path']}"
+            while time.time() < deadline:
+                if check_http(url, require_health_body=True):
+                    log(f"[{server.host}] 健康检查通过: {url}")
+                    return
+                time.sleep(rt["interval"])
+            self._dump_journal(server)
+            raise RuntimeError(f"[{server.host}] 健康检查超时: {url}")
+        from health_check import check_tcp_port, check_tcp_port_via_ssh
+        while time.time() < deadline:
+            # 与容器发布同口径：优先经 SSH 在目标机内部探 127.0.0.1（业务端口常不对公网
+            # 放行，平台机直连会假超时）；探测机制不可用（None）时才回退直连
+            verdict = check_tcp_port_via_ssh(
+                server.host, self.cfg["port"],
+                getattr(server, "ssh_cfg", {}) or {})
+            if verdict is True or (verdict is None and
+                                   check_tcp_port(server.host, self.cfg["port"])):
+                log(f"[{server.host}] TCP {self.cfg['port']} 已就绪")
+                return
+            time.sleep(rt["interval"])
+        self._dump_journal(server)
+        raise RuntimeError(
+            f"[{server.host}] TCP 端口 {self.cfg['port']} 在 {rt['timeout']}s 内未就绪")
+
+    def _dump_journal(self, server, lines: int = 80):
+        """失败现场取证：journal 尾部进任务日志，便于直接定位启动异常"""
+        try:
+            out = server.exec(
+                f"journalctl -u {shlex.quote(self.unit)}.service -n {lines} --no-pager "
+                f"2>/dev/null || true", timeout=30)
+            if out.strip():
+                log(f"[{server.host}] {self.unit}.service 最近日志:\n{out.rstrip()}")
+        except Exception as e:
+            log(f"[{server.host}] 读取 journal 失败: {e}")

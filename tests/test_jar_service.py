@@ -299,5 +299,98 @@ class TestPrefetch(unittest.TestCase):
         self.assertEqual(failures, ["10.0.0.2"])
 
 
+class TestSwitchPhase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.d = make_jar_deployer(self.tmp)
+        self.s = self.d.strategy
+        make_jar(self.d)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_switch_stops_relinks_starts_and_marks_modified(self):
+        server = FakeRemote()
+        self.s.switch(server)
+        joined = "\n".join(server.exec_calls)
+        # Task 8 统一改名为 target_modified（此处先用既有属性名，保证本任务独立可过）
+        self.assertTrue(self.d.container_modified)
+        self.assertIn("systemctl stop hqb-auth.service", joined)
+        self.assertIn(f"ln -sfn {APP_HOME}/releases/1.0.31 {APP_HOME}/.CURRENT.tmp", joined)
+        self.assertIn(f"mv -Tf {APP_HOME}/.CURRENT.tmp {APP_HOME}/CURRENT", joined)
+        self.assertIn("systemctl start hqb-auth.service", joined)
+        self.assertIn(f"echo 1.0.31 > {APP_HOME}/.deploy_version", joined)
+        self.assertNotIn("docker", joined)
+
+    def test_switch_failure_after_link_keeps_flag_set(self):
+        server = FakeRemote(rules={"systemctl start": RuntimeError("start failed")})
+        with self.assertRaises(RuntimeError):
+            self.s.switch(server)
+        self.assertTrue(self.d.container_modified)
+
+
+class TestVerifyPhase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.d = make_jar_deployer(self.tmp)
+        self.s = self.d.strategy
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_process_mode_only_checks_active(self):
+        server = FakeRemote()
+        self.s.verify(server)
+        self.assertIn("systemctl is-active --quiet hqb-auth.service",
+                      server.exec_calls[0])
+
+    def test_inactive_dumps_journal_and_raises(self):
+        server = FakeRemote(rules={"systemctl is-active": RuntimeError("inactive")})
+        with self.assertRaises(RuntimeError) as ctx:
+            self.s.verify(server)
+        self.assertIn("active", str(ctx.exception))
+        # verify 失败时必须在抛错前抓取 journal 尾部（否则线上只剩一句「未 active」）
+        self.assertTrue(any("journalctl" in c for c in server.exec_calls))
+
+    def test_http_readiness_success(self):
+        self.d.proj_cfg["runtime_config"] = {
+            "app_home": APP_HOME, "port": 8080,
+            "readiness": {"type": "http", "path": "/actuator/health",
+                          "timeout": 5, "interval": 1}}
+        s = create_strategy("jar_service", self.d)  # 配置已改，重建策略读取新 runtime_config
+        with mock.patch("health_check.check_http", return_value=True) as ch:
+            s.verify(FakeRemote())
+        self.assertEqual(ch.call_args[0][0], "http://10.0.0.1:8080/actuator/health")
+        self.assertTrue(ch.call_args.kwargs["require_health_body"])
+
+    def test_http_readiness_timeout_raises(self):
+        self.d.proj_cfg["runtime_config"] = {
+            "app_home": APP_HOME, "port": 8080,
+            "readiness": {"type": "http", "path": "/health",
+                          "timeout": 1, "interval": 1}}
+        s = create_strategy("jar_service", self.d)  # 配置已改，重建策略读取新 runtime_config
+        with mock.patch("health_check.check_http", return_value=False), \
+                mock.patch("deploy_strategies.jar_service.time.sleep"), \
+                mock.patch("deploy_strategies.jar_service.time.time",
+                           side_effect=[0, 0, 2]), \
+                mock.patch("deploy_strategies.jar_service.log"):
+            with self.assertRaises(RuntimeError) as ctx:
+                s.verify(FakeRemote())
+        self.assertIn("健康检查超时", str(ctx.exception))
+
+    def test_tcp_readiness(self):
+        self.d.proj_cfg["runtime_config"] = {
+            "app_home": APP_HOME, "port": 9000,
+            "readiness": {"type": "tcp", "timeout": 5, "interval": 1}}
+        s = create_strategy("jar_service", self.d)  # 配置已改，重建策略读取新 runtime_config
+        # 优先在目标机内部探测回环端口（云安全组常挡外部直连），探测机制不可用时才直连
+        with mock.patch("health_check.check_tcp_port_via_ssh",
+                        return_value=None) as via, \
+                mock.patch("health_check.check_tcp_port", return_value=True) as ch:
+            s.verify(FakeRemote())
+        via.assert_called_once()
+        ch.assert_called_once_with("10.0.0.1", 9000)
+
+
 if __name__ == "__main__":
     unittest.main()
