@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import shutil
+import hashlib
 import zipfile
 import subprocess
 import argparse
@@ -365,6 +366,10 @@ def _run_build_steps(proj: dict, project_root: Path, version: str,
                      profile: str, env_vars: dict, config: dict = None):
     """根据 build_type 执行 Maven 或前端构建步骤"""
     build_type = proj.get("build_type", "maven")
+    if build_type == "none":
+        # 产物由外部投入（build_type=none）：不执行任何构建命令，只做产物校验
+        log("构建类型 none：跳过构建，直接使用现成产物")
+        return
     if build_type == "frontend":
         _run_frontend_steps(proj, project_root, version, env_vars)
     else:
@@ -469,6 +474,65 @@ def _make_static_zip(proj: dict, project_root: Path, version: str, config: dict)
     log(f"静态包已生成: {zip_path}（{zip_path.stat().st_size / 1024 / 1024:.1f} MB）")
 
 
+_JAR_NOISE_SUFFIXES = ("-sources.jar", "-javadoc.jar", "-original.jar")
+
+
+def _jar_search_dirs(proj: dict, project_root: Path) -> list:
+    """产物搜索目录：项目根优先，其次各构建模块目录（多模块项目 jar 在子模块 target/）"""
+    dirs = [project_root]
+    for step in proj.get("build_order", []) or []:
+        candidate = project_root / (step.get("path") or ".")
+        if candidate not in dirs:
+            dirs.append(candidate)
+    return dirs
+
+
+def _select_jar(proj: dict, project_root: Path) -> Path:
+    """按 artifact_pattern 选择可执行 jar
+
+    命中多个时的裁决规则（写入设计文档，避免依赖 readdir 顺序）：
+    排除测试/源码/原始包后取体积最大者——Spring Boot repackaged fat jar 必然大于 thin jar。
+    """
+    pattern = (proj.get("runtime_config") or {}).get("artifact_pattern") or "target/*.jar"
+    first_listing = ""
+    for base in _jar_search_dirs(proj, project_root):
+        matches = [p for p in base.glob(pattern)
+                   if p.is_file() and not p.name.endswith(_JAR_NOISE_SUFFIXES)]
+        if matches:
+            picked = max(matches, key=lambda p: p.stat().st_size)
+            log(f"选中构建产物: {picked}（{picked.stat().st_size / 1024 / 1024:.1f} MB，"
+                f"候选 {len(matches)} 个）")
+            return picked
+        if not first_listing and base.exists():
+            names = sorted(p.name for p in base.glob("**/*.jar"))
+            first_listing = "、".join(names) or "（无 jar）"
+    fail(f"未找到可执行 jar（pattern={pattern}，基准目录 {project_root}）；"
+         f"现有 jar: {first_listing or '（无）'}")
+
+
+def _make_jar_artifact(proj: dict, project_root: Path, version: str, config: dict) -> Path:
+    """把选中的 jar 拷为 dist/{service}-{version}.jar 并生成 .sha256 旁文件
+
+    命名与 deploy_strategies.jar_service 的约定一致；不重命名原始 target 产物，
+    保留构建工具自身的校验能力（IDE/CI 仍可复用）。
+    """
+    src = _select_jar(proj, project_root)
+    service = proj.get("image_name") or proj.get("name") or "app"
+    dist_dir = Path(config["deploy"].get("dist_dir", "dist"))
+    if not dist_dir.is_absolute():
+        dist_dir = Path(__file__).resolve().parent.parent / dist_dir
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    out = dist_dir / f"{service}-{version}.jar"
+    shutil.copy2(src, out)
+    h = hashlib.sha256()
+    with open(out, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    out.with_name(out.name + ".sha256").write_text(h.hexdigest() + "\n", encoding="utf-8")
+    log(f"jar 产物已生成: {out}（{out.stat().st_size / 1024 / 1024:.1f} MB，sha256={h.hexdigest()[:12]}…）")
+    return out
+
+
 def build_project(project_name: str, version: str, env: str = None):
     config = load_config(env=env)
     proj = get_project_config(project_name)
@@ -476,32 +540,32 @@ def build_project(project_name: str, version: str, env: str = None):
     mode = get_registry_mode(config)
     build_type = proj.get("build_type", "maven")
     deploy_mode = proj.get("deploy_mode") or "container"
-    is_static = deploy_mode == "static_archive"
-    # Maven profile 仅对 maven 类型项目有意义
-    profile = get_maven_profile(config, env) if build_type != "frontend" else ""
+    artifact = {"static_archive": "archive", "jar_service": "jar"}.get(deploy_mode, "image")
+    # 只有 maven 构建才需要 profile；frontend 与 none（外部投入产物）都不该因环境名
+    # 不在 local/dev/test/prod 而被 get_maven_profile 拦下
+    profile = get_maven_profile(config, env) if build_type == "maven" else ""
     project_root = Path(config["deploy"]["project_root"]).expanduser()
     if not project_root.exists():
         log(f"警告: 项目根目录不存在: {project_root}（Docker 部署时请勾选「跳过构建」，或在宿主机上确认路径存在）")
         return
 
-    # 构建前 Git 准备：切换分支 + 拉取最新代码（配置了才执行，失败不阻断）
     git_prepare(proj, project_root)
 
-    if is_static:
-        log("静态发布（deploy_mode=static_archive）: 跳过 docker login")
+    if artifact != "image":
+        log(f"发布方式 {deploy_mode}（产物 {artifact}）: 跳过 docker login")
     elif mode == "push":
         docker_login(registry)
     else:
         log(f"直传模式（{mode}）: 跳过 docker login / docker push")
 
     env_vars = os.environ.copy()
-
-    # 按 build_type 执行对应的构建步骤
     _run_build_steps(proj, project_root, version, profile, env_vars, config)
 
-    if is_static:
-        # 静态发布：产出目录打包 zip 即可，无镜像概念，跳过 Docker 构建/推送
+    if artifact == "archive":
         _make_static_zip(proj, project_root, version, config)
+        return
+    if artifact == "jar":
+        _make_jar_artifact(proj, project_root, version, config)
         return
 
     # Docker 构建（超时 10 分钟，--progress=plain 便于排查）
