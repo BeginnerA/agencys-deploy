@@ -283,6 +283,16 @@ servers:
 
 直传模式回滚说明：回滚到 `--previous-version` 时，脚本优先使用服务器本地与本地镜像一致的旧镜像；若服务器上没有，会尝试从本地导出旧版本镜像传输，此时本地也必须保留有旧版本镜像（或上次构建的 tar 包在 `dist/` 目录）。
 
+## 运行方式（deploy_mode）
+
+每个服务在「管理 → 服务」里选择一种发布方式。三种方式共用项目/环境/流水线/回滚编排，差异只在构建产物与切换动作：
+
+- `container`：Docker 容器（默认）。Maven 构建 → 镜像推送/直传 → 滚动替换容器。
+- `static_archive`：静态站点压缩包（1Panel/nginx）。前端构建 → zip → 站点目录解压换入，无容器、无 Nacos。
+- `jar_service`：纯 Java 可执行 jar + Linux systemd。Maven 构建 → jar 上传到目标机版本目录 → 切换 `CURRENT` 符号链接 → 重启单元。
+
+`jar_service` 要求目标机已安装 JDK/JRE，并由平台生成 systemd 单元后接入（管理员操作，记审计）；平台不安装 JDK，也不接管人工维护的单元。版本目录 `{app_home}/releases/{version}/app.jar` 不可变，`CURRENT` 符号链接原子切换，回滚只换链接不重传。单实例重启存在停机窗口，平台不承诺零停机。字段表与操作步骤见 `docs/usage.md`「Java 进程发布（jar_service）」。
+
 ## 回滚策略
 
 - **发布时自动回滚**：单台健康检查失败时，脚本自动把容器回滚到 `--previous-version` 并恢复 Nacos 上线；首台失败会立即停止继续滚动。

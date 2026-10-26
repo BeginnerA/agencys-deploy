@@ -728,6 +728,64 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 
 出包与发布完整流程（版本号常量 `RELEASE_VERSION`、五阶段门禁 fetch/assemble/leak_check/smoke/zip、三重防泄漏红线、ASCII 发布资产名与 SHA256 校验、双远端 tag 与 `gh release` 收口）见 README「便携版打包与发布（Windows 免安装）」一节。产物目录 `dist-portable/` 已被 `.gitignore` 忽略，不入库；`--skip-smoke` 仅供调试，禁止用于发布。
 
+### 10.8 Java 进程发布（jar_service）
+
+`jar_service` 面向「目标机只跑一个 Java 进程、由 systemd 托管」的后端服务：不构建镜像、不操作容器，jar 按版本目录并存。
+
+前提：
+
+- 目标机为 Linux 且启用 systemd，已安装 JDK/JRE（平台不安装，也不配置 `JAVA_HOME`）；
+- `java_bin` 指向目标机上的绝对路径（默认 `/usr/bin/java`）；
+- 发布账号可创建/写入 `app_home`；
+- systemd 单元由平台生成并接入（管理员操作，见下文），平台不接管人工维护的单元。
+
+配置字段（服务表单「Java 进程」分区，保存在 `services.runtime_config`）：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `app_home` | 是 | 应用根目录（绝对路径），如 `/opt/apps/hqb-auth`；其下放 `releases/`、`CURRENT`、`.deploy_version` |
+| `java_bin` | 否 | 目标机 Java 绝对路径，默认 `/usr/bin/java` |
+| `jvm_opts` | 否 | JVM 参数，如 `-Xms512m -Xmx1g` |
+| `app_args` | 否 | 启动参数，如 `--spring.profiles.active=prod` |
+| `run_user` | 否 | systemd `User=`；留空以 root 运行（平台不改目标机用户与权限） |
+| `work_dir` | 否 | 工作目录；留空默认 `{app_home}/CURRENT` |
+| `unit_name` | 否 | systemd 单元名（不含 `.service`）；留空默认同服务名/镜像短名 |
+| `port` | 条件 | HTTP/TCP 就绪方式必填，1-65535；仅进程存活方式可留空 |
+| `readiness.type` | 否 | `http`（默认）/ `tcp` / `process` |
+| `readiness.path` | 否 | HTTP 健康路径，默认 `/actuator/health`，要求响应体含 UP 语义 |
+| `readiness.timeout` / `interval` | 否 | 就绪总超时（默认 90s）/ 轮询间隔（默认 5s） |
+| `stop_timeout` / `start_timeout` | 否 | systemd `TimeoutStopSec` / `TimeoutStartSec`，默认 60s / 120s |
+| `artifact_pattern` | 否 | 可执行 jar 匹配，默认 `target/*.jar`；多命中时排除 sources/javadoc/original 后取体积最大者（fat jar 优先） |
+| `env_files` | 否 | 环境变量文件绝对路径数组，写入 `EnvironmentFile=`；文件缺失会导致单元启动失败 |
+
+构建：`jar_service` 固定走 Maven（表单中构建类型锁定）。构建产物拷贝为 `dist/{服务名}-{版本}.jar` 并生成 `.sha256` 旁文件；匹配顺序为项目根 → `build_order` 各模块目录。也可跳过构建，把 jar 与 `.sha256` 手工放入 `dist/`。
+
+单元接入（首次发布前）：
+
+1. 在服务表单填好字段并保存；
+2. 点「预览 systemd 单元」，核对 `ExecStart` 是否为 `{java_bin} ... -jar {app_home}/CURRENT/app.jar ...`，以及 `User=`、`EnvironmentFile=`；
+3. 管理员发起接入：`POST /api/projects/{项目ID}/services/{服务ID}/unit`（body 可传 `{"env": "prod"}` 指定环境，缺省用项目默认环境）；
+4. 接入动作只写 `/etc/systemd/system/{unit}.service`、执行 `daemon-reload` 与 `enable`，不启动单元、不装依赖；每次接入写审计（动作 `onboard_service_unit`）。
+
+发布与回滚：
+
+- 预检：Java/systemd 可用、`app_home` 可写、磁盘余量 ≥ jar 的 1.5 倍；
+- 准备：确认单元已接入，且 `ExecStart` 指向 `{app_home}/CURRENT/app.jar`——否则拒绝发布，避免接管人工维护的服务；
+- 传输：上传到 `releases/{version}/app.jar`；远端 sha256 相同则跳过，上传后复核校验和；
+- 切换：`systemctl stop` → 临时链接 + `mv -Tf` 原子换 `CURRENT` → `systemctl start` → 写 `.deploy_version`；
+- 验证：`systemctl is-active`，再按 readiness 探测；失败先抓 `journalctl` 尾部写入任务日志，再触发自动回滚；
+- 回滚：链接指回 `releases/{previous_version}` 并重启，不重传 jar；目标机没有该版本目录时跳过并告警。
+
+停机窗口：单实例发布在「停止 → 换链接 → 启动」期间服务不可用，平台不承诺零停机。需要连续可用时请改用容器多实例方案。
+
+失败排查：
+
+- 预检失败：看任务日志中的 Java/systemctl/目录/磁盘提示；
+- 「单元未接入」：先执行上面的接入步骤（管理员）；
+- 「拒绝接管非平台创建的单元」：现有单元 `ExecStart` 未指向 `CURRENT/app.jar`，请人工确认后重建；
+- 未 active 或就绪超时：任务日志已附 `journalctl` 尾部，重点检查 `java_bin`、`env_files` 是否存在、端口占用与 `app_args`；
+- 设备页对 jar 服务的状态列暂显示「发布中 / 未知」：进程指标与 journal 采集在后续里程碑接入，当前以任务日志与目标机 `journalctl` 为准。
+
 ## 十一、Jenkins / Ansible 集成
 
 ### 11.1 Jenkins
