@@ -860,3 +860,75 @@ def config_export():
     written = export_all(current_app.config["DB_PATH"], target)
     audit("export_config", "config", 0, {"files": written})
     return _ok({"files": written, "dir": str(target)})
+
+
+# ---------- jar_service systemd 单元 ----------
+
+def _jar_service_or_404(pid, sid):
+    from deploy_strategies.jar_config import validate_runtime_config
+    rec, err = _owned_or_404("services", sid, pid)
+    if err:
+        return None, err
+    if (rec.get("deploy_mode") or "container") != "jar_service":
+        return None, _err("该服务不是 jar_service 发布方式")
+    errs = validate_runtime_config(rec.get("runtime_config"), "jar_service")
+    if errs:
+        return None, _err("；".join(errs))
+    return rec, None
+
+
+def _unit_target(rec) -> tuple:
+    from deploy_strategies.jar_config import parse_runtime_config
+    import service_unit
+    cfg = parse_runtime_config(rec.get("runtime_config"))
+    unit = cfg["unit_name"] or rec.get("image_name") or rec["name"]
+    return unit, service_unit.render_unit(cfg, unit)
+
+
+@config_bp.route("/projects/<int:pid>/services/<int:sid>/unit", methods=["GET"])
+@require_auth
+def preview_service_unit(pid, sid):
+    rec, err = _jar_service_or_404(pid, sid)
+    if err:
+        return err
+    unit, content = _unit_target(rec)
+    return _ok({"unit_name": unit, "content": content})
+
+
+@config_bp.route("/projects/<int:pid>/services/<int:sid>/unit", methods=["POST"])
+@require_auth
+@require_role("admin")
+def onboard_service_unit(pid, sid):
+    """逐次确认后接入 unit：只写 unit/reload/enable，不启动、不装依赖"""
+    import service_unit
+    import deploy as deploy_mod
+    from deploy_strategies.jar_config import parse_runtime_config
+    rec, err = _jar_service_or_404(pid, sid)
+    if err:
+        return err
+    env_name = (_json_body() or {}).get("env") or ""
+    db_path = current_app.config["DB_PATH"]
+    env_obj = (dbm.get_env_by_name(db_path, pid, env_name) if env_name
+               else dbm.get_default_env(db_path, pid))
+    if not env_obj:
+        return _err("目标环境不存在")
+    servers = dbm.list_env_servers(db_path, env_obj["id"])
+    if not servers:
+        return _err("环境未绑定服务器")
+    cfg = parse_runtime_config(rec.get("runtime_config"))
+    unit, content = _unit_target(rec)
+    done, failed = [], []
+    for srv in servers:
+        ssh_cfg = deploy_mod.merge_server_ssh(env_obj.get("ssh") or {}, srv)
+        server = deploy_mod.RemoteServer(srv["host"], ssh_cfg)
+        try:
+            service_unit.onboard_unit(server, unit, content, cfg["app_home"])
+            done.append(srv["host"])
+        except Exception as e:
+            failed.append({"host": srv["host"], "error": str(e)})
+        finally:
+            server.close()
+    audit("onboard_service_unit", "service", sid,
+          {"unit": unit, "env": env_obj["name"], "ok": done, "failed": failed})
+    return _ok({"hosts": done, "failed": failed}) if not failed else \
+        (_ok({"hosts": done, "failed": failed}), 207)
