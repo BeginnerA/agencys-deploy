@@ -3,5 +3,6 @@
 from .base import DeployStrategy, register, create_strategy
 from . import container  # noqa: F401 — 触发 @register ContainerStrategy
 from . import static_archive  # noqa: F401 — 触发 @register StaticArchiveStrategy
+from . import jar_service  # noqa: F401 — 触发 @register JarServiceStrategy
 
 __all__ = ["DeployStrategy", "register", "create_strategy"]
