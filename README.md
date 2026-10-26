@@ -440,21 +440,26 @@ python scripts/package_portable.py  # 五阶段一键出包，走缓存约 24~30
 ### 发布收口（双远端 + Release）
 
 ```powershell
-git tag -f v0.1.0 <commit>                     # tag 必须指向实际打包基线，保证 tag 与包内容同源
-git push origin v0.1.0 --force                 # Gitee
-git push github master; git push github v0.1.0 --force
+git tag -f v<版本> <commit>                     # tag 必须指向实际打包基线，保证 tag 与包内容同源
+git push origin v<版本> --force                 # Gitee
+git push github master; git push github v<版本> --force
 
-Copy-Item "dist-portable\智能运维平台-便携版-v0.1.0.zip" `
-          "dist-portable\SmartOps-portable-v0.1.0-win-x64.zip"
-gh release delete-asset v0.1.0 <旧asset> --repo <owner>/<repo> --yes
-gh release upload v0.1.0 "dist-portable\SmartOps-portable-v0.1.0-win-x64.zip" --repo <owner>/<repo> --clobber
-gh release edit v0.1.0 --repo <owner>/<repo> --notes-file dist-portable\_release-notes-v0.1.0.md
+Copy-Item "dist-portable\智能运维平台-便携版-v<版本>.zip" `
+          "dist-portable\SmartOps-portable-v<版本>-win-x64.zip"
+# 新版本：创建 Release 并上传资产
+gh release create v<版本> "dist-portable\SmartOps-portable-v<版本>-win-x64.zip" `
+  --repo <owner>/<repo> --title "智能运维平台 便携版 v<版本>" `
+  --notes-file dist-portable\_release-notes-v<版本>.md
+# 同版本原地重发：替换资产并刷新说明
+gh release delete-asset v<版本> <旧asset> --repo <owner>/<repo> --yes
+gh release upload v<版本> "dist-portable\SmartOps-portable-v<版本>-win-x64.zip" --repo <owner>/<repo> --clobber
+gh release edit v<版本> --repo <owner>/<repo> --notes-file dist-portable\_release-notes-v<版本>.md
 ```
 
-- **发布资产必须用 ASCII 文件名**（如 `SmartOps-portable-v0.1.0-win-x64.zip`）：中文文件名会被 GitHub 吞成 `-.-`，下载直链失效。
-- 发布前刷新 `dist-portable/_release-notes-v0.1.0.md` 的 SHA256 与打包 commit；上传后核对 GitHub 自算 `digest` 与本地 SHA256 一致，并用免登录直链验证 `302 → 200` 且 `Content-Length` 与本地一致。
+- **发布资产必须用 ASCII 文件名**（如 `SmartOps-portable-v<版本>-win-x64.zip`）：中文文件名会被 GitHub 吞成 `-.-`，下载直链失效。
+- 发布前刷新 `dist-portable/_release-notes-v<版本>.md` 的 SHA256 与打包 commit；上传后核对 GitHub 自算 `digest` 与本地 SHA256 一致，并用免登录直链验证 `302 → 200` 且 `Content-Length` 与本地一致。
 - 发布完整性核验：包内源码逐文件与 `git show <打包基线commit>:<path>` 的 blob 比对（不可拿 master HEAD 当基准；`core.autocrlf=true` 下仅 CRLF 行尾差异属预期）。
 - 发布后若 master 上只追加测试配置/文档（不改包内白名单源码），无需重打包或挪 tag；在 release notes 写明产物基线 commit，避免包内文档比 master 滞后被误认为产物过期。
 - 渠道定位：Gitee 为使用主渠道（仅同步 `master` + tag，未建发行版），下载入口统一在 GitHub Release。
 - 发布前删除陈旧包副本（如 `dist-portable/_preview`）：旧包易被误当发布物。
-- Releases 列表页的时间取的是 release 的 `published_at`：`gh release edit` 与 delete-asset + upload 只推进 `updated_at`，同版本号原地重发后页面仍显示首次发布时间（看起来像旧版，但资产 digest 已是新的）。需要把时间刷成当天只能 `gh release delete v0.1.0 --yes`（不会删 tag）后 `gh release create v0.1.0 --title … --notes-file …` + `gh release upload` 重建；代价是下载计数与 release 编辑历史归零，`/releases/tag/<v>` 与 `/releases/download/...` 直链不变。
+- Releases 列表页的时间取的是 release 的 `published_at`：`gh release edit` 与 delete-asset + upload 只推进 `updated_at`，同版本号原地重发后页面仍显示首次发布时间（看起来像旧版，但资产 digest 已是新的）。需要把时间刷成当天只能 `gh release delete v<版本> --yes`（不会删 tag）后 `gh release create v<版本> --title … --notes-file …` + `gh release upload` 重建；代价是下载计数与 release 编辑历史归零，`/releases/tag/<v>` 与 `/releases/download/...` 直链不变。
