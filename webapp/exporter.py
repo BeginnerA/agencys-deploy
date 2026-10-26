@@ -56,7 +56,7 @@ def export_projects_yaml(db_path: str, project_id: int) -> str:
         # build_type 仅非默认值时输出（保持向后兼容）
         if s.get("build_type") and s["build_type"] != "maven":
             cfg["build_type"] = s["build_type"]
-        # 发布方式与静态专属字段仅非默认时输出（container 项目导出不新增字段，向后兼容）
+        # 发布方式与方式专属字段仅非默认时输出（container 项目导出不新增字段，向后兼容）
         deploy_mode = s.get("deploy_mode") or "container"
         if deploy_mode != "container":
             cfg["deploy_mode"] = deploy_mode
@@ -64,6 +64,10 @@ def export_projects_yaml(db_path: str, project_id: int) -> str:
                         "zip_prefix", "entry_file", "file_mode"):
                 if s.get(key):
                     cfg[key] = s[key]
+        if deploy_mode == "jar_service" and s.get("runtime_config"):
+            # 进程发布没有镜像/站点字段，JVM 与单元参数必须完整导出，
+            # 否则从 YAML 重建环境时会静默退回缺省值
+            cfg["runtime_config"] = s["runtime_config"]
         if s.get("git_branch"):
             cfg["git_branch"] = s["git_branch"]
         if s.get("git_pull_before_build"):

@@ -64,6 +64,7 @@ def _import_projects(db_path: str, path: Path) -> tuple:
             build_order=normalised_build_order,
             build_type=cfg.get("build_type", "maven"),
             deploy_mode=cfg.get("deploy_mode") or "container",
+            runtime_config=cfg.get("runtime_config") or {},
             site_root=cfg.get("site_root", ""),
             backup_dir=cfg.get("backup_dir", ""),
             static_dist_dir=cfg.get("static_dist_dir", ""),
