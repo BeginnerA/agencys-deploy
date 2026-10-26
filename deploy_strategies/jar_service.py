@@ -85,3 +85,115 @@ class JarServiceStrategy(DeployStrategy):
     def next_version(self, current: str) -> str:
         import deploy as deploy_mod
         return deploy_mod.bump_patch_version(current)
+
+    # ---------- 五阶段 ----------
+
+    def check(self, server):
+        """预检：Java、systemd、目录可写、磁盘余量——全部在造成变更前完成"""
+        server.exec(f"command -v {shlex.quote(self.cfg['java_bin'])} >/dev/null", timeout=15)
+        server.exec("command -v systemctl >/dev/null", timeout=15)
+        server.exec(
+            f"mkdir -p {shlex.quote(self.jars_dir)} && test -w {shlex.quote(self.app_home)}",
+            timeout=15)
+        self._check_disk(server)
+
+    def _check_disk(self, server):
+        """按包大小的 1.5 倍检查可用空间：留出解压/临时文件与一次失败重传的余量"""
+        p = self.local_jar()
+        if not p.exists():
+            return  # 本地产物缺失由 check_local/transfer 报错，这里不重复报
+        need_kb = int(p.stat().st_size * 1.5 / 1024) + 1
+        out = server.exec(
+            f"df -Pk {shlex.quote(self.app_home)} | awk 'NR==2 {{print $4}}'",
+            timeout=15).strip()
+        try:
+            avail_kb = int(out)
+        except ValueError:
+            log(f"[{server.host}] 无法解析磁盘余量（{out!r}），跳过空间预检")
+            return
+        if avail_kb < need_kb:
+            raise RuntimeError(
+                f"[{server.host}] 磁盘空间不足: {self.app_home} 剩余 {avail_kb}KB，"
+                f"需要约 {need_kb}KB（含 1.5 倍余量）")
+
+    def prepare(self, server):
+        """确认单元已由平台接入，且不会被误当成别人创建的服务接管
+
+        平台对 unit 的承诺是「只管理自己创建的」：ExecStart 不指向 CURRENT/app.jar
+        的单元一律拒绝，避免把人工维护的服务改坏。
+        """
+        installed = server.try_exec(
+            f"systemctl cat {shlex.quote(self.unit)}.service >/dev/null 2>&1", timeout=15)
+        if not installed:
+            raise RuntimeError(
+                f"[{server.host}] systemd 单元 {self.unit}.service 未接入"
+                f"（先在服务配置页执行「生成并接入单元」，需管理员确认）")
+        exec_start = server.exec(
+            f"systemctl show -p ExecStart --value {shlex.quote(self.unit)}.service",
+            timeout=15)
+        expected = f"{self.curr_link}/app.jar"
+        if expected not in exec_start:
+            raise RuntimeError(
+                f"[{server.host}] 拒绝接管非平台创建的单元 {self.unit}.service："
+                f"ExecStart 未指向 {expected}")
+
+    def transfer(self, server, version: str = None):
+        """上传到 releases/{version}/app.jar（幂等：远端 sha256 相同则跳过）"""
+        ver = version or self.d.version
+        local = self.local_jar(ver)
+        if not local.exists():
+            raise RuntimeError(f"本地 jar 不存在: {local}")
+        local_sha = sha256_file(local)
+        remote_dir = f"{self.jars_dir}/{ver}"
+        remote = f"{remote_dir}/app.jar"
+        server.exec(f"mkdir -p {shlex.quote(remote_dir)}", timeout=15)
+        if server.try_exec(f"test -f {remote}", timeout=15):
+            current = server.exec(
+                f"sha256sum {shlex.quote(remote)} | awk '{{print $1}}'", timeout=60).strip()
+            if current == local_sha:
+                log(f"[{server.host}] 远端已有相同产物，跳过上传: {ver}")
+                return True
+        log(f"[{server.host}] 上传 jar {self.jar_name(ver)}"
+            f"（{local.stat().st_size / 1024 / 1024:.1f} MB）-> {remote}")
+        server.sftp_put_with_progress(
+            str(local), remote, label=self.jar_name(ver),
+            streams=getattr(self.d, "upload_streams", 1))
+        # 传输后必须复核：SFTP 中断可能留下半包，宁可在这里失败也不要切到坏包
+        remote_sha = server.exec(
+            f"sha256sum {shlex.quote(remote)} | awk '{{print $1}}'", timeout=60).strip()
+        if remote_sha != local_sha:
+            raise RuntimeError(
+                f"[{server.host}] 上传后校验和不一致（本地 {local_sha[:12]}…，"
+                f"远端 {remote_sha[:12]}…）")
+        return True
+
+    def prefetch(self, servers: list) -> list:
+        """并行预传（失败不中断，滚动阶段自动重试），与静态策略同构"""
+        try:
+            self.check_local()
+        except Exception as e:
+            log(f"jar 预传输跳过: {e}")
+            return [s["ip"] for s in servers]
+        import deploy as deploy_mod
+        from concurrent.futures import ThreadPoolExecutor
+        log(f">>> 并行预上传 jar 到 {len(servers)} 台服务器")
+
+        def _one(srv: dict) -> tuple:
+            host = srv["ip"]
+            server = deploy_mod.RemoteServer(host, merge_server_ssh(self.d.ssh_cfg, srv))
+            try:
+                self.transfer(server)
+                log(f"[{host}] jar 预传输完成")
+                return host, True
+            except Exception as e:
+                log(f"[{host}] jar 预传输失败: {e}")
+                return host, False
+            finally:
+                server.close()
+
+        with ThreadPoolExecutor(max_workers=max(1, min(len(servers), 8))) as pool:
+            results = list(pool.map(_one, servers))
+        failures = [host for host, ok in results if not ok]
+        log(f"jar 预传输完成：成功 {len(servers) - len(failures)} 台" +
+            (f"，失败 {len(failures)} 台: {failures}（滚动阶段自动重试）" if failures else "，全部就绪"))
+        return failures

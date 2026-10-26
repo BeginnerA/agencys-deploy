@@ -189,5 +189,115 @@ class TestVersion(unittest.TestCase):
         self.assertIsNone(ver)
 
 
+class TestCheckPhase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.d = make_jar_deployer(self.tmp)
+        self.s = self.d.strategy
+        make_jar(self.d)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_check_commands(self):
+        server = FakeRemote(rules={"df -Pk": "1048576\n"})
+        self.s.check(server)
+        joined = "\n".join(server.exec_calls)
+        self.assertIn("command -v /usr/bin/java", joined)
+        self.assertIn("command -v systemctl", joined)
+        self.assertIn(f"mkdir -p {APP_HOME}/releases", joined)
+
+    def test_check_disk_insufficient_raises(self):
+        # 默认测试 jar 仅 9 字节 → 需要 1KB；df 返回 0 必然不足
+        server = FakeRemote(rules={"df -Pk": "0\n"})
+        with self.assertRaises(RuntimeError) as ctx:
+            self.s.check(server)
+        self.assertIn("磁盘空间不足", str(ctx.exception))
+
+    def test_prepare_requires_installed_unit(self):
+        server = FakeRemote(try_exec_ok={"systemctl cat": False})
+        with self.assertRaises(RuntimeError) as ctx:
+            self.s.prepare(server)
+        self.assertIn("未接入", str(ctx.exception))
+
+    def test_prepare_rejects_foreign_unit(self):
+        server = FakeRemote(rules={
+            "systemctl show": "ExecStart={ path=/usr/local/bin/java ; argv[]=/usr/local/bin/java -jar /srv/other.jar }",
+        })
+        with self.assertRaises(RuntimeError) as ctx:
+            self.s.prepare(server)
+        self.assertIn("拒绝接管", str(ctx.exception))
+
+    def test_prepare_accepts_platform_unit(self):
+        server = FakeRemote(rules={
+            "systemctl show": f"ExecStart={{ path=/usr/bin/java ; argv[]=/usr/bin/java -jar {APP_HOME}/CURRENT/app.jar }}",
+        })
+        self.s.prepare(server)
+
+
+class TestTransferPhase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.d = make_jar_deployer(self.tmp)
+        self.s = self.d.strategy
+        self.jar = make_jar(self.d)
+        self.sha = sha256_file(self.jar)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_uploads_to_version_dir_and_verifies_sha(self):
+        server = FakeRemote(try_exec_ok={"test -f": False},
+                            rules={"sha256sum": self.sha + "\n"})
+        self.assertTrue(self.s.transfer(server))
+        local, remote, _ = server.uploaded[0]
+        self.assertTrue(local.endswith("hqb-auth-1.0.31.jar"))
+        self.assertEqual(remote, f"{APP_HOME}/releases/1.0.31/app.jar")
+        joined = "\n".join(server.exec_calls)
+        self.assertIn(f"mkdir -p {APP_HOME}/releases/1.0.31", joined)
+
+    def test_skips_when_remote_sha_matches(self):
+        server = FakeRemote(try_exec_ok={"test -f": True},
+                            rules={"sha256sum": self.sha + "\n"})
+        self.s.transfer(server)
+        self.assertEqual(server.uploaded, [])
+
+    def test_remote_sha_mismatch_after_upload_raises(self):
+        server = FakeRemote(try_exec_ok={"test -f": False},
+                            rules={"sha256sum": "deadbeef\n"})
+        with self.assertRaises(RuntimeError) as ctx:
+            self.s.transfer(server)
+        self.assertIn("校验和不一致", str(ctx.exception))
+
+    def test_missing_local_jar_raises(self):
+        self.jar.unlink()
+        with self.assertRaises(RuntimeError):
+            self.s.transfer(FakeRemote())
+
+
+class TestPrefetch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.d = make_jar_deployer(self.tmp)
+        make_jar(self.d)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_prefetch_returns_failed_hosts(self):
+        ok = FakeRemote(host="10.0.0.1", try_exec_ok={"test -f": False},
+                        rules={"sha256sum": sha256_file(
+                            Path(self.tmp) / "hqb-auth-1.0.31.jar") + "\n"})
+        bad = FakeRemote(host="10.0.0.2",
+                         rules={"sftp": RuntimeError("disk full")})
+        bad.sftp_put_with_progress = mock.Mock(side_effect=RuntimeError("disk full"))
+        with mock.patch.object(deploy_mod, "RemoteServer",
+                               side_effect=[ok, bad]), \
+                mock.patch("deploy_strategies.jar_service.log"):
+            failures = self.d.strategy.prefetch([{"ip": "10.0.0.1"},
+                                                 {"ip": "10.0.0.2"}])
+        self.assertEqual(failures, ["10.0.0.2"])
+
+
 if __name__ == "__main__":
     unittest.main()
