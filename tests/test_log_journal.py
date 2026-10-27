@@ -13,8 +13,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from webapp import db as dbm
-from webapp.log_collector import (LogCollector, _build_journal_cmd,
-                                  _journal_lines, _journal_since)
+from webapp.log_collector import (LogCollector, _archive_and_cleanup_files,
+                                  _build_journal_cmd, _journal_lines,
+                                  _journal_since)
 
 
 class JournalSinceTest(unittest.TestCase):
@@ -190,6 +191,95 @@ class CollectorJournalTest(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(count, 3)
+
+
+class JournalArchiveCleanupTest(unittest.TestCase):
+    """归档清理按 file_path 匹配：unit 与 service 显示名不同也要删掉索引行"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="log_journal_cleanup_")
+        self.db = os.path.join(self.tmp, "t.db")
+        dbm.init_db(self.db)
+        self.log_dir = os.path.join(self.tmp, "logs")
+        pid = dbm.create_record(self.db, "projects", dict(
+            name="p", code="p", description="", git_org="", created_at=0))
+        env = dbm.create_record(self.db, "environments", dict(
+            project_id=pid, name="prod", is_default=1, registry="{}",
+            nacos="{}", mysql_snailjob="{}",
+            ssh='{"user":"root","password":"pw"}',
+            build="{}", deploy="{}", monitor_enabled=1))
+        dbm.create_record(self.db, "services", dict(
+            project_id=pid, name="auth-svc", image_name="", service_name="",
+            deploy_mode="jar_service",
+            runtime_config={"app_home": "/opt/auth-svc", "unit_name": "auth",
+                            "port": 8080},
+            docker_context="", dockerfile="", build_order="[]",
+            nacos_groups="[]", dubbo_services="[]", snailjob_group="",
+            health_url="", health_port=0, log_error_keywords="[]",
+            clear_log_dir="", git_repo="", enabled=1))
+        srv = dbm.create_record(self.db, "servers", dict(
+            host="9.9.9.9", ssh_port=22, ssh_user="root", ssh_password="pw",
+            ssh_key_file="", nacos_ip="", remark="", enabled=1))
+        dbm.bind_server(self.db, env, srv)
+        self.ssh_calls = []
+
+        class _FakeMonitor:
+            _server_containers = {
+                "9.9.9.9": {"containers": [], "ts": time.time()}}
+
+        self.output = "\n".join([
+            "@@LOGCUT:deadbeef:journal:auth",
+            json.dumps({"__REALTIME_TIMESTAMP": "1787049001123456",
+                        "MESSAGE": "Started auth-svc"}),
+        ]) + "\n"
+        self.collector = LogCollector(self.db, self.log_dir, interval=30,
+                                      ssh_func=self._fake_ssh,
+                                      monitor=_FakeMonitor())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _fake_ssh(self, host, port, ssh_cfg, cmd, timeout=10):
+        self.ssh_calls.append(cmd)
+        return self.output
+
+    def test_archive_cleanup_matches_journal_rows_when_unit_differs(self):
+        # 服务显示名 auth-svc，systemd 单元 auth → 文件在 collect/prod/auth/，
+        # log_entries.service 为 auth-svc
+        with mock.patch("webapp.log_collector.secrets.token_hex",
+                        return_value="deadbeef"):
+            self.collector._collect_round()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = os.path.join(self.log_dir, "collect", "prod", "auth",
+                            f"{today}.log")
+        self.assertTrue(os.path.isfile(path))
+        conn = dbm.get_conn(self.db)
+        try:
+            rows = conn.execute(
+                "SELECT service, file_path FROM log_entries").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual([(r["service"], r["file_path"]) for r in rows],
+                         [("auth-svc", path)])
+
+        # retention=0 → 今天日期的文件也过期（确定性，无需 sleep）
+        dbm.create_record(self.db, "platform_settings", dict(
+            key="log_retention_days", value=json.dumps(0),
+            updated_at=int(time.time())))
+        result = _archive_and_cleanup_files(self.db, self.log_dir)
+
+        self.assertEqual(result, {"archived": 1, "purged": 0})
+        self.assertFalse(os.path.exists(path))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.log_dir, "archive", "prod", "auth", f"{today}.log.gz")))
+        conn = dbm.get_conn(self.db)
+        try:
+            entries = conn.execute("SELECT COUNT(*) FROM log_entries").fetchone()[0]
+            fts = conn.execute("SELECT COUNT(*) FROM log_fts").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(entries, 0)
+        self.assertEqual(fts, 0)
 
 
 if __name__ == "__main__":

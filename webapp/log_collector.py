@@ -788,13 +788,18 @@ class LogCollector:
             conn.close()
 
 
-def _cleanup_fts_for_file(db_path: str, env: str, service: str, file_path: str):
-    """清理指定文件的 FTS5 + log_entries 条目"""
+def _cleanup_fts_for_file(db_path: str, env: str, file_path: str):
+    """清理指定文件的 FTS5 + log_entries 条目
+
+    file_path 已包含环境与单元/容器目录，只按 env + file_path 匹配：
+    journal 文件目录名是 unit，而 log_entries.service 是服务显示名，
+    再用 service 过滤会漏删（必须按文件路径精确清除）。
+    """
     conn = dbm.get_conn(db_path)
     try:
         rows = conn.execute(
-            "SELECT id FROM log_entries WHERE env=? AND service=? AND file_path=?",
-            (env, service, file_path)
+            "SELECT id FROM log_entries WHERE env=? AND file_path=?",
+            (env, file_path)
         ).fetchall()
         for row in rows:
             conn.execute("DELETE FROM log_fts WHERE rowid=?", (row["id"],))
@@ -868,7 +873,7 @@ def _archive_and_cleanup_files(db_path: str, log_dir: str) -> dict:
                             shutil.copyfileobj(f_in, f_out)
                     log_file.unlink()
                     archived += 1
-                    _cleanup_fts_for_file(db_path, env_name, service, str(log_file))
+                    _cleanup_fts_for_file(db_path, env_name, str(log_file))
 
     if os.path.isdir(archive_base):
         for env_dir in Path(archive_base).iterdir():
