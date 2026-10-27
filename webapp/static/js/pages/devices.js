@@ -147,7 +147,6 @@
           <button class="btn sm ghost" data-roll="${s.id}">回滚</button>
           ${isStatic ? '' : `<button class="btn sm ghost" data-restart="${s.id}">⭯ 重启</button>`}` : '<span class="weak" style="font-size:11px">只读账号</span>'}
           ${isJar ? `<button class="btn sm ghost" data-hosts="${s.id}" data-name="${esc(s.name)}" title="查看每主机版本与进程状态">🖥 主机</button>` : ''}
-          ${isJar ? '' : ''}
           <button class="svc-log-btn" data-svc="${esc(s.name)}" data-static="${isStatic ? 1 : 0}" title="${isStatic ? '查看发布日志' : (isJar ? '查看进程日志（journalctl）' : '查看实时日志')}">📋 日志</button>
         </div>
       </div>`;

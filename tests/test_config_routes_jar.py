@@ -139,11 +139,12 @@ class JarHostsRoutesTest(unittest.TestCase):
         return self.c.post(f"/api/projects/{self.pid}/services",
                            json=body, headers=self.h)
 
-    def _hosts_ready(self, name, host):
+    def _hosts_ready(self, name, host, default_env=False):
         r = self._create(name=name)
         sid = r.get_json()["id"]
         r = self.c.post(f"/api/projects/{self.pid}/environments",
-                        json={"name": "prod"}, headers=self.h)
+                        json={"name": "prod", "is_default": default_env},
+                        headers=self.h)
         assert r.status_code == 201, r.get_data(as_text=True)
         r = self.c.post("/api/servers", json={
             "host": host, "ssh_port": 22, "ssh_user": "root"}, headers=self.h)
@@ -173,6 +174,12 @@ class JarHostsRoutesTest(unittest.TestCase):
         self.assertEqual(row["version"], "1.0.1")
         self.assertEqual(row["previous_version"], "0.9.0")
         self.assertEqual(row["pid"], 42)
+        self.assertEqual(row["uptime_hours"], 2.5)
+        self.assertEqual(row["restarts"], 1)
+        self.assertEqual(row["cpu"], 3.2)
+        self.assertEqual(row["rss_mb"], 128.0)
+        self.assertIsInstance(row["updated_at"], int)
+        self.assertGreater(row["updated_at"], 0)  # DB 行写入时间戳
         self.assertTrue(row["live"])
 
     def test_hosts_falls_back_to_snapshot_when_monitor_off(self):
@@ -188,6 +195,14 @@ class JarHostsRoutesTest(unittest.TestCase):
         self.assertEqual(row["status"], "unknown")
         self.assertEqual(row["version"], "2.0.0")
         self.assertFalse(row["live"])
+
+    def test_hosts_resolves_default_env_when_param_missing(self):
+        sid = self._hosts_ready("auth7", "10.0.0.13", default_env=True)
+        r = self.c.get(
+            f"/api/projects/{self.pid}/services/{sid}/hosts",
+            headers=self.h)
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(r.get_json()["env"], "prod")
 
     def test_hosts_rejects_non_jar_service(self):
         r = self.c.post(f"/api/projects/{self.pid}/services", json={

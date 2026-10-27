@@ -95,7 +95,7 @@ def _journal_since(cursor: str, now: float = None) -> tuple:
             dt = datetime.fromisoformat(cursor)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            min_us = int(dt.timestamp() * 1_000_000)
+            min_us = round(dt.timestamp() * 1_000_000)
             return f"@{max(0, min_us // 1_000_000 - 1)}", min_us
         except (TypeError, ValueError):
             pass
