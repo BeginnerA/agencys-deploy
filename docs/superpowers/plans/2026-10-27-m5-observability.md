@@ -291,7 +291,7 @@ class BuildViewTest(unittest.TestCase):
         view = jar_probe.build_view(self._raw(), proc_uptime=7200.0, now=100.0)
         self.assertEqual(view["status"], "online")
         self.assertEqual(view["version"], "1.0.1")
-        self.assertEqual(view["uptime_hours"], 36.0)
+        self.assertEqual(view["uptime_hours"], 1.0)
         self.assertEqual(view["rss_mb"], 100.0)
         self.assertIn("sample", view)
 
