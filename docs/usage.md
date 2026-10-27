@@ -738,7 +738,7 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 - `java_bin` 指向目标机上的绝对路径（默认 `/usr/bin/java`）；
 - 发布账号可创建/写入 `app_home`；
 - systemd 单元由平台生成并接入（管理员操作，见下文），平台不接管人工维护的单元。
-- 发布账号需能读取 journal（root 或 `systemd-journal` 组），否则日志采集为空、进程状态仍正常；
+- 发布账号需能读取 journal（root 或 `systemd-journal` 组），否则日志采集为空、进程状态仍正常。
 
 配置字段（服务表单「Java 进程」分区，保存在 `services.runtime_config`）：
 
