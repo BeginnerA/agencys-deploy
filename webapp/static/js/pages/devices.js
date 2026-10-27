@@ -127,7 +127,7 @@
             ? `${jOnline}/${jHosts.length} 在线` : '—'}</span>
                ${upTxt ? `<span class="weak" style="margin-left:10px">已运行</span> ${upTxt}` : ''}</div>
           <div><span class="weak">应用根</span> <span class="num ellipsis" style="display:inline-block;max-width:78%;vertical-align:bottom" title="${esc((s.runtime_config || {}).app_home || '')}">${esc((s.runtime_config || {}).app_home || '未配置')}</span></div>
-          <div><span class="weak">端口</span> <span class="num">${(s.runtime_config || {}).port || s.health_port || '-'}</span></div>` : isStatic ? `
+          <div><span class="weak">端口</span> <span class="num">${esc((s.runtime_config || {}).port || s.health_port || '-')}</span></div>` : isStatic ? `
           <div><span class="weak">版本</span> <span class="num">${esc(ver)}</span>
                <span class="weak" style="margin-left:10px">状态</span> ${svcLabel(st, run, isStatic)}</div>
           <div><span class="weak">站点根</span> <span class="num ellipsis" style="display:inline-block;max-width:78%;vertical-align:bottom" title="${esc(s.site_root || '')}">${esc(s.site_root || '未配置')}</span></div>
@@ -138,7 +138,7 @@
           <div><span class="weak">镜像</span> <span class="num">${esc(ver)}</span></div>
           <div><span class="weak">实例</span> <span class="num">${inst}</span>
                <span class="weak" style="margin-left:10px">状态</span> ${svcLabel(st, run)}</div>
-          <div><span class="weak">端口</span> <span class="num">${s.health_port || '-'}</span>
+          <div><span class="weak">端口</span> <span class="num">${esc(s.health_port || '-')}</span>
                ${ts ? `<span class="weak" style="margin-left:10px">探测</span> ${ts}` : ''}</div>
           <div><span class="weak">健康</span> ${hcTxt}</div>`}
         </div>

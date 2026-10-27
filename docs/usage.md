@@ -738,6 +738,7 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 - `java_bin` 指向目标机上的绝对路径（默认 `/usr/bin/java`）；
 - 发布账号可创建/写入 `app_home`；
 - systemd 单元由平台生成并接入（管理员操作，见下文），平台不接管人工维护的单元。
+- 发布账号需能读取 journal（root 或 `systemd-journal` 组），否则日志采集为空、进程状态仍正常；
 
 配置字段（服务表单「Java 进程」分区，保存在 `services.runtime_config`）：
 
@@ -783,8 +784,14 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 - 预检失败：看任务日志中的 Java/systemctl/目录/磁盘提示；
 - 「单元未接入」：先执行上面的接入步骤（管理员）；
 - 「拒绝接管非平台创建的单元」：现有单元 `ExecStart` 未指向 `CURRENT/app.jar`，请人工确认后重建；
-- 未 active 或就绪超时：任务日志已附 `journalctl` 尾部，重点检查 `java_bin`、`env_files` 是否存在、端口占用与 `app_args`；
-- 设备页对 jar 服务的状态列暂显示「发布中 / 未知」：进程指标与 journal 采集在后续里程碑接入，当前以任务日志与目标机 `journalctl` 为准。
+- 未 active 或就绪超时：任务日志已附 `journalctl` 尾部，重点检查 `java_bin`、`env_files` 是否存在、端口占用与 `app_args`。
+
+观测（M5）：
+
+- 设备页 jar 卡片展示实时状态（在线/已停止/未部署/探测失败）、当前版本、在线主机数与运行时长；版本以目标机 `.deploy_version` 为准；
+- 点「主机」查看每主机版本、上一版本、PID、运行时长、重启数、CPU/内存；监控关闭时显示「版本快照」，来自 `service_host_state`；
+- 点「日志」读取采集器入库的 `journalctl` 日志（默认 30s 一轮，按 `systemd:<unit>` 独立游标，关键词告警照常生效）；
+- 首次采集窗口为最近 5 分钟，之后按游标增量；日志正文中的多行消息逐行保留并带时间戳。
 
 ## 十一、Jenkins / Ansible 集成
 

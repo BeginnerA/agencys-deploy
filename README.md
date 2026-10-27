@@ -142,7 +142,7 @@ python webapp/app.py          # 默认 http://127.0.0.1:5678
 - 首次启动自动导入 `config/` 旧配置（原 11 个服务 + 4 条流水线 + prod/test 环境），创建默认管理员 `admin/admin`（首次登录强制改密）。
 - 大屏主页：服务状态卡片墙（在线/异常/发布中/未部署 + 镜像版本 + Nacos 实例数）、发布趋势/成功率图表、实时任务日志；点击卡片直接发布/回滚。
 - 「管理」抽屉（admin）：项目管理、服务/环境/服务器/流水线 CRUD、用户与角色、YAML 导入导出。
-- 实时监控：周期默认读取 `DASHBOARD_MONITOR_INTERVAL`（30s），可用 `--monitor-interval N` 覆盖；`0` 仅关闭实时探测与告警引擎，发布调度、日志采集、SSL 到期探测、AI 建议调度仍独立运行。
+- 实时监控：周期默认读取 `DASHBOARD_MONITOR_INTERVAL`（30s），可用 `--monitor-interval N` 覆盖；`0` 仅关闭实时探测与告警引擎，发布调度、日志采集、SSL 到期探测、AI 建议调度仍独立运行。`jar_service` 额外探测 systemd 单元（进程存活、版本、PID、运行时长、重启数、CPU/RSS）并采集 `journalctl` 日志；设备页可查看每主机版本视图。
 - 后台服务周期独立：发布调度 `--deploy-interval`（默认 30s，或 `DASHBOARD_DEPLOY_INTERVAL`）、AI 建议 `--agent-interval`（默认 30s，或 `DASHBOARD_AGENT_INTERVAL`，`0` 单独关闭）；监控关闭时日志采集回退为 120s 独立轮询。
 - 页面数据实时推送（SSE 通道 `/api/stream`）：监控轮次完成、告警产生/状态变更、发布任务新建与状态流转、审批单/决策建议更新、服务日志采集轮次有新行时，后端逐帧通知前端，页面收到后去抖重取数据（所有列表页已改为事件驱动，无事件时不发请求）；通道异常自动退回原有定时轮询，顶栏指示灯显示「实时 / 连接中 / 降级轮询」，后台标签页自动释放连接并降频。例外：发布任务日志正文由子进程写文件（跨进程无法事件化），抽屉/日志中心仍保留 2s/3s 增量追尾。
 - 交互无障碍：可点击的非原生元素（筛选 chip、侧栏导航项、任务名链接、搜索下拉项等）自动补 `tabindex/role/aria-label` 并支持 Enter/Space 触发，键盘焦点统一显形（`:focus-visible` 主色焦点环）；抽屉/弹窗/下拉面板/搜索面板共用 Esc 层栈（只关最顶一层），关闭后焦点归还触发元素，确认框初始焦点在「取消」；通知同屏上限 4 条、同文案合并计数、读屏可播报；系统开启「减弱动态效果」时全局停用动画与过渡。
@@ -291,7 +291,7 @@ servers:
 - `static_archive`：静态站点压缩包（1Panel/nginx）。前端构建 → zip → 站点目录解压换入，无容器、无 Nacos。
 - `jar_service`：纯 Java 可执行 jar + Linux systemd。Maven 构建 → jar 上传到目标机版本目录 → 切换 `CURRENT` 符号链接 → 重启单元。
 
-`jar_service` 要求目标机已安装 JDK/JRE，并由平台生成 systemd 单元后接入（管理员操作，记审计）；平台不安装 JDK，也不接管人工维护的单元。版本目录 `{app_home}/releases/{version}/app.jar` 不可变，`CURRENT` 符号链接原子切换，回滚只换链接不重传。单实例重启存在停机窗口，平台不承诺零停机。字段表与操作步骤见 `docs/usage.md`「Java 进程发布（jar_service）」。
+`jar_service` 要求目标机已安装 JDK/JRE，并由平台生成 systemd 单元后接入（管理员操作，记审计）；平台不安装 JDK，也不接管人工维护的单元。版本目录 `{app_home}/releases/{version}/app.jar` 不可变，`CURRENT` 符号链接原子切换，回滚只换链接不重传。单实例重启存在停机窗口，平台不承诺零停机。字段表与操作步骤见 `docs/usage.md`「Java 进程发布（jar_service）」。平台周期探测单元状态并从 `.deploy_version` 读取每主机版本；版本变化时写穿 `service_host_state`，监控关闭时页面回退到该快照。
 
 ## 回滚策略
 
