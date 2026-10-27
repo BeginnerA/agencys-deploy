@@ -201,9 +201,9 @@ class TestProbeDedup(unittest.TestCase):
         uptime_seq = iter([12.0, 13.0])
 
         def fake_probe(host, port, ssh_cfg, service_names, timeout=10,
-                       skip_extended=False):
+                       skip_extended=False, units=None):
             calls.append({"host": host, "service_names": set(service_names),
-                          "skip_extended": skip_extended})
+                          "skip_extended": skip_extended, "units": units})
             up = next(uptime_seq)
             result = {
                 "ssh_ok": True,

@@ -11,6 +11,7 @@ import requests
 
 from . import db as dbm
 from . import events
+from .jar_probe import build_probe_cmd, parse_probe_output
 
 # Nacos accessToken 缓存：{base_url: (token, expire_ts)}，避免每服务每轮重复登录
 _NACOS_TOKEN_CACHE = {}
@@ -218,11 +219,15 @@ def _probe_health_via_ssh(host: str, ssh_port: int, ssh_cfg: dict,
 
 
 def _probe_server_full(host: str, port: int, ssh_cfg: dict, service_names: set,
-                       timeout: int = 10, skip_extended: bool = False) -> dict:
-    """单连接探测整台服务器：容器镜像 + docker stats 资源 + 主机指标 + 扩展指标
+                       timeout: int = 10, skip_extended: bool = False,
+                       units: dict = None) -> dict:
+    """单连接探测整台服务器：容器 + 主机指标 + 扩展指标 + jar/systemd 单元
+
+    units: {unit: {"app_home": ...}}，非空时在第一批命令末尾追加单元探测，
+    结果写入 result["jar_probe"]（uptime/clk_tck/units）。
 
     返回 {ssh_ok, containers, containers_stopped, container_list, container_status,
-         resources, host_metrics, extended, error}。
+         resources, host_metrics, extended, jar_probe, error}。
     第一轮：2 条命令（ps -a 一次覆盖全部容器状态 + 仅服务容器的 stats/主机指标），
     1 次 SSH 连接；第二轮：扩展指标 4 条命令，1 次 SSH 连接。
     service_names 为需采集资源指标的容器名集合（跨环境合并后的并集）。
@@ -231,7 +236,7 @@ def _probe_server_full(host: str, port: int, ssh_cfg: dict, service_names: set,
     """
     result = {"ssh_ok": False, "containers": {}, "container_list": [],
               "containers_stopped": {}, "container_status": {}, "resources": {},
-              "host_metrics": {}, "extended": {}, "error": ""}
+              "host_metrics": {}, "extended": {}, "jar_probe": {}, "error": ""}
     try:
         # 第一轮：基础指标。ps -a 一次覆盖运行中/已停止（原 ps + ps -a 两次
         # dockerd 调用合并为一次，并用 shell 变量复用输出避免重复调用 dockerd）；
@@ -255,8 +260,13 @@ def _probe_server_full(host: str, port: int, ssh_cfg: dict, service_names: set,
                     "grep -c processor /proc/cpuinfo; "
                     "awk '/MemTotal|MemFree|Buffers|Cached/' /proc/meminfo; "
                     "df -P / | tail -1")
-        base_out, hm_out = _ssh_exec_multi(
-            host, port, ssh_cfg, [base_cmd, host_cmd], timeout=timeout)
+        unit_cmd, unit_token = (build_probe_cmd(units) if units else (None, None))
+        cmds = [base_cmd, host_cmd] + ([unit_cmd] if unit_cmd else [])
+        outs = _ssh_exec_multi(host, port, ssh_cfg, cmds, timeout=timeout)
+        base_out, hm_out = outs[0], outs[1]
+        if unit_cmd:
+            result["jar_probe"] = parse_probe_output(
+                outs[2] if len(outs) > 2 else "", unit_token, list(units))
         ps_part, _, stats_out = base_out.partition("@@STATS@@")
         containers = {}
         container_names = []
@@ -805,25 +815,40 @@ class MonitorScheduler:
         """
         if not env_tasks:
             return
+        from deploy_strategies.jar_config import (derive_unit_name,
+                                                  parse_runtime_config)
         env_ctxs = []
-        host_jobs = {}  # (host, port) -> {"host","port","ssh_cfg","service_names": set}
+        jar_by_project = {}  # {project_id: [{"unit", "app_home"}, ...]}
         for proj, env in env_tasks:
             services = dbm.list_services(self._db_path, proj["id"], enabled_only=True)
             servers = dbm.list_env_servers(self._db_path, env["id"])
-            env_ssh = env.get("ssh") or {}
             env_ctxs.append({"proj": proj, "env": env, "services": services,
                              "servers": servers})
-            svc_names = [svc["service_name"] for svc in services
-                         if svc.get("service_name")]
-            for s in servers:
+            for svc in services:
+                if (svc.get("deploy_mode") or "container") != "jar_service":
+                    continue
+                cfg = parse_runtime_config(svc.get("runtime_config"))
+                unit = derive_unit_name(cfg, svc.get("image_name"), svc["name"])
+                jar_by_project.setdefault(proj["id"], []).append(
+                    {"unit": unit, "app_home": cfg["app_home"]})
+        host_jobs = {}  # (host, port) -> {"host","port","ssh_cfg","service_names","jar_units"}
+        for ctx in env_ctxs:
+            env_ssh = ctx["env"].get("ssh") or {}
+            svc_names = [svc["service_name"] for svc in ctx["services"]
+                         if svc.get("service_name")
+                         and (svc.get("deploy_mode") or "container") == "container"]
+            for s in ctx["servers"]:
                 key = (s["host"], int(s.get("ssh_port") or 22))
                 job = host_jobs.get(key)
                 if job is None:
                     job = {"host": s["host"], "port": key[1],
                            "ssh_cfg": _merge_server_ssh(env_ssh, s),
-                           "service_names": set()}
+                           "service_names": set(), "jar_units": {}}
                     host_jobs[key] = job
                 job["service_names"].update(svc_names)
+                for info in jar_by_project.get(ctx["proj"]["id"], []):
+                    job["jar_units"].setdefault(
+                        info["unit"], {"app_home": info["app_home"]})
         skip_extended = (self._round % 3) != 0
         host_results = self._probe_hosts(host_jobs, skip_extended)
         with ThreadPoolExecutor(max_workers=min(4, len(env_ctxs))) as pool:
@@ -849,7 +874,8 @@ class MonitorScheduler:
         with ThreadPoolExecutor(max_workers=min(16, len(host_jobs))) as pool:
             futures = {pool.submit(_probe_server_full, job["host"], job["port"],
                                    job["ssh_cfg"], job["service_names"],
-                                   10, skip_extended): key
+                                   10, skip_extended,
+                                   job.get("jar_units") or None): key
                        for key, job in host_jobs.items()}
             for fut, key in futures.items():
                 try:
