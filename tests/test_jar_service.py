@@ -118,6 +118,25 @@ class TestRegistry(unittest.TestCase):
         self.assertEqual(s.unit, "hqb-auth")
         self.assertEqual(s.jar_name("1.0.31"), "hqb-auth-1.0.31.jar")
 
+    def test_unit_falls_back_to_app_like_shared_derivation(self):
+        """无 unit_name / image_name / project 时必须与 derive_unit_name 一致，回退 app"""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        d = make_jar_deployer(tmp)
+        d.proj_cfg["image_name"] = ""
+        d.project = ""
+        s = create_strategy("jar_service", d)
+        self.assertEqual(s.unit, "app")
+
+    def test_unit_name_wins_over_service(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        d = make_jar_deployer(tmp, runtime_config={
+            "app_home": APP_HOME, "port": 8080, "unit_name": "custom-unit",
+            "readiness": {"type": "process"}})
+        s = create_strategy("jar_service", d)
+        self.assertEqual(s.unit, "custom-unit")
+
 
 class TestCheckLocal(unittest.TestCase):
     def setUp(self):

@@ -12,8 +12,8 @@ import time
 from pathlib import Path
 
 from .base import DeployStrategy, register
-from .jar_config import (artifact_filename, parse_runtime_config,
-                         sha256_file)
+from .jar_config import (artifact_filename, derive_unit_name,
+                         parse_runtime_config, sha256_file)
 from common import (log, load_yaml, default_servers_file, merge_server_ssh,
                     get_ssh_config)
 
@@ -38,7 +38,7 @@ class JarServiceStrategy(DeployStrategy):
         self.app_home = self.cfg["app_home"]
         self.service = (proj.get("image_name") or
                         getattr(deployer, "project", "app"))
-        self.unit = self.cfg["unit_name"] or self.service
+        self.unit = derive_unit_name(self.cfg, self.service)
         self.jars_dir = f"{self.app_home}/releases"
         self.curr_link = f"{self.app_home}/CURRENT"
 
