@@ -367,8 +367,8 @@ import time
 UNIT_PROPS = ("LoadState", "ActiveState", "SubState", "MainPID",
               "NRestarts", "ActiveEnterTimestampMonotonic")
 
-_STATUS_RANK = {"online": 4, "stopped": 3, "not_deployed": 2,
-                "probe_failed": 1, "unknown": 0}
+_STATUS_RANK = {"online": 4, "probe_failed": 3, "stopped": 2,
+                "not_deployed": 1, "unknown": 0}
 
 
 def build_probe_cmd(units: dict, token: str = None) -> tuple:
