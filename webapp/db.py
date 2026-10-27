@@ -1313,6 +1313,24 @@ def upsert_host_state(db_path: str, project_id: int, env: str, service: str,
         conn.close()
 
 
+def record_host_state_live(db_path: str, project_id: int, env: str, service: str,
+                           host: str, current_version: str) -> None:
+    """监控轮询写穿当前版本：只更新 current_version，保留回滚基线与任务号"""
+    conn = get_conn(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO service_host_state "
+            "(project_id, env, service, host, current_version, previous_version, "
+            " last_task_id, updated_at) VALUES (?,?,?,?,?, '', 0, ?) "
+            "ON CONFLICT(project_id, env, service, host) DO UPDATE SET "
+            "current_version=excluded.current_version, updated_at=excluded.updated_at",
+            (project_id, env or "", service, host, current_version or "",
+             int(time.time())))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def list_host_state(db_path: str, project_id: int, env: str = None,
                     service: str = None) -> list:
     """按项目/环境/服务查询主机版本缓存（参数为空表示不过滤）"""

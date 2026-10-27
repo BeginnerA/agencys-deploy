@@ -878,10 +878,10 @@ def _jar_service_or_404(pid, sid):
 
 
 def _unit_target(rec) -> tuple:
-    from deploy_strategies.jar_config import parse_runtime_config
+    from deploy_strategies.jar_config import derive_unit_name, parse_runtime_config
     import service_unit
     cfg = parse_runtime_config(rec.get("runtime_config"))
-    unit = cfg["unit_name"] or rec.get("image_name") or rec["name"]
+    unit = derive_unit_name(cfg, rec.get("image_name"), rec["name"])
     return unit, service_unit.render_unit(cfg, unit)
 
 

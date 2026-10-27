@@ -347,12 +347,13 @@ def _run_restart(db_path: str, task: dict, log_file: str,
             return "failed"
         deploy_mode = rec.get("deploy_mode") or "container"
         if deploy_mode == "jar_service":
-            from deploy_strategies.jar_config import parse_runtime_config
+            from deploy_strategies.jar_config import (derive_unit_name,
+                                                      parse_runtime_config)
             cfg = parse_runtime_config(rec.get("runtime_config"))
             if not cfg["app_home"]:
                 f.write("[platform] jar_service 未配置 runtime_config.app_home，重启中止\n")
                 return "failed"
-            unit = cfg["unit_name"] or rec.get("image_name") or rec["name"]
+            unit = derive_unit_name(cfg, rec.get("image_name"), rec["name"])
             svc_name = ""
         else:
             unit = ""

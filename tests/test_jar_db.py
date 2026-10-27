@@ -47,6 +47,24 @@ class JarDbTest(unittest.TestCase):
         self.assertEqual(rows[0]["current_version"], "1.0.2")
         self.assertEqual(rows[0]["last_task_id"], 8)
 
+    def test_host_state_live_keeps_rollback_info(self):
+        dbm.upsert_host_state(self.db, self.pid, "prod", "auth", "10.0.0.1",
+                              "1.0.1", "1.0.0", 7)
+        dbm.record_host_state_live(self.db, self.pid, "prod", "auth",
+                                   "10.0.0.1", "1.0.2")
+        rows = dbm.list_host_state(self.db, self.pid, "prod", "auth")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["current_version"], "1.0.2")
+        self.assertEqual(rows[0]["previous_version"], "1.0.0")  # 直播写穿不清回滚基线
+        self.assertEqual(rows[0]["last_task_id"], 7)
+
+    def test_host_state_live_inserts_when_missing(self):
+        dbm.record_host_state_live(self.db, self.pid, "prod", "auth",
+                                   "10.0.0.2", "2.0.0")
+        rows = dbm.list_host_state(self.db, self.pid, "prod", "auth")
+        self.assertEqual([r["host"] for r in rows], ["10.0.0.2"])
+        self.assertEqual(rows[0]["current_version"], "2.0.0")
+
     def test_migrate_adds_column_to_legacy_db(self):
         """存量库（无该列）init_db 后必须自动补列，且旧行读到 {}"""
         import sqlite3

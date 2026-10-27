@@ -123,3 +123,10 @@ def sha256_file(path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def derive_unit_name(runtime_config, image_name: str = "",
+                     service_name: str = "") -> str:
+    """平台统一口径：unit_name → image_name → 服务名 → app（不含 .service）"""
+    cfg = _as_dict(runtime_config)
+    return str(cfg.get("unit_name") or image_name or service_name or "app")

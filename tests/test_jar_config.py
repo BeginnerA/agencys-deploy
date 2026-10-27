@@ -12,7 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from deploy_strategies.base import registered_modes
 from deploy_strategies.jar_config import (
-    artifact_filename, parse_runtime_config, sha256_file, validate_runtime_config)
+    artifact_filename, derive_unit_name, parse_runtime_config, sha256_file,
+    validate_runtime_config)
 
 
 class ParseTest(unittest.TestCase):
@@ -87,6 +88,19 @@ class ArtifactTest(unittest.TestCase):
                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class DeriveUnitNameTest(unittest.TestCase):
+    def test_priority(self):
+        self.assertEqual(derive_unit_name(
+            {"unit_name": "hqb-auth"}, "img", "svc"), "hqb-auth")
+        self.assertEqual(derive_unit_name({"unit_name": ""}, "img", "svc"), "img")
+        self.assertEqual(derive_unit_name({}, "", "svc"), "svc")
+        self.assertEqual(derive_unit_name({}, "", ""), "app")
+
+    def test_accepts_json_string(self):
+        self.assertEqual(derive_unit_name('{"unit_name": "u1"}', "img"), "u1")
+        self.assertEqual(derive_unit_name("{bad json", "img"), "img")
 
 
 class RegistryTest(unittest.TestCase):
