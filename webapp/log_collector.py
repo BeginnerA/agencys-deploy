@@ -81,6 +81,76 @@ def _build_log_file_path(base_dir: str, env: str, service: str, date_str: str) -
     return os.path.join(base_dir, "collect", env, service, f"{date_str}.log")
 
 
+_JOURNAL_TS_FMT = "%Y-%m-%dT%H:%M:%S.%fZ "
+
+
+def _journal_since(cursor: str, now: float = None) -> tuple:
+    """游标 ISO → (journalctl --since 参数, 客户端严格过滤阈值 µs)
+
+    journalctl 不接受带 T/Z 的 ISO 8601，统一用 @epoch；--since 含边界，
+    since 取游标秒数 -1，真正的去重由 min_us（严格 >）完成。
+    """
+    if cursor:
+        try:
+            dt = datetime.fromisoformat(cursor)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            min_us = int(dt.timestamp() * 1_000_000)
+            return f"@{max(0, min_us // 1_000_000 - 1)}", min_us
+        except (TypeError, ValueError):
+            pass
+    base = int(time.time() if now is None else now)
+    return f"@{max(0, base - 300)}", 0
+
+
+def _build_journal_cmd(unit: str, since_arg: str, max_lines: int) -> str:
+    """单单元增量拉取；-n 限制条数（多行消息展开后由调用方全量入库）"""
+    # shlex.quote('@123') 会原样返回（@/数字均在安全字符集），这里显式单引号
+    # 包裹并对内嵌单引号转义，确保 --since 始终以引号形式出现在命令中
+    since_quoted = "'" + str(since_arg).replace("'", "'\\''") + "'"
+    return (f"journalctl -u {shlex.quote(unit)} "
+            f"--since={since_quoted} -o json --no-pager "
+            f"-n {int(max_lines)} 2>/dev/null")
+
+
+def _journal_lines(raw: str, min_us: int = 0) -> list:
+    """journalctl -o json → 带时间戳前缀的日志行（复用 docker -t 解析管线）
+
+    MESSAGE 可能是 str/整数/字节数组；多行消息逐行加同一前缀，保证
+    _parse_ts 对每行都能解析出时间。min_us 严格过滤游标及更早条目。
+    """
+    out = []
+    for raw_line in (raw or "").splitlines():
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            entry = json.loads(raw_line)
+        except (TypeError, ValueError):
+            continue
+        try:
+            ts_us = int(entry.get("__REALTIME_TIMESTAMP") or 0)
+        except (TypeError, ValueError):
+            ts_us = 0
+        if ts_us <= 0 or ts_us <= min_us:
+            continue
+        msg = entry.get("MESSAGE", "")
+        if isinstance(msg, list):
+            try:
+                msg = bytes(msg).decode("utf-8", "replace")
+            except (TypeError, ValueError):
+                msg = str(msg)
+        elif not isinstance(msg, str):
+            msg = str(msg)
+        if not msg:
+            continue
+        prefix = datetime.fromtimestamp(ts_us / 1_000_000,
+                                        tz=timezone.utc).strftime(_JOURNAL_TS_FMT)
+        for part in msg.splitlines():
+            out.append(prefix + part + "\n")
+    return out
+
+
 def _marker(token: str, container: str) -> str:
     """单通道批量采集的分段标记（在输出中独占一行）"""
     return f"@@LOGCUT:{token}:{container}"
