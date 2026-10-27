@@ -16,6 +16,8 @@
   let svcLogShowTs = true;
   let svcLogAutoScroll = true;
   let _svcLogRows = [];
+  // jar 每主机版本抽屉（monitor 事件驱动 + 降级兜底轮询）
+  let jarHostLive = null;
 
   // 服务卡片：状态灯优先级 发布中 > 探测结果（沿用旧 dotClass 语义）
   function dotClass(svc, runningTask, isStatic){
@@ -96,7 +98,11 @@
       // （平台是线上 .deploy_version 的唯一写入方，tasksCache 按 id DESC 故 find 即最新）
       const lastOk = (isStatic || isJar) ? tasksCache.find(t =>
         t.name === s.name && t.env === state.currentEnv && t.status === 'success' && t.version) : null;
-      const ver = (isStatic || isJar) ? ((lastOk && lastOk.version) || '—') : (st.version || '—');
+      const ver = isStatic ? ((lastOk && lastOk.version) || '—')
+        : (isJar ? (st.version || (lastOk && lastOk.version) || '—')
+                 : (st.version || '—'));
+      const jHosts = Array.isArray(st.hosts) ? st.hosts : [];
+      const jOnline = jHosts.filter(h => h.status === 'online').length;
       const inst = st.instances !== undefined && st.instances !== -1 ? st.instances : '—';
       const ts = st.ts ? fmtTime(st.ts) : '';
       const dotCls = dotClass(st, run, isStatic);
@@ -116,7 +122,10 @@
         <div class="svc-meta">
           ${isJar ? `
           <div><span class="weak">版本</span> <span class="num">${esc(ver)}</span>
-               <span class="weak" style="margin-left:10px">状态</span> <span class="weak" style="font-size:11px">${run ? '发布中' : '未知'}</span></div>
+               <span class="weak" style="margin-left:10px">状态</span> ${svcLabel(st, run)}</div>
+          <div><span class="weak">主机</span> <span class="num">${jHosts.length
+            ? `${jOnline}/${jHosts.length} 在线` : '—'}</span>
+               ${upTxt ? `<span class="weak" style="margin-left:10px">已运行</span> ${upTxt}` : ''}</div>
           <div><span class="weak">应用根</span> <span class="num ellipsis" style="display:inline-block;max-width:78%;vertical-align:bottom" title="${esc((s.runtime_config || {}).app_home || '')}">${esc((s.runtime_config || {}).app_home || '未配置')}</span></div>
           <div><span class="weak">端口</span> <span class="num">${(s.runtime_config || {}).port || s.health_port || '-'}</span></div>` : isStatic ? `
           <div><span class="weak">版本</span> <span class="num">${esc(ver)}</span>
@@ -137,13 +146,21 @@
           ${canDeploy() ? `<button class="btn sm primary" data-pub="${s.id}">发布</button>
           <button class="btn sm ghost" data-roll="${s.id}">回滚</button>
           ${isStatic ? '' : `<button class="btn sm ghost" data-restart="${s.id}">⭯ 重启</button>`}` : '<span class="weak" style="font-size:11px">只读账号</span>'}
-          ${isJar ? '' : `<button class="svc-log-btn" data-svc="${esc(s.name)}" data-static="${isStatic ? 1 : 0}" title="${isStatic ? '查看发布日志' : '查看实时日志'}">📋 日志</button>`}
+          ${isJar ? `<button class="btn sm ghost" data-hosts="${s.id}" data-name="${esc(s.name)}" title="查看每主机版本与进程状态">🖥 主机</button>` : ''}
+          ${isJar ? '' : ''}
+          <button class="svc-log-btn" data-svc="${esc(s.name)}" data-static="${isStatic ? 1 : 0}" title="${isStatic ? '查看发布日志' : (isJar ? '查看进程日志（journalctl）' : '查看实时日志')}">📋 日志</button>
         </div>
       </div>`;
     }).join('') || emptyState('📭', '该项目暂无服务');
     wall.querySelectorAll('[data-pub]').forEach(b => b.onclick = () => openDeployDrawer(Number(b.dataset.pub), false));
     wall.querySelectorAll('[data-roll]').forEach(b => b.onclick = () => openDeployDrawer(Number(b.dataset.roll), true));
     wall.querySelectorAll('[data-restart]').forEach(b => b.onclick = () => restartService(Number(b.dataset.restart)));
+    wall.querySelectorAll('[data-hosts]').forEach(btn => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        openJarHostsDrawer(Number(btn.dataset.hosts), btn.dataset.name);
+      };
+    });
     wall.querySelectorAll('.svc-log-btn').forEach(btn => {
       btn.onclick = (e) => {
         e.stopPropagation();
@@ -348,6 +365,33 @@
     };
   }
 
+  // ---- jar 每主机版本抽屉（monitor 事件驱动 + 降级 15s 兜底轮询）----
+  function stopJarHostPolling(){
+    if (jarHostLive){ jarHostLive(); jarHostLive = null; }
+  }
+  function openJarHostsDrawer(sid, svcName){
+    stopJarHostPolling();
+    openDrawer({
+      title: '每主机版本 · ' + svcName, wide: true,
+      onClose: stopJarHostPolling,
+      body: '<div id="jarHostBox">加载中...</div>',
+    });
+    const refresh = () => refreshJarHosts(sid);
+    refresh();
+    jarHostLive = liveBind('monitor', refresh, 15000);
+  }
+  async function refreshJarHosts(sid){
+    try {
+      const env = state.currentEnv || '';
+      const data = await api(`/api/projects/${state.currentProject.id}/services/${sid}`
+        + `/hosts?env=${encodeURIComponent(env)}`);
+      const box = document.getElementById('jarHostBox');
+      if (box) box.innerHTML = jarHostTableHTML(data.hosts || []);
+    } catch(e) {
+      const box = document.getElementById('jarHostBox');
+      if (box) box.innerHTML = `<span class="err">加载失败：${esc(e.message || e)}</span>`;
+    }
+  }
   // ---- 服务日志抽屉（1Panel 风格，轮询 /api/logs/tail，5s 增量追加）----
   function stopSvcLogPolling(){
     if (svcLogLive){ svcLogLive(); svcLogLive = null; }
@@ -456,7 +500,7 @@
       if (destroyed) return [];
       return [];
     },
-    destroy: function(){ destroyed = true; clearLiveOffs(); lastSig = null; stopSvcLogPolling(); },
+    destroy: function(){ destroyed = true; clearLiveOffs(); lastSig = null; stopSvcLogPolling(); stopJarHostPolling(); },
   };
 
   async function render(){
