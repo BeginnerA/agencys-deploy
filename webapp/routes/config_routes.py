@@ -932,3 +932,64 @@ def onboard_service_unit(pid, sid):
           {"unit": unit, "env": env_obj["name"], "ok": done, "failed": failed})
     return _ok({"hosts": done, "failed": failed}) if not failed else \
         (_ok({"hosts": done, "failed": failed}), 207)
+
+
+def _merge_host_row(host: str, unit: str, db_row: dict, live: dict) -> dict:
+    """DB 快照 + 实时视图合并：实时优先，DB 补版本/回滚基线"""
+    db_row = db_row or {}
+    live = live or {}
+    return {
+        "host": host,
+        "unit": live.get("unit") or unit,
+        "status": live.get("status") or ("unknown" if db_row else "not_deployed"),
+        "version": live.get("version") or db_row.get("current_version") or "",
+        "previous_version": db_row.get("previous_version") or "",
+        "pid": live.get("pid") or 0,
+        "uptime_hours": live.get("uptime_hours"),
+        "restarts": live.get("restarts") or 0,
+        "cpu": live.get("cpu"),
+        "rss_mb": live.get("rss_mb"),
+        "updated_at": db_row.get("updated_at") or 0,
+        "live": bool(live),
+    }
+
+
+@config_bp.route("/projects/<int:pid>/services/<int:sid>/hosts", methods=["GET"])
+@require_auth
+def service_hosts(pid, sid):
+    """每主机版本/进程视图（只读）：实时监控优先，监控关闭时回退 DB 快照"""
+    db_path = current_app.config["DB_PATH"]
+    rec, err = _jar_service_or_404(pid, sid)
+    if err:
+        return err
+    env_name = request.args.get("env") or ""
+    env_obj = (dbm.get_env_by_name(db_path, pid, env_name) if env_name
+               else dbm.get_default_env(db_path, pid))
+    if not env_obj:
+        return _err("目标环境不存在", 404)
+    env_name = env_obj["name"]
+    unit = _unit_target(rec)[0]
+    db_rows = {r["host"]: r for r in
+               dbm.list_host_state(db_path, pid, env_name, rec["name"])}
+    live_rows = {}
+    try:
+        from ..monitor import get_monitor
+        monitor = get_monitor()
+        if monitor:
+            overview = monitor.get_overview(pid, env_name)
+            svc_view = (overview.get("services") or {}).get(rec["name"]) or {}
+            live_rows = {h["host"]: h
+                         for h in (svc_view.get("hosts") or [])}
+    except Exception:
+        live_rows = {}
+    hosts, seen = [], set()
+    for srv in dbm.list_env_servers(db_path, env_obj["id"]):
+        seen.add(srv["host"])
+        hosts.append(_merge_host_row(srv["host"], unit,
+                                     db_rows.get(srv["host"]),
+                                     live_rows.get(srv["host"])))
+    for host, row in live_rows.items():
+        if host not in seen:
+            hosts.append(_merge_host_row(host, unit, db_rows.get(host), row))
+    return _ok({"env": env_name, "unit": unit,
+                "hosts": sorted(hosts, key=lambda h: h["host"])})
