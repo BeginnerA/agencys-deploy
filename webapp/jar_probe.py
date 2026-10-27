@@ -11,8 +11,9 @@ import time
 UNIT_PROPS = ("LoadState", "ActiveState", "SubState", "MainPID",
               "NRestarts", "ActiveEnterTimestampMonotonic")
 
-_STATUS_RANK = {"online": 4, "stopped": 3, "not_deployed": 2,
-                "probe_failed": 1, "unknown": 0}
+# 与 MonitorScheduler._svc_priority 对齐：不可达(probe_failed)不得被 stopped 掩盖
+_STATUS_RANK = {"online": 4, "probe_failed": 3, "stopped": 2,
+                "not_deployed": 1, "unknown": 0}
 
 
 def build_probe_cmd(units: dict, token: str = None) -> tuple:

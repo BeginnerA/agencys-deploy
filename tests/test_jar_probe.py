@@ -141,6 +141,16 @@ class AggregateHostsTest(unittest.TestCase):
         self.assertEqual(agg["version"], "1.0.1")
         self.assertEqual(agg["online_hosts"], 1)
 
+    def test_probe_failed_outranks_stopped(self):
+        # 混合主机：一台 stopped、一台探测失败 → 聚合取 probe_failed
+        # （不可达主机不能被另一台的 stopped 掩盖，与 MonitorScheduler 优先级一致）
+        agg = jar_probe.aggregate_hosts([
+            {"host": "a", "status": "stopped", "version": "1.0.0"},
+            {"host": "b", "status": "probe_failed", "version": ""},
+        ])
+        self.assertEqual(agg["status"], "probe_failed")
+        self.assertEqual(agg["version"], "1.0.0")
+
     def test_empty(self):
         agg = jar_probe.aggregate_hosts([])
         self.assertEqual(agg, {"status": "unknown", "version": "",

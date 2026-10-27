@@ -229,7 +229,8 @@ def _probe_server_full(host: str, port: int, ssh_cfg: dict, service_names: set,
     返回 {ssh_ok, containers, containers_stopped, container_list, container_status,
          resources, host_metrics, extended, jar_probe, error}。
     第一轮：2 条命令（ps -a 一次覆盖全部容器状态 + 仅服务容器的 stats/主机指标），
-    1 次 SSH 连接；第二轮：扩展指标 4 条命令，1 次 SSH 连接。
+    含 jar 单元时追加第 3 条（systemctl/版本/进程 stat），1 次 SSH 连接；
+    第二轮：扩展指标 4 条命令，1 次 SSH 连接。
     service_names 为需采集资源指标的容器名集合（跨环境合并后的并集）。
     container_status 每轮从第一轮 ps -a 输出构建（节流轮也保持运行时长新鲜）。
     skip_extended=True 时跳过第二轮（节流，降低 SSH 频率）。
@@ -771,6 +772,8 @@ class MonitorScheduler:
         self._thread = None
         self._round = 0  # 探测轮次计数器（扩展指标节流用）
         self._prev_cpu = {}  # {host: /proc/stat 累计值} 跨轮差分算 CPU 使用率
+        self._jar_prev = {}      # {(host, unit): {pid, cpu_ticks, ts}} CPU 差分基准
+        self._host_versions = {}  # {(project_id, env, service, host): version} 写穿去重
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -885,7 +888,7 @@ class MonitorScheduler:
                     r = {"ssh_ok": False, "containers": {}, "containers_stopped": {},
                          "container_list": [], "container_status": {},
                          "resources": {}, "host_metrics": {}, "extended": {},
-                         "error": "timeout"}
+                         "jar_probe": {}, "error": "timeout"}
                 if r.get("ssh_ok"):
                     # CPU 使用率：/proc/stat 跨轮差分（取代 vmstat sleep 采样）
                     self._apply_cpu_delta(key[0], r.get("host_metrics") or {})
@@ -913,6 +916,82 @@ class MonitorScheduler:
         d_busy = raw["busy"] - prev["busy"]
         if d_total > 0 and d_busy >= 0:
             hm["cpu"] = round(min(100.0, max(0.0, d_busy / d_total * 100)), 1)
+
+    def _merge_jar_services(self, env: dict, jar_services: list, servers: list,
+                            host_results: dict, result: dict,
+                            health_hosts: dict):
+        """jar_service：每主机 systemd 进程视图 → 服务聚合 + 版本写穿
+
+        版本权威在目标机（.deploy_version / CURRENT）；只有版本变化才写
+        service_host_state，避免 30s 轮询写放大。CPU 需要上一轮样本，
+        首次探测为 None，第二轮起才有值。
+        """
+        from deploy_strategies.jar_config import (derive_unit_name,
+                                                  parse_runtime_config)
+        from . import jar_probe
+        for svc in jar_services:
+            cfg = parse_runtime_config(svc.get("runtime_config"))
+            unit = derive_unit_name(cfg, svc.get("image_name"), svc["name"])
+            rows = []
+            for s in servers:
+                key = (s["host"], int(s.get("ssh_port") or 22))
+                r = host_results.get(key) or {}
+                probe = r.get("jar_probe") or {}
+                raw = (probe.get("units") or {}).get(unit)
+                if not r.get("ssh_ok"):
+                    rows.append({"host": s["host"], "status": "probe_failed",
+                                 "version": "", "pid": 0, "uptime_hours": None,
+                                 "restarts": 0, "cpu": None, "rss_mb": None,
+                                 "unit": unit})
+                    continue
+                if not raw:
+                    rows.append({"host": s["host"], "status": "not_deployed",
+                                 "version": "", "pid": 0, "uptime_hours": None,
+                                 "restarts": 0, "cpu": None, "rss_mb": None,
+                                 "unit": unit})
+                    continue
+                prev_key = (s["host"], unit)
+                with self._lock:
+                    prev = self._jar_prev.get(prev_key)
+                view = jar_probe.build_view(
+                    raw, prev=prev,
+                    proc_uptime=probe.get("uptime") or 0.0,
+                    clk_tck=probe.get("clk_tck") or 100)
+                sample = view.pop("sample", None)
+                if sample:
+                    with self._lock:
+                        self._jar_prev[prev_key] = sample
+                view["host"] = s["host"]
+                rows.append(view)
+                if view["status"] == "online":
+                    health_hosts.setdefault(svc["name"], []).append(s["host"])
+                version = view.get("version") or ""
+                if version and view["status"] in ("online", "stopped"):
+                    cache_key = (env.get("project_id"), env["name"],
+                                 svc["name"], s["host"])
+                    with self._lock:
+                        changed = self._host_versions.get(cache_key) != version
+                        self._host_versions[cache_key] = version
+                    if changed:
+                        try:
+                            dbm.record_host_state_live(
+                                self._db_path, env.get("project_id") or 0,
+                                env["name"], svc["name"], s["host"], version)
+                        except Exception as e:
+                            print(f"[monitor] jar 版本写穿失败({s['host']}): {e!r}",
+                                  file=sys.stderr)
+            agg = jar_probe.aggregate_hosts(rows)
+            st = result["services"].setdefault(svc["name"], {"ts": time.time()})
+            st.update({"status": agg["status"], "version": agg["version"],
+                       "instances": -1, "ts": time.time(), "hosts": rows,
+                       "online_hosts": agg["online_hosts"], "unit": unit,
+                       "health_port": cfg["port"]})
+            online_uptime = next(
+                (h["uptime_hours"] for h in rows
+                 if h["status"] == "online" and h.get("uptime_hours") is not None),
+                None)
+            if online_uptime is not None:
+                st["uptime_hours"] = online_uptime
 
     def _probe_env(self, ctx: dict, host_results: dict):
         """环境级组装：把去重后的主机探测结果切片为本环境视图并叠加平台侧检查
@@ -944,7 +1023,7 @@ class MonitorScheduler:
             if r is None:
                 r = {"ssh_ok": False, "containers": {}, "containers_stopped": {},
                      "resources": {}, "host_metrics": {}, "extended": {},
-                     "container_status": {}, "error": "timeout"}
+                     "jar_probe": {}, "container_status": {}, "error": "timeout"}
             # 服务资源/状态按本环境服务集合从主机结果中切片（主机结果为跨环境并集）
             matched = sum(1 for n in (r.get("containers") or {}) if n in svc_name_set)
             result["servers"].append(
@@ -975,8 +1054,9 @@ class MonitorScheduler:
                     per_server_extended[s["host"]] = cur_ext
             ext_cs = (cur_ext or {}).get("container_status") or {}
             for svc in services:
-                if (svc.get("deploy_mode") or "container") == "static_archive":
-                    continue  # 静态托管无容器，不参与容器匹配（循环后按 HTTP 统一探测）
+                if (svc.get("deploy_mode") or "container") in ("static_archive",
+                                                               "jar_service"):
+                    continue  # 静态托管/纯 Java 进程没有容器，走各自的探测分支
                 image = (r.get("containers") or {}).get(svc["service_name"])
                 st = result["services"].setdefault(svc["name"],
                                                    {"status": "not_deployed",
@@ -1003,6 +1083,11 @@ class MonitorScheduler:
                         st["status"] = "stopped"
         result["host_metrics"] = per_server_metrics
         result["extended_metrics"] = per_server_extended
+        jar_services = [svc for svc in services
+                        if (svc.get("deploy_mode") or "container") == "jar_service"]
+        if jar_services:
+            self._merge_jar_services(env, jar_services, servers, host_results,
+                                     result, health_hosts)
         # 静态托管服务：无容器/Nacos 可查，配了 health_url 则 HTTP 探活（200 即在线，
         # 静态首页无 UP 体，不能复用 check_http 的 Actuator 语义）；未配置则 unknown
         for svc in services:
@@ -1036,13 +1121,19 @@ class MonitorScheduler:
                   if result["services"].get(s["name"], {}).get("status") == "online"]
         if online:
             with ThreadPoolExecutor(max_workers=min(8, len(online))) as pool:
-                futs = {pool.submit(_probe_nacos_instances, env, s["service_name"],
-                                    s.get("nacos_groups") or []): s for s in online}
+                futs = {pool.submit(_probe_nacos_instances, env,
+                                    s.get("service_name") or s["name"],
+                                    s.get("nacos_groups") or []): s
+                        for s in online}
                 for fut, s in futs.items():
                     try:
-                        result["services"][s["name"]]["instances"] = fut.result(timeout=20)
+                        inst = fut.result(timeout=20)
                     except Exception:
-                        result["services"][s["name"]]["instances"] = -1
+                        inst = -1
+                    if (inst < 0 and (s.get("deploy_mode") or "") == "jar_service"):
+                        inst = (result["services"].get(s["name"]) or {}).get(
+                            "online_hosts", 0)
+                    result["services"][s["name"]]["instances"] = inst
         # 健康检查（在线服务）：经 SSH 在服务器本地探测 127.0.0.1:health_port。
         # 微服务业务端口不对公网放行（云安全组只挡外部），从监控机直连必失败，
         # 故复用 _probe_server_full 已建立的 SSH 连接在宿主机 localhost 探测。
@@ -1054,6 +1145,9 @@ class MonitorScheduler:
             host_checks = {}  # {host: [(svc_name, hp, hu), ...]}
             for svc in online:
                 hp = svc.get("health_port") or 0
+                if hp <= 0:
+                    # jar_service 的健康端口来自 runtime_config.port（聚合时写入视图）
+                    hp = (result["services"].get(svc["name"]) or {}).get("health_port", 0) or 0
                 hu = (svc.get("health_url") or "").strip()
                 if hp <= 0:
                     continue
