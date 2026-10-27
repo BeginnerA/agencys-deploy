@@ -39,3 +39,6 @@ Thumbs.db
 
 # ---- 本地 git worktree ----
 .worktrees/
+
+# ---- Qoder 站点发布元数据（本地保留，不入库）----
+*.qoder.site
