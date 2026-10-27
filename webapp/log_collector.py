@@ -117,7 +117,9 @@ def _journal_lines(raw: str, min_us: int = 0) -> list:
     """journalctl -o json → 带时间戳前缀的日志行（复用 docker -t 解析管线）
 
     MESSAGE 可能是 str/整数/字节数组；多行消息逐行加同一前缀，保证
-    _parse_ts 对每行都能解析出时间。min_us 严格过滤游标及更早条目。
+    _parse_ts 对每行都能解析出时间。min_us 为客户端去重阈值：保留
+    ts_us >= min_us 的条目——游标本身是上一条 +1μs，恰好等于 min_us
+    的条目属于新日志，必须保留。
     """
     out = []
     for raw_line in (raw or "").splitlines():
@@ -128,11 +130,13 @@ def _journal_lines(raw: str, min_us: int = 0) -> list:
             entry = json.loads(raw_line)
         except (TypeError, ValueError):
             continue
+        if not isinstance(entry, dict):
+            continue  # null/数组/数字等合法 JSON 非对象：跳过，不中断整批
         try:
             ts_us = int(entry.get("__REALTIME_TIMESTAMP") or 0)
         except (TypeError, ValueError):
             ts_us = 0
-        if ts_us <= 0 or ts_us <= min_us:
+        if ts_us <= 0 or ts_us < min_us:
             continue
         msg = entry.get("MESSAGE", "")
         if isinstance(msg, list):
@@ -244,14 +248,17 @@ class LogCollector:
         conn = dbm.get_conn(self.db_path)
         try:
             envs = conn.execute(
-                "SELECT e.id, e.name, e.ssh, p.name as project "
+                "SELECT e.id, e.name, e.ssh, e.project_id, p.name as project "
                 "FROM environments e JOIN projects p ON e.project_id = p.id "
                 "WHERE e.monitor_enabled = 1"
             ).fetchall()
         finally:
             conn.close()
 
-        # 按主机聚合环境：jobs[(host, port)] = {"host","port","ssh_cfg","envs"}
+        # 项目 → systemd 单元（jar_service 走 journalctl，与容器共用一条 SSH 通道）
+        jar_by_project = self._load_jar_services()
+        # 按主机聚合环境：jobs[(host, port)] = {"host","port","ssh_cfg","envs",
+        # "jar_units"}
         from .monitor import _merge_server_ssh
         jobs = {}
         for env_row in envs:
@@ -280,9 +287,12 @@ class LogCollector:
                 if job is None:
                     job = {"host": srv["host"], "port": key[1],
                            "ssh_cfg": _merge_server_ssh(env_ssh, srv),
-                           "envs": []}
+                           "envs": [], "jar_units": {}}
                     jobs[key] = job
                 job["envs"].append((env_name, env_id))
+                for info in jar_by_project.get(env_row["project_id"], []):
+                    job["jar_units"].setdefault(
+                        info["unit"], {"service": info["service"]})
         if not jobs:
             self._current_kw_rules = None
             return
@@ -299,6 +309,28 @@ class LogCollector:
         self._current_kw_rules = None
         self._publish_round_event()
 
+    def _load_jar_services(self) -> dict:
+        """项目 → [{unit, service}]；单元名口径与部署/监控共用 derive_unit_name
+
+        service 为 log_entries.service 的取值（service_name or name），与
+        tail/pipeline 的服务名口径一致；unit 仅用于 journalctl -u 与目录名。
+        """
+        from deploy_strategies.jar_config import derive_unit_name
+        conn = dbm.get_conn(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT project_id, name, image_name, service_name, runtime_config "
+                "FROM services WHERE enabled=1 AND deploy_mode='jar_service'"
+            ).fetchall()
+        finally:
+            conn.close()
+        result = {}
+        for r in rows:
+            unit = derive_unit_name(r["runtime_config"], r["image_name"], r["name"])
+            result.setdefault(r["project_id"], []).append(
+                {"unit": unit, "service": r["service_name"] or r["name"]})
+        return result
+
     def _publish_round_event(self):
         """轮末单帧发布（而非每容器一帧）：采集周期本身就是 30s 量级，
         细粒度推送只会让已绑 logs 的页面反复重取；本轮无新行则不推"""
@@ -311,11 +343,12 @@ class LogCollector:
                                     "services_total": len(services)})
 
     def _collect_host(self, job: dict):
-        """采集单台主机：一次 SSH 单通道批量拉取所有容器增量日志
+        """采集单台主机：一次 SSH 单通道批量拉取所有容器 + journal 单元增量日志
 
         优先复用 monitor 探测缓存的容器列表（省去独立 docker ps SSH 连接）；
         缓存不可用时退化为自己执行 docker ps。
-        每个容器前打印唯一 @@LOGCUT 标记，单条命令一次拉取全部容器；输出按
+        jar_service 的 systemd 单元走 journalctl，与容器共用同一条命令。
+        每个容器/单元前打印唯一 @@LOGCUT 标记，单条命令一次拉取全部；输出按
         标记切分后分发给绑定该主机的各环境（原来的每容器、每环境各一条
         SSH 命令/channel → 每主机 1 条命令）。
         """
@@ -323,6 +356,7 @@ class LogCollector:
         host, port = job["host"], job["port"]
         ssh_cfg = job["ssh_cfg"]
         env_pairs = job["envs"]
+        jar_units = job.get("jar_units") or {}
         # 同名环境（跨项目 prod/test）共用同一日志目录与游标：按环境名去重，
         # 避免同一份日志被重复追加/重复索引
         out_envs = []
@@ -352,7 +386,7 @@ class LogCollector:
                     name = line.split("|", 1)[0].strip()
                     if name:
                         containers.append(name)
-        if not containers:
+        if not containers and not jar_units:
             return
         # 各环境游标：批量读取（每环境 1 次查询）
         states_by_env = {env_name: self._load_scan_states(env_name, host)
@@ -381,20 +415,38 @@ class LogCollector:
             parts.append("echo " + shlex.quote(_marker(token, container)))
             parts.append(logs_cmd)
             metas.append((container, last_ts))
+        # systemd 单元（jar_service）：与容器共用同一条 SSH 通道，
+        # 文件目录用单元名（不含 ':'），游标键用 systemd:<unit> 与容器名隔离
+        journal_metas = []
+        for unit in sorted(jar_units):
+            scan_key = f"systemd:{unit}"
+            cursors = [st.get(scan_key, {}).get("last_ts", "")
+                       for st in states_by_env.values()]
+            valid = [c for c in cursors if c]
+            last_ts = min(valid) if valid and len(valid) == len(out_envs) else ""
+            since_arg, _ = _journal_since(last_ts)
+            parts.append("echo " + shlex.quote(
+                _marker(token, f"journal:{unit}")))
+            parts.append(_build_journal_cmd(unit, since_arg, self.max_lines))
+            journal_metas.append((unit, last_ts))
         cmd = "; ".join(parts)
-        # 批量总超时随容器数放宽（单容器通常 <1s）
-        timeout = max(30, min(300, 10 + 4 * len(metas)))
+        # 批量总超时随容器/单元数放宽（单通道通常 <1s）
+        timeout = max(30, min(300, 10 + 4 * (len(metas) + len(journal_metas))))
         try:
             # 单连接单命令顺序拉取（原为每容器一条命令，逐条 channel）
             out = self.ssh_func(host, port, ssh_cfg, cmd, timeout=timeout)
         except Exception:
+            fail_keys = ([c for c, _ in metas]
+                         + [f"systemd:{u}" for u, _ in journal_metas])
             with self._lock:
-                for container, _ in metas:
+                for container in fail_keys:
                     for env_name, _ in out_envs:
                         k = (env_name, host, container)
                         self._fail_counts[k] = self._fail_counts.get(k, 0) + 1
             return
-        chunks = _split_marker_output(out, token, [c for c, _ in metas])
+        chunks = _split_marker_output(
+            out, token,
+            [c for c, _ in metas] + [f"journal:{u}" for u, _ in journal_metas])
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         for container, _ in metas:
             out_container = chunks.get(container)
@@ -416,6 +468,33 @@ class LogCollector:
                 self._collect_container_output(env_name, env_id, host, container,
                                                out_container,
                                                st.get("last_ts") or "", file_offset)
+        # systemd 单元分发：客户端按游标 µs 过滤（journalctl --since 含边界）
+        for unit, _last_ts in journal_metas:
+            raw = chunks.get(f"journal:{unit}")
+            fail_key = f"systemd:{unit}"
+            if raw is None:
+                # 标记缺失（命令中途失败/单元消失）：记失败，下轮重试
+                with self._lock:
+                    for env_name, _ in out_envs:
+                        k = (env_name, host, fail_key)
+                        self._fail_counts[k] = self._fail_counts.get(k, 0) + 1
+                continue
+            with self._lock:
+                for env_name, _ in out_envs:
+                    self._fail_counts.pop((env_name, host, fail_key), None)
+            for env_name, env_id in out_envs:
+                st = (states_by_env.get(env_name) or {}).get(fail_key, {})
+                _since, min_us = _journal_since(st.get("last_ts") or "")
+                lines = _journal_lines(raw, min_us)
+                if not lines:
+                    continue
+                file_offset = (st.get("file_offset", 0)
+                               if st.get("file_date") == today else 0)
+                self._collect_container_output(
+                    env_name, env_id, host, unit, "".join(lines),
+                    st.get("last_ts") or "", file_offset,
+                    service_key=(jar_units.get(unit) or {}).get("service") or unit,
+                    scan_key=fail_key)
 
     def _load_scan_states(self, env_name: str, host: str) -> dict:
         """批量读取服务器所有容器采集游标：
@@ -465,9 +544,17 @@ class LogCollector:
 
     def _collect_container_output(self, env_name: str, env_id: int, host: str,
                                   container: str, out: str, last_ts: str,
-                                  file_offset: int = 0):
-        """处理单容器采集输出：解析行 → 归档文件 → FTS 索引 → 关键词扫描 → 游标
+                                  file_offset: int = 0, *,
+                                  service_key: str = None,
+                                  scan_key: str = None):
+        """处理单容器/单系统单元采集输出：解析行 → 归档文件 → FTS 索引 →
+        关键词扫描 → 游标
 
+        container: 日志文件目录名（journal 传单元名，不含 ':'）；
+        service_key: log_entries.service（jar 传 service_name or name，
+        旧容器路径默认取 container）；
+        scan_key: log_scan_state.container（journal 传 systemd:<unit>，
+        旧容器路径默认取 container）；
         file_offset: 该容器当日日志文件的“文件级逻辑字节偏移”基准（跨日重置 0）。
         line_offset 语义与 log_routes.log_context 的定位逻辑一致：
         从文件头逐行累加源行字节长度（无 \r）得到的文件级偏移。
@@ -480,8 +567,9 @@ class LogCollector:
             return
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        service = container
-        file_path = _build_log_file_path(self.log_dir, env_name, service, today)
+        service = service_key or container
+        scan_key = scan_key or container
+        file_path = _build_log_file_path(self.log_dir, env_name, container, today)
 
         self._append_to_file(file_path, lines)
 
@@ -500,7 +588,7 @@ class LogCollector:
         if entries:
             rowids = self._index_log_entries(entries)
             self._scan_keywords_in_entries(entries, env_name, env_id, rowids)
-            self._update_scan_state(env_name, host, container, service,
+            self._update_scan_state(env_name, host, scan_key, service,
                                     last_line_ts or "", line_offset, today)
             with self._lock:
                 self._round_entries += len(entries)

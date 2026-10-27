@@ -225,3 +225,31 @@ class TestLogRoutes(unittest.TestCase):
         """手动清理仅 admin：未登录 401"""
         resp = self.client.post("/api/logs/maintenance")
         self.assertEqual(resp.status_code, 401)
+
+    def test_tail_falls_back_to_service_name_for_jar(self):
+        """jar 服务无 service_name（容器名）→ tail 回退用服务名映射"""
+        pid = dbm.create_record(self.db, "projects", dict(
+            name="jar-p", code="jarp", description="", git_org="",
+            created_at=int(time.time())))
+        dbm.create_record(self.db, "services", dict(
+            project_id=pid, name="jar-auth", image_name="", service_name="",
+            deploy_mode="jar_service", runtime_config={"app_home": "/opt/auth"},
+            docker_context="", dockerfile="", build_order="[]",
+            nacos_groups="[]", dubbo_services="[]", snailjob_group="",
+            health_url="", health_port=0, log_error_keywords="[]",
+            clear_log_dir="", git_repo="", enabled=1))
+        conn = dbm.get_conn(self.db)
+        try:
+            conn.execute(
+                "INSERT INTO log_entries (ts, env, service, container, file_path, "
+                "line_offset, line_count, content, keywords) "
+                "VALUES (?, 'prod', 'jar-auth', 'jar-auth', '', 0, 1, 'BOOT OK', '[]')",
+                (int(time.time()),))
+            conn.commit()
+        finally:
+            conn.close()
+        r = self.client.get("/api/logs/tail?service=jar-auth&lines=10",
+                            headers=self._auth_headers())
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertTrue(any("BOOT OK" in x["content"]
+                            for x in r.get_json()["rows"]))

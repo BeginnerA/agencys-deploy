@@ -183,8 +183,11 @@ def log_services():
     db_path = current_app.config["DB_PATH"]
     conn = dbm.get_conn(db_path)
     try:
+        # jar_service 无容器名（service_name 为空）→ 回退到服务名，
+        # 与采集器写入 log_entries.service 的口径（service_name or name）一致
         sql = (
-            "SELECT DISTINCT e.name AS env, s.service_name AS service "
+            "SELECT DISTINCT e.name AS env, "
+            "CASE WHEN s.service_name != '' THEN s.service_name ELSE s.name END AS service "
             "FROM services s "
             "JOIN environments e ON s.project_id = e.project_id "
             "WHERE s.enabled = 1"
@@ -193,7 +196,7 @@ def log_services():
         if project_id:
             sql += " AND s.project_id = ?"
             params.append(project_id)
-        sql += " ORDER BY e.name, s.service_name"
+        sql += " ORDER BY e.name, service"
         rows = conn.execute(sql, params).fetchall()
         return jsonify([dict(r) for r in rows])
     finally:
@@ -224,13 +227,13 @@ def tail_service_logs():
     db_path = current_app.config["DB_PATH"]
     conn = dbm.get_conn(db_path)
     try:
-        # 将服务显示名映射到 service_name（Docker 容器名）
-        # log_entries.service 存储的是容器名
+        # 将服务显示名映射到 service_name（Docker 容器名）/服务名
+        # （jar_service 无容器名，log_entries.service = service_name or name）
         row = conn.execute(
-            "SELECT service_name FROM services WHERE name = ? LIMIT 1",
+            "SELECT service_name, name FROM services WHERE name = ? LIMIT 1",
             (service,)
         ).fetchone()
-        svc_key = row["service_name"] if row else service
+        svc_key = ((row["service_name"] or row["name"]) if row else service)
 
         # 查询最近的日志条目
         if after:
