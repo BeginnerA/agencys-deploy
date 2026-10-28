@@ -20,7 +20,7 @@
 - Maven 3.8 及以上版本
 - Docker（已登录到目标镜像仓库并能推送）
 - 到所有目标服务器的免密 SSH 访问
-- Go 构建需平台机安装 Go 工具链（或配置 `build.go_home`）；Rust 构建需 cargo，Windows 平台机交叉编译须配置 `build.rust_target` 与对应 target/linker，否则请用 WSL/Linux 构建或 `build_type=none`；
+- Go 构建需平台机安装 Go 工具链（或配置 `build.go_home`）；Rust 构建需 cargo，Windows/macOS 平台机交叉编译须配置 `build.rust_target` 与对应 target/linker，否则请用 WSL/Linux 构建或 `build_type=none`；
 
 ### 2.2 目标服务器环境
 
@@ -798,14 +798,15 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 
 ### 10.9 Go/Rust 单二进制发布（go_binary / rust_binary）
 
-`go_binary` / `rust_binary` 面向「目标机只跑一个编译型二进制、由 systemd 托管」的后端服务：平台机交叉编译出 Linux 二进制（Go 固定 `CGO_ENABLED=0 GOOS=linux`，Rust 走 `cargo build --release`），不构建镜像、不操作容器，与 jar 共用 `releases/{version}` 版本目录、`CURRENT` 符号链接切换、systemd 托管与进程族观测；目标机零运行时依赖（不装 JDK，也没有解释器要求）。
+`go_binary` / `rust_binary` 面向「目标机只跑一个编译型二进制、由 systemd 托管」的后端服务：平台机交叉编译出 Linux 二进制（Go 固定 `CGO_ENABLED=0 GOOS=linux`，Rust 走 `cargo build --release`），不构建镜像、不操作容器，与 jar 共用 `releases/{version}` 版本目录、`CURRENT` 符号链接切换、systemd 托管与进程族观测；目标机无 JDK/解释器依赖——Go（`CGO_ENABLED=0`）产物完全静态，Rust 的 gnu target 产物仍动态链接目标机 glibc（glibc 过旧会报 `GLIBC_2.xx not found`，可改用 musl target 或静态链接规避，见下条 triple 说明）。
 
 平台机构建前提：
 
-- `go`/`cargo` 在平台机 PATH 中；或配置 `build.go_home` / `build.cargo_home` 指向工具链根目录（或可执行文件）。Windows 下该配置会依次尝试 `go`/`cargo` 的 `.exe`、`.cmd`、`.bat` 形态（`CreateProcess` 不做扩展名解析，必须落盘匹配），PATH 查找交由系统 `which` 处理；
-- Go 交叉编译默认 `GOARCH=amd64`（`build.go_arch` 可改），支持 `build.go_main`（入口包，默认 `.`）与 `build.go_ldflags`；服务表单中 `go_binary` 的构建类型锁定 `go`，或选 `none` 外部投入产物；
-- Rust 交叉编译限制：Windows 平台机未配置 `build.rust_target`（交叉 triple，如 `x86_64-unknown-linux-gnu`）时直接报错并引导三选一——配置 triple（并 `rustup target add` 对应 target、安装交叉 linker）、改用 WSL/Linux 构建、或 `build_type=none` 外部投入产物；未配 triple 时 cargo 按平台机本机默认目标构建（Linux 平台机产物即 Linux 二进制，macOS 平台机产物无法在 Linux 目标机运行，同样需要配置 triple）；
-- Rust 产物二进制名默认取服务名，可在 `build.rust_bin` 显式指定；配置了 `rust_target` 时在 `target/{triple}/release/` 下查找产物。
+- `go`/`cargo` 在平台机 PATH 中；或配置 `build.go_home` / `build.cargo_home` 指向工具链根目录（或可执行文件）。Windows 下该配置会依次尝试 `go`/`cargo` 的 `.exe`、`.cmd`、`.bat` 形态（`CreateProcess` 不做扩展名解析，必须落盘匹配），PATH 查找按 PATH/PATHEXT 解析；
+- Go 交叉编译默认 `GOARCH=amd64`（`build.go_arch` 可改），支持 `build.go_main`（入口包，默认 `.`）与 `build.go_ldflags`；服务表单中构建类型随发布方式联动缺省（`go_binary` → `go`、`rust_binary` → `rust`），两者都可改选 `none` 外部投入产物；
+- Rust 交叉编译限制：Windows 平台机未配置 `build.rust_target`（交叉 triple，如 `x86_64-unknown-linux-gnu`）时直接报错，并引导三选一——配置 triple（`rustup target add` 对应 target、安装交叉 linker）、改用 WSL/Linux 构建、或 `build_type=none` 外部投入产物；macOS 平台机同样必须配置 Linux triple，未配置时 cargo 按本机默认目标静默产出 darwin 二进制（无法在 Linux 目标机运行）；Linux 平台机不配置时产物即本机 Linux 二进制。gnu triple 动态链接 glibc，目标机 glibc 过旧会报 `GLIBC_2.xx not found`，需要完全静态时改用 musl triple（如 `x86_64-unknown-linux-musl`，同样需 `rustup target add`）或自行静态链接；
+- Rust 产物二进制名默认取服务名，可在 `build.rust_bin` 显式指定；配置了 `rust_target` 时在 `target/{triple}/release/` 下查找产物；
+- 外部投入产物（`build_type=none`）：不执行任何构建命令，须自行把二进制放到平台机 `dist/`（`deploy.dist_dir`，缺省 `dist`，相对路径以仓库根为基准）下，即 `dist/{service}-{version}`（`service` 取服务名/`image_name`），并在同目录生成同名 `.sha256` 旁文件（内容为产物的 sha256 十六进制，如 `sha256sum {service}-{version} | cut -d' ' -f1 > {service}-{version}.sha256`）；发布预检会校验旁文件存在且与产物一致。
 
 目标机前提：
 
