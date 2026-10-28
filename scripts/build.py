@@ -1,8 +1,10 @@
 """Maven 多模块构建 / 前端构建 + Docker 镜像构建推送 / 静态站点 zip 打包
 
-支持两种构建类型（由 projects.yaml 的 build_type 字段决定）：
+支持多种构建类型（由 projects.yaml 的 build_type 字段决定）：
   maven    - Java 微服务：Maven 多模块构建 → Docker 镜像（默认）
   frontend - Web 前端项目：自定义命令（npm install / npm run build 等）→ Docker 镜像
+  go/rust  - 单二进制交叉编译（CGO_ENABLED=0 GOOS=linux / cargo --target），
+             产物直接写 dist/{service}-{version}（含 .sha256 旁文件），零 Docker
 
 发布方式 deploy_mode: static_archive 时构建尾部改为把产出目录打包为
  dist/{zip_prefix}-{version}.zip 供静态策略上传解压，跳过 Docker 构建。
@@ -364,7 +366,7 @@ def get_maven_profile(config: dict, env: str = None) -> str:
 
 def _run_build_steps(proj: dict, project_root: Path, version: str,
                      profile: str, env_vars: dict, config: dict = None):
-    """根据 build_type 执行 Maven 或前端构建步骤"""
+    """根据 build_type 执行对应构建步骤（maven/frontend/go/rust/node/python/none）"""
     build_type = proj.get("build_type", "maven")
     if build_type == "none":
         # 产物由外部投入（build_type=none）：不执行任何构建命令，只做产物校验
@@ -372,8 +374,14 @@ def _run_build_steps(proj: dict, project_root: Path, version: str,
         return
     if build_type == "frontend":
         _run_frontend_steps(proj, project_root, version, env_vars)
-    else:
-        _run_maven_steps(proj, project_root, version, profile, env_vars, config)
+        return
+    if build_type == "go":
+        _run_go_steps(proj, project_root, version, env_vars, config)
+        return
+    if build_type == "rust":
+        _run_rust_steps(proj, project_root, version, env_vars, config)
+        return
+    _run_maven_steps(proj, project_root, version, profile, env_vars, config)
 
 
 def _step_env(env_vars: dict, step: dict) -> dict:
@@ -533,6 +541,94 @@ def _make_jar_artifact(proj: dict, project_root: Path, version: str, config: dic
     return out
 
 
+def _dist_dir(config: dict) -> Path:
+    """dist 目录解析：与 _make_static_zip/_make_jar_artifact 同规则，统一入口"""
+    dist_dir = Path(config["deploy"].get("dist_dir", "dist"))
+    if not dist_dir.is_absolute():
+        dist_dir = Path(__file__).resolve().parent.parent / dist_dir
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    return dist_dir
+
+
+def _write_sha256(path: Path) -> None:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    path.with_name(path.name + ".sha256").write_text(h.hexdigest() + "\n",
+                                                     encoding="utf-8")
+
+
+def _find_tool(tool: str, config_key: str, config: dict, hint: str) -> str:
+    """跨平台定位构建工具：build.{config_key} 显式配置（GOROOT/cargo 根或可执行文件）
+    > PATH；与 find_mvn 同套路（Windows CreateProcess 只认 .exe/.cmd，which 已处理）"""
+    home = (config.get("build") or {}).get(config_key) or ""
+    if home:
+        base = Path(home).expanduser()
+        for cand in (base / "bin" / tool, base / tool):
+            if cand.exists():
+                return str(cand)
+        fail(f"配置的 build.{config_key} 无效（找不到 {tool}）：{home}")
+    found = shutil.which(tool)
+    if found:
+        return found
+    fail(hint)
+
+
+def _run_go_steps(proj: dict, project_root: Path, version: str,
+                  env_vars: dict, config: dict):
+    """Go 交叉编译：CGO_ENABLED=0 GOOS=linux，产物直接写 dist/{svc}-{ver}（零 docker）"""
+    go = _find_tool("go", "go_home", config,
+                    "未找到 Go：请在 config 的 build.go_home 配置 GOROOT，"
+                    "或安装 Go 并加入 PATH（需支持 GOOS=linux 交叉编译）")
+    build_cfg = config.get("build") or {}
+    arch = str(build_cfg.get("go_arch") or "amd64")
+    main = str(build_cfg.get("go_main") or ".")
+    service = proj.get("image_name") or proj.get("name") or "app"
+    out = _dist_dir(config) / f"{service}-{version}"
+    env = dict(env_vars)
+    env["CGO_ENABLED"] = "0"
+    env["GOOS"] = "linux"
+    env["GOARCH"] = arch
+    cmd = [go, "build", "-trimpath"]
+    if build_cfg.get("go_ldflags"):
+        cmd += ["-ldflags", str(build_cfg["go_ldflags"])]
+    cmd += ["-o", str(out), main]
+    log(f"使用 Go: {go}（CGO_ENABLED=0 GOOS=linux GOARCH={arch}）")
+    run(cmd, project_root, env=env, timeout=600)
+    _write_sha256(out)
+    log(f"二进制产物已生成: {out}（sha256 已写旁文件）")
+
+
+def _run_rust_steps(proj: dict, project_root: Path, version: str,
+                    env_vars: dict, config: dict):
+    """cargo --release 构建：交叉编译需 build.rust_target；Windows 主机缺配置即报错引导"""
+    cargo = _find_tool("cargo", "cargo_home", config,
+                       "未找到 cargo：请配置 build.cargo_home 或安装 Rust；"
+                       "Windows 平台机建议改用 WSL/Linux 构建，"
+                       "或 build_type=none 外部投入产物")
+    build_cfg = config.get("build") or {}
+    triple = str(build_cfg.get("rust_target") or "")
+    if not triple and os.name == "nt":
+        fail("build.rust_target 未配置：Windows 平台机无法自动确定 Linux 交叉目标；"
+             "请配置（如 x86_64-unknown-linux-gnu，并安装对应 target 与 linker），"
+             "或改用 WSL/Linux 构建，或 build_type=none 外部投入产物")
+    cmd = [cargo, "build", "--release"]
+    if triple:
+        cmd += ["--target", triple]
+    run(cmd, project_root, env=env_vars, timeout=1800)
+    service = proj.get("image_name") or proj.get("name") or "app"
+    bin_name = str(build_cfg.get("rust_bin") or service)
+    parts = ["target"] + ([triple] if triple else []) + ["release", bin_name]
+    src = project_root.joinpath(*parts)
+    if not src.exists():
+        fail(f"cargo 产物不存在: {src}（检查 build.rust_bin 与 build.rust_target）")
+    out = _dist_dir(config) / f"{service}-{version}"
+    shutil.copy2(src, out)
+    _write_sha256(out)
+    log(f"二进制产物已生成: {out}（sha256 已写旁文件）")
+
+
 def build_project(project_name: str, version: str, env: str = None):
     config = load_config(env=env)
     proj = get_project_config(project_name)
@@ -540,7 +636,10 @@ def build_project(project_name: str, version: str, env: str = None):
     mode = get_registry_mode(config)
     build_type = proj.get("build_type", "maven")
     deploy_mode = proj.get("deploy_mode") or "container"
-    artifact = {"static_archive": "archive", "jar_service": "jar"}.get(deploy_mode, "image")
+    artifact = {"static_archive": "archive", "jar_service": "jar",
+                "go_binary": "binary", "rust_binary": "binary",
+                "node_process": "package", "python_process": "package"
+                }.get(deploy_mode, "image")
     # 只有 maven 构建才需要 profile；frontend 与 none（外部投入产物）都不该因环境名
     # 不在 local/dev/test/prod 而被 get_maven_profile 拦下
     profile = get_maven_profile(config, env) if build_type == "maven" else ""
@@ -567,6 +666,8 @@ def build_project(project_name: str, version: str, env: str = None):
     if artifact == "jar":
         _make_jar_artifact(proj, project_root, version, config)
         return
+    if artifact in ("binary", "package"):
+        return  # 产物已在对应 _run_*_steps 内生成（含 .sha256），无后续打包
 
     # Docker 构建（超时 10 分钟，--progress=plain 便于排查）
     if mode == "push":
