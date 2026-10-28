@@ -3,6 +3,21 @@
   'use strict';
   const H = window.cfgHelpers;
 
+  // 进程族：deploy_mode → 固定/缺省 build_type；none 作为外部投入产物的兜底
+  const PROCESS_BUILD = { jar_service: 'maven', go_binary: 'go', rust_binary: 'rust',
+                          node_process: 'node', python_process: 'python' };
+  const PROCESS_RC_DEFAULT = {
+    jar_service: { java_bin: '/usr/bin/java', artifact_pattern: 'target/*.jar',
+                   readiness: { type: 'http', path: '/actuator/health',
+                                timeout: 90, interval: 5 } },
+    go_binary: { readiness: { type: 'process', path: '', timeout: 90, interval: 5 } },
+    rust_binary: { readiness: { type: 'process', path: '', timeout: 90, interval: 5 } },
+    node_process: { node_bin: '/usr/bin/node', start_file: '',
+                    readiness: { type: 'process', path: '', timeout: 90, interval: 5 } },
+    python_process: { requirements: 'requirements.txt', start_file: '',
+                      readiness: { type: 'process', path: '', timeout: 90, interval: 5 } },
+  };
+
   function open(container, project, svc, onSaved){
     const st = {
       project, container, onSaved,
@@ -43,7 +58,10 @@
       });
       // ① 基本信息
       const isStatic = (d.deploy_mode || 'container') === 'static_archive';
+      const isProc = !!PROCESS_BUILD[d.deploy_mode];
       const isJar = d.deploy_mode === 'jar_service';
+      const isGo = d.deploy_mode === 'go_binary';
+      const isRust = d.deploy_mode === 'rust_binary';
       if (!d.runtime_config || typeof d.runtime_config !== 'object') d.runtime_config = {};
       const rc = d.runtime_config;
       const basic = `
@@ -51,11 +69,13 @@
           <div class="field full">
             <label>发布方式</label>
             <select id="sDeployMode">
-              <option value="container" ${!isStatic && !isJar ? 'selected' : ''}>🐳 容器（Docker 镜像 + compose）</option>
+              <option value="container" ${!isStatic && !isProc ? 'selected' : ''}>🐳 容器（Docker 镜像 + compose）</option>
               <option value="static_archive" ${isStatic ? 'selected' : ''}>🗂️ 静态站点（zip → 1Panel/nginx 目录）</option>
               <option value="jar_service" ${isJar ? 'selected' : ''}>☕ 纯 Java 进程（jar → systemd）</option>
+              <option value="go_binary" ${isGo ? 'selected' : ''}>🐹 Go 单二进制（systemd）</option>
+              <option value="rust_binary" ${isRust ? 'selected' : ''}>🦀 Rust 单二进制（systemd）</option>
             </select>
-            <div class="f-hint">静态站点：前端构建产物 zip 上传 1Panel 站点目录解压切换，无容器无 Nacos；版本号用日期号 YYYYMMDD 而非 semver。纯 Java 进程：Maven 构建出可执行 jar，按版本放入 app_home/releases 并切换 CURRENT 链接，由 systemd 托管；无容器、无镜像。单实例重启期间服务短暂不可用，不承诺零停机。</div>
+            <div class="f-hint">静态站点：前端构建产物 zip 上传 1Panel 站点目录解压切换，无容器无 Nacos；版本号用日期号 YYYYMMDD 而非 semver。纯 Java 进程：Maven 构建出可执行 jar，按版本放入 app_home/releases 并切换 CURRENT 链接，由 systemd 托管；无容器、无镜像。Go/Rust 单二进制：平台机交叉编译（Go）或本地构建（Rust）出 Linux 可执行文件，按版本放入 app_home/releases 并切换 CURRENT 链接；目标机零运行时依赖。单实例重启期间服务短暂不可用，不承诺零停机。</div>
           </div>
           <div class="field full" style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
             <label style="margin:0;white-space:nowrap">启用状态</label>
@@ -67,8 +87,8 @@
             <span id="swEnabledTxt" class="weak" style="font-size:12px">${d.enabled ? '启用中 — 参与监控、告警与发布' : '已停用 — 不出现在监控/告警/总览'}</span>
           </div>
           ${H.field({ label:'服务名', required:true, tip:'发布命令 --project 参数；容器模式须与 docker-compose 服务名、镜像名对应；项目内唯一', input:`<input id="sName" value="${esc(d.name)}" placeholder="如 service-biz">`, hint:'被流水线 stages 引用后改名不受影响（引用按 id），但请同步更新发布习惯' })}
-          ${H.field({ label:'镜像短名', required:!isStatic && !isJar, tip:'完整镜像名 = {registry}/{namespace}/{image_name}:{version}；静态站点不适用，留空自动回退服务名', input:`<input id="sImage" value="${esc(d.image_name)}" placeholder="${isStatic ? '留空即可（静态站点）' : '如 biz'}">`, hint:'不要带命名空间前缀，命名空间来自环境配置' })}
-          ${H.field({ label:'Git 仓库路径', required:!isStatic && !isJar, tip:'相对 deploy.project_root 的目录名，或 http(s) 远程 URL（首次构建自动 clone 到 project_root 下同名目录）；发布成功后在仓库打 v{version}(-{后缀}) tag 并推送远端（可下方关闭）', input:`<input id="sGit" value="${esc(d.git_repo)}" placeholder="如 service-biz 或 https://git.example.com/service-biz.git">`, hint:'多服务共用仓库时填仓库目录名；远程 URL 形态建议勾选下方「构建前拉取代码」；手工传 zip 的静态发布可留空' })}
+          ${H.field({ label:'镜像短名', required:!isStatic && !isProc, tip:'完整镜像名 = {registry}/{namespace}/{image_name}:{version}；静态站点不适用，留空自动回退服务名', input:`<input id="sImage" value="${esc(d.image_name)}" placeholder="${isStatic ? '留空即可（静态站点）' : '如 biz'}">`, hint:'不要带命名空间前缀，命名空间来自环境配置' })}
+          ${H.field({ label:'Git 仓库路径', required:!isStatic && !isProc, tip:'相对 deploy.project_root 的目录名，或 http(s) 远程 URL（首次构建自动 clone 到 project_root 下同名目录）；发布成功后在仓库打 v{version}(-{后缀}) tag 并推送远端（可下方关闭）', input:`<input id="sGit" value="${esc(d.git_repo)}" placeholder="如 service-biz 或 https://git.example.com/service-biz.git">`, hint:'多服务共用仓库时填仓库目录名；远程 URL 形态建议勾选下方「构建前拉取代码」；手工传 zip 的静态发布可留空' })}
           ${H.field({ label:'构建分支', tip:'构建前 checkout 的分支或 tag；留空则不切换，使用当前分支', input:`<input id="sGitBranch" value="${esc(d.git_branch || '')}" placeholder="如 master / v1.0.0">` })}
           <div class="field full" style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
             <label style="margin:0;white-space:nowrap">构建前拉取代码</label>
@@ -88,30 +108,42 @@
             </div>
             <span id="swGitTagTxt" class="weak" style="font-size:12px">${d.git_tag_enabled ? '开启 — 发布成功后打 v{version}(-{环境后缀}) tag 并推送远端' : '关闭 — 发布成功不打 Git Tag'}</span>
           </div>
-          ${H.field({ label:'docker-compose 服务名', required:!isStatic && !isJar, tip:'docker-compose.yml 里的服务名；静态站点不适用，留空自动回退服务名', input:`<input id="sCompose" value="${esc(d.service_name)}" placeholder="留空自动填服务名">` })}
+          ${H.field({ label:'docker-compose 服务名', required:!isStatic && !isProc, tip:'docker-compose.yml 里的服务名；静态站点不适用，留空自动回退服务名', input:`<input id="sCompose" value="${esc(d.service_name)}" placeholder="留空自动填服务名">` })}
         </div>`;
-      // ② 构建配置（静态发布无 Docker 环节，隐藏上下文/Dockerfile 字段；jar 由 Maven 构建，同样无 Docker 环节）
-      const isFrontend = isStatic || (!isJar && d.build_type === 'frontend');
+      // ② 构建配置（静态=前端；jar=Maven；go/rust=go/rust（可切 none 外部投入）；其余进程族在批 B 扩展）
+      const isFrontend = isStatic || (!isProc && d.build_type === 'frontend');
+      const btLocked = isStatic || isJar;  // 构建类型跟随发布方式锁定
+      const btOptions = (mode) => {
+        if (mode === 'jar_service') return `<option value="maven" selected>☕ Java (Maven)</option>`;
+        if (mode === 'go_binary') return `<option value="go" ${d.build_type === 'go' ? 'selected' : ''}>🐹 Go 交叉编译</option><option value="none" ${d.build_type === 'none' ? 'selected' : ''}>📦 外部投入产物（none）</option>`;
+        if (mode === 'rust_binary') return `<option value="rust" ${d.build_type === 'rust' ? 'selected' : ''}>🦀 Cargo 构建</option><option value="none" ${d.build_type === 'none' ? 'selected' : ''}>📦 外部投入产物（none）</option>`;
+        if (mode === 'node_process') return `<option value="node" ${d.build_type === 'node' ? 'selected' : ''}>🟩 Node (npm)</option><option value="none" ${d.build_type === 'none' ? 'selected' : ''}>📦 外部投入产物（none）</option>`;
+        if (mode === 'python_process') return `<option value="python" ${d.build_type === 'python' ? 'selected' : ''}>🐍 Python (wheelhouse)</option><option value="none" ${d.build_type === 'none' ? 'selected' : ''}>📦 外部投入产物（none）</option>`;
+        return `<option value="maven" ${!isFrontend && !isStatic ? 'selected' : ''}>☕ Java (Maven)</option>
+                <option value="frontend" ${isFrontend || isStatic ? 'selected' : ''}>🌐 Web 前端 (npm/pnpm/yarn)</option>`;
+      };
       const build = `
         <div class="form-grid">
           <div class="field full">
             <label>构建类型</label>
-            <select id="sBuildType" ${isStatic || isJar ? 'disabled' : ''}>
-              <option value="maven" ${!isFrontend && !isStatic ? 'selected' : ''}>☕ Java (Maven)</option>
-              <option value="frontend" ${isFrontend || isStatic ? 'selected' : ''}>🌐 Web 前端 (npm/pnpm/yarn)</option>
-            </select>
-            <div class="f-hint">${isStatic ? '静态站点固定为前端构建（构建产出目录打包 zip，不产镜像）' : 'Java 项目使用 Maven 构建；Web 前端项目使用 npm/pnpm/yarn 等命令构建'}</div>
+            <select id="sBuildType" ${btLocked ? 'disabled' : ''}>${btOptions(d.deploy_mode)}</select>
+            <div class="f-hint">${isStatic ? '静态站点固定为前端构建（构建产出目录打包 zip，不产镜像）'
+              : isJar ? 'Java 项目使用 Maven 构建'
+              : isGo ? 'Go：平台机交叉编译 Linux 二进制（CGO_ENABLED=0，GOOS=linux；架构与 ldflags 见构建配置文件）；none = 自行构建后把产物放入平台 dist 目录'
+              : isRust ? 'Rust：cargo 构建（Windows 平台机须配置 rust_target，建议 WSL/Linux 构建或选 none）'
+              : 'Java 项目使用 Maven 构建；Web 前端项目使用 npm/pnpm/yarn 等命令构建'}</div>
           </div>
           ${isFrontend ? `
           <div class="field full"><label>构建步骤（commands）</label>
             ${H.cmdList({ id:'sBuildOrder', rows: d.build_order }).html}
             <div class="f-hint">每个步骤填写工作目录和命令列表（每行一条命令，框高随内容自动伸展）；支持 \${VERSION} 变量替换；自动探测 npm/pnpm/yarn 可执行路径；步骤级环境变量（env，如 NODE_OPTIONS）保存时原样保留。</div>
-          </div>` : `
+          </div>` : (isProc && !isJar ? `
+          <div class="field full"><span class="weak">Go/Rust 构建无需 build_order：产物定位用构建配置（build.go_main / build.rust_bin 等），详见使用文档。</span></div>` : `
           <div class="field full"><label>构建顺序（build_order）</label>
             ${H.rowList({ id:'sBuildOrder', rows: d.build_order }).html}
             <div class="f-hint">按顺序对每个模块执行 mvn clean {goal} -P{profile}；common-build / api 等被依赖模块一般 install，最终服务模块 package；extra_profile 用于同一仓库按 profile 产出不同 jar 的项目。</div>
-          </div>`}
-          ${isStatic || isJar ? '' : `
+          </div>`)}
+          ${isStatic || isProc ? '' : `
           ${H.field({ label:'Docker 上下文目录', tip:'docker build 的上下文', input:`<input id="sDockerCtx" value="${esc(d.docker_context)}" placeholder="如 .">` })}
           ${H.field({ label:'Dockerfile 路径', tip:'相对 docker_context', input:`<input id="sDockerfile" value="${esc(d.dockerfile)}" placeholder="如 Dockerfile">` })}`}
         </div>`;
@@ -125,27 +157,31 @@
           ${H.field({ label:'入口文件（entry_file）', tip:'解压后据此定位产物根目录（兼容 zip 多包一层目录），默认 index.html', input:`<input id="sEntryFile" value="${esc(d.entry_file || '')}" placeholder="留空默认 index.html">` })}
           ${H.field({ label:'文件权限（file_mode）', tip:'换入后文件权限归一，默认 0644（目录固定 0755，属主 root:root）', input:`<input id="sFileMode" value="${esc(d.file_mode || '')}" placeholder="留空默认 0644">` })}
         </div>` : '';
-      // ②c 纯 Java 进程专属配置（deploy_mode=jar_service）
-      const javaCfg = isJar ? `
+      // ②c 进程族专属配置（jar/go/rust/node/python 共享组 + 模式专属组；node/python 组随批 B 选项启用）
+      const procCfg = isProc ? `
         <div class="form-grid">
-          ${H.field({ label:'应用根目录（app_home）', required:true, input:`<input id="jAppHome" value="${esc(rc.app_home || '')}" placeholder="/opt/apps/hqb-auth">`, hint:'版本目录 releases/ 与 CURRENT 链接的根；回滚只换链接，不重传 jar' })}
-          ${H.field({ label:'Java 路径（java_bin）', input:`<input id="jJavaBin" value="${esc(rc.java_bin || '/usr/bin/java')}">`, hint:'目标机已安装的 JDK/JRE 绝对路径，平台不负责安装' })}
-          ${H.field({ label:'JVM 参数（jvm_opts）', input:`<input id="jJvmOpts" value="${esc(rc.jvm_opts || '')}" placeholder="-Xms512m -Xmx1g">` })}
+          ${H.field({ label:'应用根目录（app_home）', required:true, input:`<input id="jAppHome" value="${esc(rc.app_home || '')}" placeholder="${isJar ? '/opt/apps/hqb-auth' : '/opt/apps/' + esc(d.name || 'app')}">`, hint:`版本目录 releases/ 与 CURRENT 链接的根；回滚只换链接，不重传${isJar ? ' jar' : '产物'}` })}
+          ${isJar ? H.field({ label:'Java 路径（java_bin）', input:`<input id="jJavaBin" value="${esc(rc.java_bin || '/usr/bin/java')}">`, hint:'目标机已安装的 JDK/JRE 绝对路径，平台不负责安装' })
+                 + H.field({ label:'JVM 参数（jvm_opts）', input:`<input id="jJvmOpts" value="${esc(rc.jvm_opts || '')}" placeholder="-Xms512m -Xmx1g">` }) : ''}
+          ${d.deploy_mode === 'node_process' ? H.field({ label:'Node 路径（node_bin）', input:`<input id="gNodeBin" value="${esc(rc.node_bin || '/usr/bin/node')}">`, hint:'目标机 node 绝对路径，平台不负责安装' }) : ''}
+          ${(d.deploy_mode === 'node_process' || d.deploy_mode === 'python_process') ? H.field({ label:'入口文件（start_file）', required:true, input:`<input id="gStartFile" value="${esc(rc.start_file || '')}" placeholder="${d.deploy_mode === 'node_process' ? 'dist/server.js' : 'main.py'}">`, hint:'CURRENT 下的相对路径；ExecStart 直接执行该入口' }) : ''}
+          ${d.deploy_mode === 'python_process' ? H.field({ label:'依赖清单（requirements）', input:`<input id="pRequirements" value="${esc(rc.requirements || 'requirements.txt')}">`, hint:'相对项目根；平台机收 wheel，目标机 venv 离线安装' })
+                 + H.field({ label:'目标机 Python 版本（python_version）', input:`<input id="pPythonVersion" value="${esc(rc.python_version || '')}" placeholder="3.11">`, hint:'wheel 解析用；留空取平台机版本并需自行核对目标机一致' }) : ''}
           ${H.field({ label:'启动参数（app_args）', input:`<input id="jAppArgs" value="${esc(rc.app_args || '')}" placeholder="--spring.profiles.active=prod">` })}
           ${H.field({ label:'运行用户（run_user）', input:`<input id="jRunUser" value="${esc(rc.run_user || '')}" placeholder="appuser">`, hint:'留空则由 systemd 以 root 运行；平台不改目标机用户与权限' })}
           ${H.field({ label:'工作目录（work_dir）', input:`<input id="jWorkDir" value="${esc(rc.work_dir || '')}" placeholder="留空默认 {app_home}/CURRENT">` })}
           ${H.field({ label:'systemd 单元名（unit_name）', input:`<input id="jUnit" value="${esc(rc.unit_name || '')}" placeholder="留空默认同服务名">` })}
           ${H.field({ label:'端口（port）', input:`<input id="jPort" type="number" value="${esc(rc.port || '')}" placeholder="8080">`, hint:'HTTP/TCP 就绪方式必填；仅进程存活方式可留空' })}
           ${H.field({ label:'就绪方式（readiness.type）', input:`<select id="jReadinessType">
-              <option value="http" ${(!rc.readiness || rc.readiness.type === 'http') ? 'selected' : ''}>HTTP 健康端点</option>
+              <option value="http" ${(isJar ? (!rc.readiness || rc.readiness.type === 'http') : rc.readiness?.type === 'http') ? 'selected' : ''}>HTTP 健康端点</option>
               <option value="tcp" ${rc.readiness?.type === 'tcp' ? 'selected' : ''}>TCP 端口</option>
-              <option value="process" ${rc.readiness?.type === 'process' ? 'selected' : ''}>仅进程存活</option>
-            </select>` })}
-          ${H.field({ label:'健康路径（readiness.path）', input:`<input id="jReadinessPath" value="${esc(rc.readiness?.path || '/actuator/health')}">`, hint:'仅 HTTP 方式使用；要求响应体含 UP 语义（Actuator 约定）' })}
+              <option value="process" ${(isJar ? (rc.readiness && rc.readiness.type === 'process') : (!rc.readiness?.type || rc.readiness?.type === 'process')) ? 'selected' : ''}>仅进程存活</option>
+            </select>`, hint:isJar ? 'Java 缺省 HTTP + /actuator/health' : 'Go/Rust/Node/Python 缺省仅进程存活；有健康端点请显式选 HTTP/TCP' })}
+          ${H.field({ label:'健康路径（readiness.path）', input:`<input id="jReadinessPath" value="${esc(rc.readiness?.path || (isJar ? '/actuator/health' : ''))}">`, hint:isJar ? '仅 HTTP 方式使用；要求响应体含 UP 语义（Actuator 约定）' : '仅 HTTP 方式使用' })}
           ${H.field({ label:'就绪超时/间隔（秒）', input:`<input id="jReadinessTimeout" type="number" value="${esc((rc.readiness && rc.readiness.timeout) || 90)}" style="width:45%"> <input id="jReadinessInterval" type="number" value="${esc((rc.readiness && rc.readiness.interval) || 5)}" style="width:45%">`, hint:'前为总超时，后为轮询间隔' })}
           ${H.field({ label:'停止/启动超时（秒）', input:`<input id="jStopTimeout" type="number" value="${esc(rc.stop_timeout || 60)}" style="width:45%"> <input id="jStartTimeout" type="number" value="${esc(rc.start_timeout || 120)}" style="width:45%">`, hint:'写入 systemd TimeoutStopSec / TimeoutStartSec' })}
-          ${H.field({ label:'可执行 jar 匹配（artifact_pattern）', input:`<input id="jArtifactPattern" value="${esc(rc.artifact_pattern || 'target/*.jar')}">`, hint:'命中多个时取体积最大者（fat jar 必然更大），并排除 sources/javadoc/original' })}
-          ${H.field({ label:'环境变量文件（env_files）', input:`<textarea id="jEnvFiles" rows="2" placeholder="/opt/apps/hqb-auth/.env">${esc((rc.env_files || []).join('\n'))}</textarea>`, hint:'每行一个绝对路径，写入 systemd EnvironmentFile；文件缺失会导致单元启动失败' })}
+          ${isJar ? H.field({ label:'可执行 jar 匹配（artifact_pattern）', input:`<input id="jArtifactPattern" value="${esc(rc.artifact_pattern || 'target/*.jar')}">`, hint:'命中多个时取体积最大者（fat jar 必然更大），并排除 sources/javadoc/original' }) : ''}
+          ${H.field({ label:'环境变量文件（env_files）', input:`<textarea id="jEnvFiles" rows="2" placeholder="${isJar ? '/opt/apps/hqb-auth/.env' : '/opt/apps/' + esc(d.name || 'app') + '/.env'}">${esc((rc.env_files || []).join('\n'))}</textarea>`, hint:'每行一个绝对路径，写入 systemd EnvironmentFile；文件缺失会导致单元启动失败' })}
           <div class="hint">单实例发布重启期间服务不可用，平台不承诺零停机。首次发布前请用下方「预览 systemd 单元」核对 ExecStart。</div>
           <button class="btn" id="jUnitPreview" type="button" ${d.id ? '' : 'disabled title="保存后可预览"'}>预览 systemd 单元</button>
           <pre id="jUnitContent" class="weak" style="display:none;white-space:pre-wrap;font-size:12px;margin:0"></pre>
@@ -181,11 +217,11 @@
 
       const groups = [
         H.section({ id:'basic', icon:'📝', title:'基本信息', desc:'发布方式 / 服务名 / 镜像 / 仓库关联', open:true, body: basic }),
-        H.section({ id:'build', icon:'🔨', title:'构建配置', desc:isStatic ? '前端构建步骤与静态打包产出' : (isJar ? 'Maven 构建与可执行 jar 产物' : '构建顺序与 Docker 上下文'), open:!!(d.build_order.length || isStatic || isJar), body: build }),
+        H.section({ id:'build', icon:'🔨', title:'构建配置', desc:isStatic ? '前端构建步骤与静态打包产出' : (isProc ? '进程族构建与产物' : '构建顺序与 Docker 上下文'), open:!!(d.build_order.length || isStatic || isProc), body: build }),
         isStatic
           ? H.section({ id:'static', icon:'🗂️', title:'静态站点', desc:'1Panel 站点目录与 zip 产物约定', open:true, body: staticCfg })
-          : (isJar
-              ? H.section({ id:'jar', icon:'☕', title:'Java 进程', desc:'app_home / JVM / systemd 单元', open:true, body: javaCfg })
+          : (isProc
+              ? H.section({ id:'jar', icon:'⚙️', title:'进程配置', desc:'app_home / systemd 单元 / 就绪方式', open:true, body: procCfg })
               : null),
         isStatic ? null : H.section({ id:'reg', icon:'🛰️', title:'注册中心与任务调度', desc:'Nacos 分组 / Dubbo / SnailJob', open:!!(d.nacos_groups.length || d.dubbo_services.length || d.snailjob_group), body: reg }),
         H.section({ id:'health', icon:'💚', title:'健康检查与日志', desc:isStatic ? '站点探活 URL（发布后 HTTP 验证）' : '探活端口 / URL / 启动失败判定', open:true, body: health }),
@@ -207,12 +243,16 @@
       } else {
         H.rowList({ id:'sBuildOrder', rows: d.build_order }).bind();
       }
-      // 发布方式切换：静态↔容器重新渲染表单（字段集差异大，整体重建最可靠）
+      // 发布方式切换：静态↔容器↔进程族重新渲染表单（字段集差异大，整体重建最可靠）
       const dmSel = document.getElementById('sDeployMode');
       if (dmSel) dmSel.onchange = e => {
         d.deploy_mode = e.target.value;
+        const prev = d.runtime_config || {};
+        const base = PROCESS_RC_DEFAULT[d.deploy_mode] || {};
+        d.runtime_config = { ...base, ...prev,
+          readiness: { ...(base.readiness || {}), ...(prev.readiness || {}) } };
         if (d.deploy_mode === 'static_archive') d.build_type = 'frontend';
-        if (d.deploy_mode === 'jar_service') d.build_type = 'maven';
+        else if (PROCESS_BUILD[d.deploy_mode]) d.build_type = PROCESS_BUILD[d.deploy_mode];
         render();
       };
       // 构建类型切换：重新渲染表单
@@ -265,7 +305,7 @@
           git_tag_enabled: d.git_tag_enabled,
           build_type: d.build_type || 'maven',
           deploy_mode: d.deploy_mode || 'container',
-          runtime_config: d.deploy_mode === 'jar_service' ? d.runtime_config : {},
+          runtime_config: PROCESS_BUILD[d.deploy_mode] ? d.runtime_config : {},
           site_root: d.site_root || '', backup_dir: d.backup_dir || '',
           static_dist_dir: d.static_dist_dir || '', zip_prefix: d.zip_prefix || '',
           entry_file: d.entry_file || '', file_mode: d.file_mode || '',
@@ -307,6 +347,7 @@
       d.git_tag_enabled = document.getElementById('sGitTag').checked;
       d.deploy_mode = val('sDeployMode') || 'container';
       const isStatic = d.deploy_mode === 'static_archive';
+      const isProc = !!PROCESS_BUILD[d.deploy_mode];
       const isJar = d.deploy_mode === 'jar_service';
       d.site_root = val('sSiteRoot').trim();
       d.backup_dir = val('sBackupDir').trim();
@@ -314,7 +355,9 @@
       d.zip_prefix = val('sZipPrefix').trim();
       d.entry_file = val('sEntryFile').trim();
       d.file_mode = val('sFileMode').trim();
-      d.build_type = isJar ? 'maven' : (val('sBuildType') || 'maven');
+      d.build_type = isJar ? 'maven'
+        : (isProc ? (val('sBuildType') || PROCESS_BUILD[d.deploy_mode])
+                  : (isStatic ? 'frontend' : (val('sBuildType') || 'maven')));
       d.service_name = val('sCompose').trim();
       d.docker_context = val('sDockerCtx').trim();
       d.dockerfile = val('sDockerfile').trim();
@@ -326,7 +369,7 @@
       d.enabled = document.getElementById('sEnabled').checked;
       d.build_order = (d.build_type === 'frontend'
         ? H.cmdList({ id:'sBuildOrder', rows:[] }).read()
-        : H.rowList({ id:'sBuildOrder', rows:[] }).read());
+        : (isProc && !isJar ? [] : H.rowList({ id:'sBuildOrder', rows:[] }).read()));
       d.nacos_groups = H.tagInput({ id:'sNacosGroups', values:[] }).read();
       d.dubbo_services = H.tagInput({ id:'sDubbo', values:[] }).read();
       d.log_error_keywords = H.tagInput({ id:'sLogKw', values:[] }).read();
@@ -334,7 +377,7 @@
       let ok = true;
       const checks = isStatic
         ? [['sName', 'name', '服务名必填']]
-        : isJar
+        : isProc
           ? [['sName', 'name', '服务名必填']]
           : [['sName', 'name', '服务名必填'],
              ['sImage', 'image_name', '镜像短名必填'],
@@ -343,7 +386,7 @@
         if (!d[key]){ H.fieldErr(id, msg); ok = false; }
         else H.fieldErr(id, '');
       });
-      if (isJar) {
+      if (isProc) {
         const num = (id, dflt) => {
           const n = Number(val(id));
           return Number.isFinite(n) && n > 0 ? n : dflt;
@@ -352,8 +395,6 @@
         d.runtime_config = {
           ...prev,
           app_home: val('jAppHome').trim(),
-          java_bin: val('jJavaBin').trim() || '/usr/bin/java',
-          jvm_opts: val('jJvmOpts').trim(),
           app_args: val('jAppArgs').trim(),
           run_user: val('jRunUser').trim(),
           work_dir: val('jWorkDir').trim(),
@@ -361,24 +402,41 @@
           port: Number(val('jPort') || 0),
           stop_timeout: num('jStopTimeout', 60),
           start_timeout: num('jStartTimeout', 120),
-          artifact_pattern: val('jArtifactPattern').trim() || 'target/*.jar',
           env_files: val('jEnvFiles').split('\n').map(x => x.trim()).filter(Boolean),
           readiness: {
             ...(prev.readiness || {}),
-            type: val('jReadinessType') || 'http',
-            path: val('jReadinessPath').trim() || '/actuator/health',
+            type: val('jReadinessType') || (isJar ? 'http' : 'process'),
+            path: val('jReadinessPath').trim() || (isJar ? '/actuator/health' : ''),
             timeout: num('jReadinessTimeout', 90),
             interval: num('jReadinessInterval', 5),
           },
         };
+        if (isJar) {
+          d.runtime_config.java_bin = val('jJavaBin').trim() || '/usr/bin/java';
+          d.runtime_config.jvm_opts = val('jJvmOpts').trim();
+          d.runtime_config.artifact_pattern = val('jArtifactPattern').trim() || 'target/*.jar';
+        }
+        if (d.deploy_mode === 'node_process') {
+          d.runtime_config.node_bin = val('gNodeBin').trim() || '/usr/bin/node';
+          d.runtime_config.start_file = val('gStartFile').trim();
+        }
+        if (d.deploy_mode === 'python_process') {
+          d.runtime_config.requirements = val('pRequirements').trim() || 'requirements.txt';
+          d.runtime_config.start_file = val('gStartFile').trim();
+          d.runtime_config.python_version = val('pPythonVersion').trim();
+        }
         if (!d.runtime_config.app_home.startsWith('/')) {
-          H.fieldErr('jAppHome', '应用根目录必须为绝对路径（如 /opt/apps/hqb-auth）'); ok = false;
+          H.fieldErr('jAppHome', isJar ? '应用根目录必须为绝对路径（如 /opt/apps/hqb-auth）' : '应用根目录必须为绝对路径（如 /opt/apps/app）'); ok = false;
         } else H.fieldErr('jAppHome', '');
         const rt = d.runtime_config.readiness.type;
         const p = d.runtime_config.port;
         if ((rt === 'http' || rt === 'tcp') && !(Number.isInteger(p) && p > 0 && p < 65536)) {
           H.fieldErr('jPort', 'HTTP/TCP 就绪方式必须填写 1-65535 的端口'); ok = false;
         } else H.fieldErr('jPort', '');
+        if ((d.deploy_mode === 'node_process' || d.deploy_mode === 'python_process')
+            && (!d.runtime_config.start_file || d.runtime_config.start_file.startsWith('/'))) {
+          H.fieldErr('gStartFile', '入口文件必填，且为 CURRENT 下的相对路径'); ok = false;
+        } else if (document.getElementById('gStartFile')) H.fieldErr('gStartFile', '');
       }
       if (isStatic && !d.site_root.startsWith('/')){
         H.fieldErr('sSiteRoot', '静态发布必须填写站点根绝对路径（如 /data/1panel/www/sites/example.com/index）'); ok = false;
