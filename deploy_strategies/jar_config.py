@@ -1,10 +1,11 @@
-"""jar_service 运行时配置契约：Java 专属字段、产物命名
+"""jar_service 运行时配置契约：Java 专属字段、产物命名（re-export）
 
-公共字段解析/校验、sha256、单元名派生已上移到 process_config.py（进程族共享层）；
-本模块保留 Java 专属部分并维持既有公共函数签名不变——既有导入
-（deploy_strategies.jar_config import ...）不受影响。
+公共字段解析/校验、sha256、单元名派生、产物命名（artifact_filename）已上移到
+process_config.py（进程族共享层）；本模块保留 Java 专属部分并维持既有公共函数
+签名不变——既有导入（deploy_strategies.jar_config import ...）不受影响。
 """
-from .process_config import (derive_unit_name,  # noqa: F401 — re-export 兼容
+from .process_config import (artifact_filename,  # noqa: F401 — re-export 兼容
+                             derive_unit_name,  # noqa: F401 — re-export 兼容
                              parse_common, sha256_file,  # noqa: F401 — re-export
                              validate_common, _as_dict, _as_int)
 
@@ -50,7 +51,3 @@ def validate_runtime_config(raw, deploy_mode: str) -> list:
     """兼容入口：全量分派给 process_config（jar/Go/Rust/Node/Python）"""
     from .process_config import validate_runtime_config as validate
     return validate(raw, deploy_mode)
-
-
-def artifact_filename(service: str, version: str) -> str:
-    return f"{service}-{version}.jar"
