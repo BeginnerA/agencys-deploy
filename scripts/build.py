@@ -559,15 +559,26 @@ def _write_sha256(path: Path) -> None:
                                                      encoding="utf-8")
 
 
+def _tool_candidate_names(tool: str) -> tuple:
+    """配置分支下工具可执行文件的候选名：非 Windows 仅裸名（与既有形态逐字一致）；
+    Windows CreateProcess 不做扩展名解析（exists("C:/Go/bin/go") 对 go.exe 恒 False），
+    必须补齐 PATHEXT 常见可执行形态，否则 build.go_home/cargo_home 这条逃生通道
+    在 Windows 主机上必然误报"配置无效"""
+    if os.name == "nt":
+        return (tool, tool + ".exe", tool + ".cmd", tool + ".bat")
+    return (tool,)
+
+
 def _find_tool(tool: str, config_key: str, config: dict, hint: str) -> str:
     """跨平台定位构建工具：build.{config_key} 显式配置（GOROOT/cargo 根或可执行文件）
     > PATH；与 find_mvn 同套路（Windows CreateProcess 只认 .exe/.cmd，which 已处理）"""
     home = (config.get("build") or {}).get(config_key) or ""
     if home:
         base = Path(home).expanduser()
-        for cand in (base / "bin" / tool, base / tool):
-            if cand.exists():
-                return str(cand)
+        for name in _tool_candidate_names(tool):
+            for cand in (base / "bin" / name, base / name):
+                if cand.exists():
+                    return str(cand)
         fail(f"配置的 build.{config_key} 无效（找不到 {tool}）：{home}")
     found = shutil.which(tool)
     if found:

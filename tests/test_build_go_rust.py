@@ -107,5 +107,49 @@ class RustBuildTest(unittest.TestCase):
         self.assertTrue((root / "out" / "report-1.0.0.sha256").exists())
 
 
+class FindToolTest(unittest.TestCase):
+    """_find_tool 配置分支：Windows 需解析可执行扩展名；全不中即 fail 且不回退 PATH"""
+
+    def test_windows_config_go_home_hits_go_exe(self):
+        root = Path(tempfile.mkdtemp(prefix="find_tool_win_"))
+        (root / "bin").mkdir()
+        (root / "bin" / "go.exe").write_bytes(b"mock")
+        cfg = base_config(root)
+        cfg["build"] = {"go_home": str(root)}
+        with mock.patch.object(build_mod.os, "name", "nt"):
+            found = build_mod._find_tool("go", "go_home", cfg, "hint")
+        self.assertEqual(Path(found), root / "bin" / "go.exe")
+
+    def test_windows_config_home_root_level_exe(self):
+        root = Path(tempfile.mkdtemp(prefix="find_tool_win2_"))
+        (root / "cargo.exe").write_bytes(b"mock")
+        cfg = base_config(root)
+        cfg["build"] = {"cargo_home": str(root)}
+        with mock.patch.object(build_mod.os, "name", "nt"):
+            found = build_mod._find_tool("cargo", "cargo_home", cfg, "hint")
+        self.assertEqual(Path(found), root / "cargo.exe")
+
+    def test_windows_config_home_all_miss_fails_without_path_fallback(self):
+        root = Path(tempfile.mkdtemp(prefix="find_tool_miss_"))
+        (root / "bin").mkdir()
+        cfg = base_config(root)
+        cfg["build"] = {"go_home": str(root)}
+        with mock.patch.object(build_mod.os, "name", "nt"), \
+                mock.patch.object(build_mod.shutil, "which") as which:
+            with self.assertRaises(SystemExit):
+                build_mod._find_tool("go", "go_home", cfg, "未找到 Go 的提示")
+        which.assert_not_called()  # 显式配置=权威：全不中直接 fail，绝不静默回退 PATH
+
+    def test_windows_candidate_names_include_exe_forms(self):
+        with mock.patch.object(build_mod.os, "name", "nt"):
+            names = build_mod._tool_candidate_names("go")
+        self.assertEqual(names, ("go", "go.exe", "go.cmd", "go.bat"))
+
+    def test_posix_candidate_names_bare_only(self):
+        with mock.patch.object(build_mod.os, "name", "posix"):
+            names = build_mod._tool_candidate_names("go")
+        self.assertEqual(names, ("go",))  # Linux 行为逐字不变：仅裸名形态
+
+
 if __name__ == "__main__":
     unittest.main()
