@@ -239,5 +239,80 @@ class JarHostsRoutesTest(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
 
+class ServiceUpdateRoutesTest(unittest.TestCase):
+    """PUT /services 回归：update_service 的 deploy_mode 校验分支不得 500，
+    且切进程模式时按「即将生效的值」校验 runtime_config"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.mkdtemp(prefix="svc_update_")
+        cls.app = create_app(data_dir=Path(cls._tmp))
+        cls.c = cls.app.test_client()
+        token = cls._login(cls.c, "admin", "admin")
+        r = cls.c.post("/api/auth/password", json={
+            "old_password": "admin", "new_password": "test1234"},
+            headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 200, r.get_data(as_text=True)
+        cls.h = {"Authorization": f"Bearer {cls._login(cls.c, 'admin', 'test1234')}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls._tmp, ignore_errors=True)
+
+    @staticmethod
+    def _login(c, user, pwd):
+        r = c.post("/api/auth/login", json={"username": user, "password": pwd})
+        assert r.status_code == 200, r.get_data(as_text=True)
+        return r.get_json()["token"]
+
+    def setUp(self):
+        # 完整用例名做项目编码（_SAFE_NAME 白名单内），不截断避免长名互撞
+        code = "upd-" + self._testMethodName.lower()
+        r = self.c.post("/api/projects", json={"name": code, "code": code},
+                        headers=self.h)
+        assert r.status_code == 201, r.get_data(as_text=True)
+        self.pid = r.get_json()["id"]
+
+    def _create_container(self, name):
+        r = self.c.post(f"/api/projects/{self.pid}/services", json={
+            "name": name, "image_name": name, "service_name": name},
+            headers=self.h)
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        return r.get_json()["id"]
+
+    def _get_service(self, sid):
+        svcs = self.c.get(f"/api/projects/{self.pid}/services",
+                          headers=self.h).get_json()
+        return next(x for x in svcs if x["id"] == sid)
+
+    def test_update_container_service_returns_200(self):
+        """纯容器字段编辑（不涉及 deploy_mode）也走 process_modes 分支，不得 NameError"""
+        sid = self._create_container("web1")
+        r = self.c.put(f"/api/projects/{self.pid}/services/{sid}",
+                       json={"name": "web1-renamed"}, headers=self.h)
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(self._get_service(sid)["name"], "web1-renamed")
+
+    def test_update_switch_to_process_mode_returns_200(self):
+        """切到 jar_service 且 runtime_config 合法：200 并按 JSON 对象往返落库"""
+        sid = self._create_container("web2")
+        r = self.c.put(f"/api/projects/{self.pid}/services/{sid}", json={
+            "deploy_mode": "jar_service",
+            "runtime_config": {"app_home": "/opt/web2", "port": 8080}},
+            headers=self.h)
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        rec = self._get_service(sid)
+        self.assertEqual(rec["deploy_mode"], "jar_service")
+        self.assertEqual(rec["runtime_config"]["app_home"], "/opt/web2")
+
+    def test_update_switch_to_process_mode_without_runtime_config_400(self):
+        """切进程模式但旧记录无 runtime_config：按生效值校验，400 而非绕过"""
+        sid = self._create_container("web3")
+        r = self.c.put(f"/api/projects/{self.pid}/services/{sid}",
+                       json={"deploy_mode": "jar_service"}, headers=self.h)
+        self.assertEqual(r.status_code, 400, r.get_data(as_text=True))
+        self.assertIn("app_home", r.get_json()["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

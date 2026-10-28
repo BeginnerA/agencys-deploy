@@ -325,6 +325,7 @@ def update_service(pid, sid):
         from deploy_strategies.base import registered_modes
         if fields["deploy_mode"] not in registered_modes():
             return _err(f"deploy_mode 仅支持 {' / '.join(registered_modes())}")
+    from deploy_strategies.base import process_modes
     # 切到进程族或修改运行时配置都要校验：用「即将生效的值」而不是只看本次提交，
     # 否则从 container 切进程模式且不传 runtime_config 时会绕过 app_home 必填检查
     if mode in process_modes():
