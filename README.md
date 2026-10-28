@@ -285,13 +285,17 @@ servers:
 
 ## 运行方式（deploy_mode）
 
-每个服务在「管理 → 服务」里选择一种发布方式。三种方式共用项目/环境/流水线/回滚编排，差异只在构建产物与切换动作：
+每个服务在「管理 → 服务」里选择一种发布方式。五种方式共用项目/环境/流水线/回滚编排，差异只在构建产物与切换动作：
 
 - `container`：Docker 容器（默认）。Maven 构建 → 镜像推送/直传 → 滚动替换容器。
 - `static_archive`：静态站点压缩包（1Panel/nginx）。前端构建 → zip → 站点目录解压换入，无容器、无 Nacos。
 - `jar_service`：纯 Java 可执行 jar + Linux systemd。Maven 构建 → jar 上传到目标机版本目录 → 切换 `CURRENT` 符号链接 → 重启单元。
+- `go_binary`：Go 单二进制 + Linux systemd。平台机交叉编译（`CGO_ENABLED=0 GOOS=linux`）出 Linux 二进制 → 上传到目标机版本目录 → 切换 `CURRENT` 符号链接 → 重启单元，目标机零运行时依赖。
+- `rust_binary`：Rust 单二进制 + Linux systemd。平台机 `cargo build --release` 构建出 Linux 二进制，后续切换动作与 `go_binary` 相同。
 
 `jar_service` 要求目标机已安装 JDK/JRE，并由平台生成 systemd 单元后接入（管理员操作，记审计）；平台不安装 JDK，也不接管人工维护的单元。版本目录 `{app_home}/releases/{version}/app.jar` 不可变，`CURRENT` 符号链接原子切换，回滚只换链接不重传。单实例重启存在停机窗口，平台不承诺零停机。字段表与操作步骤见 `docs/usage.md`「Java 进程发布（jar_service）」。平台周期探测单元状态并从 `.deploy_version` 读取每主机版本；版本变化时写穿 `service_host_state`，监控关闭时页面回退到该快照。
+
+Go/Rust 单二进制（`deploy_mode=go_binary`/`rust_binary`）：平台机交叉编译（Go，`CGO_ENABLED=0 GOOS=linux`）或 cargo 构建出 Linux 二进制，与 jar 共用 releases/CURRENT 切换与 systemd 托管；目标机零运行时依赖。构建前提在平台机：`go`/`cargo` 在 PATH，或配置 `build.go_home`/`build.cargo_home` 指向工具链（Windows 下同时解析 `go.exe`/`cargo.exe`、`.cmd`/`.bat` 等可执行形态）。Rust 在 Windows 平台机需配置 `build.rust_target`（如 `x86_64-unknown-linux-gnu`，并安装对应 target 与 linker），未配置直接报错，建议 WSL/Linux 构建或 `build_type=none` 外部投入。目标机前提与 jar 相同：仅 Linux + systemd，单元由平台生成并接入，平台只接管 `ExecStart` 指向 `{app_home}/CURRENT/app` 特征串的单元（jar 为 `…/CURRENT/app.jar`）。单实例发布重启存在停机窗口，平台不承诺零停机；jar/容器/静态三种既有方式行为零变化。字段表见 `docs/usage.md`「Go/Rust 单二进制发布」。
 
 ## 回滚策略
 

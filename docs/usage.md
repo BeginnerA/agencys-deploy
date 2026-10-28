@@ -20,6 +20,7 @@
 - Maven 3.8 及以上版本
 - Docker（已登录到目标镜像仓库并能推送）
 - 到所有目标服务器的免密 SSH 访问
+- Go 构建需平台机安装 Go 工具链（或配置 `build.go_home`）；Rust 构建需 cargo，Windows 平台机交叉编译须配置 `build.rust_target` 与对应 target/linker，否则请用 WSL/Linux 构建或 `build_type=none`；
 
 ### 2.2 目标服务器环境
 
@@ -788,10 +789,36 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 
 观测（M5）：
 
+进程族观测口径一致：Go/Rust（`go_binary`/`rust_binary`）服务与 jar 同样具备实时状态、journal 日志与每主机版本视图。
+
 - 设备页 jar 卡片展示实时状态（在线/已停止/未部署/探测失败）、当前版本、在线主机数与运行时长；版本以目标机 `.deploy_version` 为准；
 - 点「主机」查看每主机版本、上一版本、PID、运行时长、重启数、CPU/内存；监控关闭时显示「版本快照」，来自 `service_host_state`；
 - 点「日志」读取采集器入库的 `journalctl` 日志（采集周期为监控周期的 2 倍，默认 60s；监控关闭时 120s，按 `systemd:<unit>` 独立游标，关键词告警照常生效）；
 - 首次采集窗口为最近 5 分钟，之后按游标增量；日志正文中的多行消息逐行保留并带时间戳。
+
+### 10.9 Go/Rust 单二进制发布（go_binary / rust_binary）
+
+`go_binary` / `rust_binary` 面向「目标机只跑一个编译型二进制、由 systemd 托管」的后端服务：平台机交叉编译出 Linux 二进制（Go 固定 `CGO_ENABLED=0 GOOS=linux`，Rust 走 `cargo build --release`），不构建镜像、不操作容器，与 jar 共用 `releases/{version}` 版本目录、`CURRENT` 符号链接切换、systemd 托管与进程族观测；目标机零运行时依赖（不装 JDK，也没有解释器要求）。
+
+平台机构建前提：
+
+- `go`/`cargo` 在平台机 PATH 中；或配置 `build.go_home` / `build.cargo_home` 指向工具链根目录（或可执行文件）。Windows 下该配置会依次尝试 `go`/`cargo` 的 `.exe`、`.cmd`、`.bat` 形态（`CreateProcess` 不做扩展名解析，必须落盘匹配），PATH 查找交由系统 `which` 处理；
+- Go 交叉编译默认 `GOARCH=amd64`（`build.go_arch` 可改），支持 `build.go_main`（入口包，默认 `.`）与 `build.go_ldflags`；服务表单中 `go_binary` 的构建类型锁定 `go`，或选 `none` 外部投入产物；
+- Rust 交叉编译限制：Windows 平台机未配置 `build.rust_target`（交叉 triple，如 `x86_64-unknown-linux-gnu`）时直接报错并引导三选一——配置 triple（并 `rustup target add` 对应 target、安装交叉 linker）、改用 WSL/Linux 构建、或 `build_type=none` 外部投入产物；未配 triple 时 cargo 按平台机本机默认目标构建（Linux 平台机产物即 Linux 二进制，macOS 平台机产物无法在 Linux 目标机运行，同样需要配置 triple）；
+- Rust 产物二进制名默认取服务名，可在 `build.rust_bin` 显式指定；配置了 `rust_target` 时在 `target/{triple}/release/` 下查找产物。
+
+目标机前提：
+
+- 仅 Linux 且启用 systemd（与 jar 相同，无容器参与）；
+- `runtime_config.app_home` 必填（绝对路径），其下放 `releases/`、`CURRENT`、`.deploy_version`；
+- systemd 单元由平台生成并接入（管理员操作，记审计）；平台只接管 `ExecStart` 指向 `{app_home}/CURRENT/app` 特征串的单元（jar 为 `…/CURRENT/app.jar`），其余单元一律拒绝接管，避免改坏人工维护的服务；
+- 预检只检查 systemctl 可用、`app_home` 可写与磁盘余量，不在目标机查找任何运行时。
+
+配置字段与 jar 共用公共字段（`app_home`/`run_user`/`work_dir`/`unit_name`/`port`/`app_args`/`readiness`/`stop_timeout`/`start_timeout`/`env_files`），没有 `java_bin`/`jvm_opts`/`artifact_pattern`。差异点：`readiness` 缺省为 `process`（仅判进程存活），有健康端点的服务应显式配置 `http`/`tcp` + `port`。
+
+发布与回滚流程同 jar：预检 → 上传 `releases/{version}/app`（远端 sha256 相同则跳过，上传后 chmod 0755 并复核校验和）→ 临时链接 + `mv -Tf` 原子换 `CURRENT` → 重启单元 → 按 readiness 验证；回滚只换链接不重传二进制。停机窗口与 jar 相同：单实例发布在「停止 → 换链接 → 启动」期间服务不可用，平台不承诺零停机；需要连续可用时请改用容器多实例方案。
+
+兼容性：`jar_service`、`container`、`static_archive` 三种既有方式行为零变化，未使用 go/rust 的项目无需任何改动。
 
 ## 十一、Jenkins / Ansible 集成
 
