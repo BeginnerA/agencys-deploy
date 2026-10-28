@@ -204,6 +204,31 @@ class JarHostsRoutesTest(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         self.assertEqual(r.get_json()["env"], "prod")
 
+    def test_hosts_accepts_go_binary_service(self):
+        r = self.c.post(f"/api/projects/{self.pid}/services", json={
+            "name": "gosvc", "image_name": "gosvc", "service_name": "gosvc",
+            "deploy_mode": "go_binary", "build_type": "go",
+            "runtime_config": {"app_home": "/opt/apps/gosvc"}}, headers=self.h)
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        sid = r.get_json()["id"]
+        r = self.c.post(f"/api/projects/{self.pid}/environments",
+                        json={"name": "prod"}, headers=self.h)
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        r = self.c.post("/api/servers", json={
+            "host": "10.0.0.21", "ssh_port": 22, "ssh_user": "root"}, headers=self.h)
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        dbm.upsert_host_state(self.app.config["DB_PATH"], self.pid, "prod",
+                              "gosvc", "10.0.0.21", "1.0.0", "", 0)
+        with mock.patch("webapp.monitor.get_monitor", return_value=None):
+            r = self.c.get(
+                f"/api/projects/{self.pid}/services/{sid}/hosts?env=prod",
+                headers=self.h)
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        row = r.get_json()["hosts"][0]
+        self.assertEqual(row["status"], "unknown")
+        self.assertEqual(row["version"], "1.0.0")
+        self.assertFalse(row["live"])
+
     def test_hosts_rejects_non_jar_service(self):
         r = self.c.post(f"/api/projects/{self.pid}/services", json={
             "name": "web7", "image_name": "web7", "service_name": "web7"},

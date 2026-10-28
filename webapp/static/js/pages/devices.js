@@ -89,18 +89,23 @@
     wall.innerHTML = services.map(s => {
       const st = svcStatus[s.name] || {};
       const isStatic = (s.deploy_mode || 'container') === 'static_archive';
-      const isJar = s.deploy_mode === 'jar_service';
-      const modeBadge = isStatic ? '🗂️ 静态站点' : (isJar ? '☕ Java 进程' : '');
+      const PROCESS_MODES = ['jar_service', 'go_binary', 'rust_binary',
+                             'node_process', 'python_process'];
+      const isProcess = PROCESS_MODES.includes(s.deploy_mode);
+      const MODE_BADGE = { jar_service: '☕ Java 进程', go_binary: '🐹 Go 程序',
+                           rust_binary: '🦀 Rust 程序', node_process: '🟩 Node 进程',
+                           python_process: '🐍 Python 进程' };
+      const modeBadge = isStatic ? '🗂️ 静态站点' : (MODE_BADGE[s.deploy_mode] || '');
       const run = running.find(r =>
         (r.type === 'project' && r.name === s.name && r.env === state.currentEnv) ||
         (r.type === 'restart' && r.ref_id === s.id && r.env === state.currentEnv));
-      // 静态站点/纯 Java 进程无镜像/容器版本可采，在线版本取最近一次成功发布任务的版本
+      // 静态站点/进程族服务无镜像/容器版本可采，在线版本取最近一次成功发布任务的版本
       // （平台是线上 .deploy_version 的唯一写入方，tasksCache 按 id DESC 故 find 即最新）
-      const lastOk = (isStatic || isJar) ? tasksCache.find(t =>
+      const lastOk = (isStatic || isProcess) ? tasksCache.find(t =>
         t.name === s.name && t.env === state.currentEnv && t.status === 'success' && t.version) : null;
       const ver = isStatic ? ((lastOk && lastOk.version) || '—')
-        : (isJar ? (st.version || (lastOk && lastOk.version) || '—')
-                 : (st.version || '—'));
+        : (isProcess ? (st.version || (lastOk && lastOk.version) || '—')
+                     : (st.version || '—'));
       const jHosts = Array.isArray(st.hosts) ? st.hosts : [];
       const jOnline = jHosts.filter(h => h.status === 'online').length;
       const inst = st.instances !== undefined && st.instances !== -1 ? st.instances : '—';
@@ -120,7 +125,7 @@
           ${modeBadge ? `<span class="weak" style="margin-left:${upTxt ? '8' : 'auto'};font-size:11px">${modeBadge}</span>` : ''}
           ${upTxt ? '<span class="weak" style="margin-left:auto;font-size:11px">⏱'+upTxt+'</span>' : ''}</div>
         <div class="svc-meta">
-          ${isJar ? `
+          ${isProcess ? `
           <div><span class="weak">版本</span> <span class="num">${esc(ver)}</span>
                <span class="weak" style="margin-left:10px">状态</span> ${svcLabel(st, run)}</div>
           <div><span class="weak">主机</span> <span class="num">${jHosts.length
@@ -146,8 +151,8 @@
           ${canDeploy() ? `<button class="btn sm primary" data-pub="${s.id}">发布</button>
           <button class="btn sm ghost" data-roll="${s.id}">回滚</button>
           ${isStatic ? '' : `<button class="btn sm ghost" data-restart="${s.id}">⭯ 重启</button>`}` : '<span class="weak" style="font-size:11px">只读账号</span>'}
-          ${isJar ? `<button class="btn sm ghost" data-hosts="${s.id}" data-name="${esc(s.name)}" title="查看每主机版本与进程状态">🖥 主机</button>` : ''}
-          <button class="svc-log-btn" data-svc="${esc(s.name)}" data-static="${isStatic ? 1 : 0}" title="${isStatic ? '查看发布日志' : (isJar ? '查看进程日志（journalctl）' : '查看实时日志')}">📋 日志</button>
+          ${isProcess ? `<button class="btn sm ghost" data-hosts="${s.id}" data-name="${esc(s.name)}" title="查看每主机版本与进程状态">🖥 主机</button>` : ''}
+          <button class="svc-log-btn" data-svc="${esc(s.name)}" data-static="${isStatic ? 1 : 0}" title="${isStatic ? '查看发布日志' : (isProcess ? '查看进程日志（journalctl）' : '查看实时日志')}">📋 日志</button>
         </div>
       </div>`;
     }).join('') || emptyState('📭', '该项目暂无服务');

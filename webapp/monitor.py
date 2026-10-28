@@ -818,21 +818,23 @@ class MonitorScheduler:
         """
         if not env_tasks:
             return
-        from deploy_strategies.jar_config import (derive_unit_name,
-                                                  parse_runtime_config)
+        from deploy_strategies.base import process_modes
+        from deploy_strategies.process_config import (derive_unit_name,
+                                                      parse_runtime_config)
         env_ctxs = []
-        jar_by_project = {}  # {project_id: [{"unit", "app_home"}, ...]}
+        process_by_project = {}  # {project_id: [{"unit", "app_home"}, ...]}
         for proj, env in env_tasks:
             services = dbm.list_services(self._db_path, proj["id"], enabled_only=True)
             servers = dbm.list_env_servers(self._db_path, env["id"])
             env_ctxs.append({"proj": proj, "env": env, "services": services,
                              "servers": servers})
             for svc in services:
-                if (svc.get("deploy_mode") or "container") != "jar_service":
+                if (svc.get("deploy_mode") or "container") not in process_modes():
                     continue
-                cfg = parse_runtime_config(svc.get("runtime_config"))
+                cfg = parse_runtime_config(svc.get("runtime_config"),
+                                           svc.get("deploy_mode"))
                 unit = derive_unit_name(cfg, svc.get("image_name"), svc["name"])
-                jar_by_project.setdefault(proj["id"], []).append(
+                process_by_project.setdefault(proj["id"], []).append(
                     {"unit": unit, "app_home": cfg["app_home"]})
         host_jobs = {}  # (host, port) -> {"host","port","ssh_cfg","service_names","jar_units"}
         for ctx in env_ctxs:
@@ -849,7 +851,7 @@ class MonitorScheduler:
                            "service_names": set(), "jar_units": {}}
                     host_jobs[key] = job
                 job["service_names"].update(svc_names)
-                for info in jar_by_project.get(ctx["proj"]["id"], []):
+                for info in process_by_project.get(ctx["proj"]["id"], []):
                     job["jar_units"].setdefault(
                         info["unit"], {"app_home": info["app_home"]})
         skip_extended = (self._round % 3) != 0
@@ -917,20 +919,21 @@ class MonitorScheduler:
         if d_total > 0 and d_busy >= 0:
             hm["cpu"] = round(min(100.0, max(0.0, d_busy / d_total * 100)), 1)
 
-    def _merge_jar_services(self, env: dict, jar_services: list, servers: list,
-                            host_results: dict, result: dict,
-                            health_hosts: dict):
-        """jar_service：每主机 systemd 进程视图 → 服务聚合 + 版本写穿
+    def _merge_process_services(self, env: dict, process_services: list, servers: list,
+                                host_results: dict, result: dict,
+                                health_hosts: dict):
+        """进程族：每主机 systemd 进程视图 → 服务聚合 + 版本写穿
 
         版本权威在目标机（.deploy_version / CURRENT）；只有版本变化才写
         service_host_state，避免 30s 轮询写放大。CPU 需要上一轮样本，
         首次探测为 None，第二轮起才有值。
         """
-        from deploy_strategies.jar_config import (derive_unit_name,
-                                                  parse_runtime_config)
+        from deploy_strategies.process_config import (derive_unit_name,
+                                                      parse_runtime_config)
         from . import jar_probe
-        for svc in jar_services:
-            cfg = parse_runtime_config(svc.get("runtime_config"))
+        for svc in process_services:
+            cfg = parse_runtime_config(svc.get("runtime_config"),
+                                       svc.get("deploy_mode"))
             unit = derive_unit_name(cfg, svc.get("image_name"), svc["name"])
             rows = []
             for s in servers:
@@ -1015,6 +1018,7 @@ class MonitorScheduler:
             for h, ext in (prev_cache.get("extended_metrics") or {}).items():
                 per_server_extended[h] = dict(ext)
         fresh_hosts = set()  # 本轮扩展指标为新采集的 host（仅这些落库，避免写放大）
+        from deploy_strategies.base import process_modes
         svc_name_set = {svc["service_name"] for svc in services
                         if svc.get("service_name")}
         for s in servers:
@@ -1054,9 +1058,9 @@ class MonitorScheduler:
                     per_server_extended[s["host"]] = cur_ext
             ext_cs = (cur_ext or {}).get("container_status") or {}
             for svc in services:
-                if (svc.get("deploy_mode") or "container") in ("static_archive",
-                                                               "jar_service"):
-                    continue  # 静态托管/纯 Java 进程没有容器，走各自的探测分支
+                if (svc.get("deploy_mode") or "container") in (
+                        "static_archive", *process_modes()):
+                    continue  # 静态托管/进程族服务没有容器，走各自的探测分支
                 image = (r.get("containers") or {}).get(svc["service_name"])
                 st = result["services"].setdefault(svc["name"],
                                                    {"status": "not_deployed",
@@ -1083,11 +1087,12 @@ class MonitorScheduler:
                         st["status"] = "stopped"
         result["host_metrics"] = per_server_metrics
         result["extended_metrics"] = per_server_extended
-        jar_services = [svc for svc in services
-                        if (svc.get("deploy_mode") or "container") == "jar_service"]
-        if jar_services:
-            self._merge_jar_services(env, jar_services, servers, host_results,
-                                     result, health_hosts)
+        process_services = [svc for svc in services
+                            if (svc.get("deploy_mode") or "container")
+                            in process_modes()]
+        if process_services:
+            self._merge_process_services(env, process_services, servers,
+                                         host_results, result, health_hosts)
         # 静态托管服务：无容器/Nacos 可查，配了 health_url 则 HTTP 探活（200 即在线，
         # 静态首页无 UP 体，不能复用 check_http 的 Actuator 语义）；未配置则 unknown
         for svc in services:
@@ -1130,7 +1135,8 @@ class MonitorScheduler:
                         inst = fut.result(timeout=20)
                     except Exception:
                         inst = -1
-                    if (inst < 0 and (s.get("deploy_mode") or "") == "jar_service"):
+                    if (inst < 0 and (s.get("deploy_mode") or "")
+                            in process_modes()):
                         inst = (result["services"].get(s["name"]) or {}).get(
                             "online_hosts", 0)
                     result["services"][s["name"]]["instances"] = inst
@@ -1146,7 +1152,7 @@ class MonitorScheduler:
             for svc in online:
                 hp = svc.get("health_port") or 0
                 if hp <= 0:
-                    # jar_service 的健康端口来自 runtime_config.port（聚合时写入视图）
+                    # 进程族服务的健康端口来自 runtime_config.port（聚合时写入视图）
                     hp = (result["services"].get(svc["name"]) or {}).get("health_port", 0) or 0
                 hu = (svc.get("health_url") or "").strip()
                 if hp <= 0:

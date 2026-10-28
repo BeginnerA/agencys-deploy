@@ -2,6 +2,8 @@
 import re
 from pathlib import Path
 
+from deploy_strategies.base import process_modes
+
 from . import db as dbm
 
 # 文件名安全字符：仅允许字母数字下划线连字符（防路径穿越）
@@ -64,8 +66,8 @@ def export_projects_yaml(db_path: str, project_id: int) -> str:
                         "zip_prefix", "entry_file", "file_mode"):
                 if s.get(key):
                     cfg[key] = s[key]
-        if deploy_mode == "jar_service" and s.get("runtime_config"):
-            # 进程发布没有镜像/站点字段，JVM 与单元参数必须完整导出，
+        if deploy_mode in process_modes() and s.get("runtime_config"):
+            # 进程发布没有镜像/站点字段，运行时参数必须完整导出，
             # 否则从 YAML 重建环境时会静默退回缺省值
             cfg["runtime_config"] = s["runtime_config"]
         if s.get("git_branch"):

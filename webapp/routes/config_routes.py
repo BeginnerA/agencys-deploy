@@ -230,16 +230,16 @@ def create_service(pid):
         return _err("请求体必须为 JSON 对象")
     if not isinstance(body.get("name"), str) or not body.get("name").strip():
         return _err("name 必填")
-    from deploy_strategies.base import registered_modes
-    from deploy_strategies.jar_config import validate_runtime_config
+    from deploy_strategies.base import process_modes, registered_modes
+    from deploy_strategies.process_config import validate_runtime_config
 
     deploy_mode = body.get("deploy_mode") or "container"
     if deploy_mode not in registered_modes():
         return _err(f"deploy_mode 仅支持 {' / '.join(registered_modes())}")
     is_static = deploy_mode == "static_archive"
-    is_jar = deploy_mode == "jar_service"
-    # 镜像/ compose 字段仅容器发布必需；静态与进程发布无镜像概念，留空时回退 name
-    if not is_static and not is_jar:
+    is_process = deploy_mode in process_modes()
+    # 镜像/compose 字段仅容器发布必需；静态与进程发布无镜像概念，留空时回退 name
+    if not is_static and not is_process:
         for k in ("image_name", "service_name"):
             if not isinstance(body.get(k), str) or not body.get(k).strip():
                 return _err(f"{k} 必填")
@@ -325,10 +325,10 @@ def update_service(pid, sid):
         from deploy_strategies.base import registered_modes
         if fields["deploy_mode"] not in registered_modes():
             return _err(f"deploy_mode 仅支持 {' / '.join(registered_modes())}")
-    # 切到 jar_service 或修改运行时配置都要校验：用「即将生效的值」而不是只看本次提交，
-    # 否则从 container 切 jar 且不传 runtime_config 时会绕过 app_home 必填检查
-    if mode == "jar_service":
-        from deploy_strategies.jar_config import validate_runtime_config
+    # 切到进程族或修改运行时配置都要校验：用「即将生效的值」而不是只看本次提交，
+    # 否则从 container 切进程模式且不传 runtime_config 时会绕过 app_home 必填检查
+    if mode in process_modes():
+        from deploy_strategies.process_config import validate_runtime_config
         errs = validate_runtime_config(
             fields.get("runtime_config", rec.get("runtime_config")), mode)
         if errs:
@@ -862,33 +862,37 @@ def config_export():
     return _ok({"files": written, "dir": str(target)})
 
 
-# ---------- jar_service systemd 单元 ----------
+# ---------- 进程族 systemd 单元 ----------
 
-def _jar_service_or_404(pid, sid):
-    from deploy_strategies.jar_config import validate_runtime_config
+def _process_service_or_404(pid, sid):
+    from deploy_strategies.base import process_modes
+    from deploy_strategies.process_config import validate_runtime_config
     rec, err = _owned_or_404("services", sid, pid)
     if err:
         return None, err
-    if (rec.get("deploy_mode") or "container") != "jar_service":
-        return None, _err("该服务不是 jar_service 发布方式")
-    errs = validate_runtime_config(rec.get("runtime_config"), "jar_service")
+    mode = rec.get("deploy_mode") or "container"
+    if mode not in process_modes():
+        return None, _err("该服务不是进程族发布方式")
+    errs = validate_runtime_config(rec.get("runtime_config"), mode)
     if errs:
         return None, _err("；".join(errs))
     return rec, None
 
 
 def _unit_target(rec) -> tuple:
-    from deploy_strategies.jar_config import derive_unit_name, parse_runtime_config
     import service_unit
-    cfg = parse_runtime_config(rec.get("runtime_config"))
+    from deploy_strategies.process_config import (derive_unit_name,
+                                                  parse_runtime_config)
+    mode = rec.get("deploy_mode") or "jar_service"
+    cfg = parse_runtime_config(rec.get("runtime_config"), mode)
     unit = derive_unit_name(cfg, rec.get("image_name"), rec["name"])
-    return unit, service_unit.render_unit(cfg, unit)
+    return unit, service_unit.render_unit(cfg, unit, mode)
 
 
 @config_bp.route("/projects/<int:pid>/services/<int:sid>/unit", methods=["GET"])
 @require_auth
 def preview_service_unit(pid, sid):
-    rec, err = _jar_service_or_404(pid, sid)
+    rec, err = _process_service_or_404(pid, sid)
     if err:
         return err
     unit, content = _unit_target(rec)
@@ -902,8 +906,8 @@ def onboard_service_unit(pid, sid):
     """逐次确认后接入 unit：只写 unit/reload/enable，不启动、不装依赖"""
     import service_unit
     import deploy as deploy_mod
-    from deploy_strategies.jar_config import parse_runtime_config
-    rec, err = _jar_service_or_404(pid, sid)
+    from deploy_strategies.process_config import parse_runtime_config
+    rec, err = _process_service_or_404(pid, sid)
     if err:
         return err
     env_name = (_json_body() or {}).get("env") or ""
@@ -915,14 +919,16 @@ def onboard_service_unit(pid, sid):
     servers = dbm.list_env_servers(db_path, env_obj["id"])
     if not servers:
         return _err("环境未绑定服务器")
-    cfg = parse_runtime_config(rec.get("runtime_config"))
+    cfg = parse_runtime_config(rec.get("runtime_config"),
+                               rec.get("deploy_mode") or "jar_service")
     unit, content = _unit_target(rec)
     done, failed = [], []
     for srv in servers:
         ssh_cfg = deploy_mod.merge_server_ssh(env_obj.get("ssh") or {}, srv)
         server = deploy_mod.RemoteServer(srv["host"], ssh_cfg)
         try:
-            service_unit.onboard_unit(server, unit, content, cfg["app_home"])
+            service_unit.onboard_unit(server, unit, content, cfg,
+                                      rec.get("deploy_mode") or "jar_service")
             done.append(srv["host"])
         except Exception as e:
             failed.append({"host": srv["host"], "error": str(e)})
@@ -959,7 +965,7 @@ def _merge_host_row(host: str, unit: str, db_row: dict, live: dict) -> dict:
 def service_hosts(pid, sid):
     """每主机版本/进程视图（只读）：实时监控优先，监控关闭时回退 DB 快照"""
     db_path = current_app.config["DB_PATH"]
-    rec, err = _jar_service_or_404(pid, sid)
+    rec, err = _process_service_or_404(pid, sid)
     if err:
         return err
     env_name = request.args.get("env") or ""

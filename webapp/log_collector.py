@@ -255,8 +255,8 @@ class LogCollector:
         finally:
             conn.close()
 
-        # 项目 → systemd 单元（jar_service 走 journalctl，与容器共用一条 SSH 通道）
-        jar_by_project = self._load_jar_services()
+        # 项目 → systemd 单元（进程族走 journalctl，与容器共用一条 SSH 通道）
+        process_by_project = self._load_process_services()
         # 按主机聚合环境：jobs[(host, port)] = {"host","port","ssh_cfg","envs",
         # "jar_units"}
         from .monitor import _merge_server_ssh
@@ -290,7 +290,7 @@ class LogCollector:
                            "envs": [], "jar_units": {}}
                     jobs[key] = job
                 job["envs"].append((env_name, env_id))
-                for info in jar_by_project.get(env_row["project_id"], []):
+                for info in process_by_project.get(env_row["project_id"], []):
                     job["jar_units"].setdefault(
                         info["unit"], {"service": info["service"]})
         if not jobs:
@@ -309,24 +309,31 @@ class LogCollector:
         self._current_kw_rules = None
         self._publish_round_event()
 
-    def _load_jar_services(self) -> dict:
+    def _load_process_services(self) -> dict:
         """项目 → [{unit, service}]；单元名口径与部署/监控共用 derive_unit_name
 
         service 为 log_entries.service 的取值（service_name or name），与
         tail/pipeline 的服务名口径一致；unit 仅用于 journalctl -u 与目录名。
+        进程族模式来自 process_modes()（注册表自动收集）。
         """
-        from deploy_strategies.jar_config import derive_unit_name
+        from deploy_strategies.base import process_modes
+        from deploy_strategies.process_config import (derive_unit_name,
+                                                      parse_runtime_config)
+        modes = process_modes()
+        placeholders = ",".join("?" * len(modes))
         conn = dbm.get_conn(self.db_path)
         try:
             rows = conn.execute(
-                "SELECT project_id, name, image_name, service_name, runtime_config "
-                "FROM services WHERE enabled=1 AND deploy_mode='jar_service'"
-            ).fetchall()
+                "SELECT project_id, name, image_name, service_name, runtime_config, "
+                f"deploy_mode FROM services "
+                f"WHERE enabled=1 AND deploy_mode IN ({placeholders})",
+                modes).fetchall()
         finally:
             conn.close()
         result = {}
         for r in rows:
-            unit = derive_unit_name(r["runtime_config"], r["image_name"], r["name"])
+            cfg = parse_runtime_config(r["runtime_config"], r["deploy_mode"])
+            unit = derive_unit_name(cfg, r["image_name"], r["name"])
             result.setdefault(r["project_id"], []).append(
                 {"unit": unit, "service": r["service_name"] or r["name"]})
         return result
@@ -347,7 +354,7 @@ class LogCollector:
 
         优先复用 monitor 探测缓存的容器列表（省去独立 docker ps SSH 连接）；
         缓存不可用时退化为自己执行 docker ps。
-        jar_service 的 systemd 单元走 journalctl，与容器共用同一条命令。
+        进程族的 systemd 单元走 journalctl，与容器共用同一条命令。
         每个容器/单元前打印唯一 @@LOGCUT 标记，单条命令一次拉取全部；输出按
         标记切分后分发给绑定该主机的各环境（原来的每容器、每环境各一条
         SSH 命令/channel → 每主机 1 条命令）。
@@ -415,7 +422,7 @@ class LogCollector:
             parts.append("echo " + shlex.quote(_marker(token, container)))
             parts.append(logs_cmd)
             metas.append((container, last_ts))
-        # systemd 单元（jar_service）：与容器共用同一条 SSH 通道，
+        # systemd 单元（进程族）：与容器共用同一条 SSH 通道，
         # 文件目录用单元名（不含 ':'），游标键用 systemd:<unit> 与容器名隔离
         journal_metas = []
         for unit in sorted(jar_units):

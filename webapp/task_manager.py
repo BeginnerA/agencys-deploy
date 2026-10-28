@@ -328,7 +328,7 @@ _RESTART_HEALTH_INTERVAL = 5.0
 def _run_restart(db_path: str, task: dict, log_file: str,
                  handle: "_RestartHandle") -> str:
     """执行服务重启：按发布方式并发重启每台服务器（容器走 docker restart，
-    jar_service 走 systemctl restart）并做健康检查。
+    进程族走 systemctl restart）并做健康检查。
 
     返回 "success" / "failed"。日志逐行写入 log_file（每台一行 + 汇总行）。
     复用 monitor 的 SSH 连接池（同进程），凭据合并语义与监控探测一致。
@@ -337,6 +337,7 @@ def _run_restart(db_path: str, task: dict, log_file: str,
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from . import db as dbm
     from . import monitor as monitor_mod
+    from deploy_strategies.base import process_modes
 
     rec = dbm.get_record(db_path, "services", task["ref_id"])
     env_obj = dbm.get_env_by_name(db_path, task["project_id"], task["env"])
@@ -346,19 +347,19 @@ def _run_restart(db_path: str, task: dict, log_file: str,
             f.write("[platform] 服务记录不存在，重启中止\n")
             return "failed"
         deploy_mode = rec.get("deploy_mode") or "container"
-        if deploy_mode == "jar_service":
-            from deploy_strategies.jar_config import (derive_unit_name,
-                                                      parse_runtime_config)
-            cfg = parse_runtime_config(rec.get("runtime_config"))
+        if deploy_mode in process_modes():
+            from deploy_strategies.process_config import (derive_unit_name,
+                                                          parse_runtime_config)
+            cfg = parse_runtime_config(rec.get("runtime_config"), deploy_mode)
             if not cfg["app_home"]:
-                f.write("[platform] jar_service 未配置 runtime_config.app_home，重启中止\n")
+                f.write("[platform] 进程族服务未配置 runtime_config.app_home，重启中止\n")
                 return "failed"
             unit = derive_unit_name(cfg, rec.get("image_name"), rec["name"])
             svc_name = ""
         else:
             unit = ""
             svc_name = rec.get("service_name") or ""
-        if deploy_mode != "jar_service" and not svc_name:
+        if deploy_mode not in process_modes() and not svc_name:
             f.write(f"[platform] 服务「{rec['name']}」未配置容器名（service_name），重启中止\n")
             return "failed"
         if not env_obj:
@@ -368,7 +369,7 @@ def _run_restart(db_path: str, task: dict, log_file: str,
         if not servers:
             f.write("[platform] 环境未绑定服务器，重启中止\n")
             return "failed"
-        target_desc = (f"单元 {unit}" if deploy_mode == "jar_service"
+        target_desc = (f"单元 {unit}" if deploy_mode in process_modes()
                        else f"容器名 {svc_name}")
         f.write(f"[platform] 重启服务「{rec['name']}」（{target_desc}），"
                 f"环境「{task['env']}」，共 {len(servers)} 台服务器\n")
@@ -390,7 +391,7 @@ def _run_restart(db_path: str, task: dict, log_file: str,
                 # （无论运行/停止）即命中 → docker restart 将其拉起，日志「重启成功」
                 # 与行为一致；docker restart 成功时 stdout 为容器名，失败时
                 # stderr 返回错误文本（_ssh_exec_multi 返回 out or err）
-                if deploy_mode == "jar_service":
+                if deploy_mode in process_modes():
                     out = monitor_mod._ssh_exec_multi(host, port, ssh_cfg, [
                         f"systemctl restart {shlex.quote(unit)} 2>&1; "
                         f"systemctl is-active {shlex.quote(unit)}",
@@ -447,7 +448,7 @@ def _run_restart(db_path: str, task: dict, log_file: str,
                     f"{skip_count} 台跳过 → 任务失败\n")
             return "failed"
         if ok_count == 0:
-            if deploy_mode == "jar_service":
+            if deploy_mode in process_modes():
                 f.write(f"[platform] 汇总：全部 {len(servers)} 台单元重启失败 → 任务失败\n")
             else:
                 f.write(f"[platform] 汇总：全部 {skip_count} 台未找到容器 → 任务失败\n")
