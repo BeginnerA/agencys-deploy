@@ -188,13 +188,13 @@ class TestVersion(unittest.TestCase):
 
     def _query(self, rules):
         fake = FakeRemote(rules=rules)
-        with mock.patch("deploy_strategies.jar_service.default_servers_file",
+        with mock.patch("deploy_strategies.process_service.default_servers_file",
                         return_value="servers.test.yaml"), \
-                mock.patch("deploy_strategies.jar_service.load_yaml",
+                mock.patch("deploy_strategies.process_service.load_yaml",
                            return_value={"servers": [{"ip": "10.0.0.1"}]}), \
-                mock.patch("deploy_strategies.jar_service.get_ssh_config",
+                mock.patch("deploy_strategies.process_service.get_ssh_config",
                            return_value={}), \
-                mock.patch("deploy_strategies.jar_service.merge_server_ssh",
+                mock.patch("deploy_strategies.process_service.merge_server_ssh",
                            return_value={}), \
                 mock.patch.object(deploy_mod, "RemoteServer", return_value=fake):
             return self.d.strategy.query_current_version(), fake
@@ -312,7 +312,7 @@ class TestPrefetch(unittest.TestCase):
         bad.sftp_put_with_progress = mock.Mock(side_effect=RuntimeError("disk full"))
         with mock.patch.object(deploy_mod, "RemoteServer",
                                side_effect=[ok, bad]), \
-                mock.patch("deploy_strategies.jar_service.log"):
+                mock.patch("deploy_strategies.process_service.log"):
             failures = self.d.strategy.prefetch([{"ip": "10.0.0.1"},
                                                  {"ip": "10.0.0.2"}])
         self.assertEqual(failures, ["10.0.0.2"])
@@ -389,10 +389,10 @@ class TestVerifyPhase(unittest.TestCase):
                           "timeout": 1, "interval": 1}}
         s = create_strategy("jar_service", self.d)  # 配置已改，重建策略读取新 runtime_config
         with mock.patch("health_check.check_http", return_value=False), \
-                mock.patch("deploy_strategies.jar_service.time.sleep"), \
-                mock.patch("deploy_strategies.jar_service.time.time",
+                mock.patch("deploy_strategies.process_service.time.sleep"), \
+                mock.patch("deploy_strategies.process_service.time.time",
                            side_effect=[0, 0, 2]), \
-                mock.patch("deploy_strategies.jar_service.log"):
+                mock.patch("deploy_strategies.process_service.log"):
             with self.assertRaises(RuntimeError) as ctx:
                 s.verify(FakeRemote())
         self.assertIn("健康检查超时", str(ctx.exception))
@@ -430,7 +430,7 @@ class TestRollback(unittest.TestCase):
 
     def test_missing_previous_release_skips_without_touching(self):
         server = FakeRemote(try_exec_ok={"test -d": False})
-        with mock.patch("deploy_strategies.jar_service.log"):
+        with mock.patch("deploy_strategies.process_service.log"):
             self.s.rollback(server)
         self.assertNotIn("systemctl", "\n".join(server.exec_calls))
 

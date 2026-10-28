@@ -1,8 +1,8 @@
 """systemd 单元生成与接入
 
 平台对目标机的系统写入被刻意限制为三件事：写 unit 文件、daemon-reload、enable。
-不安装 JDK、不改内核参数、不动防火墙；对已存在且 ExecStart 不指向
-{app_home}/CURRENT/app.jar 的单元一律拒绝接管。
+不安装运行时、不改内核参数、不动防火墙；对已存在且 ExecStart 不含本模式特征串
+（process_config.exec_start_marker）的单元一律拒绝接管。
 """
 import base64
 import shlex
@@ -13,17 +13,16 @@ from pathlib import Path
 # 不能依赖「先 import 了 deploy_strategies 才顺带生效」这种隐式顺序
 sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 
-from deploy_strategies.jar_config import parse_runtime_config
+from deploy_strategies.process_config import (build_exec_start, exec_start_marker,
+                                              parse_runtime_config)
 from common import log
 
 
-def render_unit(runtime_config, service: str) -> str:
-    """按运行时配置渲染 unit：ExecStart 固定引用 CURRENT，发布只换链接不改 unit"""
-    cfg = parse_runtime_config(runtime_config)
+def render_unit(runtime_config, service: str, deploy_mode: str = "jar_service") -> str:
+    """按运行时配置渲染 unit：ExecStart 固定引用 CURRENT（或 venv），发布只换链接不改 unit"""
+    cfg = parse_runtime_config(runtime_config, deploy_mode)
     work_dir = cfg["work_dir"] or f"{cfg['app_home']}/CURRENT"
-    exec_start = " ".join(x for x in (
-        cfg["java_bin"], cfg["jvm_opts"],
-        "-jar", f"{cfg['app_home']}/CURRENT/app.jar", cfg["app_args"]) if x)
+    exec_start = build_exec_start(cfg, deploy_mode)
     lines = [
         "[Unit]",
         f"Description={service}",
@@ -34,7 +33,8 @@ def render_unit(runtime_config, service: str) -> str:
         f"User={cfg['run_user']}" if cfg["run_user"] else "",
         f"WorkingDirectory={work_dir}",
         f"ExecStart={exec_start}",
-        # Java 收到 SIGTERM 正常退出码 143：不声明会被 systemd 判为失败并触发重启
+        # 有 SIGTERM 处理器的运行时（Java、部分 Python 应用）正常退出码 143：
+        # 不声明会被 systemd 判为失败并触发重启；无处理器的运行时此行无害
         "SuccessExitStatus=143",
         "Restart=on-failure",
         "RestartSec=5",
@@ -49,9 +49,14 @@ def render_unit(runtime_config, service: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def onboard_unit(server, unit: str, content: str, app_home: str) -> None:
-    """在单台服务器接入 unit（幂等）：拒绝接管、写文件、reload、enable"""
-    expected = f"{app_home.rstrip('/')}/CURRENT/app.jar"
+def onboard_unit(server, unit: str, content: str, cfg: dict,
+                 deploy_mode: str = "jar_service") -> None:
+    """在单台服务器接入 unit（幂等）：拒绝接管、写文件、reload、enable
+
+    cfg 为 parse_runtime_config 的产物（含 app_home 与模式专属字段），
+    接管特征串按 deploy_mode 分派。
+    """
+    expected = exec_start_marker(cfg, deploy_mode)
     existing = server.exec(
         f"systemctl show -p ExecStart --value {shlex.quote(unit)}.service "
         f"2>/dev/null || true", timeout=15)

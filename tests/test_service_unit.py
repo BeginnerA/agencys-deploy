@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import service_unit
+from deploy_strategies.process_config import parse_runtime_config
 
 
 class FakeRemote:
@@ -72,7 +73,9 @@ class OnboardTest(unittest.TestCase):
     def test_writes_reloads_and_enables_only(self):
         server = FakeRemote(try_exec_ok={"systemctl show": True})
         with mock.patch("service_unit.log"):
-            service_unit.onboard_unit(server, "hqb-auth", "[Unit]\n", "/opt/auth")
+            service_unit.onboard_unit(
+                server, "hqb-auth", "[Unit]\n",
+                parse_runtime_config({"app_home": "/opt/auth"}, "jar_service"))
         joined = "\n".join(server.exec_calls)
         self.assertIn("/etc/systemd/system/hqb-auth.service", joined)
         self.assertIn("systemctl daemon-reload", joined)
@@ -86,7 +89,9 @@ class OnboardTest(unittest.TestCase):
             "systemctl show": "ExecStart={ path=/usr/bin/java ; argv[]=java -jar /srv/x.jar }"})
         with mock.patch("service_unit.log"):
             with self.assertRaises(RuntimeError) as ctx:
-                service_unit.onboard_unit(server, "hqb-auth", "[Unit]\n", "/opt/auth")
+                service_unit.onboard_unit(
+                    server, "hqb-auth", "[Unit]\n",
+                    parse_runtime_config({"app_home": "/opt/auth"}, "jar_service"))
         self.assertIn("拒绝接管", str(ctx.exception))
 
 
