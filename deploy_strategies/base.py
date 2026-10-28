@@ -119,3 +119,12 @@ def create_strategy(deploy_mode: str, deployer):
 def registered_modes() -> list:
     """已注册的发布方式（路由校验与前端选项读取同一来源，新增策略无需改两处）"""
     return sorted(_REGISTRY)
+
+
+def process_modes() -> list:
+    """进程族 deploy_mode（注册表自动收集：ProcessServiceStrategy 的子类）
+
+    新增进程运行时 = 新策略子类 + @register，观测/路由放行无需改清单。
+    """
+    return sorted(name for name, cls in _REGISTRY.items()
+                  if getattr(cls, "is_process", False))

@@ -21,6 +21,7 @@ from common import (log, load_yaml, default_servers_file, merge_server_ssh,
 @register
 class JarServiceStrategy(DeployStrategy):
     name = "jar_service"
+    is_process = True
     supports_nacos = True
     supports_canary = True
     supports_prefetch = True
