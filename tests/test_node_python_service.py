@@ -110,6 +110,7 @@ class NodeTransferTest(unittest.TestCase):
 
 
 from deploy_strategies.python_process import PythonProcessStrategy  # noqa: E402
+from deploy_strategies.process_config import validate_runtime_config  # noqa: E402
 
 
 def make_py_deployer(tmp_dir: str, version="1.0.0") -> Deployer:
@@ -170,7 +171,152 @@ class PythonVenvTest(unittest.TestCase):
         joined = "\n".join(r.exec_calls)
         self.assertNotIn("python3 -m venv", joined)
         self.assertIn("pip install", joined)
-        self.assertIn("rm -f", joined)  # 先清旧标记再写新标记
+        self.assertIn("rm -f", joined)  # 安装前清旧标记、成功后写新标记
+
+
+class PythonVenvHardeningTest(unittest.TestCase):
+    """venv 生命周期加固：标记顺序、依赖清单缺失、空哈希、损坏 venv 重建"""
+
+    def _svc(self):
+        tmp = tempfile.mkdtemp(prefix="py_hard_")
+        return create_strategy("python_process", make_py_deployer(tmp))
+
+    def test_marker_cleared_before_install(self):
+        s = self._svc()
+        r = FakeRemote(try_exec_ok={"pyvenv.cfg": True},
+                       rules={"sha256sum": "b" * 64, "cat ": "a" * 64})
+        s.ensure_runtime(r, "1.0.0")
+        rm_idx = next(i for i, c in enumerate(r.exec_calls)
+                      if c.startswith("rm -f ") and ".req_hash" in c)
+        pip_idx = next(i for i, c in enumerate(r.exec_calls) if "pip install" in c)
+        # 先清标记再安装：安装中断时不能留下上一版本的「已装」指纹
+        self.assertLess(rm_idx, pip_idx)
+
+    def test_missing_requirements_raises_without_install(self):
+        s = self._svc()
+        r = FakeRemote(try_exec_ok={"pyvenv.cfg": True, "requirements.txt": False},
+                       rules={"sha256sum": ""})
+        with self.assertRaises(RuntimeError) as ctx:
+            s.ensure_runtime(r, "1.0.0")
+        self.assertIn(f"{APP_HOME}/releases/1.0.0/requirements.txt",
+                      str(ctx.exception))
+        self.assertIn("发布包必须包含", str(ctx.exception))
+        self.assertFalse(any("pip install" in c for c in r.exec_calls))
+
+    def test_empty_hash_raises_instead_of_silent_skip(self):
+        s = self._svc()
+        r = FakeRemote(try_exec_ok={"pyvenv.cfg": True}, rules={"sha256sum": ""})
+        with self.assertRaises(RuntimeError) as ctx:
+            s.ensure_runtime(r, "1.0.0")
+        self.assertIn("哈希", str(ctx.exception))
+        self.assertFalse(any("pip install" in c for c in r.exec_calls))
+
+    def test_broken_venv_recreated_and_installed(self):
+        s = self._svc()
+        # pyvenv.cfg 仍在但解释器不可用（系统 Python 升级后的典型形态）
+        r = FakeRemote(
+            try_exec_ok={"bin/python -V": False, "pyvenv.cfg": True,
+                         "test -d": True},
+            rules={"sha256sum": "c" * 64, "cat ": ""})
+        s.ensure_runtime(r, "1.0.0")
+        joined = "\n".join(r.exec_calls)
+        self.assertIn(f"rm -rf {APP_HOME}/venv", joined)
+        self.assertIn(f"python3 -m venv {APP_HOME}/venv", joined)
+        self.assertIn("pip install", joined)
+        rm_idx = next(i for i, c in enumerate(r.exec_calls)
+                      if f"rm -rf {APP_HOME}/venv" in c)
+        venv_idx = next(i for i, c in enumerate(r.exec_calls)
+                        if "python3 -m venv" in c)
+        self.assertLess(rm_idx, venv_idx)
+
+
+class PythonRollbackTest(unittest.TestCase):
+    def _svc(self):
+        d = make_py_deployer(tempfile.mkdtemp(prefix="py_rb_"))
+        d.previous_version = "0.9.0"
+        return create_strategy("python_process", d), d
+
+    def test_rollback_installs_before_restart_and_never_docker(self):
+        s, _ = self._svc()
+        r = FakeRemote(try_exec_ok={"test -d": True},
+                       rules={"sha256sum": "b" * 64, "cat ": "a" * 64})
+        s.rollback(r)
+        joined = "\n".join(r.exec_calls)
+        pip_idx = next(i for i, c in enumerate(r.exec_calls) if "pip install" in c)
+        restart_idx = next(i for i, c in enumerate(r.exec_calls)
+                           if "systemctl restart" in c)
+        self.assertLess(pip_idx, restart_idx)
+        self.assertIn(f"ln -sfn {APP_HOME}/releases/0.9.0", joined)
+        self.assertIn(f"echo 0.9.0 > {APP_HOME}/.deploy_version", joined)
+        self.assertNotIn("docker", joined)
+
+    def test_rollback_missing_wheels_stops_nothing(self):
+        s, d = self._svc()
+        r = FakeRemote(try_exec_ok={"wheels": False})
+        with mock.patch("deploy_strategies.python_process.log") as log_mock:
+            s.rollback(r)
+        joined = "\n".join(r.exec_calls)
+        self.assertNotIn("systemctl", joined)
+        self.assertNotIn("ln -sfn", joined)
+        self.assertNotIn("mv -Tf", joined)
+        self.assertFalse(getattr(d, "target_modified", False))
+        self.assertTrue(any("wheels" in str(c) for c in log_mock.call_args_list))
+
+
+class SwitchOrderingTest(unittest.TestCase):
+    @staticmethod
+    def _assert_ordered(calls, needles):
+        idx = []
+        for needle in needles:
+            i = next((k for k, c in enumerate(calls) if needle in c), -1)
+            if i < 0:
+                raise AssertionError(f"missing command: {needle}")
+            idx.append(i)
+        if idx != sorted(idx):
+            raise AssertionError(f"wrong order: {needles} -> {idx}")
+
+    def test_node_switch_order_without_docker(self):
+        d = make_deployer(tempfile.mkdtemp(prefix="node_sw_"))
+        s = create_strategy("node_process", d)
+        r = FakeRemote()
+        s.switch(r)
+        self._assert_ordered(r.exec_calls, [
+            "systemctl stop", f"ln -sfn {APP_HOME}/releases/1.0.0 ",
+            "mv -Tf", "systemctl start", ".deploy_version"])
+        self.assertFalse(any("docker" in c for c in r.exec_calls))
+
+    def test_python_switch_order_includes_ensure_runtime(self):
+        d = make_py_deployer(tempfile.mkdtemp(prefix="py_sw_"))
+        s = create_strategy("python_process", d)
+        r = FakeRemote(try_exec_ok={"pyvenv.cfg": True},
+                       rules={"sha256sum": "b" * 64, "cat ": ""})
+        s.switch(r)
+        self._assert_ordered(r.exec_calls, [
+            "systemctl stop", f"ln -sfn {APP_HOME}/releases/1.0.0 ",
+            "mv -Tf", "pip install", "systemctl start", ".deploy_version"])
+        self.assertFalse(any("docker" in c for c in r.exec_calls))
+
+
+class RuntimeConfigValidationTest(unittest.TestCase):
+    def test_requirements_rejects_dotdot_and_whitespace(self):
+        base = {"app_home": APP_HOME, "start_file": "main.py"}
+        for bad in ("../x.txt", "a b.txt", "conf/a\tb.txt"):
+            errs = validate_runtime_config(dict(base, requirements=bad),
+                                           "python_process")
+            self.assertTrue(any("runtime_config.requirements" in e for e in errs),
+                            bad)
+        self.assertEqual(validate_runtime_config(
+            dict(base, requirements="conf/requirements.txt"), "python_process"), [])
+
+    def test_node_bin_rejects_control_chars(self):
+        base = {"app_home": APP_HOME, "start_file": "dist/server.js"}
+        for bad in ("/usr/bin/no\nde", "/usr/bin/no de", "/usr/bin/no\tde"):
+            errs = validate_runtime_config(dict(base, node_bin=bad),
+                                           "node_process")
+            self.assertTrue(any("runtime_config.node_bin" in e for e in errs),
+                            repr(bad))
+        self.assertEqual(validate_runtime_config(
+            dict(base, node_bin="/usr/local/bin/node"), "node_process"), [])
 
 
 if __name__ == "__main__":

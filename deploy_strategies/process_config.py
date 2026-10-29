@@ -148,14 +148,27 @@ def validate_runtime_config(raw, deploy_mode: str) -> list:
             node_bin = cfg.get("node_bin", "/usr/bin/node")
             if not isinstance(node_bin, str) or not node_bin.startswith("/"):
                 errors.append("runtime_config.node_bin 必须是绝对路径")
+            elif any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F
+                     for c in node_bin):
+                # node_bin 会拼进 systemd unit 与 shell 命令，空白/控制字符
+                # 会改变命令结构
+                errors.append("runtime_config.node_bin 必须是绝对路径，"
+                              "且不含空白与控制字符")
         else:
             pv = cfg.get("python_version")
             if pv is not None and str(pv) and not _PYVER_RE.match(str(pv)):
                 errors.append("runtime_config.python_version 形如 3.11（major.minor）")
             req = cfg.get("requirements")
-            if req is not None and (not isinstance(req, str) or not req.strip()
-                                    or req.startswith("/")):
-                errors.append("runtime_config.requirements 须为项目内相对路径")
+            if req is not None:
+                if not isinstance(req, str) or not req.strip() or req.startswith("/"):
+                    errors.append("runtime_config.requirements 须为项目内相对路径")
+                elif (".." in req.replace("\\", "/").split("/")
+                      or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F
+                             for c in req)):
+                    # .. 段会让构建读到 project_root 之外、目标机读到 releases/{v}
+                    # 之外；空白/控制字符则会被拼进 shell 命令
+                    errors.append("runtime_config.requirements 须为项目内相对路径"
+                                  "（不含空白、控制字符与 .. 段）")
     return errors
 
 

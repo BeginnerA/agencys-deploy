@@ -75,6 +75,10 @@ class ProcessServiceStrategy(DeployStrategy):
     def ensure_runtime(self, server, version: str):
         """版本级运行时保障（python 的 venv），switch/rollback 在启动前调用；默认无动作"""
 
+    def rollback_preflight(self, server, version: str) -> bool:
+        """回滚前检查目标版本是否具备启动前提；False = 跳过回滚、保持现状"""
+        return True
+
     # ---------- ExecStart 与接管门槛（公式化，子类无需覆盖） ----------
 
     def exec_start_argv(self) -> str:
@@ -380,6 +384,12 @@ class ProcessServiceStrategy(DeployStrategy):
         target = f"{self.jars_dir}/{ver}"
         if not server.try_exec(f"test -d {shlex.quote(target)}", timeout=15):
             log(f"[{server.host}] 无回滚源（{target} 不存在），跳过回滚")
+            return
+        # 停机前确认目标版本具备启动前提（python：依赖清单 + wheels），
+        # 避免停完单元才发现依赖装不上，服务停在半途
+        if not self.rollback_preflight(server, ver):
+            log(f"[{server.host}] 回滚前置检查未通过（releases/{ver}），"
+                "跳过回滚，服务保持现状")
             return
         tmp = f"{self.app_home}/.CURRENT.tmp"
         self.d.target_modified = True
