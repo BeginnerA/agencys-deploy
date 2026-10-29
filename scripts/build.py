@@ -386,6 +386,9 @@ def _run_build_steps(proj: dict, project_root: Path, version: str,
     if build_type == "node":
         _run_node_steps(proj, project_root, version, env_vars, config)
         return
+    if build_type == "python":
+        _run_python_steps(proj, project_root, version, env_vars, config)
+        return
     _run_maven_steps(proj, project_root, version, profile, env_vars, config)
 
 
@@ -700,6 +703,46 @@ def _run_node_steps(proj: dict, project_root: Path, version: str,
         run([npm, "run", "build"], project_root, env=env_vars, timeout=900)
     run([npm, "prune", "--omit=dev"], project_root, env=env_vars, timeout=900)
     _make_node_package(proj, project_root, version, config)
+
+
+def _make_python_package(proj: dict, project_root: Path, version: str,
+                         config: dict, wheels_dir: Path, req_name: str) -> Path:
+    """源码 + requirements + wheels/ → dist/{service}-{version}.tar.gz + .sha256"""
+    service = proj.get("image_name") or proj.get("name") or "app"
+    out = _dist_dir(config) / f"{service}-{version}.tar.gz"
+    with tarfile.open(out, "w:gz") as tf:
+        tf.add(project_root, arcname=".", filter=_tar_filter(out))
+        tf.add(str(wheels_dir), arcname="wheels")
+        tf.add(str(project_root / req_name), arcname=req_name)
+    _write_sha256(out)
+    log(f"Python 产物已生成: {out}（含 wheels 离线依赖，sha256 已写旁文件）")
+    return out
+
+
+def _run_python_steps(proj: dict, project_root: Path, version: str,
+                      env_vars: dict, config: dict):
+    """wheelhouse：平台机 pip download manylinux wheel，目标机 venv 离线安装（不联网）"""
+    rc = proj.get("runtime_config") or {}
+    req_name = str(rc.get("requirements") or "requirements.txt")
+    req_path = project_root / req_name
+    if not req_path.exists():
+        fail(f"未找到依赖清单: {req_path}（runtime_config.requirements 相对项目根）")
+    py_ver = str(rc.get("python_version") or
+                 f"{sys.version_info.major}.{sys.version_info.minor}")
+    if not rc.get("python_version"):
+        log(f"警告: 未配置 runtime_config.python_version，按平台机 "
+            f"{py_ver} 解析 wheel——请核对目标机 python3 版本一致")
+    wheels_dir = project_root / ".wheels-build"
+    if wheels_dir.exists():
+        shutil.rmtree(wheels_dir, ignore_errors=True)
+    wheels_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "pip", "download", "-r", str(req_path),
+           "-d", str(wheels_dir), "--platform", "manylinux2014_x86_64",
+           "--only-binary=:all:", "--implementation", "cp",
+           "--python-version", py_ver]
+    log(f"收集 manylinux wheel（python {py_ver}）：{req_path}")
+    run(cmd, project_root, env=env_vars, timeout=1800)
+    _make_python_package(proj, project_root, version, config, wheels_dir, req_name)
 
 
 def build_project(project_name: str, version: str, env: str = None):

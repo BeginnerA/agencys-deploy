@@ -109,5 +109,69 @@ class NodeTransferTest(unittest.TestCase):
         self.assertIn(f"{APP_HOME}/releases/1.0.0.tmp/node_modules/.bin", joined)
 
 
+from deploy_strategies.python_process import PythonProcessStrategy  # noqa: E402
+
+
+def make_py_deployer(tmp_dir: str, version="1.0.0") -> Deployer:
+    d = make_deployer(tmp_dir, version=version)
+    d.proj_cfg = {"deploy_mode": "python_process", "image_name": "psvc",
+                  "runtime_config": {"app_home": APP_HOME,
+                                     "start_file": "main.py",
+                                     "python_version": "3.11"}}
+    d.project = "psvc"
+    return d
+
+
+class PythonRegistryTest(unittest.TestCase):
+    def test_registered_and_family_complete(self):
+        self.assertIn("python_process", _REGISTRY)
+        from deploy_strategies.base import process_modes
+        self.assertEqual(process_modes(),
+                         ["go_binary", "jar_service", "node_process",
+                          "python_process", "rust_binary"])
+
+    def test_python_probe_checks_ensurepip(self):
+        s = create_strategy("python_process", make_py_deployer(tempfile.mkdtemp()))
+        r = FakeRemote()
+        s.runtime_probe(r)
+        joined = "\n".join(r.exec_calls)
+        self.assertIn("command -v python3", joined)
+        self.assertIn("python3 -m ensurepip", joined)
+
+
+class PythonVenvTest(unittest.TestCase):
+    def test_first_deploy_creates_venv_and_installs(self):
+        tmp = tempfile.mkdtemp(prefix="py_svc_")
+        s = create_strategy("python_process", make_py_deployer(tmp))
+        r = FakeRemote(try_exec_ok={"pyvenv.cfg": False},
+                       rules={"sha256sum": "a" * 64})
+        s.ensure_runtime(r, "1.0.0")
+        joined = "\n".join(r.exec_calls)
+        self.assertIn(f"python3 -m venv {APP_HOME}/venv", joined)
+        self.assertIn("--no-index", joined)
+        self.assertIn(f"--find-links {APP_HOME}/releases/1.0.0/wheels", joined)
+        self.assertIn(f"-r {APP_HOME}/releases/1.0.0/requirements.txt", joined)
+        self.assertIn(".req_hash", joined)
+
+    def test_hash_match_skips_install(self):
+        tmp = tempfile.mkdtemp(prefix="py_svc_")
+        s = create_strategy("python_process", make_py_deployer(tmp))
+        r = FakeRemote(rules={"sha256sum": "a" * 64, "cat ": "a" * 64})
+        s.ensure_runtime(r, "1.0.0")
+        self.assertFalse(any("pip install" in c for c in r.exec_calls))
+        self.assertFalse(any("python3 -m venv" in c for c in r.exec_calls))
+
+    def test_requirements_change_reinstalls_without_recreate(self):
+        tmp = tempfile.mkdtemp(prefix="py_svc_")
+        s = create_strategy("python_process", make_py_deployer(tmp))
+        r = FakeRemote(try_exec_ok={"pyvenv.cfg": True},
+                       rules={"sha256sum": "b" * 64, "cat ": "a" * 64})
+        s.ensure_runtime(r, "1.0.0")
+        joined = "\n".join(r.exec_calls)
+        self.assertNotIn("python3 -m venv", joined)
+        self.assertIn("pip install", joined)
+        self.assertIn("rm -f", joined)  # 先清旧标记再写新标记
+
+
 if __name__ == "__main__":
     unittest.main()

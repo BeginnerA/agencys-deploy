@@ -72,5 +72,50 @@ class NodeBuildTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)  # ci + prune
 
 
+class PythonBuildTest(unittest.TestCase):
+    def test_pip_download_and_package(self):
+        root = Path(tempfile.mkdtemp(prefix="py_build_"))
+        (root / "requirements.txt").write_text("fastapi==0.111.0\n",
+                                               encoding="utf-8")
+        (root / "main.py").write_text("print('x')\n", encoding="utf-8")
+        calls = []
+
+        def fake_run(cmd, cwd, env=None, timeout=None, **kw):
+            calls.append(cmd)
+            # 模拟 pip download 产出 wheel
+            out_dir = Path(cmd[cmd.index("-d") + 1])
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "fastapi-0.111.0-py3-none-any.whl").write_bytes(b"w")
+
+        rc = {"app_home": "/opt/apps/psvc", "start_file": "main.py",
+              "python_version": "3.11"}
+        with mock.patch.object(build_mod, "run", side_effect=fake_run), \
+                mock.patch.object(build_mod, "_find_tool", return_value="python"):
+            build_mod._run_python_steps({"image_name": "psvc",
+                                         "runtime_config": rc},
+                                        root, "1.0.0", {}, base_config(root))
+        cmd = calls[0]
+        self.assertIn("pip", cmd)
+        self.assertIn("--platform", cmd)
+        self.assertIn("manylinux2014_x86_64", cmd)
+        self.assertIn("--only-binary=:all:", cmd)
+        self.assertIn("3.11", cmd)
+        out = root / "out" / "psvc-1.0.0.tar.gz"
+        self.assertTrue(out.exists())
+        with tarfile.open(out, "r:gz") as tf:
+            names = tf.getnames()
+        self.assertTrue(any("wheels/" in n for n in names))
+        self.assertTrue(any(n.endswith("requirements.txt") for n in names))
+        self.assertTrue(any(n.endswith("main.py") for n in names))
+
+    def test_missing_requirements_fails(self):
+        root = Path(tempfile.mkdtemp(prefix="py_build_"))
+        rc = {"app_home": "/opt/apps/psvc", "start_file": "main.py"}
+        with self.assertRaises(SystemExit):
+            build_mod._run_python_steps({"image_name": "psvc",
+                                         "runtime_config": rc},
+                                        root, "1.0.0", {}, base_config(root))
+
+
 if __name__ == "__main__":
     unittest.main()
