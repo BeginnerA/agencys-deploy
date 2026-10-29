@@ -293,7 +293,7 @@ servers:
 - `go_binary`：Go 单二进制 + Linux systemd。平台机交叉编译（`CGO_ENABLED=0 GOOS=linux`）出 Linux 二进制 → 上传到目标机版本目录 → 切换 `CURRENT` 符号链接 → 重启单元，目标机无 JDK/解释器依赖（`CGO_ENABLED=0` 产物静态链接）。
 - `rust_binary`：Rust 单二进制 + Linux systemd。平台机 `cargo build --release` 构建出 Linux 二进制，后续切换动作与 `go_binary` 相同。
 - `node_process`：Node 后端进程 + Linux systemd。平台机 `npm ci` → 可选 `npm run build`（`package.json` 有 `build` 脚本才执行）→ `npm prune --omit=dev` 打成含 `node_modules` 的 tar.gz → 上传解压到目标机版本目录 → 切换 `CURRENT` 符号链接 → 重启单元，目标机只需 node。
-- `python_process`：Python 进程 + Linux systemd。平台机收集 manylinux wheel 打成 wheelhouse 包（源码 + `requirements.txt` + `wheels/`）→ 上传解压到目标机版本目录 → 离线装进 `app_home/venv` → 切换 `CURRENT` 符号链接 → 重启单元，目标机只需 python3 + python3-venv。
+- `python_process`：Python 进程 + Linux systemd。平台机收集 manylinux wheel 打成 wheelhouse 包（源码 + `requirements.txt` + `wheels/`）→ 上传解压到目标机版本目录 → 停止单元 → 切换 `CURRENT` 符号链接 →（依赖变化时）离线装进 `app_home/venv` → 启动单元，目标机只需 python3 + python3-venv。
 
 `jar_service` 要求目标机已安装 JDK/JRE，并由平台生成 systemd 单元后接入（管理员操作，记审计）；平台不安装 JDK，也不接管人工维护的单元。版本目录 `{app_home}/releases/{version}/app.jar` 不可变，`CURRENT` 符号链接原子切换，回滚只换链接不重传。单实例重启存在停机窗口，平台不承诺零停机。字段表与操作步骤见 `docs/usage.md`「Java 进程发布（jar_service）」。平台周期探测单元状态并从 `.deploy_version` 读取每主机版本；版本变化时写穿 `service_host_state`，监控关闭时页面回退到该快照。
 

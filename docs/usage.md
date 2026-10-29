@@ -21,6 +21,7 @@
 - Docker（已登录到目标镜像仓库并能推送）
 - 到所有目标服务器的免密 SSH 访问
 - Go 构建需平台机安装 Go 工具链（或配置 `build.go_home`）；Rust 构建需 cargo，Windows/macOS 平台机交叉编译须配置 `build.rust_target` 与对应 target/linker，否则请用 WSL/Linux 构建或 `build_type=none`；
+- Node 构建需平台机 `npm` 在 PATH 中（或配置 `build.npm_home`）；Python 构建使用平台机自身的 Python（`python -m pip download`）收集 wheel，因此需安装 `pip` 并能访问 Python 包索引；
 
 ### 2.2 目标服务器环境
 
@@ -794,7 +795,7 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 
 观测（M5）：
 
-进程族观测口径一致：Go/Rust（`go_binary`/`rust_binary`）、Node/Python（`node_process`/`python_process`）服务与 jar 同样具备实时状态、journal 日志与每主机版本视图。Python 回滚触发 venv 重装时，任务日志会输出离线安装步骤，整体耗时看任务列表的「耗时」列（平台不打印单步计时）。
+进程族观测口径一致：Go/Rust（`go_binary`/`rust_binary`）、Node/Python（`node_process`/`python_process`）服务与 jar 同样具备实时状态、journal 日志与每主机版本视图。Python 回滚触发 venv 重装时，任务日志会输出离线安装提示（含 wheels 目录），整体耗时见任务列表的「耗时」列（平台不打印单步计时）。
 
 - 设备页 jar 卡片展示实时状态（在线/已停止/未部署/探测失败）、当前版本、在线主机数与运行时长；版本以目标机 `.deploy_version` 为准；
 - 点「主机」查看每主机版本、上一版本、PID、运行时长、重启数、CPU/内存；监控关闭时显示「版本快照」，来自 `service_host_state`；
@@ -828,7 +829,7 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 
 ### 10.10 Node/Python 进程发布（node_process / python_process）
 
-`node_process` / `python_process` 面向「目标机只跑一个解释器进程、由 systemd 托管」的后端服务：产物是整目录压缩包（Node 为源码 + `node_modules`，Python 为源码 + `requirements.txt` + `wheels/`），平台机构建后上传，目标机解压平铺到 `releases/{version}/`，与 jar 共用 `CURRENT` 符号链接切换、systemd 托管与进程族观测；不构建镜像、不操作容器。Node 的 `ExecStart` 为 `{node_bin} {app_home}/CURRENT/{start_file}`，Python 为 `{app_home}/venv/bin/python {app_home}/CURRENT/{start_file}`。
+`node_process` / `python_process` 面向「目标机只跑一个解释器进程、由 systemd 托管」的后端服务：产物是整目录压缩包（Node 为源码 + `node_modules`，Python 为源码 + `requirements.txt` + `wheels/`），平台机构建后上传，目标机解压平铺到 `releases/{version}/`，与 jar 共用 `CURRENT` 符号链接切换、systemd 托管与进程族观测；不构建镜像、不操作容器。Node 的 `ExecStart` 为 `{node_bin} {app_home}/CURRENT/{start_file}`，Python 为 `{app_home}/venv/bin/python {app_home}/CURRENT/{start_file}`（配置 `app_args` 时追加在末尾）。
 
 平台机构建前提：
 
@@ -873,7 +874,7 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 - 只有 sdist 的依赖无法收集（`--only-binary=:all:`），构建期直接报错并指出包名，请改用提供 manylinux wheel 的版本；
 - 平台机需联网：Node 需访问 npm registry（`npm ci`），Python 需访问包索引（`pip download`）；`npm ci` 要求项目已提交 `package-lock.json`；
 - Node 构建会就地清空重装 `project_root` 的 `node_modules`；打包排除 `.git`、`.env*`、`__pycache__`、`.wheels-build`、`.venv`/`venv` 与 `*.log`；
-- Python 回滚触发重装时，停机窗口内额外包含依赖安装耗时；任务日志会输出离线安装步骤，整体耗时见任务列表的「耗时」列（平台不打印单步计时）。
+- Python 回滚触发重装时，停机窗口内额外包含依赖安装耗时；任务日志会输出离线安装提示（含 wheels 目录），整体耗时见任务列表的「耗时」列（平台不打印单步计时）。
 
 停机口径：单实例发布在「停止 → 换链接 →（`ensure_runtime`）→ 启动」期间服务不可用，Python 触发重装时窗口更长；平台不承诺零停机，需要连续可用时请改用容器多实例方案。
 
