@@ -11,9 +11,11 @@
 """
 import os
 import sys
+import json
 import time
 import shutil
 import hashlib
+import tarfile
 import zipfile
 import subprocess
 import argparse
@@ -381,6 +383,9 @@ def _run_build_steps(proj: dict, project_root: Path, version: str,
     if build_type == "rust":
         _run_rust_steps(proj, project_root, version, env_vars, config)
         return
+    if build_type == "node":
+        _run_node_steps(proj, project_root, version, env_vars, config)
+        return
     _run_maven_steps(proj, project_root, version, profile, env_vars, config)
 
 
@@ -638,6 +643,63 @@ def _run_rust_steps(proj: dict, project_root: Path, version: str,
     shutil.copy2(src, out)
     _write_sha256(out)
     log(f"二进制产物已生成: {out}（sha256 已写旁文件）")
+
+
+_TAR_EXCLUDE_PARTS = {".git", ".env", "__pycache__", ".wheels-build",
+                      "node_modules/.cache", ".venv", "venv"}
+
+
+def _tar_filter(out_path: Path):
+    """tarfile filter：排除版本库/密钥/缓存/临时目录；Windows 打包的执行位由远端 chmod 兜底"""
+    def _f(ti: tarfile.TarInfo):
+        name = ti.name.replace("\\", "/")
+        parts = name.split("/")
+        if any(seg in _TAR_EXCLUDE_PARTS for seg in parts):
+            return None
+        if any(seg.startswith(".env") for seg in parts):
+            return None
+        if name.endswith(".log"):
+            return None
+        if out_path and name.rstrip("/") in (out_path.name,):
+            return None  # 防 dist 目录在项目根内时自包含
+        return ti
+    return _f
+
+
+def _make_node_package(proj: dict, project_root: Path, version: str,
+                       config: dict) -> Path:
+    """项目目录（含 node_modules）→ dist/{service}-{version}.tar.gz + .sha256"""
+    service = proj.get("image_name") or proj.get("name") or "app"
+    out = _dist_dir(config) / f"{service}-{version}.tar.gz"
+    with tarfile.open(out, "w:gz") as tf:
+        tf.add(project_root, arcname=".", filter=_tar_filter(out))
+    _write_sha256(out)
+    log(f"Node 产物已生成: {out}（含 node_modules，sha256 已写旁文件）")
+    return out
+
+
+def _run_node_steps(proj: dict, project_root: Path, version: str,
+                    env_vars: dict, config: dict):
+    """Node 后端构建：npm ci（全量）→ 可选 npm run build → npm prune --omit=dev → tar.gz"""
+    npm = _find_tool("npm", "npm_home", config,
+                     "未找到 npm：请安装 Node.js 并加入 PATH（需含 npm）")
+    pkg = project_root / "package.json"
+    if not pkg.exists():
+        fail(f"未找到 package.json: {pkg}")
+    if not (project_root / "package-lock.json").exists():
+        fail("未找到 package-lock.json：npm ci 需要锁定依赖（在项目内提交 lock 文件）")
+    log(f"使用 npm: {npm}")
+    run([npm, "ci"], project_root, env=env_vars, timeout=900)
+    scripts = {}
+    try:
+        scripts = (json.loads(pkg.read_text(encoding="utf-8"))
+                   .get("scripts") or {})
+    except ValueError:
+        fail(f"package.json 解析失败: {pkg}")
+    if scripts.get("build"):
+        run([npm, "run", "build"], project_root, env=env_vars, timeout=900)
+    run([npm, "prune", "--omit=dev"], project_root, env=env_vars, timeout=900)
+    _make_node_package(proj, project_root, version, config)
 
 
 def build_project(project_name: str, version: str, env: str = None):
