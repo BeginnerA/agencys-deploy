@@ -29,6 +29,11 @@
 - 服务器上有统一的 `docker-compose.yml` 文件，例如 `/data/docker/docker-compose.yml`
 - 服务器能访问 Nacos、MySQL、镜像仓库和控制机健康检查端口
 
+进程类发布方式（`node_process` / `python_process`）不在目标机跑容器，另有以下目标机前提：
+
+- Node 进程发布：目标机需预装 node（`runtime_config.node_bin`）；Python 进程发布：目标机需预装 python3 与 python3-venv（含 ensurepip），平台不代装；
+- Python 依赖经 wheelhouse 离线安装：无 Linux wheel、需现场编译的 sdist 依赖会在平台构建期报错并列出包名，请改用提供 manylinux wheel 的版本；
+
 ### 2.3 安装依赖
 
 在控制机上进入项目目录（`agencys-deploy`），执行：
@@ -789,7 +794,7 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 
 观测（M5）：
 
-进程族观测口径一致：Go/Rust（`go_binary`/`rust_binary`）服务与 jar 同样具备实时状态、journal 日志与每主机版本视图。
+进程族观测口径一致：Go/Rust（`go_binary`/`rust_binary`）、Node/Python（`node_process`/`python_process`）服务与 jar 同样具备实时状态、journal 日志与每主机版本视图。Python 回滚触发 venv 重装时，任务日志会输出离线安装步骤，整体耗时看任务列表的「耗时」列（平台不打印单步计时）。
 
 - 设备页 jar 卡片展示实时状态（在线/已停止/未部署/探测失败）、当前版本、在线主机数与运行时长；版本以目标机 `.deploy_version` 为准；
 - 点「主机」查看每主机版本、上一版本、PID、运行时长、重启数、CPU/内存；监控关闭时显示「版本快照」，来自 `service_host_state`；
@@ -820,6 +825,57 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 发布与回滚流程同 jar：预检 → 上传 `releases/{version}/app`（远端 sha256 相同则跳过，上传后 chmod 0755 并复核校验和）→ 临时链接 + `mv -Tf` 原子换 `CURRENT` → 重启单元 → 按 readiness 验证；回滚只换链接不重传二进制。停机窗口与 jar 相同：单实例发布在「停止 → 换链接 → 启动」期间服务不可用，平台不承诺零停机；需要连续可用时请改用容器多实例方案。
 
 兼容性：`jar_service`、`container`、`static_archive` 三种既有方式行为零变化，未使用 go/rust 的项目无需任何改动。
+
+### 10.10 Node/Python 进程发布（node_process / python_process）
+
+`node_process` / `python_process` 面向「目标机只跑一个解释器进程、由 systemd 托管」的后端服务：产物是整目录压缩包（Node 为源码 + `node_modules`，Python 为源码 + `requirements.txt` + `wheels/`），平台机构建后上传，目标机解压平铺到 `releases/{version}/`，与 jar 共用 `CURRENT` 符号链接切换、systemd 托管与进程族观测；不构建镜像、不操作容器。Node 的 `ExecStart` 为 `{node_bin} {app_home}/CURRENT/{start_file}`，Python 为 `{app_home}/venv/bin/python {app_home}/CURRENT/{start_file}`。
+
+平台机构建前提：
+
+- 构建在 `deploy.project_root` 下就地执行：`npm ci` / `npm run build` / `npm prune` 都会改写该目录的 `node_modules`，请保证可写且不与生产共用；Python 的 wheel 收集写在项目根临时目录 `.wheels-build`（重新构建前先清空，打包时排除）；
+- Node：`npm` 在平台机 PATH 中，或配置 `build.npm_home` 指向 Node 安装目录/可执行文件；项目根需有 `package.json` 与已提交的 `package-lock.json`（`npm ci` 要求），平台机需能访问 npm registry；只有 `package.json` 的 `scripts` 里存在 `build` 时才额外执行 `npm run build`；
+- Python：平台机用当前 `sys.executable -m pip download -r <requirements> -d <项目根>/.wheels-build --platform manylinux2014_x86_64 --only-binary=:all: --implementation cp --python-version <ver>` 收集 wheel，平台机需能访问 Python 包索引；`runtime_config.python_version`（`major.minor`，如 `3.11`）决定 wheel 解析的目标 CPython 版本，留空时取平台机版本并在构建日志告警；
+- 服务表单中构建类型随发布方式联动缺省（`node_process` → `node`、`python_process` → `python`），两者都可改选 `none` 外部投入产物（把 tar.gz 与同名 `.sha256` 放进平台机 `dist/`）。
+
+目标机前提：
+
+- 仅 Linux 且启用 systemd（与 jar 相同，无容器参与），`runtime_config.app_home` 必填（绝对路径），其下放 `releases/`、`CURRENT`、`.deploy_version`（Python 另有共享 `venv/`）；
+- Node：预装 node，`runtime_config.node_bin` 指向其绝对路径（默认 `/usr/bin/node`），预检用 `command -v` 探测；平台不安装 node；
+- Python：预装 python3 与 python3-venv（含 ensurepip），预检会执行 `python3 -m ensurepip --version`，把缺 ensurepip 的机器（如 Debian 未装 python3-venv）在切换前拦下；平台不安装 python3 与 venv 模块；
+- systemd 单元由平台生成并接入（管理员操作，记审计），接入与 jar 相同；平台只接管 `ExecStart` 指向 `{app_home}/CURRENT/{start_file}` 特征串（Python 为 `{app_home}/venv/bin/python`）的单元，其余一律拒绝接管；
+- 磁盘按包体积 3 倍预检（压缩包、解压暂存目录与正式目录并存）。
+
+配置字段：与 jar 共用公共字段（`app_home`/`run_user`/`work_dir`/`unit_name`/`port`/`app_args`/`readiness`/`stop_timeout`/`start_timeout`/`env_files`），没有 `java_bin`/`jvm_opts`/`artifact_pattern`。模式专属字段：
+
+| 字段 | 适用 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `start_file` | 两者 | 是 | `CURRENT` 下的相对入口（如 `dist/server.js` / `main.py`），不能是绝对路径，不含空白与 `..` 段 |
+| `node_bin` | Node | 否 | 目标机 node 绝对路径，默认 `/usr/bin/node` |
+| `requirements` | Python | 否 | 依赖清单，相对项目根，默认 `requirements.txt` |
+| `python_version` | Python | 否 | 目标机 Python 版本（`major.minor`），留空取平台机版本解析 wheel，须自行核对目标机一致 |
+
+`readiness` 缺省为 `process`（仅判进程存活），有健康端点的服务应显式配置 `http`/`tcp` + `port`（与 Go/Rust 一致）。
+
+发布与回滚流程：
+
+- 预检：运行时探测（node / python3 + ensurepip）、`systemctl` 可用、`app_home` 可写、磁盘余量 ≥ 包体积 3 倍；
+- 准备：确认单元已接入且 `ExecStart` 含模式特征串，否则拒绝发布，避免接管人工维护的服务；
+- 传输：上传 `dist/{服务名}-{版本}.tar.gz` → 远端复核 sha256 → 解压到 `releases/{version}.tmp` →（Node）修复 `node_modules/.bin` 执行位 → `mv -Tf` 原子就位并删除压缩包；远端已有同一校验和则跳过上传，上次中断留下的残骸会先清除重建；
+- 切换：`systemctl stop` → 临时链接 + `mv -Tf` 原子换 `CURRENT` → `ensure_runtime` → `systemctl start` → 写 `.deploy_version`；
+- 验证：`systemctl is-active`，再按 readiness 探测；失败先抓 `journalctl` 尾部写入任务日志，再触发自动回滚；
+- 回滚：链接指回 `releases/{previous_version}` → `ensure_runtime` → 重启单元，不重传产物；目标机没有该版本目录时跳过并告警。
+
+`ensure_runtime` 在每次切换与每次回滚的启动前都会执行：Node 无动作；Python 检查 `{app_home}/venv`（缺 `pyvenv.cfg` 则 `python3 -m venv` 创建），再把 `releases/{version}/requirements.txt` 的远端 sha256 与 `venv/.req_hash` 比对，不一致时执行 `venv/bin/pip install --no-index --find-links {releases}/{version}/wheels -r ...` 离线重装（全程 `--no-index`，不联网）。因此首次发布、requirements 变化、以及回滚到依赖不同的旧版本，都是「先重装依赖再启动」，不会带着错误的依赖重启。
+
+限制与已知取舍：
+
+- wheel 只按 x86_64 Linux + CPython 解析（`--platform manylinux2014_x86_64`、`--implementation cp`、`--python-version`）：目标机须为 x86_64 Linux，且 Python 版本与 `python_version` 一致；aarch64、musl（Alpine）、PyPy 目标机不适用；
+- 只有 sdist 的依赖无法收集（`--only-binary=:all:`），构建期直接报错并指出包名，请改用提供 manylinux wheel 的版本；
+- 平台机需联网：Node 需访问 npm registry（`npm ci`），Python 需访问包索引（`pip download`）；`npm ci` 要求项目已提交 `package-lock.json`；
+- Node 构建会就地清空重装 `project_root` 的 `node_modules`；打包排除 `.git`、`.env*`、`__pycache__`、`.wheels-build`、`.venv`/`venv` 与 `*.log`；
+- Python 回滚触发重装时，停机窗口内额外包含依赖安装耗时；任务日志会输出离线安装步骤，整体耗时见任务列表的「耗时」列（平台不打印单步计时）。
+
+停机口径：单实例发布在「停止 → 换链接 →（`ensure_runtime`）→ 启动」期间服务不可用，Python 触发重装时窗口更长；平台不承诺零停机，需要连续可用时请改用容器多实例方案。
 
 ## 十一、Jenkins / Ansible 集成
 

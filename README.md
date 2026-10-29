@@ -285,17 +285,21 @@ servers:
 
 ## 运行方式（deploy_mode）
 
-每个服务在「管理 → 服务」里选择一种发布方式。五种方式共用项目/环境/流水线/回滚编排，差异只在构建产物与切换动作：
+每个服务在「管理 → 服务」里选择一种发布方式。七种方式共用项目/环境/流水线/回滚编排，差异只在构建产物与切换动作：
 
 - `container`：Docker 容器（默认）。Maven 构建 → 镜像推送/直传 → 滚动替换容器。
 - `static_archive`：静态站点压缩包（1Panel/nginx）。前端构建 → zip → 站点目录解压换入，无容器、无 Nacos。
 - `jar_service`：纯 Java 可执行 jar + Linux systemd。Maven 构建 → jar 上传到目标机版本目录 → 切换 `CURRENT` 符号链接 → 重启单元。
 - `go_binary`：Go 单二进制 + Linux systemd。平台机交叉编译（`CGO_ENABLED=0 GOOS=linux`）出 Linux 二进制 → 上传到目标机版本目录 → 切换 `CURRENT` 符号链接 → 重启单元，目标机无 JDK/解释器依赖（`CGO_ENABLED=0` 产物静态链接）。
 - `rust_binary`：Rust 单二进制 + Linux systemd。平台机 `cargo build --release` 构建出 Linux 二进制，后续切换动作与 `go_binary` 相同。
+- `node_process`：Node 后端进程 + Linux systemd。平台机 `npm ci` → 可选 `npm run build`（`package.json` 有 `build` 脚本才执行）→ `npm prune --omit=dev` 打成含 `node_modules` 的 tar.gz → 上传解压到目标机版本目录 → 切换 `CURRENT` 符号链接 → 重启单元，目标机只需 node。
+- `python_process`：Python 进程 + Linux systemd。平台机收集 manylinux wheel 打成 wheelhouse 包（源码 + `requirements.txt` + `wheels/`）→ 上传解压到目标机版本目录 → 离线装进 `app_home/venv` → 切换 `CURRENT` 符号链接 → 重启单元，目标机只需 python3 + python3-venv。
 
 `jar_service` 要求目标机已安装 JDK/JRE，并由平台生成 systemd 单元后接入（管理员操作，记审计）；平台不安装 JDK，也不接管人工维护的单元。版本目录 `{app_home}/releases/{version}/app.jar` 不可变，`CURRENT` 符号链接原子切换，回滚只换链接不重传。单实例重启存在停机窗口，平台不承诺零停机。字段表与操作步骤见 `docs/usage.md`「Java 进程发布（jar_service）」。平台周期探测单元状态并从 `.deploy_version` 读取每主机版本；版本变化时写穿 `service_host_state`，监控关闭时页面回退到该快照。
 
 Go/Rust 单二进制（`deploy_mode=go_binary`/`rust_binary`）：平台机交叉编译（Go，`CGO_ENABLED=0 GOOS=linux`）或 cargo 构建出 Linux 二进制，与 jar 共用 releases/CURRENT 切换与 systemd 托管；目标机无 JDK/解释器依赖——Go 产物静态链接，Rust gnu target 产物仍依赖目标机 glibc 版本（glibc 过旧会报 `GLIBC_2.xx not found`，可改 musl target 或静态链接规避，见 `docs/usage.md` 10.9）。构建前提在平台机：`go`/`cargo` 在 PATH，或配置 `build.go_home`/`build.cargo_home` 指向工具链（Windows 下同时解析 `go.exe`/`cargo.exe`、`.cmd`/`.bat` 等可执行形态）。Windows/macOS 平台机需配置 `build.rust_target`（如 `x86_64-unknown-linux-gnu`，并安装对应 target 与 linker）：Windows 未配置直接报错，macOS 未配置会静默产出 darwin 二进制，均建议改用 WSL/Linux 构建或 `build_type=none` 外部投入。外部投入（`build_type=none`）时须把产物放到平台机 `dist/`（`deploy.dist_dir`）下，即 `dist/{service}-{version}`，并附同名 `.sha256` 旁文件，发布前会校验。目标机前提与 jar 相同：仅 Linux + systemd，单元由平台生成并接入，平台只接管 `ExecStart` 指向 `{app_home}/CURRENT/app` 特征串的单元（jar 为 `…/CURRENT/app.jar`）。单实例发布重启存在停机窗口，平台不承诺零停机；jar/容器/静态三种既有方式行为零变化。字段说明见 `docs/usage.md`「Go/Rust 单二进制发布」。
+
+Node 进程（`deploy_mode=node_process`）：平台机 `npm ci` →（可选 build）→ `npm prune --omit=dev` 打 tar.gz（含 node_modules），远端解压到 `releases/{version}/` 后切换 `CURRENT`；目标机只需 node。Python 进程（`deploy_mode=python_process`）：平台机收集 manylinux wheel，目标机在 `app_home/venv` 离线安装（不联网、不写系统目录），requirements 变化时自动重装，回滚到依赖不同的旧版本时先重装再重启。完整字段、构建前提与限制见 `docs/usage.md`「Node/Python 进程发布」。目标机只需预装 node（`runtime_config.node_bin` 指向其绝对路径）或 python3 + python3-venv（含 ensurepip），平台不代装任一运行时；单实例发布在「停止 → 换链接 → 启动」期间服务不可用，Python 触发依赖重装还会拉长这段窗口，平台不承诺零停机。
 
 ## 回滚策略
 
