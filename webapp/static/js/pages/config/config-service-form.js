@@ -62,6 +62,8 @@
       const isJar = d.deploy_mode === 'jar_service';
       const isGo = d.deploy_mode === 'go_binary';
       const isRust = d.deploy_mode === 'rust_binary';
+      const isNode = d.deploy_mode === 'node_process';
+      const isPython = d.deploy_mode === 'python_process';
       if (!d.runtime_config || typeof d.runtime_config !== 'object') d.runtime_config = {};
       const rc = d.runtime_config;
       const basic = `
@@ -112,7 +114,7 @@
           </div>
           ${H.field({ label:'docker-compose 服务名', required:!isStatic && !isProc, tip:'docker-compose.yml 里的服务名；静态站点不适用，留空自动回退服务名', input:`<input id="sCompose" value="${esc(d.service_name)}" placeholder="留空自动填服务名">` })}
         </div>`;
-      // ② 构建配置（静态=前端；jar=Maven；go/rust=go/rust（可切 none 外部投入）；其余进程族在批 B 扩展）
+      // ② 构建配置（静态=前端；jar=Maven；go/rust=go/rust；node/python=node/python（均可切 none 外部投入））
       const isFrontend = isStatic || (!isProc && d.build_type === 'frontend');
       const btLocked = isStatic || isJar;  // 构建类型跟随发布方式锁定
       const btOptions = (mode) => {
@@ -133,6 +135,8 @@
               : isJar ? 'Java 项目使用 Maven 构建'
               : isGo ? 'Go：平台机交叉编译 Linux 二进制（CGO_ENABLED=0，GOOS=linux；架构与 ldflags 见构建配置文件）；none = 自行构建后把产物放入平台 dist 目录'
               : isRust ? 'Rust：cargo 构建（Windows 平台机须配置 rust_target，建议 WSL/Linux 构建或选 none）'
+              : isNode ? 'Node：平台机 npm ci（有 build 脚本再 npm run build）→ npm prune --omit=dev，连同 node_modules 打 tar.gz；none = 自行构建后把产物放入平台 dist 目录'
+              : isPython ? 'Python：平台机 pip download 收集 manylinux wheel 打成 wheelhouse 包（源码 + requirements + wheels/）；none = 自行构建后把产物放入平台 dist 目录'
               : 'Java 项目使用 Maven 构建；Web 前端项目使用 npm/pnpm/yarn 等命令构建'}</div>
           </div>
           ${isFrontend ? `
@@ -140,7 +144,7 @@
             ${H.cmdList({ id:'sBuildOrder', rows: d.build_order }).html}
             <div class="f-hint">每个步骤填写工作目录和命令列表（每行一条命令，框高随内容自动伸展）；支持 \${VERSION} 变量替换；自动探测 npm/pnpm/yarn 可执行路径；步骤级环境变量（env，如 NODE_OPTIONS）保存时原样保留。</div>
           </div>` : (isProc && !isJar ? `
-          <div class="field full"><span class="weak">Go/Rust 构建无需 build_order：产物定位用构建配置（build.go_main / build.rust_bin 等），详见使用文档。</span></div>` : `
+          <div class="field full"><span class="weak">Go / Rust / Node / Python 构建无需 build_order：Go、Rust 的产物定位用构建配置（build.go_main / build.rust_bin），Node、Python 直接以项目根为工作目录，详见使用文档。</span></div>` : `
           <div class="field full"><label>构建顺序（build_order）</label>
             ${H.rowList({ id:'sBuildOrder', rows: d.build_order }).html}
             <div class="f-hint">按顺序对每个模块执行 mvn clean {goal} -P{profile}；common-build / api 等被依赖模块一般 install，最终服务模块 package；extra_profile 用于同一仓库按 profile 产出不同 jar 的项目。</div>
@@ -159,7 +163,7 @@
           ${H.field({ label:'入口文件（entry_file）', tip:'解压后据此定位产物根目录（兼容 zip 多包一层目录），默认 index.html', input:`<input id="sEntryFile" value="${esc(d.entry_file || '')}" placeholder="留空默认 index.html">` })}
           ${H.field({ label:'文件权限（file_mode）', tip:'换入后文件权限归一，默认 0644（目录固定 0755，属主 root:root）', input:`<input id="sFileMode" value="${esc(d.file_mode || '')}" placeholder="留空默认 0644">` })}
         </div>` : '';
-      // ②c 进程族专属配置（jar/go/rust/node/python 共享组 + 模式专属组；node/python 组随批 B 选项启用）
+      // ②c 进程族专属配置（jar/go/rust/node/python 共享组 + 模式专属组）
       const procCfg = isProc ? `
         <div class="form-grid">
           ${H.field({ label:'应用根目录（app_home）', required:true, input:`<input id="jAppHome" value="${esc(rc.app_home || '')}" placeholder="${isJar ? '/opt/apps/hqb-auth' : '/opt/apps/' + esc(d.name || 'app')}">`, hint:`版本目录 releases/ 与 CURRENT 链接的根；回滚只换链接，不重传${isJar ? ' jar' : '产物'}` })}
