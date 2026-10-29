@@ -74,8 +74,10 @@
               <option value="jar_service" ${isJar ? 'selected' : ''}>☕ 纯 Java 进程（jar → systemd）</option>
               <option value="go_binary" ${isGo ? 'selected' : ''}>🐹 Go 单二进制（systemd）</option>
               <option value="rust_binary" ${isRust ? 'selected' : ''}>🦀 Rust 单二进制（systemd）</option>
+              <option value="node_process" ${d.deploy_mode === 'node_process' ? 'selected' : ''}>🟩 Node 进程（systemd）</option>
+              <option value="python_process" ${d.deploy_mode === 'python_process' ? 'selected' : ''}>🐍 Python 进程（wheelhouse + venv）</option>
             </select>
-            <div class="f-hint">静态站点：前端构建产物 zip 上传 1Panel 站点目录解压切换，无容器无 Nacos；版本号用日期号 YYYYMMDD 而非 semver。纯 Java 进程：Maven 构建出可执行 jar，按版本放入 app_home/releases 并切换 CURRENT 链接，由 systemd 托管；无容器、无镜像。Go/Rust 单二进制：平台机交叉编译（Go）或本地构建（Rust）出 Linux 可执行文件，按版本放入 app_home/releases 并切换 CURRENT 链接；目标机零运行时依赖。单实例重启期间服务短暂不可用，不承诺零停机。</div>
+            <div class="f-hint">静态站点：前端构建产物 zip 上传 1Panel 站点目录解压切换，无容器无 Nacos；版本号用日期号 YYYYMMDD 而非 semver。纯 Java 进程：Maven 构建出可执行 jar，按版本放入 app_home/releases 并切换 CURRENT 链接，由 systemd 托管；无容器、无镜像。Go/Rust 单二进制：平台机交叉编译（Go）或本地构建（Rust）出 Linux 可执行文件，按版本放入 app_home/releases 并切换 CURRENT 链接；目标机零运行时依赖。单实例重启期间服务短暂不可用，不承诺零停机。Node 进程：平台机 npm 构建（ci/build/prune）打 tar.gz（含 node_modules），目标机仅需 node；Python 进程：平台机收集 manylinux wheel，目标机 app_home/venv 离线安装，需预装 python3-venv。</div>
           </div>
           <div class="field full" style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
             <label style="margin:0;white-space:nowrap">启用状态</label>
