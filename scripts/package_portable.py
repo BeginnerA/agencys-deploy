@@ -44,7 +44,7 @@ EMBED_URLS = [
     f"https://registry.npmmirror.com/-/binary/python/{PY_VERSION}/{EMBED_NAME}",
 ]
 PKG_NAME = "智能运维平台-便携版"
-RELEASE_VERSION = "v0.3.0"
+RELEASE_VERSION = "v0.4.0"
 
 DIST_DIR = ROOT / "dist-portable"
 CACHE_DIR = DIST_DIR / ".cache"
