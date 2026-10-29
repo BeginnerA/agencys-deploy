@@ -457,7 +457,7 @@
     </nav>
     <div class="head-cta">
       <a class="ghost-link" href="https://github.com/BeginnerA/agencys-deploy" target="_blank" rel="noopener">GITHUB ↗</a>
-      <a class="btn btn-primary btn-sm" href="https://github.com/BeginnerA/agencys-deploy/releases/tag/v0.3.0" target="_blank" rel="noopener">下载 v0.3.0</a>
+      <a class="btn btn-primary btn-sm" href="https://github.com/BeginnerA/agencys-deploy/releases/tag/v0.4.0" target="_blank" rel="noopener">下载 v0.4.0</a>
     </div>
     <button class="nav-toggle" id="navToggle" aria-expanded="false" aria-controls="mobileNav"><i aria-hidden="true"></i>菜单</button>
   </div>
@@ -490,7 +490,7 @@
             </a>
           </div>
           <div class="hero-meta" aria-label="版本与运行信息">
-            <span><i aria-hidden="true"></i>v0.3.0 已发布</span>
+            <span><i aria-hidden="true"></i>v0.4.0 已发布</span>
             <span><i aria-hidden="true"></i>Windows 10 / 11 x64</span>
             <span><i aria-hidden="true"></i>约 19 MB · 解压即用</span>
             <span><i aria-hidden="true"></i>Apache-2.0</span>
@@ -547,7 +547,7 @@
           <p class="lead">服务或整条流水线排进队列后，平台按顺序完成构建、发布与探活，再处理注册中心上下线。任何一步失败，都能按版本回滚。</p>
           <ul class="pipe-points">
             <li><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8.2 3.1 3.1L13 4.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>多服务流水线、金丝雀灰度、定时计划与发布窗口</li>
-            <li><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8.2 3.1 3.1L13 4.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>多运行时发布：容器 / 静态站点 / Java jar / Go 与 Rust 单二进制，共用同一条发布与回滚链</li>
+            <li><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8.2 3.1 3.1L13 4.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>多运行时发布：容器 / 静态站点 / Java jar / Go 与 Rust 单二进制 / Node 与 Python 进程，共用同一条发布与回滚链</li>
             <li><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8.2 3.1 3.1L13 4.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>部署快照与版本对比，知道上一次到底改了什么</li>
             <li><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 8.2 3.1 3.1L13 4.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>服务依赖拓扑，发布前看清上下游影响</li>
           </ul>
@@ -760,8 +760,8 @@
           <div class="machine-top"><span class="led" aria-hidden="true"></span><b>LOCAL NODE</b><span>127.0.0.1:5678</span></div>
           <dl class="specs">
             <div class="spec"><dt>运行环境</dt><dd><b>Python 3.9+</b>，或 Windows 10 / 11 x64 便携版</dd></div>
-            <div class="spec"><dt>镜像构建</dt><dd>需要 git / Maven / Docker，可在构建机或发布机执行；进程产物需 mvn / go / cargo，或外部投入并附校验</dd></div>
-            <div class="spec"><dt>目标服务器</dt><dd>Linux + SSH；容器发布需 Docker，静态站点可直接打包发布，jar / Go / Rust 进程发布只需 systemd（jar 另需 JDK）</dd></div>
+            <div class="spec"><dt>镜像构建</dt><dd>需要 git / Maven / Docker，可在构建机或发布机执行；进程产物需 mvn / go / cargo / npm 或 python3 + pip，或外部投入并附校验</dd></div>
+            <div class="spec"><dt>目标服务器</dt><dd>Linux + SSH；容器发布需 Docker，静态站点可直接打包发布，jar / Go / Rust / Node / Python 进程发布只需 systemd（jar 另需 JDK，Node 需 node，Python 需 python3 + python3-venv）</dd></div>
             <div class="spec"><dt>数据存储</dt><dd>SQLite 单文件，首次启动自动建库</dd></div>
             <div class="spec"><dt>许可</dt><dd>Apache-2.0，可自部署与二次修改</dd></div>
           </dl>
@@ -780,14 +780,14 @@
             <div class="kicker">06 / <span>DOWNLOAD</span></div>
             <h2 id="downloadTitle">下载，解压，开始发布。</h2>
           </div>
-          <div class="ver"><span>RELEASE</span><strong>v0.3.0</strong></div>
+          <div class="ver"><span>RELEASE</span><strong>v0.4.0</strong></div>
         </div>
         <div class="dl-grid">
           <div class="dl-main">
             <h3>智能运维平台 · Windows 便携版</h3>
             <p class="dl-meta">WINDOWS 10 / 11 · X64　·　约 19 MB　·　解压后约 45 MB</p>
             <div class="dl-actions">
-              <a class="btn btn-primary" href="https://github.com/BeginnerA/agencys-deploy/releases/download/v0.3.0/SmartOps-portable-v0.3.0-win-x64.zip" target="_blank" rel="noopener">下载便携版 zip
+              <a class="btn btn-primary" href="https://github.com/BeginnerA/agencys-deploy/releases/download/v0.4.0/SmartOps-portable-v0.4.0-win-x64.zip" target="_blank" rel="noopener">下载便携版 zip
                 <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m0 0 3.2-3.2M8 10 4.8 6.8M3 12.5h10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
               </a>
               <a class="btn btn-ghost" href="https://github.com/BeginnerA/agencys-deploy" target="_blank" rel="noopener">GitHub 仓库
@@ -797,7 +797,7 @@
             <p class="dl-note">内置 Python 3.12 运行时与全部依赖。无需 pip、无需安装开发环境。构建镜像时仍需本机具备 git / Maven / Docker。</p>
             <div class="dl-links">
               <a href="https://gitee.com/agencys/agencys-deploy" target="_blank" rel="noopener">Gitee 镜像</a><i>·</i>
-              <a href="https://github.com/BeginnerA/agencys-deploy/releases/tag/v0.3.0" target="_blank" rel="noopener">Release 说明</a><i>·</i>
+              <a href="https://github.com/BeginnerA/agencys-deploy/releases/tag/v0.4.0" target="_blank" rel="noopener">Release 说明</a><i>·</i>
               <a href="https://github.com/BeginnerA/agencys-deploy/blob/main/LICENSE" target="_blank" rel="noopener">Apache-2.0</a><i>·</i>
               <span>校验与更新以 Release 页为准</span>
             </div>
@@ -833,11 +833,11 @@
           </details>
           <details class="faq-item">
             <summary>一定要装 Docker 吗？</summary>
-            <div class="a">平台自身不需要 Docker。容器发布需要构建机或目标机具备 Docker；也支持静态站点包发布，以及 jar / Go / Rust 单二进制交给 systemd 托管（平台不代装运行时）。SSH 连接使用纯 Python 的 paramiko，不需要本机安装 ssh 客户端。</div>
+            <div class="a">平台自身不需要 Docker。容器发布需要构建机或目标机具备 Docker；也支持静态站点包发布，以及 jar / Go / Rust 单二进制与 Node / Python 进程交给 systemd 托管（平台不代装运行时；Node 产物自带 node_modules，Python 依赖经 wheelhouse 离线装进 app_home/venv）。SSH 连接使用纯 Python 的 paramiko，不需要本机安装 ssh 客户端。</div>
           </details>
           <details class="faq-item">
             <summary>进程方式发布，服务会中断吗？</summary>
-            <div class="a">会。单实例的 jar / Go / Rust 发布在「停止 → 切换版本链接 → 启动」期间不可用，就绪验证失败会自动切回旧版本，但平台<b>不承诺零停机</b>。需要连续可用请改用容器多实例滚动发布。</div>
+            <div class="a">会。单实例的 jar / Go / Rust / Node / Python 发布在「停止 → 切换版本链接 → 启动」期间不可用；Python 依赖变化时还要在窗口内离线重装 venv，耗时可在任务日志查看。就绪验证失败会自动切回旧版本，但平台<b>不承诺零停机</b>。需要连续可用请改用容器多实例滚动发布。</div>
           </details>
           <details class="faq-item">
             <summary>能部署到 Linux 服务器吗？</summary>
