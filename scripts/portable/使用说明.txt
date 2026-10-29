@@ -23,6 +23,7 @@
 
 【能做什么】
 - Web 大屏：服务状态卡片墙、发布/回滚、多服务流水线、金丝雀灰度
+- 多运行时发布：Docker 容器、静态站点，以及 Java jar / Go / Rust 单二进制 + systemd（版本目录不可变、CURRENT 链接原子切换、回滚不重传产物）
 - 实时监控 + 告警（企业微信/飞书/钉钉/邮件等六渠道）+ 日志中心
 - AI 智能运维助手：自然语言生成发布计划 → 人工审批 → 执行闭环
 - 全部 SSH 连接内置（paramiko 纯 Python），无需安装 ssh 客户端
@@ -32,6 +33,9 @@
 - 「在本机构建镜像」这一步需要本机装有 git / Maven / Docker（用于 git clone、mvn 打包、docker build）：
   · 没有工具链时：可用 --skip-build 复用已有镜像发布，或用 Web 界面做配置/监控/审批
   · 也可改在装有工具链的机器上执行构建
+- 进程族发布（jar / Go / Rust）在平台机侧需要对应构建工具链：mvn、go 或 cargo（也可配置 build.go_home / build.cargo_home，或选 build_type=none 由外部投入产物并附同名 .sha256）；
+  目标机侧只需要 Linux + systemd：jar 需已安装 JDK/JRE，Go 产物静态链接、Rust 产物按 target 依赖目标机 glibc，平台都不安装运行时
+- 单实例进程发布在「停止 → 换版本 → 启动」期间有中断窗口，平台不承诺零停机；需要连续可用请用容器多实例
 - AI 助手需要大模型 API（DeepSeek / OpenAI 兼容端点），在平台「智能助手」页配置；不配置不影响其他功能
 
 【常见问题】
