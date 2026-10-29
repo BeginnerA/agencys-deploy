@@ -7,7 +7,7 @@ CURRENT（或 venv 解释器）：发布与回滚都只是「换链接 + 重启�
 产物形态两种：
 - file（go/rust/jar）：单文件，SFTP 上传 + sha256 复核 + post_transfer 钩子（chmod）；
 - archive（node/python）：tar.gz，上传复核后解压到 {ver}.tmp → post_extract 钩子 →
-  原子 mv 就位（Task 8 落地，本任务仅含 file 路径）。
+  原子 mv 就位并清理压缩包。
 
 与容器模式的根本差异：单实例重启必然有停机窗口，切换语义是「停机→换链接→启动」，
 不承诺零停机；Nacos 上下线仍由编排层按能力标志调度，与运行时方式无关。
@@ -29,7 +29,7 @@ class ProcessServiceStrategy(DeployStrategy):
 
     is_process = True
     name = ""
-    artifact_kind = "file"      # file | archive（archive 路径由 Task 8 引入）
+    artifact_kind = "file"      # file | archive
     artifact_label = "产物"      # 日志文案用名词（jar/二进制/压缩包）
     supports_nacos = True
     supports_canary = True
@@ -180,11 +180,13 @@ class ProcessServiceStrategy(DeployStrategy):
                 f"ExecStart 未指向 {expected}")
 
     def transfer(self, server, version: str = None):
-        """上传到 releases/{ver}/（幂等：远端 sha256 相同则跳过）——file 路径"""
+        """上传产物到 releases/（幂等：远端 sha256 相同则跳过）——file/archive 两路径"""
         ver = version or self.d.version
         local = self.local_artifact(ver)
         if not local.exists():
             raise RuntimeError(f"本地 {self.artifact_label} 不存在: {local}")
+        if self.artifact_kind == "archive":
+            return self._transfer_archive(server, ver, local)
         local_sha = sha256_file(local)
         remote_dir = f"{self.jars_dir}/{ver}"
         remote = f"{remote_dir}/{self.remote_entry()}"
@@ -208,6 +210,50 @@ class ProcessServiceStrategy(DeployStrategy):
                 f"[{server.host}] 上传后校验和不一致（本地 {local_sha[:12]}…，"
                 f"远端 {remote_sha[:12]}…）")
         self.post_transfer(server, remote)
+        return True
+
+    def _transfer_archive(self, server, ver: str, local: Path) -> bool:
+        """目录产物（tar.gz）传输：上传复核 → 解压暂存 → post_extract → 原子就位 → 清理
+
+        幂等：远端 {ver}/.sha256 与本次一致则跳过；不一致说明上次发布中断留下残骸，
+        rm -rf 重建（该目录的唯一写入者就是本次 transfer，不违反不可变约定）。
+        """
+        local_sha = sha256_file(local)
+        base = f"{self.jars_dir}/{ver}"
+        remote_tar = f"{base}.tar.gz"
+        tmp_dir = f"{base}.tmp"
+        server.exec(f"mkdir -p {shlex.quote(self.jars_dir)}", timeout=15)
+        marker = server.exec(
+            f"cat {shlex.quote(base + '/.sha256')} 2>/dev/null || true",
+            timeout=15).strip()
+        if marker == local_sha:
+            log(f"[{server.host}] 远端已有相同产物，跳过上传: {ver}")
+            return True
+        log(f"[{server.host}] 上传 {self.artifact_label} {self.artifact_name(ver)}"
+            f"（{local.stat().st_size / 1024 / 1024:.1f} MB）-> {remote_tar}")
+        server.sftp_put_with_progress(
+            str(local), remote_tar, label=self.artifact_name(ver),
+            streams=getattr(self.d, "upload_streams", 1))
+        remote_sha = server.exec(
+            f"sha256sum {shlex.quote(remote_tar)} | awk '{{print $1}}'", timeout=60).strip()
+        if remote_sha != local_sha:
+            raise RuntimeError(
+                f"[{server.host}] 上传后校验和不一致（本地 {local_sha[:12]}…，"
+                f"远端 {remote_sha[:12]}…）")
+        # ① 解压到暂存目录并写入压缩包校验和（解压失败时旧版本原状，未触达 CURRENT）
+        server.exec(
+            f"rm -rf {shlex.quote(tmp_dir)} && mkdir -p {shlex.quote(tmp_dir)} && "
+            f"tar -xzf {shlex.quote(remote_tar)} -C {shlex.quote(tmp_dir)} && "
+            f"echo {shlex.quote(local_sha)} > {shlex.quote(tmp_dir + '/.sha256')}",
+            timeout=300)
+        # ② 形态钩子（node 修 node_modules/.bin 执行位等）
+        self.post_extract(server, tmp_dir, ver)
+        # ③ 原子就位并清理压缩包（同文件系统 mv 原子；残骸先清除）
+        server.exec(
+            f"rm -rf {shlex.quote(base)} && "
+            f"mv -Tf {shlex.quote(tmp_dir)} {shlex.quote(base)} && "
+            f"rm -f {shlex.quote(remote_tar)}",
+            timeout=120)
         return True
 
     def prefetch(self, servers: list) -> list:
