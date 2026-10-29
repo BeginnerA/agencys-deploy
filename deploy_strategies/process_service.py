@@ -370,27 +370,30 @@ class ProcessServiceStrategy(DeployStrategy):
 
     # ---------- 阶段 5：回滚 ----------
 
-    def rollback(self, server):
+    def rollback(self, server) -> bool:
         """链接指回 previous_version 并重启；本机没有该版本目录时告警跳过
 
         产物按版本不可变保存，回滚只需换链接 + 重启，无需重传；目标版本目录缺失
         说明该主机从未发过该版本（或产物被清理），此处保持现状由编排层/人工介入。
         回滚目标版本的运行时保障（venv 依赖变化重装）在重启前完成。
+
+        返回值供编排层如实汇报：True = 确实回滚或按既有语义「无需回滚即跳过」；
+        False = 前置检查阻止，单元/链接均未动，服务停在失败版本上需要人工处理。
         """
         ver = self.d.previous_version
         if not ver:
             log(f"[{server.host}] 未指定回滚版本（--previous-version），跳过回滚，服务保持现状")
-            return
+            return True
         target = f"{self.jars_dir}/{ver}"
         if not server.try_exec(f"test -d {shlex.quote(target)}", timeout=15):
             log(f"[{server.host}] 无回滚源（{target} 不存在），跳过回滚")
-            return
+            return True
         # 停机前确认目标版本具备启动前提（python：依赖清单 + wheels），
         # 避免停完单元才发现依赖装不上，服务停在半途
         if not self.rollback_preflight(server, ver):
             log(f"[{server.host}] 回滚前置检查未通过（releases/{ver}），"
                 "跳过回滚，服务保持现状")
-            return
+            return False
         tmp = f"{self.app_home}/.CURRENT.tmp"
         self.d.target_modified = True
         server.exec(f"systemctl stop {shlex.quote(self.unit)}.service || true",
@@ -406,6 +409,7 @@ class ProcessServiceStrategy(DeployStrategy):
             f"echo {shlex.quote(ver)} > {shlex.quote(self.app_home + '/.deploy_version')}",
             timeout=15)
         log(f"[{server.host}] 已回滚 CURRENT -> releases/{ver}")
+        return True
 
     def rollback_source_missing(self, server) -> bool:
         """显式回滚前置检查：本机缺少 previous_version 产物目录即判定该主机回滚失败"""

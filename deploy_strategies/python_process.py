@@ -62,17 +62,25 @@ class PythonProcessStrategy(ProcessServiceStrategy):
         server.exec(f"mkdir -p {shlex.quote(self.jars_dir)}", timeout=15)
         # 健康判定不能只看 pyvenv.cfg：系统 Python 升级后配置文件仍在，
         # 但 venv 解释器已指向不存在的旧版本，必须按解释器能否运行判断
-        healthy = server.try_exec(
-            f"test -f {shlex.quote(venv + '/pyvenv.cfg')} && "
-            f"{shlex.quote(venv_py)} -V >/dev/null 2>&1", timeout=15)
+        probe = (f"test -f {shlex.quote(venv + '/pyvenv.cfg')} && "
+                 f"{shlex.quote(venv_py)} -V >/dev/null 2>&1")
+        healthy = server.try_exec(probe, timeout=15)
         if not healthy:
-            if server.try_exec(f"test -d {shlex.quote(venv)}", timeout=15):
-                log(f"[{server.host}] venv 已损坏（pyvenv.cfg 存在但解释器不可用，"
-                    f"常见于系统 Python 升级），删除重建: {venv}")
-                server.exec(f"rm -rf {shlex.quote(venv)}", timeout=120)
-            log(f"[{server.host}] 创建独立 venv: {venv}")
-            server.exec(f"python3 -m venv {shlex.quote(venv)}", timeout=180)
-            server.exec(f"rm -f {shlex.quote(marker)}", timeout=15)
+            # try_exec 在 SSH 传输异常时同样返回 False：单次抖动不该把健康的 venv
+            # 整目录删掉重建（重建后还要全量重装依赖）。复探一次并以第二次为准，
+            # 两次都判不可用才认定损坏
+            healthy = server.try_exec(probe, timeout=15)
+            if not healthy:
+                if server.try_exec(f"test -d {shlex.quote(venv)}", timeout=15):
+                    log(f"[{server.host}] venv 已损坏（pyvenv.cfg 存在但解释器不可用，"
+                        f"常见于系统 Python 升级；两次探测均失败），删除重建: {venv}")
+                    server.exec(f"rm -rf {shlex.quote(venv)}", timeout=120)
+                log(f"[{server.host}] 创建独立 venv: {venv}")
+                server.exec(f"python3 -m venv {shlex.quote(venv)}", timeout=180)
+                server.exec(f"rm -f {shlex.quote(marker)}", timeout=15)
+            else:
+                log(f"[{server.host}] venv 首次探测失败但复探通过"
+                    f"（疑似 SSH 抖动），保留现有 venv: {venv}")
         current = server.exec(
             f"cat {shlex.quote(marker)} 2>/dev/null || true", timeout=15).strip()
         if current == remote_hash:

@@ -954,10 +954,14 @@ class Deployer:
             return True
         except Exception as e:
             log(f"[{host}] 发布异常: {e}")
+            rolled_back = None  # None = 未取到结论（容器/静态策略不返回结果），按既有语义视为已回滚
             if self.target_modified and self.previous_version:
                 # 目标状态已被修改（如旧容器已停止/删除、旧单元已停止），且有回滚版本，回滚到旧版本
                 try:
-                    self.strategy.rollback(server)
+                    result = self.strategy.rollback(server)
+                    # 只有显式 False（前置检查阻止，单元/链接均未动）才算没回滚；
+                    # 其余实现（container/static_archive）返回 None 的历史行为按成功处理
+                    rolled_back = result is not False
                 except Exception as re:
                     log(f"[{host}] 回滚也失败: {re}")
             elif self.target_modified and not self.previous_version:
@@ -973,7 +977,12 @@ class Deployer:
             except Exception as ne:
                 log(f"[{host}] Nacos 恢复上线失败: {ne}")
             if self.target_modified and self.previous_version:
-                status = "已回滚"
+                if rolled_back is False:
+                    # 前置检查阻止回滚：单元仍停在失败的新版本上，绝不能汇报「已回滚」
+                    status = ("回滚被前置检查阻止（旧版本缺少依赖产物），"
+                              "服务保持现状，请人工处理")
+                else:
+                    status = "已回滚"
             elif self.target_modified:
                 status = "无回滚版本，目标保持新版本"
             else:
@@ -1095,10 +1104,14 @@ class Deployer:
                                     nacos_ip = self._nacos_ip(srv)
                                     if self.strategy.supports_nacos:
                                         self.nacos_offline(nacos_ip)
-                                    self.strategy.rollback(rollback_server)
+                                    rolled_back = self.strategy.rollback(rollback_server)
                                     if self.strategy.supports_nacos:
                                         self.nacos_online(nacos_ip, weight=1.0)
-                                    log(f"首台 {host} 已回滚")
+                                    if rolled_back is False:
+                                        log(f"首台 {host} 回滚被前置检查阻止"
+                                            "（旧版本缺少依赖产物），服务保持现状，请人工处理")
+                                    else:
+                                        log(f"首台 {host} 已回滚")
                                 except Exception as re:
                                     log(f"首台回滚失败: {re}")
                                     try:

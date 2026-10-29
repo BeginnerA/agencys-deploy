@@ -174,6 +174,23 @@ class PythonVenvTest(unittest.TestCase):
         self.assertIn("rm -f", joined)  # 安装前清旧标记、成功后写新标记
 
 
+class FlakyProbeRemote(FakeRemote):
+    """按顺序返回指定探测结果，模拟 SSH 抖动下的「首次 False、复探 True」"""
+
+    def __init__(self, probe_key, results, **kwargs):
+        super().__init__(**kwargs)
+        self._probe_key = probe_key
+        self._results = list(results)
+        self.probe_calls = 0
+
+    def try_exec(self, cmd, timeout=60):
+        if self._probe_key in cmd:
+            self.probe_calls += 1
+            self.exec_calls.append(cmd)
+            return self._results.pop(0) if self._results else True
+        return super().try_exec(cmd, timeout)
+
+
 class PythonVenvHardeningTest(unittest.TestCase):
     """venv 生命周期加固：标记顺序、依赖清单缺失、空哈希、损坏 venv 重建"""
 
@@ -229,6 +246,38 @@ class PythonVenvHardeningTest(unittest.TestCase):
                         if "python3 -m venv" in c)
         self.assertLess(rm_idx, venv_idx)
 
+    def test_unhealthy_on_both_probes_rebuilds(self):
+        s = self._svc()
+        r = FlakyProbeRemote("pyvenv.cfg", [False, False],
+                             try_exec_ok={"test -d": True},
+                             rules={"sha256sum": "c" * 64, "cat ": ""})
+        with mock.patch("deploy_strategies.python_process.log"):
+            s.ensure_runtime(r, "1.0.0")
+        self.assertEqual(r.probe_calls, 2, "两次探测都不可用才允许重建")
+        joined = "\n".join(r.exec_calls)
+        self.assertIn(f"rm -rf {APP_HOME}/venv", joined)
+        self.assertIn(f"python3 -m venv {APP_HOME}/venv", joined)
+        rm_idx = next(i for i, c in enumerate(r.exec_calls)
+                      if f"rm -rf {APP_HOME}/venv" in c)
+        venv_idx = next(i for i, c in enumerate(r.exec_calls)
+                        if "python3 -m venv" in c)
+        self.assertLess(rm_idx, venv_idx)
+
+    def test_transient_probe_failure_keeps_healthy_venv(self):
+        s = self._svc()
+        # 首次探测 False（SSH 抖动），复探 True → 不得 rm -rf、不得重建，
+        # 依赖哈希一致时连 pip install 都跳过
+        r = FlakyProbeRemote("pyvenv.cfg", [False, True],
+                             rules={"sha256sum": "a" * 64, "cat ": "a" * 64})
+        with mock.patch("deploy_strategies.python_process.log") as log_mock:
+            s.ensure_runtime(r, "1.0.0")
+        self.assertEqual(r.probe_calls, 2)
+        joined = "\n".join(r.exec_calls)
+        self.assertNotIn(f"rm -rf {APP_HOME}/venv", joined)
+        self.assertNotIn("python3 -m venv", joined)
+        self.assertNotIn("pip install", joined)
+        self.assertTrue(any("复探" in str(c) for c in log_mock.call_args_list))
+
 
 class PythonRollbackTest(unittest.TestCase):
     def _svc(self):
@@ -240,7 +289,7 @@ class PythonRollbackTest(unittest.TestCase):
         s, _ = self._svc()
         r = FakeRemote(try_exec_ok={"test -d": True},
                        rules={"sha256sum": "b" * 64, "cat ": "a" * 64})
-        s.rollback(r)
+        self.assertTrue(s.rollback(r), "回滚确实执行时必须返回 True")
         joined = "\n".join(r.exec_calls)
         pip_idx = next(i for i, c in enumerate(r.exec_calls) if "pip install" in c)
         restart_idx = next(i for i, c in enumerate(r.exec_calls)
@@ -254,13 +303,66 @@ class PythonRollbackTest(unittest.TestCase):
         s, d = self._svc()
         r = FakeRemote(try_exec_ok={"wheels": False})
         with mock.patch("deploy_strategies.python_process.log") as log_mock:
-            s.rollback(r)
+            self.assertFalse(s.rollback(r),
+                             "前置检查阻止回滚时必须返回 False，否则汇总会误报已回滚")
         joined = "\n".join(r.exec_calls)
         self.assertNotIn("systemctl", joined)
         self.assertNotIn("ln -sfn", joined)
         self.assertNotIn("mv -Tf", joined)
         self.assertFalse(getattr(d, "target_modified", False))
         self.assertTrue(any("wheels" in str(c) for c in log_mock.call_args_list))
+
+    def test_rollback_without_previous_version_returns_true(self):
+        d = make_py_deployer(tempfile.mkdtemp(prefix="py_rb_skip_"))
+        s = create_strategy("python_process", d)
+        r = FakeRemote()
+        with mock.patch("deploy_strategies.python_process.log"):
+            self.assertTrue(s.rollback(r), "无回滚版本属于既有「跳过」语义，按成功上报")
+        self.assertEqual(r.exec_calls, [])
+
+
+class DeployServerRollbackStatusTest(unittest.TestCase):
+    """发布失败后的汇总状态必须如实反映回滚是否真的执行（deploy.deploy_server）"""
+
+    class _Server:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    def _run(self, rollback_result):
+        d = make_py_deployer(tempfile.mkdtemp(prefix="py_status_"))
+        d.previous_version = "0.9.0"
+
+        def _boom(server):
+            d.target_modified = True  # 与真实 switch 一致：换链接即视为已变更
+            raise RuntimeError("start failed")
+
+        strategy = mock.Mock(supports_nacos=False)
+        strategy.switch.side_effect = _boom
+        strategy.rollback.return_value = rollback_result
+        d._strategy = strategy
+        with mock.patch("deploy.RemoteServer", self._Server), \
+                mock.patch("deploy.log") as log_mock:
+            ok = d.deploy_server("10.0.0.1")
+        messages = "\n".join(str(c.args[0]) for c in log_mock.call_args_list if c.args)
+        return ok, strategy, messages
+
+    def test_preflight_blocked_is_not_reported_as_rolled_back(self):
+        ok, strategy, messages = self._run(False)
+        self.assertFalse(ok)
+        strategy.rollback.assert_called_once()
+        self.assertIn("回滚被前置检查阻止", messages)
+        self.assertNotIn("已回滚", messages)
+
+    def test_rolled_back_and_legacy_none_still_report_rolled_back(self):
+        for result in (True, None):  # None：container/static 策略的历史返回值
+            with self.subTest(result=result):
+                ok, _, messages = self._run(result)
+                self.assertFalse(ok)
+                self.assertIn("发布失败（已回滚）", messages)
+                self.assertNotIn("被前置检查阻止", messages)
 
 
 class SwitchOrderingTest(unittest.TestCase):

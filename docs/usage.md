@@ -834,7 +834,7 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 平台机构建前提：
 
 - 构建在 `deploy.project_root` 下就地执行：`npm ci` / `npm run build` / `npm prune` 都会改写该目录的 `node_modules`，请保证可写且不与生产共用；Python 的 wheel 收集写在项目根临时目录 `.wheels-build`（重新构建前先清空，打包时排除）；
-- Node：`npm` 在平台机 PATH 中，或配置 `build.npm_home` 指向 Node 安装目录/可执行文件；项目根需有 `package.json` 与已提交的 `package-lock.json`（`npm ci` 要求），平台机需能访问 npm registry；只有 `package.json` 的 `scripts` 里存在 `build` 时才额外执行 `npm run build`；`npm ci` 在平台机执行，含原生模块（`.node`）的依赖会按平台机的 OS/架构编译——目标机为 Linux 时请在 Linux 或 WSL 上构建 Node 产物；Windows 打包的 `node_modules/.bin` 中 `.cmd` 垫片由解压后的 chmod 步骤修复执行位，但原生 `.node` 二进制不会被转换，无法在 Linux 目标机加载；
+- Node：`npm` 在平台机 PATH 中，或配置 `build.npm_home` 指向 Node 安装目录/可执行文件；项目根需有 `package.json` 与已提交的 `package-lock.json`（`npm ci` 要求），平台机需能访问 npm registry；只有 `package.json` 的 `scripts` 里存在 `build` 时才额外执行 `npm run build`；`npm ci` 在平台机执行，`npm` 可能直接拉取构建机 OS/架构的预编译二进制，只有找不到预编译包时才在本地编译——两条路径的产物都面向构建机，而非部署目标机。含原生模块（`.node`）的依赖无法跨平台加载，目标机为 Linux 时请在 Linux 或 WSL 上构建 Node 产物；Windows 打包的 `node_modules/.bin` 中无扩展名的垫片会由解压后的 chmod 步骤补上执行位，而 `.cmd` 包装脚本是 Windows 专用，在 Linux 目标机上不可用；
 - Python：平台机用当前 `sys.executable -m pip download -r <requirements> -d <项目根>/.wheels-build --platform manylinux2014_x86_64 --only-binary=:all: --implementation cp --python-version <ver>` 收集 wheel，平台机需能访问 Python 包索引；`runtime_config.python_version`（`major.minor`，如 `3.11`）决定 wheel 解析的目标 CPython 版本，留空时取平台机版本并在构建日志告警；
 - 服务表单中构建类型随发布方式联动缺省（`node_process` → `node`、`python_process` → `python`），两者都可改选 `none` 外部投入产物（把 tar.gz 与同名 `.sha256` 放进平台机 `dist/`）。
 
@@ -866,12 +866,12 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 - 验证：`systemctl is-active`，再按 readiness 探测；失败先抓 `journalctl` 尾部写入任务日志，再触发自动回滚；
 - 回滚：先做前置检查（目标版本缺 requirements 文件或 `wheels/` 时记录日志并跳过，不停单元、不换链接）→ 链接指回 `releases/{previous_version}` → `ensure_runtime` → 重启单元，不重传产物；目标机没有该版本目录时跳过并告警。
 
-`ensure_runtime` 在每次切换与每次回滚的启动前都会执行：Node 无动作；Python 先检查共享 `{app_home}/venv` 是否可用——`pyvenv.cfg` 存在且 `venv/bin/python -V` 能执行才算健康；目录存在但不健康（常见于目标机 OS 升级 Python）时记录告警并 `rm -rf` 重建，目录不存在则 `python3 -m venv` 创建。随后把 `releases/{version}/requirements.txt` 的远端 sha256 与 `venv/.req_hash` 比对：依赖清单缺失或哈希为空时直接报错（不会静默跳过安装）；不一致时先删除旧标记，再执行 `venv/bin/pip install --no-index --find-links {releases}/{version}/wheels -r ...` 离线重装（全程 `--no-index`，不联网），成功后才写入新标记。因此 venv 缺失/损坏、requirements 指纹变化、回滚到依赖不同的旧版本都会触发重装；安装失败或中途中断不会留下已安装标记，下一次发布/回滚会重试。
+`ensure_runtime` 在每次切换与每次回滚的启动前都会执行：Node 无动作；Python 先检查共享 `{app_home}/venv` 是否可用——`pyvenv.cfg` 存在且 `venv/bin/python -V` 能执行才算健康；探测走 SSH，首次探测失败会原地复探一次并以第二次结果为准（避免一次 SSH 抖动就把健康 venv 删掉），两次都不可用才判定损坏：目录存在时记录告警并 `rm -rf` 重建，目录不存在则 `python3 -m venv` 创建。随后把 `releases/{version}/requirements.txt` 的远端 sha256 与 `venv/.req_hash` 比对：依赖清单缺失或哈希为空时直接报错（不会静默跳过安装）；不一致时先删除旧标记，再执行 `venv/bin/pip install --no-index --find-links {releases}/{version}/wheels -r ...` 离线重装（全程 `--no-index`，不联网），成功后才写入新标记。因此 venv 缺失/损坏、requirements 指纹变化、回滚到依赖不同的旧版本都会触发重装；安装失败或中途中断不会留下已安装标记，下一次发布/回滚会重试。
 
 恢复与回滚前置：
 
 - 目标机 OS 升级 Python 导致既有 venv 失效时，平台在下一次发布/回滚中自动检测并重建 venv；重建等同一次完整离线安装，耗时计入停机窗口；
-- 回滚前平台先检查 `releases/{previous_version}` 下的 requirements 文件与 `wheels/` 目录，任一缺失即记录日志并跳过回滚（不停单元、不换链接、保持现状），避免服务先停再因依赖装不上而起不来。
+- 回滚前平台先检查 `releases/{previous_version}` 下的 requirements 文件与 `wheels/` 目录，任一缺失即记录日志并跳过回滚（不停单元、不换链接、保持现状），避免服务先停再因依赖装不上而起不来；这种情况下发布失败汇总会标注「回滚被前置检查阻止」，不会报告已回滚。
 
 限制与已知取舍：
 
