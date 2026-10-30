@@ -159,16 +159,19 @@ def local_image_id(image: str) -> str:
 def tar_image_id(tar_path: Path) -> str:
     """读取 docker save 导出的 tar/tar.gz 包内镜像 ID（config 文件名）；无法解析返回 None
 
-    "r:*" 模式自动识别 gzip 压缩，普通 tar 与 tar.gz 均可读取。
+    兼容两种布局：传统包 Config 形如 <hex>.json，OCI 布局包（docker 新版）
+    形如 blobs/sha256/<hex>。"r:*" 模式自动识别 gzip，两种 tar 均可读取。
     """
     try:
         import json
         import tarfile
         with tarfile.open(str(tar_path), "r:*") as tf:
             manifest = json.loads(tf.extractfile("manifest.json").read())
-        cfg = manifest[0]["Config"]  # 形如 <sha256 十六进制>.json
+        cfg = manifest[0]["Config"]
         if cfg.endswith(".json"):
             cfg = cfg[:-5]
+        if "/" in cfg:
+            cfg = cfg.rsplit("/", 1)[-1]
         return cfg if cfg.startswith("sha256:") else f"sha256:{cfg}"
     except Exception:
         return None
