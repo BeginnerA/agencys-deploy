@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from webapp import db as dbm
 
-from common import get_nacos_auth, get_mysql_auth, get_ssh_config, as_number
+from common import get_nacos_auth, get_mysql_auth, get_ssh_config, connect_ssh, as_number
 from deploy import Deployer
 from git_tag import tag_project
 import health_check as hc
@@ -680,6 +680,28 @@ class TestEmptyNumberConfig(unittest.TestCase):
         auth = get_mysql_auth({"mysql_snailjob": {"host": "10.0.0.1", "port": "",
                                                    "database": "snailjob", "username": "", "password": ""}})
         self.assertEqual(auth["port"], 3306)
+
+    def test_ssh_section_empty_dict_no_crash(self):
+        """环境级 ssh 为空对象：不再 KeyError，缺省字段由服务器级覆盖补全
+
+        db 模式允许环境级 ssh 整体为空、凭据逐台配在服务器清单里，
+        与 Web 链路 env.get("ssh") or {} 的容错语义一致。
+        """
+        ssh = get_ssh_config({"ssh": {}})
+        self.assertEqual(ssh["user"], "")
+        self.assertIsNone(ssh["key_file"])
+        self.assertEqual(ssh["port"], 22)
+        self.assertEqual(ssh["password"], "")
+        ssh2 = get_ssh_config({})
+        self.assertEqual(ssh2["user"], "")
+
+    def test_connect_ssh_missing_user_fails_clearly(self):
+        """合并后仍缺 ssh.user：连接前明确报错，而非晦涩的认证失败"""
+        client = mock.Mock()
+        with self.assertRaises(ValueError) as ctx:
+            connect_ssh(client, "1.2.3.4", {"port": 22})
+        self.assertIn("user", str(ctx.exception))
+        client.connect.assert_not_called()
 
 
 if __name__ == "__main__":

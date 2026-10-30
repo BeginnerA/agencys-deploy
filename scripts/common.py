@@ -127,11 +127,18 @@ def get_mysql_auth(config: dict):
 
 
 def get_ssh_config(config: dict):
+    """环境级 SSH 基础配置；字段缺省由服务器级覆盖补全（merge_server_ssh）。
+
+    环境级 ssh 允许整体为空（凭据逐台配在服务器清单里，db 模式常态），
+    合并后仍缺 user 会在 connect_ssh 连接前明确报错。
+    """
+    ssh = config.get("ssh") or {}
+    key_file = ssh.get("key_file")
     return {
-        "user": config["ssh"]["user"],
-        "key_file": Path(config["ssh"]["key_file"]).expanduser(),
-        "port": int(as_number(config["ssh"].get("port"), 22)) or 22,
-        "password": env_or_config(config["ssh"].get("password"), "SSH_PASSWORD"),
+        "user": ssh.get("user") or "",
+        "key_file": Path(key_file).expanduser() if key_file else None,
+        "port": int(as_number(ssh.get("port"), 22)) or 22,
+        "password": env_or_config(ssh.get("password"), "SSH_PASSWORD"),
     }
 
 
@@ -142,13 +149,17 @@ def connect_ssh(client: paramiko.SSHClient, host: str, ssh_cfg: dict, timeout: i
     密码认证失败自动回退到密钥认证；未配置密码时保持纯密钥连接。
     网络类异常（超时、拒绝连接等）直接抛出，不做回退。
     """
+    user = ssh_cfg.get("user")
+    if not user:
+        raise ValueError(
+            f"[{host}] SSH 用户未配置：请在环境级 ssh.user 或服务器级 ssh.user 补充")
     password = ssh_cfg.get("password") or None
     if password:
         try:
             client.connect(
                 hostname=host,
                 port=ssh_cfg["port"],
-                username=ssh_cfg["user"],
+                username=user,
                 password=password,
                 allow_agent=False,
                 look_for_keys=False,
@@ -161,7 +172,7 @@ def connect_ssh(client: paramiko.SSHClient, host: str, ssh_cfg: dict, timeout: i
     connect_kwargs = dict(
         hostname=host,
         port=ssh_cfg["port"],
-        username=ssh_cfg["user"],
+        username=user,
         timeout=timeout,
     )
     if key_file:

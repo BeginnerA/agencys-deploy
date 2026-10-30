@@ -14,7 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from deploy import Deployer, tar_image_id  # noqa: E402
+from deploy import Deployer, tar_image_id, tar_repo_tags  # noqa: E402
 
 
 class FakeServer:
@@ -66,6 +66,23 @@ class FakeProc:
 def ok_proc(*args, **kwargs):
     """模拟执行成功的 subprocess.Popen 工厂"""
     return FakeProc()
+
+
+def make_tar(tmp_dir: str, name: str, repo_tags) -> Path:
+    """构造 docker save 形态的 tar.gz（含 manifest.json），RepoTags 可控"""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        data = _json.dumps([{
+            "Config": "dbfc2dafed79.json",
+            "RepoTags": list(repo_tags),
+            "Layers": [],
+        }]).encode()
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    path = Path(tmp_dir) / name
+    path.write_bytes(buf.getvalue())
+    return path
 
 
 class TestEnsureImageReady(unittest.TestCase):
@@ -164,6 +181,46 @@ class TestEnsureImageReady(unittest.TestCase):
             self.deployer.ensure_image_ready(server, version="1.0.29")
         self.assertEqual(server.uploaded, [])
         self.assertEqual(server.exec_calls, [])
+
+    def test_reuse_tar_tag_mismatch_rejected(self):
+        """本地无镜像且同名 tar 包内 tag 不符：本地即报错，不得上传误导远端
+
+        回归：--skip-build 且本地无目标镜像时，旧逻辑无条件复用任意同名 tar，
+        把 tag 不符的旧包 load 到服务器后才报"docker load 后仍未找到镜像"。
+        """
+        tar = make_tar(self.tmp, "app_1.0.30.tar.gz", ["app:local"])
+        server = FakeServer(image_ids=[None])
+        with mock.patch("deploy.local_image_id", return_value=None), \
+                mock.patch("deploy.log"):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.deployer.ensure_image_ready(server)
+        msg = str(ctx.exception)
+        self.assertIn("app:1.0.30", msg, "错误信息须包含期望镜像名")
+        self.assertIn("app:local", msg, "错误信息须包含包内实际 tag")
+        self.assertEqual(server.uploaded, [], "tag 不符的 tar 不得上传")
+        self.assertEqual(server.exec_calls, [])
+
+    def test_reuse_tar_matching_tag_reused(self):
+        """本地无镜像（跳过构建场景）且同名 tar 包内 tag 含期望镜像：正常复用"""
+        make_tar(self.tmp, "app_1.0.30.tar.gz", ["app:1.0.30", "app:legacy"])
+        server = FakeServer(image_ids=[None, "sha256:dbfc2dafed79"])
+        with mock.patch("deploy.local_image_id", return_value=None), \
+                mock.patch("deploy.subprocess.Popen", side_effect=ok_proc) as proc, \
+                mock.patch("deploy.log"):
+            self.deployer.ensure_image_ready(server)
+        save_calls = [c for c in proc.call_args_list if c.args[0][0] == "docker"]
+        self.assertFalse(save_calls, "包内 tag 含期望镜像时应复用，不应 docker save")
+        self.assertEqual(len(server.uploaded), 1)
+
+    def test_reuse_tar_corrupt_treated_as_unusable(self):
+        """同名 tar 损坏（无法解析 RepoTags）：视同不可用，本地报错"""
+        (Path(self.tmp) / "app_1.0.30.tar.gz").write_bytes(b"not a tar")
+        server = FakeServer(image_ids=[None])
+        with mock.patch("deploy.local_image_id", return_value=None), \
+                mock.patch("deploy.log"):
+            with self.assertRaises(RuntimeError):
+                self.deployer.ensure_image_ready(server)
+        self.assertEqual(server.uploaded, [])
 
 
 class TestPrefetchImages(unittest.TestCase):

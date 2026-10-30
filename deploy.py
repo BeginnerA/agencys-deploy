@@ -174,6 +174,22 @@ def tar_image_id(tar_path: Path) -> str:
         return None
 
 
+def tar_repo_tags(tar_path: Path) -> list:
+    """读取 docker save 导出包内镜像 tag 列表（manifest.json RepoTags）；无法解析返回 []
+
+    用于本地无镜像（跳过构建场景）时校验包内容：tar 复用后远端 docker load
+    恢复的是打包时的原始 tag，包内 tag 与目标镜像名不符时 load 成功也查不到。
+    """
+    try:
+        import json
+        import tarfile
+        with tarfile.open(str(tar_path), "r:*") as tf:
+            manifest = json.loads(tf.extractfile("manifest.json").read())
+        return [t for entry in manifest for t in (entry.get("RepoTags") or [])]
+    except Exception:
+        return []
+
+
 def _resolve_config_source(args) -> str:
     """auto 模式：DB 中存在该项目（任一服务匹配）→ db，否则 yaml"""
     if args.config_source != "auto":
@@ -766,17 +782,32 @@ class Deployer:
         """确保本地镜像包已导出（gzip 压缩），返回 (local_tar, local_id, image)
 
         复用规则：本地 tar 与当前本地镜像 digest 一致才复用；本地缺少镜像
-        （跳过构建场景）但已有可用 tar 时也复用。
+        （跳过构建场景）时改按包内 RepoTags 校验，仅当包内含目标镜像 tag
+        才复用（tar 复用后远端 load 恢复的是打包时的原始 tag）。
         """
         version = version or self.version
         image = f"{self.image_prefix}{self.image_name}:{version}"
         local_id = local_image_id(image)
         tar_name = f"{self.image_name}_{version}.tar.gz"
         local_tar = self.dist_dir / tar_name
-        if local_tar.exists() and (local_id is None or tar_image_id(local_tar) == local_id):
+        tar_ready = False
+        if local_tar.exists():
+            if local_id is not None:
+                tar_ready = tar_image_id(local_tar) == local_id
+            else:
+                tar_ready = image in tar_repo_tags(local_tar)
+        if tar_ready:
             log(f"复用本地镜像包（与本地镜像一致）: {local_tar}")
         else:
             if local_id is None:
+                if local_tar.exists():
+                    tags = tar_repo_tags(local_tar)
+                    raise RuntimeError(
+                        f"本地缺少镜像 {image}，且本地镜像包 {tar_name} 内不含该镜像"
+                        f"（包内 tag: {', '.join(tags) if tags else '无法解析'}）。"
+                        f"处理：本地 docker tag <已有镜像> {image} 后重试，"
+                        f"或删除该包后由平台构建"
+                    )
                 raise RuntimeError(f"本地缺少镜像 {image}，且本地镜像包不可用")
             log(f"本地导出镜像 {image} -> {local_tar}（gzip 压缩）")
             self.dist_dir.mkdir(parents=True, exist_ok=True)
