@@ -116,7 +116,7 @@ def get_current_remote_version(project: str, config: dict, env: str = None) -> s
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         connect_ssh(client, first["ip"], ssh_cfg)
-        cmd = "docker ps --filter 'name=^{}$' --format '{{{{.Image}}}}'".format(service_name)
+        cmd = "docker ps --filter 'name=^/{}$' --format '{{{{.Image}}}}'".format(service_name)
         stdin, stdout, stderr = client.exec_command(cmd, timeout=30)
         image = stdout.read().decode("utf-8", errors="ignore").strip()
         rc = stdout.channel.recv_exit_status()
@@ -708,11 +708,36 @@ class Deployer:
         # 停止并删除旧容器
         server.exec(f"docker compose -f {self.compose_path} stop {self.service_name}", timeout=60)
         server.exec(f"docker compose -f {self.compose_path} rm -f {self.service_name}", timeout=30)
+        # 手动部署迁移场景：compose 够不着无标签的游离同名容器，up 前检测清理
+        self.remove_orphan_container(server)
         # 清空宿主机旧应用日志（可选，配置 clear_log_dir 时生效；失败仅告警）
         self.clear_project_logs(server)
         # 修改 docker-compose.yml 并启动
         server.update_compose_image(self.compose_path, self.service_name, self.full_image)
         server.exec(f"docker compose -f {self.compose_path} up -d {self.service_name}", timeout=120)
+
+    def remove_orphan_container(self, server: RemoteServer):
+        """compose rm 后清理游离同名容器（手动 docker run 遗留，无 compose 项目标签）
+
+        手动部署迁移到平台的场景：旧容器无 com.docker.compose.project 标签，
+        compose stop/rm 按标签定位不到，up -d 因容器名冲突失败。按标签分流：
+        无标签 → 游离旧容器直接清理；有标签 → 属于其它 compose 项目，报错交人工。
+        """
+        out = (server.exec(
+            f"docker ps -a --filter 'name=^/{self.service_name}$' --format '{{{{.ID}}}}'",
+            timeout=30) or "").strip()
+        if not out:
+            return
+        for cid in out.split():
+            proj = (server.exec(
+                f"docker inspect {cid} --format '{{{{index .Config.Labels \"com.docker.compose.project\"}}}}'",
+                timeout=30) or "").strip()
+            if proj:
+                raise RuntimeError(
+                    f"[{server.host}] 容器名 {self.service_name} 已被 compose 项目 {proj} 的容器 {cid} 占用，"
+                    f"为避免误删其它服务请人工处理（docker rm -f {cid} 或调整 service_name）")
+            server.exec(f"docker rm -f {cid}", timeout=30)
+            log(f"[{server.host}] 已清理非 compose 管理的同名旧容器 {cid}（手动部署遗留）")
 
     def clear_project_logs(self, server: RemoteServer):
         """启动新容器前清空宿主机旧应用日志（可配置 clear_log_dir；省略/留空则不清空）
@@ -740,6 +765,7 @@ class Deployer:
             server.exec(f"docker pull {self.prev_image}", timeout=120)
         server.exec(f"docker compose -f {self.compose_path} stop {self.service_name}", timeout=60)
         server.exec(f"docker compose -f {self.compose_path} rm -f {self.service_name}", timeout=30)
+        self.remove_orphan_container(server)
         server.update_compose_image(self.compose_path, self.service_name, self.prev_image)
         server.exec(f"docker compose -f {self.compose_path} up -d {self.service_name}", timeout=120)
 
