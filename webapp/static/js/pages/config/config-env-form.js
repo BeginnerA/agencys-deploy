@@ -95,6 +95,8 @@
     function render(){
       const steps = ['选择模板','填写配置','绑定服务器','校验保存'];
       const active = st.step;
+      // 上一步：填写→模板仅新建可回（编辑回模板会用模板数据覆盖已填配置）；
+      // 绑定→填写两类模式均可回（表单数据在进入绑定时已收进 st.data，回退后 renderForm 从 st.data 完整回填）
       const body = `
         <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
           ${H.stepper(steps, active)}
@@ -103,7 +105,7 @@
         </div>
         <div id="envStepBody"></div>
         <div style="display:flex;gap:10px;margin-top:18px">
-          ${st.step > 0 && !st.env ? '<button class="btn" id="envPrev">← 上一步</button>' : ''}
+          ${(st.step === 1 && !st.env) || st.step === 2 ? '<button class="btn" id="envPrev">← 上一步</button>' : ''}
           ${st.step > 0 && st.step < 2 ? '<button class="btn primary flex-1" id="envNext">下一步：绑定服务器 →</button>' : ''}
           ${st.step === 2 ? '<button class="btn primary flex-1" id="envSave">✓ 校验并保存</button>' : ''}
         </div>`;
