@@ -417,6 +417,23 @@ class TestTarImageId(unittest.TestCase):
         path.write_bytes(buf.getvalue())
         self.assertEqual(tar_image_id(path), f"sha256:{digest}")
 
+    def test_parse_manifest_oci_layout(self):
+        """OCI 布局包（docker 新版 save，Config 形如 blobs/sha256/<hex>）同样解析出镜像 ID"""
+        digest = "abcdef" * 10
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            data = _json.dumps([{
+                "Config": f"blobs/sha256/{digest}",
+                "RepoTags": ["app:1.0.30"],
+                "Layers": [],
+            }]).encode()
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        path = Path(self.tmp) / "oci.tar"
+        path.write_bytes(buf.getvalue())
+        self.assertEqual(tar_image_id(path), f"sha256:{digest}")
+
     def test_invalid_tar_returns_none(self):
         path = Path(self.tmp) / "bad.tar"
         path.write_bytes(b"not a tar")
