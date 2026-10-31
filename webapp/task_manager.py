@@ -325,6 +325,92 @@ _RESTART_HEALTH_TIMEOUT = 60.0
 _RESTART_HEALTH_INTERVAL = 5.0
 
 
+def _war_lifecycle(rec, env_obj, cfg, unit):
+    """构造 WAR 严格生命周期（惰性导入，失败信息保留原始栈）"""
+    from deploy_strategies.tomcat_instance import resolve_instance_id
+    from deploy_strategies.tomcat_lifecycle import WarTomcatLifecycle
+    from deploy_strategies.tomcat_restart import RestartContext
+    service = rec.get("service_name") or rec["name"]
+    ctx = RestartContext(env_obj, rec)
+    return WarTomcatLifecycle(
+        ctx, cfg, service, unit,
+        instance_id=lambda server: resolve_instance_id(
+            server, cfg["app_home"]))
+
+
+def _run_war_restart(f, rec, env_obj, servers, handle,
+                     release_maintenance=False) -> str:
+    """WAR 严格重启：健康超时/停止失败/锁未知都计入任务失败。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from deploy import RemoteServer
+    from deploy_strategies.tomcat_config import derive_war_unit, parse_war_config
+
+    from . import monitor as monitor_mod
+
+    cfg = parse_war_config(rec.get("runtime_config"))
+    unit = derive_war_unit(cfg, rec.get("image_name") or rec["name"])
+    f.write(f"[platform] 严格重启 WAR 实例「{rec['name']}」（单元 {unit}），"
+            f"环境「{env_obj['name']}」，共 {len(servers)} 台服务器"
+            f"{'，并结束维护' if release_maintenance else ''}\n")
+    f.flush()
+    env_ssh = env_obj.get("ssh") or {}
+    results = []
+
+    def restart_one(s):
+        host = s["host"]
+        if handle.cancel.is_set():
+            return host, "cancelled", "任务已终止，跳过"
+        server = None
+        try:
+            ssh_cfg = monitor_mod._merge_server_ssh(env_ssh, s)
+            server = RemoteServer(host, ssh_cfg)
+            lifecycle = _war_lifecycle(rec, env_obj, cfg, unit)
+            res = lifecycle.restart(server, dict(s, ip=host),
+                                    release_maintenance=release_maintenance)
+            if res.ok:
+                return host, "ok", (f"重启成功（应用健康；流量 {res.traffic_status}；"
+                                    f"锁 {res.lock_state}）")
+            return host, "failed", (
+                f"重启失败[{res.phase}] 操作={res.operation_status} "
+                f"进程={res.process_state} 应用={res.app_health} "
+                f"流量={res.traffic_status} 锁={res.lock_state} "
+                f"{res.error}").strip()
+        except Exception as e:
+            return host, "failed", f"SSH/执行失败: {e}"
+        finally:
+            if server is not None:
+                server.close()
+
+    with ThreadPoolExecutor(max_workers=min(8, len(servers))) as pool:
+        futures = [pool.submit(restart_one, s) for s in servers]
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                results.append(("?", "failed", f"执行异常: {e}"))
+    order = {s["host"]: i for i, s in enumerate(servers)}
+    results.sort(key=lambda r: order.get(r[0], len(servers)))
+    for host, status, msg in results:
+        f.write(f"[{host}] {msg}\n")
+        f.flush()
+    ok_count = sum(1 for _, st, _ in results if st == "ok")
+    fail_count = sum(1 for _, st, _ in results if st == "failed")
+    skip_count = sum(1 for _, st, _ in results if st == "cancelled")
+    if handle.cancel.is_set():
+        f.write("[platform] 任务已被终止\n")
+        return "failed"
+    if fail_count:
+        f.write(f"[platform] 汇总：{ok_count} 台成功，{fail_count} 台失败，"
+                f"{skip_count} 台跳过 → 任务失败\n")
+        return "failed"
+    if ok_count == 0:
+        f.write("[platform] 汇总：无服务器重启成功 → 任务失败\n")
+        return "failed"
+    f.write(f"[platform] 汇总：{ok_count} 台成功，{skip_count} 台跳过 → 任务成功\n")
+    return "success"
+
+
 def _run_restart(db_path: str, task: dict, log_file: str,
                  handle: "_RestartHandle") -> str:
     """执行服务重启：按发布方式并发重启每台服务器（容器走 docker restart，
@@ -354,7 +440,8 @@ def _run_restart(db_path: str, task: dict, log_file: str,
             if not cfg["app_home"]:
                 f.write("[platform] 进程族服务未配置 runtime_config.app_home，重启中止\n")
                 return "failed"
-            unit = derive_unit_name(cfg, rec.get("image_name"), rec["name"])
+            unit = derive_unit_name(cfg, rec.get("image_name"), rec["name"],
+                                    deploy_mode=deploy_mode)
             svc_name = ""
         else:
             unit = ""
@@ -369,6 +456,14 @@ def _run_restart(db_path: str, task: dict, log_file: str,
         if not servers:
             f.write("[platform] 环境未绑定服务器，重启中止\n")
             return "failed"
+        if deploy_mode == "war_tomcat":
+            # WAR 严格生命周期分支：健康超时/停止失败/锁未知都计入失败，
+            # 不走下方「健康检查超时仍视为成功」的旧语义
+            extra = task.get("extra") or []
+            if isinstance(extra, str):
+                extra = [extra]
+            return _run_war_restart(f, rec, env_obj, servers, handle,
+                                    "--release-maintenance" in extra)
         target_desc = (f"单元 {unit}" if deploy_mode in process_modes()
                        else f"容器名 {svc_name}")
         f.write(f"[platform] 重启服务「{rec['name']}」（{target_desc}），"

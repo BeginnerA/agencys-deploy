@@ -985,10 +985,89 @@ class Deployer:
         except Exception as e:
             log(f"[{host}] 主机版本状态回写失败（不影响发布）: {e}")
 
+    # ---------- WAR/Tomcat 严格主机生命周期（策略显式 opt-in 才进入） ----------
+
+    def _log_host_result(self, host: str, result):
+        log(f"[{host}] 操作={result.operation_status} 阶段={result.phase} "
+            f"版本={result.current_version or '-'} "
+            f"恢复目标={result.recovery_target or '-'} "
+            f"进程={result.process_state} 应用={result.app_health} "
+            f"恢复={result.recovery_status} 流量={result.traffic_status} "
+            f"锁={result.lock_state}" +
+            (f" 错误={result.error}" if result.error else ""))
+
+    def _strict_deploy(self, host: str, server, server_entry: dict = None) -> bool:
+        try:
+            result = self.strategy.deploy_host(server, server_entry)
+        except Exception as e:
+            # LockBusy（实例被其它操作占用）等异常在此折算为本主机失败，
+            # 不让单主机异常炸掉整个编排批次
+            log(f"[{host}] 严格发布异常: {e}")
+            return False
+        self._log_host_result(host, result)
+        if result.ok:
+            self._record_host_state(host, result.current_version or self.version,
+                                    result.recovery_target)
+        return bool(result.ok)
+
+    def _rollback_first_host_strict(self, host: str, server_entry: dict,
+                                    baseline: str) -> bool:
+        if not baseline:
+            log(f"[{host}] 没有该主机本次发布记录的恢复基线，拒绝首台回滚")
+            return False
+        server = RemoteServer(host, merge_server_ssh(self.ssh_cfg, server_entry))
+        try:
+            result = self.strategy.rollback_host(server, baseline, server_entry)
+            self._log_host_result(host, result)
+            if result.ok:
+                self._record_host_state(host, result.current_version, baseline)
+            return bool(result.ok)
+        except Exception as e:
+            log(f"[{host}] 首台严格回滚异常: {e}")
+            return False
+        finally:
+            server.close()
+
+    def _rollback_all_strict(self, servers: list) -> dict:
+        """显式批量回滚：按绑定顺序逐台执行，一台失败/未知即停止后续"""
+        results = {}
+        for srv in servers:
+            host = srv["ip"]
+            server = RemoteServer(host, merge_server_ssh(self.ssh_cfg, srv))
+            try:
+                result = self.strategy.rollback_host(server,
+                                                     self.previous_version, srv)
+                self._log_host_result(host, result)
+                results[host] = bool(result.ok)
+                if result.ok:
+                    self._record_host_state(host, result.current_version,
+                                            self.previous_version)
+            except Exception as e:
+                # LockBusy/通信异常都折算为本主机失败，由下方统一停止后续主机
+                log(f"[{host}] 严格回滚异常: {e}")
+                results[host] = False
+            finally:
+                server.close()
+            if not results[host]:
+                skipped = [s["ip"] for s in servers
+                           if s["ip"] not in results]
+                if skipped:
+                    log(f"回滚失败，停止后续主机: {skipped}")
+                break
+        return results
+
     def deploy_server(self, host: str, server_entry: dict = None, is_canary: bool = False) -> bool:
         log(f"\n========== 开始发布 {host} ==========")
         ssh_cfg = merge_server_ssh(self.ssh_cfg, server_entry) if server_entry else self.ssh_cfg
         server = RemoteServer(host, ssh_cfg)
+        # WAR/Tomcat 严格主机生命周期（显式 opt-in）：主机动作全部走策略
+        # deploy_host 的结构化结果，不进入旧五阶段/Nacos 编排；旧七种策略
+        # 均为 False 走原路径。is True：Mock 替身未显式声明时不误入此分支
+        if getattr(self.strategy, "strict_host_lifecycle", False) is True:
+            try:
+                return self._strict_deploy(host, server, server_entry)
+            finally:
+                server.close()
         nacos_ip = self._nacos_ip(server_entry)
         if self.nacos_groups() and nacos_ip != host:
             log(f"Nacos 使用内网 IP: {nacos_ip}（SSH 外网 IP: {host}）")
@@ -1158,6 +1237,14 @@ class Deployer:
                         if self.canary and is_canary and idx < len(servers) - 1:
                             decision = self._canary_prompt(host)
                             if decision == "rollback":
+                                if self.strategy.strict_host_lifecycle is True:
+                                    # 严格生命周期：只回本次发布记录在该主机的恢复基线，
+                                    # 基线缺失（如停机前失败）由 _rollback_first_host_strict 拒绝
+                                    recorded = self.strategy.last_results.get(host) or {}
+                                    baseline = recorded.get("recovery_target") or ""
+                                    self._rollback_first_host_strict(host, srv, baseline)
+                                    success_all = False
+                                    break
                                 log(f">>> 回滚首台 {host} 到 {self.previous_version}")
                                 rollback_server = RemoteServer(host, merge_server_ssh(self.ssh_cfg, srv))
                                 try:
@@ -1255,95 +1342,101 @@ class Deployer:
         else:
             log(">>> 步骤 1/3: 无需暂停 SnailJob")
 
-        log(">>> 步骤 2/3: 并行回滚所有服务器（各服务器独立 SSH 连接，传输+回滚并行）")
-
-        def _rollback_one(srv: dict) -> tuple:
-            """单台回滚：Nacos 下线 → 回滚目标 → 健康检查 → Nacos 上线，返回 (host, ok)"""
-            host = srv["ip"]
-            log(f"\n========== 开始回滚 {host} ==========")
-            ssh_cfg = merge_server_ssh(self.ssh_cfg, srv)
-            server = RemoteServer(host, ssh_cfg)
-            nacos_ip = self._nacos_ip(srv)
-            snapshotted = False
-            container_rolled_back = False
-            try:
-                # 显式回滚前置检查：进程模式无 releases/{version} 时 rollback 会「跳过」，
-                # 直接返回成功会误导操作者，这里在 Nacos 下线前即判该主机回滚失败
-                if self.strategy.rollback_source_missing(server):
-                    log(f"[{host}] 回滚源缺失（releases/{self.previous_version} 不存在），"
-                        f"该主机回滚失败；请先重传该版本产物或显式跳过此主机")
-                    return host, False
-                if self.strategy.supports_nacos:
-                    self.nacos_offline(nacos_ip)
-                    # 记录回滚前 Nacos 是否确实有该服务的实例（用于后续判断是否需要等待 Nacos 上线）
-                    snapshotted = any(
-                        (svc, grp, nacos_ip) in self.nacos._snapshotted_keys
-                        for svc in self.service_names()
-                        for grp in self.nacos_groups()
-                    )
-                self.strategy.rollback(server)
-                container_rolled_back = True  # 回滚执行成功即标记
-                try:
-                    self.strategy.verify(server, srv)
-                except Exception as ve:
-                    # 目标已切回旧版本但健康检查未通过：回滚不算成功，必须如实上报
-                    log(f"[{host}] 回滚后健康检查失败: {ve}")
-                    if snapshotted:
-                        try:
-                            self.nacos_online(nacos_ip, weight=1.0)
-                        except Exception:
-                            pass
-                    log(f"========== {host} 回滚失败（健康检查未通过） ==========")
-                    return host, False
-                # 回滚成功 + 健康检查通过
-                if snapshotted:
-                    # 回滚前服务在 Nacos 有注册，需要恢复上线并等待健康
-                    try:
-                        self.nacos_online(nacos_ip, weight=1.0)
-                    except Exception as ne:
-                        # 目标已回滚成功，仅 Nacos 上线失败，记为警告而非失败
-                        log(f"[{host}] 警告: 回滚成功，但 Nacos 上线异常: {ne}")
-                elif self.strategy.supports_nacos:
-                    # 回滚前服务就未在 Nacos 注册，尝试上线但不等待健康
-                    try:
-                        self.nacos_online(nacos_ip, weight=1.0)
-                    except Exception:
-                        pass
-                self._record_host_state(host, self.previous_version, self.version)
-                log(f"========== {host} 回滚成功 ==========")
-                return host, True
-            except Exception as e:
-                log(f"[{host}] 回滚异常: {e}")
-                if container_rolled_back:
-                    # 目标已成功回滚到旧版本，仅 Nacos 等后续步骤失败
-                    log(f"[{host}] 警告: 已回滚到 {self.previous_version}，但后续步骤异常: {e}")
-                    if snapshotted:
-                        try:
-                            self.nacos_online(nacos_ip, weight=1.0)
-                        except Exception:
-                            pass
-                    self._record_host_state(host, self.previous_version, self.version)
-                    log(f"========== {host} 回滚成功（目标已回滚，Nacos 待恢复） ==========")
-                    return host, True
-                # 目标未成功回滚
-                if snapshotted:
-                    try:
-                        self.nacos_online(nacos_ip, weight=1.0)
-                    except Exception:
-                        pass
-                log(f"========== {host} 回滚失败 ==========")
-                return host, False
-            finally:
-                server.close()
-
+        # WAR 严格生命周期：逐台回滚，一台失败/未知即停止后续主机。SnailJob 恢复
+        # 对两条路径共用（try/finally 包住分支，异常路径同样恢复，与既有保证一致）
         rollback_results = {}  # {host: bool}
         try:
-            # 本地旧版本镜像包只导出一次（_ensure_local_tar 内 _save_lock 保证），
-            # 各服务器并行回滚，耗时从 N 倍降为 1 倍（受最慢服务器瓶颈）
-            from concurrent.futures import ThreadPoolExecutor
-            workers = max(1, min(len(servers), 8))  # 上限 8，与并行预传输一致
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                rollback_results = dict(pool.map(_rollback_one, servers))
+            if self.strategy.strict_host_lifecycle is True:
+                log(">>> 步骤 2/3: WAR 逐台严格回滚（失败即停止）")
+                rollback_results = self._rollback_all_strict(servers)
+            else:
+                log(">>> 步骤 2/3: 并行回滚所有服务器（各服务器独立 SSH 连接，传输+回滚并行）")
+
+                def _rollback_one(srv: dict) -> tuple:
+                    """单台回滚：Nacos 下线 → 回滚目标 → 健康检查 → Nacos 上线，返回 (host, ok)"""
+                    host = srv["ip"]
+                    log(f"\n========== 开始回滚 {host} ==========")
+                    ssh_cfg = merge_server_ssh(self.ssh_cfg, srv)
+                    server = RemoteServer(host, ssh_cfg)
+                    nacos_ip = self._nacos_ip(srv)
+                    snapshotted = False
+                    container_rolled_back = False
+                    try:
+                        # 显式回滚前置检查：进程模式无 releases/{version} 时 rollback 会「跳过」，
+                        # 直接返回成功会误导操作者，这里在 Nacos 下线前即判该主机回滚失败
+                        if self.strategy.rollback_source_missing(server):
+                            log(f"[{host}] 回滚源缺失（releases/{self.previous_version} 不存在），"
+                                f"该主机回滚失败；请先重传该版本产物或显式跳过此主机")
+                            return host, False
+                        if self.strategy.supports_nacos:
+                            self.nacos_offline(nacos_ip)
+                            # 记录回滚前 Nacos 是否确实有该服务的实例（用于后续判断是否需要等待 Nacos 上线）
+                            snapshotted = any(
+                                (svc, grp, nacos_ip) in self.nacos._snapshotted_keys
+                                for svc in self.service_names()
+                                for grp in self.nacos_groups()
+                            )
+                        self.strategy.rollback(server)
+                        container_rolled_back = True  # 回滚执行成功即标记
+                        try:
+                            self.strategy.verify(server, srv)
+                        except Exception as ve:
+                            # 目标已切回旧版本但健康检查未通过：回滚不算成功，必须如实上报
+                            log(f"[{host}] 回滚后健康检查失败: {ve}")
+                            if snapshotted:
+                                try:
+                                    self.nacos_online(nacos_ip, weight=1.0)
+                                except Exception:
+                                    pass
+                            log(f"========== {host} 回滚失败（健康检查未通过） ==========")
+                            return host, False
+                        # 回滚成功 + 健康检查通过
+                        if snapshotted:
+                            # 回滚前服务在 Nacos 有注册，需要恢复上线并等待健康
+                            try:
+                                self.nacos_online(nacos_ip, weight=1.0)
+                            except Exception as ne:
+                                # 目标已回滚成功，仅 Nacos 上线失败，记为警告而非失败
+                                log(f"[{host}] 警告: 回滚成功，但 Nacos 上线异常: {ne}")
+                        elif self.strategy.supports_nacos:
+                            # 回滚前服务就未在 Nacos 注册，尝试上线但不等待健康
+                            try:
+                                self.nacos_online(nacos_ip, weight=1.0)
+                            except Exception:
+                                pass
+                        self._record_host_state(host, self.previous_version, self.version)
+                        log(f"========== {host} 回滚成功 ==========")
+                        return host, True
+                    except Exception as e:
+                        log(f"[{host}] 回滚异常: {e}")
+                        if container_rolled_back:
+                            # 目标已成功回滚到旧版本，仅 Nacos 等后续步骤失败
+                            log(f"[{host}] 警告: 已回滚到 {self.previous_version}，但后续步骤异常: {e}")
+                            if snapshotted:
+                                try:
+                                    self.nacos_online(nacos_ip, weight=1.0)
+                                except Exception:
+                                    pass
+                            self._record_host_state(host, self.previous_version, self.version)
+                            log(f"========== {host} 回滚成功（目标已回滚，Nacos 待恢复） ==========")
+                            return host, True
+                        # 目标未成功回滚
+                        if snapshotted:
+                            try:
+                                self.nacos_online(nacos_ip, weight=1.0)
+                            except Exception:
+                                pass
+                        log(f"========== {host} 回滚失败 ==========")
+                        return host, False
+                    finally:
+                        server.close()
+
+                # 本地旧版本镜像包只导出一次（_ensure_local_tar 内 _save_lock 保证），
+                # 各服务器并行回滚，耗时从 N 倍降为 1 倍（受最慢服务器瓶颈）
+                from concurrent.futures import ThreadPoolExecutor
+                workers = max(1, min(len(servers), 8))  # 上限 8，与并行预传输一致
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    rollback_results = dict(pool.map(_rollback_one, servers))
         finally:
             if group and not skip_snailjob:
                 log(f">>> 步骤 3/3: 恢复 SnailJob group={group}")

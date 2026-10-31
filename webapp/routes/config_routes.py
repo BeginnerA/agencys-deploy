@@ -886,7 +886,8 @@ def _unit_target(rec) -> tuple:
                                                   parse_runtime_config)
     mode = rec.get("deploy_mode") or "jar_service"
     cfg = parse_runtime_config(rec.get("runtime_config"), mode)
-    unit = derive_unit_name(cfg, rec.get("image_name"), rec["name"])
+    unit = derive_unit_name(cfg, rec.get("image_name"), rec["name"],
+                            deploy_mode=mode)
     return unit, service_unit.render_unit(cfg, unit, mode)
 
 
@@ -945,7 +946,7 @@ def _merge_host_row(host: str, unit: str, db_row: dict, live: dict) -> dict:
     """DB 快照 + 实时视图合并：实时优先，DB 补版本/回滚基线"""
     db_row = db_row or {}
     live = live or {}
-    return {
+    row = {
         "host": host,
         "unit": live.get("unit") or unit,
         "status": live.get("status") or ("unknown" if db_row else "not_deployed"),
@@ -959,6 +960,15 @@ def _merge_host_row(host: str, unit: str, db_row: dict, live: dict) -> dict:
         "updated_at": db_row.get("updated_at") or 0,
         "live": bool(live),
     }
+    # WAR 实例托管字段（监控侧产出）存在才透传；不伪造默认值，jar 行保持原输出
+    for key in ("config_status", "operation_state", "operation_phase",
+                "instance_id", "app_health", "process_status",
+                "recovery_status", "version_drift", "lock_state"):
+        if key in live:
+            row[key] = live[key]
+    if "maintenance" in live:
+        row["maintenance"] = bool(live["maintenance"])
+    return row
 
 
 @config_bp.route("/projects/<int:pid>/services/<int:sid>/hosts", methods=["GET"])

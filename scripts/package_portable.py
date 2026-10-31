@@ -56,7 +56,7 @@ PORTABLE_SRC = ROOT / "scripts" / "portable"
 
 # 白名单：进包的源码目录 / 文件
 SOURCE_DIRS = ["agent", "webapp", "scripts", "deploy_strategies", "config"]
-SOURCE_FILES = ["deploy.py", "deploy_pipeline.py", "menu.py",
+SOURCE_FILES = ["deploy.py", "deploy_pipeline.py", "menu.py", "service_unit.py",
                 "requirements.txt", "README.md", "LICENSE"]
 COPY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo",
                                      ".pytest_cache", "portable",

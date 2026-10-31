@@ -883,6 +883,62 @@ Dashboard「管理 → YAML 导出」把数据库导出到 `data/export/config/`
 
 停机口径：单实例发布在「停止 → 换链接 →（`ensure_runtime`）→ 启动」期间服务不可用，Python 触发重装时窗口更长；平台不承诺零停机，需要连续可用时请改用容器多实例方案。
 
+### 10.11 WAR / Tomcat 独立实例发布（war_tomcat）
+
+`war_tomcat` 面向「WAR 包 + 目标机已安装 Tomcat」的 Java Web 应用：每应用固定一个独立实例，`CATALINA_BASE={app_home}/instance`，共享目标机 `CATALINA_HOME`；平台只管理实例目录、WAR 版本、systemd 单元和归属/锁，不安装 JDK/Tomcat，不建账号，不改 sudo/防火墙，不启用 Manager/AJP/远程 shutdown。目标机仅支持 Linux + systemd；Windows 目标机与 Kubernetes/Helm 不在本方式范围内。
+
+快速路径一览：管理员接入事务（onboard）写入实例目录、归属清单（`.smartops-instance.json`，内含 `instance_id`）与 systemd 单元 → 之后所有远端动作都在单 owner 锁内执行，令牌只经 stdin 传给受守卫的命令，不存在绕过令牌的裸命令 → 发布/回滚/重启走严格生命周期「摘流 → 确认停止 → 切换 `CURRENT` → 清理 → 启动 → 探活 → 回流」→ 每台主机返回结构化 `HostResult`，编排层只消费结果、任何失败都不会被吞成成功；批量接口对逐主机失败按 207 语义返回各主机结果，不整体回滚。
+
+目标机前提：
+
+- 已安装 JDK（`java_home`）与 Tomcat（`tomcat_home`），三个 Tomcat 文件模板（`web.xml`、`catalina.properties`、`logging.properties`）可读；模板缺失或读取失败会阻止接入，不会用其它版本模板顶替；
+- `run_user` 必须是已存在且 UID 非 0 的账号，并只对制品/配置只读、对 `webapps`/`work`/`temp`/`logs` 可写；部署身份负责版本、配置、状态、注册表与锁的写入，平台不创建账号、不改权限模型；
+- `app_home` 为 Linux 绝对路径，且与 `tomcat_home` 不相同、不互相包含；其下 `webapps`/`work`/`temp` 被平台视为可再生目录，应用上传文件、报表与持久缓存必须外置；
+- 端口需唯一且未被占用，首版业务 Connector 只监听 IPv4 `0.0.0.0`，健康探测通过 SSH 直连目标机回环地址。
+
+配置字段（`runtime_config`）：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `app_home` | 是 | 实例、制品、状态根目录；接入后不可原地换根 |
+| `tomcat_home` | 是 | 已安装 Tomcat 根目录（`CATALINA_HOME`），平台不写该目录 |
+| `java_home` | 是 | 已安装 JDK/JRE 根目录，使用其 `bin/java` |
+| `run_user` | 是 | 目标机已存在、UID 非 0 的账号 |
+| `unit_name` | 否 | 缺省 `smartops-{服务}-war`；保存与比较时规范为同一 `.service` 名 |
+| `port` | 是 | 1024–65535 的整数 |
+| `context_path` | 是 | 根应用填 `/`（规范化为空）；其它如 `/orders`、`/team/orders`，不允许末尾 `/` |
+| `artifact_pattern` | 否 | 默认 `target/*.war`，相对构建搜索根；禁止绝对路径与 `..`，全候选只能有一个 |
+| `jvm_opts` | 否 | 字符串数组，逐项写入 systemd argv；禁止换行注入、classpath、`catalina.home/base`、临时目录等平台接管参数 |
+| `env_files` | 否 | 目标机已有环境文件的绝对路径数组；平台只传路径，不读取值、不写入预览或审计 |
+| `stop_timeout` / `start_timeout` | 否 | 正整数，默认 60 / 120 秒 |
+| `readiness.path` | 是 | 相对应用根的绝对路径，如 `/health`；最终请求路径为 `context_path + path` |
+| `readiness.expected_status` | 否 | 首版只支持 200 |
+| `readiness.body_contains` | 否 | 可选固定文本，按字面量包含检查；不猜测 `UP`/`ok` |
+| `readiness.timeout` / `interval` | 否 | 默认 120 / 5 秒，正数；总等待与单请求超时共同受截止时间约束 |
+
+操作流程：
+
+1. **预览**：管理员在服务表单选择环境后预览，逐主机返回实例身份、配置摘要、unit 内容、受管文件与接入状态；任一台读取失败按 207 返回逐主机结果，不整体回滚。
+2. **接入**：确认后只写实例目录、归属清单与 systemd 单元并 `daemon-reload`/`enable`，不启动应用；接入前重算摘要，摘要变化或实例已有其它归属时拒绝，不覆盖。
+3. **发布**：Maven 构建出唯一 WAR → 上传到 `.incoming/{operation_id}` → 校验 SHA-256 → 暂存提交到 `releases/{version}/app.war` → 受控停止旧实例 → 原子切换 `CURRENT` → 清理该实例 appBase 展开副本/work/temp → 启动 → 应用 HTTP 健康。版本目录不可变，回滚只切换链接、不重传。
+4. **配置更新**：管理员确认后，在单 owner 锁内校验受管文件未漂移，保存流量快照并写维护标记，再摘流、受控停止、落新配置；完成后**不自动启动**，状态为「维护中」。普通重启会被拒绝，只有「结束维护并重启」会恢复原流量权重并清除维护标记。
+5. **恢复**：断线或失败后管理员可查看脱敏 owner、owner 文件摘要、最近结果与配置状态；确认摘要后解除锁。锁已消失或摘要不符时拒绝解除并返回冲突。
+6. **观测**：周期探测同时展示进程状态、应用 HTTP 健康、每主机版本（以 `CURRENT` 为准并标出版本漂移）、配置状态（受管/维护中/归属不一致/未接入）、恢复状态（无需/成功/受阻/失败/不可用/未知）与操作状态（空闲/操作中及当前阶段：预检、摘流、停止、切换、启动、健康检查、自动恢复）；`active` 不等于发布成功，`unknown` 不等于成功。
+
+实例配置取舍与维护时序：
+
+- `server.xml` 的 Host 配置为 `unpackWARs="false" autoDeploy="false"`，Context 的 `docBase` 指向 `{app_home}/CURRENT/app.war`：Tomcat 不把 WAR 解包到 appBase，直接从 WAR 服务，`releases/` 目录保持只读（避免 Tomcat 解包写穿不可变版本目录）；切换后仍会清理 `instance/webapps` 下历史展开副本与 `work`/`temp`，防止旧应用的类/缓存残留；
+- 维护标志在受控停止**之前**落盘（`.smartops-maintenance.json`，含停机前流量快照），停止失败时标志保留、实例占用交人工核验；实例重启成功且流量恢复后才清除维护标志并按快照恢复原权重（原停用流量不强制开启）。
+
+限制与已知取舍：
+
+- 单实例发布在「停止 → 切换 → 启动」期间不可用，平台不承诺零停机；
+- 应用回滚只回滚 WAR，不恢复实例配置、JDK/Tomcat、数据库或外置数据；
+- 环境文件内容不纳入配置指纹，外部修改由运维负责；健康接口首版不支持需要认证密钥的端点；
+- 定时等待 `canary_wait` 对 WAR 发布不生效：该 sleep 观察只存在于旧五阶段编排路径末尾，而 WAR 严格分支在进入旧五阶段之前就按逐主机 `HostResult` 返回；`--canary` 的首台人工确认卡点在编排层（run），对 WAR 仍然有效；
+- 锁是平台之间的协调协议，不能防御拥有目标机 root 权限的人；绕过协议手工操作此类实例属于运维禁令，平台只保证自身操作 fail-closed；
+- 首次接入、应用发布、配置更新、重启、回滚和恢复的实际行为仍需在 Tomcat 9 + Java 8、Tomcat 10.1 + Java 11、Tomcat 11 + Java 17 的 Linux + systemd 环境验收；文档与自动化测试不能替代真机验收。
+
 ## 十一、Jenkins / Ansible 集成
 
 ### 11.1 Jenkins

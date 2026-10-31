@@ -36,9 +36,19 @@ def _import_projects(db_path: str, path: Path) -> tuple:
     else:
         code = dbm.get_record(db_path, "projects", pid)["code"]
     n = 0
+    skipped = []
     for name, cfg in projects.items():
         if dbm.get_service_by_name(db_path, pid, name):
             continue
+        deploy_mode = cfg.get("deploy_mode") or "container"
+        if deploy_mode == "war_tomcat":
+            # WAR 配置与 CLI/前端共用同一校验器；半套配置不落库（缺 tomcat_home/
+            # run_user 等会在接入事务与发布期才炸），跳过并在结果消息中列出
+            from deploy_strategies.process_config import validate_runtime_config
+            errs = validate_runtime_config(cfg.get("runtime_config"), deploy_mode)
+            if errs:
+                skipped.append(f"{name}（{'；'.join(errs)}）")
+                continue
         build_order = cfg.get("build_order", []) or []
         # 前端项目的 build_order 元素含 commands 数组（无 goal 字段），原样保留
         normalised_build_order = []
@@ -63,7 +73,7 @@ def _import_projects(db_path: str, path: Path) -> tuple:
             dockerfile=cfg.get("dockerfile", ""),
             build_order=normalised_build_order,
             build_type=cfg.get("build_type", "maven"),
-            deploy_mode=cfg.get("deploy_mode") or "container",
+            deploy_mode=deploy_mode,
             runtime_config=cfg.get("runtime_config") or {},
             site_root=cfg.get("site_root", ""),
             backup_dir=cfg.get("backup_dir", ""),
@@ -84,7 +94,10 @@ def _import_projects(db_path: str, path: Path) -> tuple:
             git_tag_enabled=1 if cfg.get("git_tag_enabled", True) else 0,
             enabled=1))
         n += 1
-    return True, f"项目 code={code}，导入服务 {n} 个"
+    msg = f"项目 code={code}，导入服务 {n} 个"
+    if skipped:
+        msg += "，跳过校验失败: " + ", ".join(skipped)
+    return True, msg
 
 
 def _import_pipelines(db_path: str, path: Path) -> tuple:

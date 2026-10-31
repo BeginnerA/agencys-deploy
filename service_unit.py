@@ -20,6 +20,11 @@ from common import log
 
 def render_unit(runtime_config, service: str, deploy_mode: str = "jar_service") -> str:
     """按运行时配置渲染 unit：ExecStart 固定引用 CURRENT（或 venv），发布只换链接不改 unit"""
+    if deploy_mode == "war_tomcat":
+        # WAR/Tomcat unit 由 tomcat_config 渲染（Bootstrap 直启、平台接管 catalina 参数），
+        # 不经进程族的 ExecStart 拼装
+        from deploy_strategies.tomcat_config import parse_war_config, render_war_unit
+        return render_war_unit(parse_war_config(runtime_config), service)
     cfg = parse_runtime_config(runtime_config, deploy_mode)
     work_dir = cfg["work_dir"] or f"{cfg['app_home']}/CURRENT"
     exec_start = build_exec_start(cfg, deploy_mode)
@@ -54,8 +59,11 @@ def onboard_unit(server, unit: str, content: str, cfg: dict,
     """在单台服务器接入 unit（幂等）：拒绝接管、写文件、reload、enable
 
     cfg 为 parse_runtime_config 的产物（含 app_home 与模式专属字段），
-    接管特征串按 deploy_mode 分派。
+    接管特征串按 deploy_mode 分派。WAR/Tomcat 在读取任何远端状态前拒绝：
+    实例必须通过管理员接入事务（tomcat_instance.onboard）落 unit 与归属清单。
     """
+    if deploy_mode == "war_tomcat":
+        raise RuntimeError("WAR/Tomcat 实例必须通过管理员实例接入事务，不能直接写 unit")
     expected = exec_start_marker(cfg, deploy_mode)
     existing = server.exec(
         f"systemctl show -p ExecStart --value {shlex.quote(unit)}.service "

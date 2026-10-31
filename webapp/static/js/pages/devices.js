@@ -26,12 +26,15 @@
     if (st === 'online') return 'ok';
     if (st === 'error' || st === 'stopped') return 'bad';
     if (st === 'probe_failed') return 'warn';
+    if (st === 'unhealthy') return 'bad';
+    if (st === 'unmanaged') return 'warn';
     if (st === 'unknown' && isStatic) return 'gray';  // 静态未配探活：中性灰，不红
     return 'gray';
   }
   function svcLabel(st, run, isStatic){
     if (run) return '发布中';
-    const map = {online:'在线', error:'异常', stopped:'已停止', not_deployed:'未部署', probe_failed:'探测失败'};
+    const map = {online:'在线', error:'异常', stopped:'已停止', not_deployed:'未部署', probe_failed:'探测失败',
+                 unhealthy:'不健康', unmanaged:'未托管'};
     if (isStatic && (st.status === 'unknown' || !st.status)) return '未配探活';
     return map[st.status] || '未知';
   }
@@ -202,9 +205,17 @@
     if (destroyed) return; // 路由切换后在途响应丢弃，防新页面弹出旧流程
     const svc = services.find(s => s.id === sid);
     if (!svc){ toastError('服务不存在或已被删除'); return; }
+    let releaseMaintenance = false;
+    if (svc.deploy_mode === 'war_tomcat') {
+      // WAR/Tomcat 实例：维护状态下普通重启会被后端拒绝，显式询问是否同时结束维护
+      releaseMaintenance = await confirmDialog(
+        '该实例若处于维护状态，普通重启会被拒绝。是否同时结束维护并按配置更新前的快照恢复原流量权重？'
+        + '\n\n选择「取消」只会执行普通重启（维护中会失败）。');
+    }
     if (!await confirmDialog(`确认重启服务「${svc.name}」？环境：${state.currentEnv}，将重启全部实例`)) return;
     const doRestart = async (forceWindow) => await api('/api/tasks', {method:'POST', body: JSON.stringify({
-      project_id: pid, type: 'restart', ref_id: sid, env: state.currentEnv, force_window: forceWindow})});
+      project_id: pid, type: 'restart', ref_id: sid, env: state.currentEnv, force_window: forceWindow,
+      release_maintenance: releaseMaintenance})});
     try{
       const resp = await doRestart(false);
       toastSuccess(`任务 #${resp.id} 已创建`);

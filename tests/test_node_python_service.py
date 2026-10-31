@@ -127,9 +127,10 @@ class PythonRegistryTest(unittest.TestCase):
     def test_registered_and_family_complete(self):
         self.assertIn("python_process", _REGISTRY)
         from deploy_strategies.base import process_modes
+        # war_tomcat（Task 9）同为进程族：is_process=True，注册表自动收集
         self.assertEqual(process_modes(),
                          ["go_binary", "jar_service", "node_process",
-                          "python_process", "rust_binary"])
+                          "python_process", "rust_binary", "war_tomcat"])
 
     def test_python_probe_checks_ensurepip(self):
         s = create_strategy("python_process", make_py_deployer(tempfile.mkdtemp()))

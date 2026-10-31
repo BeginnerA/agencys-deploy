@@ -49,7 +49,8 @@ class ProcessServiceStrategy(DeployStrategy):
         self.app_home = self.cfg["app_home"]
         self.service = (proj.get("image_name") or
                         getattr(deployer, "project", "app"))
-        self.unit = derive_unit_name(self.cfg, self.service)
+        self.unit = derive_unit_name(self.cfg, self.service,
+                                     deploy_mode=self.mode)
         self.jars_dir = f"{self.app_home}/releases"
         self.curr_link = f"{self.app_home}/CURRENT"
 

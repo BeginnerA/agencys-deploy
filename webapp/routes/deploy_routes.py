@@ -62,8 +62,10 @@ def create_task():
     no_git_tag = _bool_field(body, "no_git_tag", False)
     force_window = _bool_field(body, "force_window", False)
     canary = _bool_field(body, "canary", False)
-    if rollback is None or auto_version is None or skip_build is None or force_window is None or no_git_tag is None or canary is None:
-        return jsonify({"error": "rollback/auto_version/skip_build/no_git_tag/force_window/canary 必须为布尔值"}), 400
+    # 结束维护并重启（WAR 维护态专用）：必须显式传布尔 true，绝不默认开启
+    release_maintenance = _bool_field(body, "release_maintenance", False)
+    if rollback is None or auto_version is None or skip_build is None or force_window is None or no_git_tag is None or canary is None or release_maintenance is None:
+        return jsonify({"error": "rollback/auto_version/skip_build/no_git_tag/force_window/canary/release_maintenance 必须为布尔值"}), 400
     if type_ == "restart":
         # 重启：env 必填且必须属于该项目；版本/构建类字段不适用，一律强制缺省
         if (rec.get("deploy_mode") or "container") == "static_archive":
@@ -76,6 +78,10 @@ def create_task():
         version = previous_version = ""
     elif auto_version and (version or previous_version):
         return jsonify({"error": "auto_version 与显式 version/previous_version 互斥"}), 400
+    if release_maintenance and (type_ != "restart"
+                                or (rec.get("deploy_mode") or "") != "war_tomcat"):
+        # 仅 war_tomcat 重启接受该标记；其余模式一律拒绝，避免误传后被静默忽略
+        return jsonify({"error": "release_maintenance 仅支持 WAR/Tomcat 服务重启"}), 400
     if rollback and canary:
         return jsonify({"error": "canary 与 rollback 互斥，回滚不支持灰度"}), 400
     if rollback:
@@ -97,6 +103,9 @@ def create_task():
         extra.append("--rollback")
     if canary:
         extra.append("--canary")
+    if type_ == "restart" and release_maintenance:
+        # WAR 重启消费该标记（重启后自动结束维护）；其余模式在执行器里忽略
+        extra.append("--release-maintenance")
     # 发布窗口检查：按本次发布的环境/服务/服务器完整作用域匹配
     window = check_deploy_window(current_app.config["DB_PATH"], project_id,
                                  env=env, ref_type=type_, ref_id=ref_id)

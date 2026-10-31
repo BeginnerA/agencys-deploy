@@ -218,6 +218,71 @@ def _probe_health_via_ssh(host: str, ssh_port: int, ssh_cfg: dict,
     return results
 
 
+def _probe_war_evidence(host: str, port: int, ssh_cfg: dict, instances: list) -> dict:
+    """读取 WAR 归属清单与 owner；只读，不触发任何写操作。"""
+    from deploy_strategies import tomcat_instance
+    from deploy_strategies.remote_operation import inspect
+
+    class _ExecAdapter:
+        def exec(self, cmd, timeout=60, stdin_data=None):
+            return _ssh_exec(host, port, ssh_cfg, cmd, timeout)
+
+    import shlex
+
+    adapter = _ExecAdapter()
+    result = {}
+    for info in instances or []:
+        app_home = info["app_home"]
+        try:
+            manifest = tomcat_instance.read_manifest(adapter, app_home)
+            iid = (manifest or {}).get("instance_id") or ""
+            state = inspect(adapter, iid) if iid else {}
+        except Exception:
+            manifest, iid, state = {}, "", {}
+        # CURRENT 是版本权威，.deploy_version 只是兼容镜像；两者不一致即漂移
+        try:
+            out = adapter.exec(
+                f"readlink -f {shlex.quote(app_home + '/CURRENT')} 2>/dev/null;"
+                f" printf '\\n---\\n';"
+                f" cat {shlex.quote(app_home + '/.deploy_version')} 2>/dev/null")
+            link_raw, _, ver_raw = out.partition("---")
+            link = link_raw.strip().rstrip("/").rsplit("/", 1)[-1]
+            depver = ver_raw.strip()
+        except Exception:
+            link, depver = "", ""
+        result[info["service"]] = {
+            "instance_id": iid,
+            "manifest": manifest,
+            "owner": state.get("owner") or {},
+            "phase": state.get("phase") or "",
+            "last_result": state.get("last_result") or {},
+            "current_version": link,
+            "deploy_version": depver,
+            "version_drift": bool(
+                (depver and not link)
+                or (link and depver and link != depver)),
+        }
+    return result
+
+
+def _probe_war_health(host: str, ssh_port: int, ssh_cfg: dict,
+                      checks: list) -> tuple:
+    """WAR 单次有界探活：SSH direct-tcpip，不依赖目标机 curl。"""
+    from deploy_strategies.tomcat_health import probe_http
+
+    class _PooledClient:
+        def client(self):
+            return _ssh_pool.get_client(host, ssh_port, ssh_cfg, 10)
+
+    out = []
+    for name, port, path, expected, contains in checks:
+        r = probe_http(_PooledClient(), port, path, expected_status=expected,
+                       body_contains=contains, timeout=4)
+        out.append((name, {"ok": r["ok"], "ms": r["ms"],
+                           "method": "http_strict"}))
+    return host, out
+
+
 def _probe_server_full(host: str, port: int, ssh_cfg: dict, service_names: set,
                        timeout: int = 10, skip_extended: bool = False,
                        units: dict = None) -> dict:
@@ -829,14 +894,19 @@ class MonitorScheduler:
             env_ctxs.append({"proj": proj, "env": env, "services": services,
                              "servers": servers})
             for svc in services:
-                if (svc.get("deploy_mode") or "container") not in process_modes():
+                deployment = svc.get("deploy_mode") or "container"
+                if deployment not in process_modes():
                     continue
-                cfg = parse_runtime_config(svc.get("runtime_config"),
-                                           svc.get("deploy_mode"))
-                unit = derive_unit_name(cfg, svc.get("image_name"), svc["name"])
-                process_by_project.setdefault(proj["id"], []).append(
-                    {"unit": unit, "app_home": cfg["app_home"]})
-        host_jobs = {}  # (host, port) -> {"host","port","ssh_cfg","service_names","jar_units"}
+                cfg = parse_runtime_config(svc.get("runtime_config"), deployment)
+                # deploy_mode 必传：WAR 不传会退回 image_name，与真实单元
+                # smartops-{image}-war 不一致，监控会长期报 not_deployed
+                unit = derive_unit_name(cfg, svc.get("image_name"), svc["name"],
+                                        deploy_mode=deployment)
+                info = {"unit": unit, "app_home": cfg["app_home"],
+                        "service": svc.get("service_name") or svc["name"],
+                        "war": deployment == "war_tomcat"}
+                process_by_project.setdefault(proj["id"], []).append(info)
+        host_jobs = {}  # (host, port) -> {"host","port","ssh_cfg","service_names","jar_units","war_instances"}
         for ctx in env_ctxs:
             env_ssh = ctx["env"].get("ssh") or {}
             svc_names = [svc["service_name"] for svc in ctx["services"]
@@ -848,12 +918,18 @@ class MonitorScheduler:
                 if job is None:
                     job = {"host": s["host"], "port": key[1],
                            "ssh_cfg": _merge_server_ssh(env_ssh, s),
-                           "service_names": set(), "jar_units": {}}
+                           "service_names": set(), "jar_units": {},
+                           "war_instances": []}
                     host_jobs[key] = job
                 job["service_names"].update(svc_names)
                 for info in process_by_project.get(ctx["proj"]["id"], []):
                     job["jar_units"].setdefault(
                         info["unit"], {"app_home": info["app_home"]})
+                    if info["war"]:
+                        # 实例身份在主机上的归属文件里，探测时不按平台字段推导
+                        job["war_instances"].append({
+                            "service": info["service"],
+                            "app_home": info["app_home"]})
         skip_extended = (self._round % 3) != 0
         host_results = self._probe_hosts(host_jobs, skip_extended)
         with ThreadPoolExecutor(max_workers=min(4, len(env_ctxs))) as pool:
@@ -891,6 +967,7 @@ class MonitorScheduler:
                          "container_list": [], "container_status": {},
                          "resources": {}, "host_metrics": {}, "extended": {},
                          "jar_probe": {}, "error": "timeout"}
+                job = host_jobs[key]
                 if r.get("ssh_ok"):
                     # CPU 使用率：/proc/stat 跨轮差分（取代 vmstat sleep 采样）
                     self._apply_cpu_delta(key[0], r.get("host_metrics") or {})
@@ -898,6 +975,13 @@ class MonitorScheduler:
                     if r.get("container_list"):
                         self._server_containers[key[0]] = {
                             "containers": r["container_list"], "ts": time.time()}
+                    if job.get("war_instances"):
+                        try:
+                            r["war_evidence"] = _probe_war_evidence(
+                                job["host"], job["port"], job["ssh_cfg"],
+                                job["war_instances"])
+                        except Exception:
+                            r["war_evidence"] = {}
                 results[key] = r
         return results
 
@@ -926,32 +1010,68 @@ class MonitorScheduler:
 
         版本权威在目标机（.deploy_version / CURRENT）；只有版本变化才写
         service_host_state，避免 30s 轮询写放大。CPU 需要上一轮样本，
-        首次探测为 None，第二轮起才有值。
+        首次探测为 None，第二轮起才有值。WAR 额外叠加归属/维护/操作状态，
+        版本以 CURRENT 链接为权威（.deploy_version 只是兼容镜像）。
         """
+        from deploy_strategies import tomcat_instance
         from deploy_strategies.process_config import (derive_unit_name,
                                                       parse_runtime_config)
         from . import jar_probe
         for svc in process_services:
-            cfg = parse_runtime_config(svc.get("runtime_config"),
-                                       svc.get("deploy_mode"))
-            unit = derive_unit_name(cfg, svc.get("image_name"), svc["name"])
+            deployment = svc.get("deploy_mode") or "container"
+            war = deployment == "war_tomcat"
+            cfg = parse_runtime_config(svc.get("runtime_config"), deployment)
+            unit = derive_unit_name(cfg, svc.get("image_name"), svc["name"],
+                                    deploy_mode=deployment)
+            svc_label = svc.get("service_name") or svc["name"]
             rows = []
             for s in servers:
                 key = (s["host"], int(s.get("ssh_port") or 22))
                 r = host_results.get(key) or {}
                 probe = r.get("jar_probe") or {}
                 raw = (probe.get("units") or {}).get(unit)
+                ev = {}
+                base = {"host": s["host"], "unit": unit, "version": "",
+                        "pid": 0, "uptime_hours": None, "restarts": 0,
+                        "cpu": None, "rss_mb": None}
+                if war:
+                    ev = ((r.get("war_evidence") or {}).get(svc_label) or {})
+                    manifest = ev.get("manifest") or {}
+                    iid = ev.get("instance_id") or ""
+                    # 有历史结果但缺字段才记 unknown；从未操作过是 not_needed
+                    last = ev.get("last_result")
+                    base.update({
+                        "instance_id": iid,
+                        "config_status": tomcat_instance.config_status(
+                            manifest, iid, env.get("project_id"), env["name"],
+                            svc_label),
+                        "operation_state": ("in_progress" if ev.get("owner")
+                                            else "idle"),
+                        "operation_phase": ((ev.get("phase") or "")
+                                            if ev.get("owner") else ""),
+                        "maintenance": bool(
+                            (manifest.get("maintenance") or {}).get("active")),
+                        "app_health": "unknown",
+                        # 进程视角在健康/归属判定前固化，展示层再据此区分
+                        # “进程在跑但应用不健康”与“进程本身停了”
+                        "process_status": "unknown",
+                        "recovery_status": ((last.get("recovery_status")
+                                             or "unknown")
+                                            if last is not None
+                                            else "not_needed"),
+                        "version_drift": bool(ev.get("version_drift")),
+                    })
                 if not r.get("ssh_ok"):
-                    rows.append({"host": s["host"], "status": "probe_failed",
-                                 "version": "", "pid": 0, "uptime_hours": None,
-                                 "restarts": 0, "cpu": None, "rss_mb": None,
-                                 "unit": unit})
+                    base["status"] = "probe_failed"
+                    if war:
+                        base["process_status"] = base.get("status") or "unknown"
+                    rows.append(base)
                     continue
                 if not raw:
-                    rows.append({"host": s["host"], "status": "not_deployed",
-                                 "version": "", "pid": 0, "uptime_hours": None,
-                                 "restarts": 0, "cpu": None, "rss_mb": None,
-                                 "unit": unit})
+                    base["status"] = "not_deployed"
+                    if war:
+                        base["process_status"] = base.get("status") or "unknown"
+                    rows.append(base)
                     continue
                 prev_key = (s["host"], unit)
                 with self._lock:
@@ -964,12 +1084,20 @@ class MonitorScheduler:
                 if sample:
                     with self._lock:
                         self._jar_prev[prev_key] = sample
+                # WAR 版本以 CURRENT 为目标：覆盖必须发生在 base.update(view)
+                # 之前，保证下方 record_host_state_live 写穿的是现场观察值，
+                # 而不是落后的 .deploy_version
+                if war and ev.get("current_version"):
+                    view["version"] = ev["current_version"]
                 view["host"] = s["host"]
-                rows.append(view)
-                if view["status"] == "online":
+                base.update(view)
+                if war:
+                    base["process_status"] = base.get("status") or "unknown"
+                rows.append(base)
+                if base["status"] == "online":
                     health_hosts.setdefault(svc["name"], []).append(s["host"])
-                version = view.get("version") or ""
-                if version and view["status"] in ("online", "stopped"):
+                version = base.get("version") or ""
+                if version and base["status"] in ("online", "stopped"):
                     cache_key = (env.get("project_id"), env["name"],
                                  svc["name"], s["host"])
                     with self._lock:
@@ -995,6 +1123,15 @@ class MonitorScheduler:
                 None)
             if online_uptime is not None:
                 st["uptime_hours"] = online_uptime
+            if war:
+                st.update({
+                    "config_status": tomcat_instance.aggregate_config_status(rows),
+                    "operation_state": tomcat_instance.aggregate_operation_state(rows),
+                    "operation_phase": next(
+                        (x.get("operation_phase") for x in rows
+                         if x.get("operation_phase")), ""),
+                    "instance_home": f"{cfg['app_home']}/instance",
+                })
 
     def _probe_env(self, ctx: dict, host_results: dict):
         """环境级组装：把去重后的主机探测结果切片为本环境视图并叠加平台侧检查
@@ -1150,6 +1287,10 @@ class MonitorScheduler:
             server_by_host = {s["host"]: s for s in servers}
             host_checks = {}  # {host: [(svc_name, hp, hu), ...]}
             for svc in online:
+                if (svc.get("deploy_mode") or "") == "war_tomcat":
+                    # WAR 走下方 SSH direct-tcpip 直连探活，避免旧 curl
+                    # /dev/tcp 路径先给 WAR 一个假健康结论
+                    continue
                 hp = svc.get("health_port") or 0
                 if hp <= 0:
                     # 进程族服务的健康端口来自 runtime_config.port（聚合时写入视图）
@@ -1185,6 +1326,89 @@ class MonitorScheduler:
                                 pass
                             if hr["ok"] and svc_name not in result["health_checks"]:
                                 result["health_checks"][svc_name] = {**hr, "host": host}
+        # WAR 直连探活：健康端口来自 runtime_config.port、路径来自 readiness，
+        # 经 SSH direct-tcpip 探测 127.0.0.1:port（与发布就绪验证同一语义）
+        if online:
+            from deploy_strategies.process_config import parse_runtime_config
+            from deploy_strategies.tomcat_config import health_request_path
+            war_checks = {}
+            for svc in online:
+                if (svc.get("deploy_mode") or "") != "war_tomcat":
+                    continue
+                cfg = parse_runtime_config(svc.get("runtime_config"),
+                                           "war_tomcat")
+                path = health_request_path(cfg)
+                for host in health_hosts.get(svc["name"], []):
+                    war_checks.setdefault(host, []).append(
+                        (svc["name"], cfg["port"], path,
+                         cfg["readiness"]["expected_status"],
+                         cfg["readiness"]["body_contains"]))
+            env_ssh = env.get("ssh") or {}
+            server_by_host = {s["host"]: s for s in servers}
+            war_health = {}   # {svc_name: {host: ok}}
+            for svc in online:
+                if (svc.get("deploy_mode") or "") == "war_tomcat":
+                    # 即使本轮探活异常也要有键，避免 app_health 缺字段
+                    war_health.setdefault(svc["name"], {})
+                    st = result["services"].get(svc["name"])
+                    if st is not None:
+                        # 在任何降级前固化进程视角，之后的 unhealthy/unmanaged
+                        # 只改展示聚合，不覆盖“进程是否在跑”
+                        st["process_status"] = st.get("status") or "unknown"
+            if war_checks:
+                def _run_war_checks(host, checks):
+                    s = server_by_host.get(host)
+                    if not s:
+                        return host, []
+                    return _probe_war_health(
+                        host, int(s.get("ssh_port") or 22),
+                        _merge_server_ssh(env_ssh, s), checks)
+
+                with ThreadPoolExecutor(max_workers=min(8, len(war_checks))) as pool:
+                    futs = [pool.submit(_run_war_checks, h, cs)
+                            for h, cs in war_checks.items()]
+                    for fut in futs:
+                        try:
+                            host, hr_list = fut.result(timeout=30)
+                        except Exception:
+                            continue
+                        for svc_name, hr in hr_list:
+                            try:
+                                dbm.save_response_time(
+                                    self._db_path, env["id"], svc_name, host,
+                                    hr["ms"] if hr["ms"] > 0 else -1, hr["ok"])
+                            except Exception:
+                                pass
+                            war_health.setdefault(svc_name, {})[host] = hr["ok"]
+                            if hr["ok"] and svc_name not in result["health_checks"]:
+                                result["health_checks"][svc_name] = {
+                                    **hr, "host": host}
+            for svc_name, per_host in war_health.items():
+                st = result["services"].get(svc_name)
+                if not st:
+                    continue
+                for row in st.get("hosts") or []:
+                    ok = per_host.get(row.get("host"))
+                    row["process_status"] = row.get("status") or "unknown"
+                    row["app_health"] = ("unknown" if ok is None
+                                         else ("ok" if ok else "failed"))
+                    if row.get("status") == "online" and ok is False:
+                        row["status"] = "unhealthy"
+                st["app_health"] = ("unknown" if not per_host
+                                    else ("ok" if all(per_host.values())
+                                          else "failed"))
+                st["recovery_status"] = next(
+                    (x.get("recovery_status")
+                     for x in st.get("hosts") or []
+                     if x.get("recovery_status") not in (None, "not_needed")),
+                    "not_needed")
+                # 整体 online 只在进程运行、应用健康且实例受管时成立
+                if st.get("status") == "online" and st["app_health"] == "failed":
+                    st["status"] = "unhealthy"
+                if (st.get("status") == "online"
+                        and st.get("config_status") in ("owner_mismatch",
+                                                        "unmanaged")):
+                    st["status"] = "unmanaged"
         # 持久化扩展指标快照：仅本轮新采集的 host（节流轮与采集失败轮不落库，
         # 快照写放大 3× → 1×）
         for host in fresh_hosts:

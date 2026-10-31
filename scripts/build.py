@@ -503,6 +503,59 @@ def _jar_search_dirs(proj: dict, project_root: Path) -> list:
     return dirs
 
 
+def _validate_war_zip(path: Path) -> None:
+    """安全检查 WAR：可读 ZIP、成员不穿越、无符号链接。"""
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as zf:
+            for info in zf.infolist():
+                name = info.filename.replace("\\", "/")
+                if name.startswith("/") or ".." in name.split("/"):
+                    raise ValueError(f"WAR 成员路径非法: {info.filename}")
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == 0o120000:
+                    raise ValueError(f"WAR 不允许符号链接: {info.filename}")
+    except zipfile.BadZipFile as e:
+        raise ValueError(f"不是有效 WAR/ZIP: {path}") from e
+
+
+def _select_war(proj: dict, project_root: Path) -> Path:
+    pattern = (proj.get("runtime_config") or {}).get("artifact_pattern") or "target/*.war"
+    candidates = []
+    for base in _jar_search_dirs(proj, project_root):
+        for p in base.glob(pattern):
+            if p.is_file() and p.suffix == ".war":
+                resolved = p.resolve()
+                if resolved not in candidates:
+                    candidates.append(resolved)
+    if not candidates:
+        fail(f"未找到 WAR（pattern={pattern}，基准目录 {project_root}）")
+    if len(candidates) > 1:
+        names = "、".join(str(p) for p in sorted(candidates))
+        fail(f"WAR 候选不唯一（{len(candidates)} 个），请收窄 artifact_pattern: {names}")
+    _validate_war_zip(candidates[0])
+    log(f"选中构建产物: {candidates[0]}")
+    return candidates[0]
+
+
+def _make_war_artifact(proj: dict, project_root: Path, version: str, config: dict) -> Path:
+    src = _select_war(proj, project_root)
+    service = proj.get("image_name") or proj.get("name") or "app"
+    dist_dir = Path(config["deploy"].get("dist_dir", "dist"))
+    if not dist_dir.is_absolute():
+        dist_dir = Path(__file__).resolve().parent.parent / dist_dir
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    out = dist_dir / f"{service}-{version}.war"
+    shutil.copy2(src, out)
+    h = hashlib.sha256()
+    with open(out, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    out.with_name(out.name + ".sha256").write_text(h.hexdigest() + "\n", encoding="utf-8")
+    log(f"WAR 产物已生成: {out}（sha256={h.hexdigest()[:12]}…）")
+    return out
+
+
 def _select_jar(proj: dict, project_root: Path) -> Path:
     """按 artifact_pattern 选择可执行 jar
 
@@ -754,8 +807,8 @@ def build_project(project_name: str, version: str, env: str = None):
     deploy_mode = proj.get("deploy_mode") or "container"
     artifact = {"static_archive": "archive", "jar_service": "jar",
                 "go_binary": "binary", "rust_binary": "binary",
-                "node_process": "package", "python_process": "package"
-                }.get(deploy_mode, "image")
+                "node_process": "package", "python_process": "package",
+                "war_tomcat": "war"}.get(deploy_mode, "image")
     # 只有 maven 构建才需要 profile；frontend 与 none（外部投入产物）都不该因环境名
     # 不在 local/dev/test/prod 而被 get_maven_profile 拦下
     profile = get_maven_profile(config, env) if build_type == "maven" else ""
@@ -781,6 +834,9 @@ def build_project(project_name: str, version: str, env: str = None):
         return
     if artifact == "jar":
         _make_jar_artifact(proj, project_root, version, config)
+        return
+    if artifact == "war":
+        _make_war_artifact(proj, project_root, version, config)
         return
     if artifact in ("binary", "package"):
         return  # 产物已在对应 _run_*_steps 内生成（含 .sha256），无后续打包

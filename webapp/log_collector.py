@@ -333,7 +333,8 @@ class LogCollector:
         result = {}
         for r in rows:
             cfg = parse_runtime_config(r["runtime_config"], r["deploy_mode"])
-            unit = derive_unit_name(cfg, r["image_name"], r["name"])
+            unit = derive_unit_name(cfg, r["image_name"], r["name"],
+                                    deploy_mode=r["deploy_mode"])
             result.setdefault(r["project_id"], []).append(
                 {"unit": unit, "service": r["service_name"] or r["name"]})
         return result

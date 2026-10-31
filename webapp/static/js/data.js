@@ -36,17 +36,19 @@ function computeAlerts(tasks, overview, monitorByProject){
            `已运行 ${Math.round(runningSec / 60)} 分钟（>30 分钟）`, t.started_at);
     }
   });
-  // 规则 3：服务异常（probe_failed / stopped / not_deployed 且服务 enabled）
+  // 规则 3：服务异常（probe_failed / stopped / not_deployed / unhealthy 且服务 enabled；unmanaged 不产生告警）
   Object.entries(monitorByProject || {}).forEach(([projectName, mon]) => {
     const svcs = (mon && mon.services) || {};
     Object.entries(svcs).forEach(([svcName, st]) => {
-      if (!['probe_failed', 'not_deployed', 'stopped'].includes(st.status)) return;
+      if (!['probe_failed', 'not_deployed', 'stopped', 'unhealthy'].includes(st.status)) return;
       const kind = st.status === 'probe_failed' ? '探测失败'
-        : st.status === 'stopped' ? '已停止' : '未部署';
+        : st.status === 'stopped' ? '已停止'
+        : st.status === 'unhealthy' ? '应用不健康' : '未部署';
       push('svc_' + projectName + '_' + svcName, 'warning', 'service',
            `服务 ${svcName}（${projectName}）${kind}`,
            st.status === 'probe_failed' ? 'SSH 探测无响应，请检查服务与网络'
              : st.status === 'stopped' ? '容器已停止（Exited），请启动服务'
+             : st.status === 'unhealthy' ? '进程在线但应用健康检查未通过，请查看服务日志'
              : '服务尚未部署到目标环境', st.ts || now);
     });
   });

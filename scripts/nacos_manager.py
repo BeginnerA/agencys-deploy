@@ -11,8 +11,9 @@ from common import load_config, get_nacos_auth, log, fail
 
 
 class NacosClient:
-    def __init__(self, env: str = None):
-        config = load_config(env=env)
+    def __init__(self, env: str = None, config: dict = None):
+        # config 非空时直接使用（DB 环境配置 {"nacos": {...}}），否则回落 YAML
+        config = config if config is not None else load_config(env=env)
         auth = get_nacos_auth(config)
         self.base = auth["url"]
         # url 为空 = 环境未接入 Nacos：调用方（deploy.Deployer.nacos_groups）据此跳过全部 Nacos 操作

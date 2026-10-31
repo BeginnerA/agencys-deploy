@@ -8,5 +8,6 @@ from . import go_binary  # noqa: F401 — 触发 @register GoBinaryStrategy
 from . import rust_binary  # noqa: F401 — 触发 @register RustBinaryStrategy
 from . import node_process  # noqa: F401 — 触发 @register NodeProcessStrategy
 from . import python_process  # noqa: F401 — 触发 @register PythonProcessStrategy
+from . import war_tomcat  # noqa: F401 — 触发 @register WarTomcatStrategy
 
 __all__ = ["DeployStrategy", "register", "create_strategy"]

@@ -70,6 +70,9 @@ def parse_common(cfg: dict, mode: str) -> dict:
 def parse_runtime_config(raw, deploy_mode: str = "jar_service") -> dict:
     """按 deploy_mode 分派；未知模式返回 {}（container/static 不消费该配置）"""
     mode = deploy_mode or "container"
+    if mode == "war_tomcat":
+        from .tomcat_config import parse_war_config
+        return parse_war_config(raw)
     if mode == "jar_service":
         from .jar_config import parse_runtime_config as parse_jar
         return parse_jar(raw)
@@ -127,6 +130,9 @@ def validate_common(cfg: dict, mode: str) -> list:
 def validate_runtime_config(raw, deploy_mode: str) -> list:
     """按 deploy_mode 分派；非进程族方式配置原样忽略（返回 []）"""
     mode = deploy_mode or "container"
+    if mode == "war_tomcat":
+        from .tomcat_config import validate_war_config
+        return validate_war_config(raw)
     if mode == "jar_service":
         from .jar_config import validate_jar_config
         return validate_jar_config(raw)
@@ -214,7 +220,15 @@ def sha256_file(path) -> str:
 
 
 def derive_unit_name(runtime_config, image_name: str = "",
-                     service_name: str = "") -> str:
-    """平台统一口径：unit_name → image_name → 服务名 → app（不含 .service）"""
+                     service_name: str = "", deploy_mode: str = "") -> str:
+    """平台统一口径：unit_name → image_name → 服务名 → app（不含 .service）
+
+    war_tomcat 显式分派：unit_name 缺省时不是裸服务名，而是 smartops-<svc>-war
+    （derive_war_unit 口径），避免与 jar/systemd 语义混淆。
+    """
     cfg = _as_dict(runtime_config)
+    if deploy_mode == "war_tomcat":
+        from .tomcat_config import derive_war_unit, parse_war_config
+        return derive_war_unit(parse_war_config(cfg),
+                               image_name or service_name or "app")
     return str(cfg.get("unit_name") or image_name or service_name or "app")

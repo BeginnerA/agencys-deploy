@@ -5,7 +5,8 @@
 
   // 进程族：deploy_mode → 固定/缺省 build_type；none 作为外部投入产物的兜底
   const PROCESS_BUILD = { jar_service: 'maven', go_binary: 'go', rust_binary: 'rust',
-                          node_process: 'node', python_process: 'python' };
+                          node_process: 'node', python_process: 'python',
+                          war_tomcat: 'maven' };
   const PROCESS_RC_DEFAULT = {
     jar_service: { java_bin: '/usr/bin/java', artifact_pattern: 'target/*.jar',
                    readiness: { type: 'http', path: '/actuator/health',
@@ -16,12 +17,20 @@
                     readiness: { type: 'process', path: '', timeout: 90, interval: 5 } },
     python_process: { requirements: 'requirements.txt', start_file: '',
                       readiness: { type: 'process', path: '', timeout: 90, interval: 5 } },
+    war_tomcat: {
+      app_home: '', tomcat_home: '', java_home: '', run_user: '',
+      unit_name: '', port: '', context_path: '', jvm_opts: [], env_files: [],
+      stop_timeout: 60, start_timeout: 120,
+      readiness: { type: 'http', path: '/', expected_status: 200,
+                   body_contains: '', timeout: 120, interval: 5 },
+    },
   };
 
   function open(container, project, svc, onSaved){
     const st = {
       project, container, onSaved,
       svcs: [],
+      envs: [],
       data: svc ? Object.assign(JSON.parse(JSON.stringify(svc)), { enabled: !!svc.enabled }) : {
         name:'', image_name:'', service_name:'', git_repo:'',
         git_branch:'', git_pull_before_build:false, git_tag_enabled:true,
@@ -45,7 +54,12 @@
     const bodyEl = document.getElementById('dwBody');
     (async () => {
       try{
-        st.svcs = (await api(`/api/projects/${project.id}/services`)).filter(x => !svc || x.id !== svc.id);
+        const [svcs, envs] = await Promise.all([
+          api(`/api/projects/${project.id}/services`),
+          api(`/api/projects/${project.id}/environments`).catch(() => []),
+        ]);
+        st.svcs = svcs.filter(x => !svc || x.id !== svc.id);
+        st.envs = envs;
         render();
       }catch(e){ bodyEl.innerHTML = errorState('加载失败：' + esc(e.message), 'navRetry'); }
     })();
@@ -59,6 +73,8 @@
       // ① 基本信息
       const isStatic = (d.deploy_mode || 'container') === 'static_archive';
       const isProc = !!PROCESS_BUILD[d.deploy_mode];
+      const isWar = d.deploy_mode === 'war_tomcat';
+      const isProcLike = isProc && !isWar;
       const isJar = d.deploy_mode === 'jar_service';
       const isGo = d.deploy_mode === 'go_binary';
       const isRust = d.deploy_mode === 'rust_binary';
@@ -74,12 +90,13 @@
               <option value="container" ${!isStatic && !isProc ? 'selected' : ''}>🐳 容器（Docker 镜像 + compose）</option>
               <option value="static_archive" ${isStatic ? 'selected' : ''}>🗂️ 静态站点（zip → 1Panel/nginx 目录）</option>
               <option value="jar_service" ${isJar ? 'selected' : ''}>☕ 纯 Java 进程（jar → systemd）</option>
+              <option value="war_tomcat" ${isWar ? 'selected' : ''}>🪶 WAR / Tomcat 独立实例（systemd）</option>
               <option value="go_binary" ${isGo ? 'selected' : ''}>🐹 Go 单二进制（systemd）</option>
               <option value="rust_binary" ${isRust ? 'selected' : ''}>🦀 Rust 单二进制（systemd）</option>
               <option value="node_process" ${d.deploy_mode === 'node_process' ? 'selected' : ''}>🟩 Node 进程（systemd）</option>
               <option value="python_process" ${d.deploy_mode === 'python_process' ? 'selected' : ''}>🐍 Python 进程（wheelhouse + venv）</option>
             </select>
-            <div class="f-hint">静态站点：前端构建产物 zip 上传 1Panel 站点目录解压切换，无容器无 Nacos；版本号用日期号 YYYYMMDD 而非 semver。纯 Java 进程：Maven 构建出可执行 jar，按版本放入 app_home/releases 并切换 CURRENT 链接，由 systemd 托管；无容器、无镜像。Go/Rust 单二进制：平台机交叉编译（Go）或本地构建（Rust）出 Linux 可执行文件，按版本放入 app_home/releases 并切换 CURRENT 链接；目标机零运行时依赖。单实例重启期间服务短暂不可用，不承诺零停机。Node 进程：平台机 npm 构建（ci/build/prune）打 tar.gz（含 node_modules），目标机仅需 node；Python 进程：平台机收集 manylinux wheel，目标机 app_home/venv 离线安装，需预装 python3-venv。</div>
+            <div class="f-hint">静态站点：前端构建产物 zip 上传 1Panel 站点目录解压切换，无容器无 Nacos；版本号用日期号 YYYYMMDD 而非 semver。纯 Java 进程：Maven 构建出可执行 jar，按版本放入 app_home/releases 并切换 CURRENT 链接，由 systemd 托管；无容器、无镜像。WAR / Tomcat：WAR 版本化部署到目标机已有 Tomcat，共享 CATALINA_HOME，固定独立实例（CATALINA_BASE 由平台生成）+ systemd 托管；不启用 Manager、不管理 Tomcat/JDK 安装。Go/Rust 单二进制：平台机交叉编译（Go）或本地构建（Rust）出 Linux 可执行文件，按版本放入 app_home/releases 并切换 CURRENT 链接；目标机零运行时依赖。单实例重启期间服务短暂不可用，不承诺零停机。Node 进程：平台机 npm 构建（ci/build/prune）打 tar.gz（含 node_modules），目标机仅需 node；Python 进程：平台机收集 manylinux wheel，目标机 app_home/venv 离线安装，需预装 python3-venv。</div>
           </div>
           <div class="field full" style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
             <label style="margin:0;white-space:nowrap">启用状态</label>
@@ -116,9 +133,10 @@
         </div>`;
       // ② 构建配置（静态=前端；jar=Maven；go/rust=go/rust；node/python=node/python（均可切 none 外部投入））
       const isFrontend = isStatic || (!isProc && d.build_type === 'frontend');
-      const btLocked = isStatic || isJar;  // 构建类型跟随发布方式锁定
+      const btLocked = isStatic || isJar || isWar;  // 构建类型跟随发布方式锁定
       const btOptions = (mode) => {
         if (mode === 'jar_service') return `<option value="maven" selected>☕ Java (Maven)</option>`;
+        if (mode === 'war_tomcat') return `<option value="maven" selected>☕ Java (Maven)</option>`;
         if (mode === 'go_binary') return `<option value="go" ${d.build_type === 'go' ? 'selected' : ''}>🐹 Go 交叉编译</option><option value="none" ${d.build_type === 'none' ? 'selected' : ''}>📦 外部投入产物（none）</option>`;
         if (mode === 'rust_binary') return `<option value="rust" ${d.build_type === 'rust' ? 'selected' : ''}>🦀 Cargo 构建</option><option value="none" ${d.build_type === 'none' ? 'selected' : ''}>📦 外部投入产物（none）</option>`;
         if (mode === 'node_process') return `<option value="node" ${d.build_type === 'node' ? 'selected' : ''}>🟩 Node (npm)</option><option value="none" ${d.build_type === 'none' ? 'selected' : ''}>📦 外部投入产物（none）</option>`;
@@ -143,7 +161,7 @@
           <div class="field full"><label>构建步骤（commands）</label>
             ${H.cmdList({ id:'sBuildOrder', rows: d.build_order }).html}
             <div class="f-hint">每个步骤填写工作目录和命令列表（每行一条命令，框高随内容自动伸展）；支持 \${VERSION} 变量替换；自动探测 npm/pnpm/yarn 可执行路径；步骤级环境变量（env，如 NODE_OPTIONS）保存时原样保留。</div>
-          </div>` : (isProc && !isJar ? `
+          </div>` : (isProc && !isJar && !isWar ? `
           <div class="field full"><span class="weak">Go / Rust / Node / Python 构建无需 build_order：Go、Rust 的产物定位用构建配置（build.go_main / build.rust_bin），Node、Python 直接以项目根为工作目录，详见使用文档。</span></div>` : `
           <div class="field full"><label>构建顺序（build_order）</label>
             ${H.rowList({ id:'sBuildOrder', rows: d.build_order }).html}
@@ -192,6 +210,58 @@
           <button class="btn" id="jUnitPreview" type="button" ${d.id ? '' : 'disabled title="保存后可预览"'}>预览 systemd 单元</button>
           <pre id="jUnitContent" class="weak" style="display:none;white-space:pre-wrap;font-size:12px;margin:0"></pre>
         </div>` : '';
+      // ②d WAR/Tomcat 实例托管配置（deploy_mode=war_tomcat）
+      const warCfg = isWar ? `
+        <div class="form-grid">
+          ${H.field({ label:'应用根目录（app_home）', required:true,
+            input:`<input id="jAppHome" value="${esc(rc.app_home || '')}" placeholder="/opt/apps/orders">`,
+            hint:'实例目录为 {app_home}/instance；平台不改账号、sudo 或防火墙' })}
+          ${H.field({ label:'Tomcat 安装目录（tomcat_home）', required:true,
+            input:`<input id="wTomcatHome" value="${esc(rc.tomcat_home || '')}" placeholder="/opt/tomcat">`,
+            hint:'共享 CATALINA_HOME；平台不安装 Tomcat，只生成 CATALINA_BASE' })}
+          ${H.field({ label:'JDK 目录（java_home）', required:true,
+            input:`<input id="wJavaHome" value="${esc(rc.java_home || '')}" placeholder="/usr/lib/jvm/java-17">`,
+            hint:'目标机已安装 JDK；平台不安装、不切换默认 Java' })}
+          ${H.field({ label:'上下文路径（context_path）', required:true,
+            input:`<input id="wContext" value="${esc(rc.context_path || '/')}" placeholder="/orders">`,
+            hint:'/ 表示根上下文；生成外部 Context XML，不写入 server.xml' })}
+          ${H.field({ label:'端口（port）', required:true,
+            input:`<input id="jPort" type="number" value="${esc(rc.port || '')}" placeholder="18080">`,
+            hint:'唯一 HTTP Connector 端口；关闭 AJP/Manager/远程 shutdown' })}
+          ${H.field({ label:'运行用户（run_user）', required:true,
+            input:`<input id="jRunUser" value="${esc(rc.run_user || '')}" placeholder="appuser">`,
+            hint:'目标机已存在且 UID 非 0 的账号；平台不创建账号、不改 sudo' })}
+          ${H.field({ label:'systemd 单元名（unit_name）',
+            input:`<input id="jUnit" value="${esc(rc.unit_name || '')}" placeholder="留空默认 smartops-{服务}-war">` })}
+          ${H.field({ label:'JVM 参数（jvm_opts，每行一项）',
+            input:`<textarea id="wJvmOpts" rows="2" placeholder="-Xms512m&#10;-Xmx1g">${esc((Array.isArray(rc.jvm_opts) ? rc.jvm_opts : String(rc.jvm_opts || '').split('\n')).filter(Boolean).join('\n'))}</textarea>`,
+            hint:'逐项写入 systemd argv；禁止换行注入、catalina.base/home、classpath 等平台接管参数' })}
+          ${H.field({ label:'环境变量文件（env_files）',
+            input:`<textarea id="wEnvFiles" rows="2" placeholder="/opt/apps/orders/.env">${esc((rc.env_files || []).join('\n'))}</textarea>`,
+            hint:'只写路径；敏感值留在目标机已有环境文件，预览与审计不显示密钥' })}
+          ${H.field({ label:'健康路径（readiness.path）', required:true,
+            input:`<input id="wHealthPath" value="${esc(rc.readiness?.path || '/')}" placeholder="/health">`,
+            hint:'经 SSH 直连 127.0.0.1:port 探活，不跟随跳转、不使用目标机 curl' })}
+          ${H.field({ label:'响应体包含（可选）',
+            input:`<input id="wBodyContains" value="${esc(rc.readiness?.body_contains || '')}" placeholder="可选固定文本">`,
+            hint:'首版只接受 HTTP 200；响应体最多读取 1 MiB；超时即任务失败，不会静默切版本' })}
+          ${H.field({ label:'健康超时/间隔（秒）',
+            input:`<input id="wHealthTimeout" type="number" value="${esc(rc.readiness?.timeout || 120)}" style="width:45%"> <input id="wHealthInterval" type="number" value="${esc(rc.readiness?.interval || 5)}" style="width:45%">` })}
+          ${H.field({ label:'停止/启动超时（秒）',
+            input:`<input id="jStopTimeout" type="number" value="${esc(rc.stop_timeout || 60)}" style="width:45%"> <input id="jStartTimeout" type="number" value="${esc(rc.start_timeout || 120)}" style="width:45%">` })}
+          <div class="field full"><label>目标环境</label>
+            <select id="wEnv">${(st.envs || []).map(e => `<option value="${esc(e.name)}" ${e.is_default ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</select>
+            <div class="f-hint">预览/接入/更新/恢复均作用于该环境绑定的全部主机；操作仅管理员可用。</div>
+          </div>
+          <div class="field full" style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn" id="wPreviewBtn" data-war="preview" type="button" ${d.id ? '' : 'disabled title="保存后可预览"'}>预览实例配置</button>
+            <button class="btn" id="wOnboardBtn" data-war="onboard" type="button" ${d.id ? '' : 'disabled'}>接入实例（不启动）</button>
+            <button class="btn" id="wConfigBtn" data-war="config" type="button" ${d.id ? 'title="未接入或维护中的主机会被后端逐台拒绝"' : 'disabled title="保存后可预览"'}>更新配置（摘流并停止）</button>
+            <button class="btn" id="wRecoveryBtn" data-war="recovery" type="button" ${d.id ? '' : 'disabled'}>人工恢复检查</button>
+          </div>
+          <div class="hint">配置更新会先保留流量快照并摘流，再受控停止实例并落配置；完成后不自动启动，只能选择「结束维护并重启」恢复原权重。</div>
+          <pre id="wPreviewContent" class="weak" style="display:none;white-space:pre-wrap;font-size:12px;margin:0"></pre>
+        </div>` : '';
       // ③ 注册中心与任务调度
       const reg = `
         <div class="form-grid">
@@ -226,9 +296,11 @@
         H.section({ id:'build', icon:'🔨', title:'构建配置', desc:isStatic ? '前端构建步骤与静态打包产出' : (isProc ? '进程族构建与产物' : '构建顺序与 Docker 上下文'), open:!!(d.build_order.length || isStatic || isProc), body: build }),
         isStatic
           ? H.section({ id:'static', icon:'🗂️', title:'静态站点', desc:'1Panel 站点目录与 zip 产物约定', open:true, body: staticCfg })
-          : (isProc
-              ? H.section({ id:'jar', icon:'⚙️', title:'进程配置', desc:'app_home / systemd 单元 / 就绪方式', open:true, body: procCfg })
-              : null),
+          : (isWar
+              ? H.section({ id:'war', icon:'🪶', title:'WAR / Tomcat 实例', desc:'固定独立实例 / 预览与接入 / 受控配置更新', open:true, body: warCfg })
+              : (isProcLike
+                  ? H.section({ id:'jar', icon:'⚙️', title:'进程配置', desc:'app_home / systemd 单元 / 就绪方式', open:true, body: procCfg })
+                  : null)),
         isStatic ? null : H.section({ id:'reg', icon:'🛰️', title:'注册中心与任务调度', desc:'Nacos 分组 / Dubbo / SnailJob', open:!!(d.nacos_groups.length || d.dubbo_services.length || d.snailjob_group), body: reg }),
         H.section({ id:'health', icon:'💚', title:'健康检查与日志', desc:isStatic ? '站点探活 URL（发布后 HTTP 验证）' : '探活端口 / URL / 启动失败判定', open:true, body: health }),
       ].filter(Boolean);
@@ -341,6 +413,90 @@
           pre.textContent = `# ${res.unit_name}.service\n\n${res.content}`;
         } catch (e) { toastError(e.message); }
       };
+      // WAR 实例托管操作：预览/接入/受控更新/人工恢复（仅管理员，后端再校验一次）
+      document.querySelectorAll('[data-war]').forEach(b => {
+        b.onclick = () => warAction(b.dataset.war);
+      });
+
+      function warEnv() {
+        const el = document.getElementById('wEnv');
+        return el ? el.value : '';
+      }
+
+      function renderWar(data) {
+        const box = document.getElementById('wPreviewContent');
+        if (!box) return;
+        const lines = [];
+        for (const h of (data.hosts || [])) {
+          lines.push(`[${h.host}] unit=${h.unit || '—'} instance=${h.instance_id || '—'}`
+            + ` config=${h.config_status || '—'}`);
+          if (h.digest) lines.push('  digest: ' + h.digest);
+          if (h.status) lines.push('  status: ' + h.status
+            + (h.started === false ? '（未启动）' : ''));
+        }
+        for (const f of (data.failed || [])) {
+          lines.push(`[${f.host}] 失败: ${f.error}`);
+        }
+        if (data.note) lines.push('', data.note);
+        const first = (data.hosts || [])[0];
+        if (first && first.unit_content) lines.push('', '--- unit ---', first.unit_content);
+        box.textContent = lines.join('\n');
+        box.style.display = 'block';
+      }
+
+      async function warAction(kind) {
+        if (!d.id) { toastError('请先保存服务'); return; }
+        const env = warEnv();
+        if (!env) { toastError('请先选择目标环境'); return; }
+        const base = `/api/projects/${project.id}/services/${d.id}/tomcat`;
+        // 207 部分失败兼容：api() 目前对 2xx 一律正常返回（err.data 分支为
+        // 未来 api() 对 207 抛错时兜底），因此成败都从响应体的 failed 读取，
+        // 绝不把 207 当整体成功。
+        const partial = (data) => {
+          renderWar(data);
+          toastError(`部分主机失败（${(data.failed || []).length} 台）`);
+        };
+        try {
+          if (kind === 'preview') {
+            const data = await api(`${base}/preview?env=${encodeURIComponent(env)}`);
+            (data.failed || []).length ? partial(data) : renderWar(data);
+            return;
+          }
+          if (kind === 'recovery') {
+            renderWar(await api(`${base}/recovery?env=${encodeURIComponent(env)}`));
+            return;
+          }
+          const preview = await api(`${base}/preview?env=${encodeURIComponent(env)}`);
+          if ((preview.failed || []).length) { renderWar(preview); return; }
+          const hosts = (preview.hosts || []).map(h => ({
+            host: h.host, instance_id: h.instance_id, digest: h.digest}));
+          if (!hosts.length) { toastError('没有可操作主机'); return; }
+          const label = kind === 'onboard'
+            ? '接入（只写实例与 unit，不启动）'
+            : '更新配置（先摘流并停止，完成后不启动）';
+          if (!await confirmDialog(
+              `确认对 ${hosts.length} 台主机${label}？\n${hosts.map(h => h.host).join('、')}`)) {
+            return;
+          }
+          const body = { env, confirm: true, hosts };
+          if (kind === 'config') body.action = 'update';
+          const data = await api(`${base}/${kind === 'onboard' ? 'onboard' : 'config'}`,
+            { method: 'POST', body: JSON.stringify(body) });
+          if ((data.failed || []).length) { partial(data); return; }
+          renderWar(data);
+          toastSuccess(kind === 'onboard'
+            ? '实例已接入（未启动）'
+            : '配置已更新（实例未启动，请结束维护并重启）');
+        } catch (e) {
+          // api() 对 207 抛错时，逐主机结果在 e.data
+          if (e.data && Array.isArray(e.data.failed)) {
+            renderWar(e.data);
+            toastError(`部分主机失败（${e.data.failed.length} 台）`);
+          } else {
+            toastError(e.message);
+          }
+        }
+      }
     }
 
     function collect(){
@@ -355,13 +511,14 @@
       const isStatic = d.deploy_mode === 'static_archive';
       const isProc = !!PROCESS_BUILD[d.deploy_mode];
       const isJar = d.deploy_mode === 'jar_service';
+      const isWar = d.deploy_mode === 'war_tomcat';
       d.site_root = val('sSiteRoot').trim();
       d.backup_dir = val('sBackupDir').trim();
       d.static_dist_dir = val('sStaticDist').trim();
       d.zip_prefix = val('sZipPrefix').trim();
       d.entry_file = val('sEntryFile').trim();
       d.file_mode = val('sFileMode').trim();
-      d.build_type = isJar ? 'maven'
+      d.build_type = (isJar || isWar) ? 'maven'
         : (isProc ? (val('sBuildType') || PROCESS_BUILD[d.deploy_mode])
                   : (isStatic ? 'frontend' : (val('sBuildType') || 'maven')));
       d.service_name = val('sCompose').trim();
@@ -375,7 +532,7 @@
       d.enabled = document.getElementById('sEnabled').checked;
       d.build_order = (d.build_type === 'frontend'
         ? H.cmdList({ id:'sBuildOrder', rows:[] }).read()
-        : (isProc && !isJar ? [] : H.rowList({ id:'sBuildOrder', rows:[] }).read()));
+        : (isProc && !isJar && !isWar ? [] : H.rowList({ id:'sBuildOrder', rows:[] }).read()));
       d.nacos_groups = H.tagInput({ id:'sNacosGroups', values:[] }).read();
       d.dubbo_services = H.tagInput({ id:'sDubbo', values:[] }).read();
       d.log_error_keywords = H.tagInput({ id:'sLogKw', values:[] }).read();
@@ -392,7 +549,54 @@
         if (!d[key]){ H.fieldErr(id, msg); ok = false; }
         else H.fieldErr(id, '');
       });
-      if (isProc) {
+      if (isWar) {
+        // WAR / Tomcat：独立收集分支（不与通用进程分支共用字段 id）
+        const num = (id, dflt) => {
+          const n = Number(val(id));
+          return Number.isFinite(n) && n > 0 ? n : dflt;
+        };
+        d.runtime_config = {
+          app_home: val('jAppHome').trim(),
+          tomcat_home: val('wTomcatHome').trim(),
+          java_home: val('wJavaHome').trim(),
+          run_user: val('jRunUser').trim(),
+          unit_name: val('jUnit').trim(),
+          port: Number(val('jPort') || 0),
+          context_path: val('wContext').trim() || '/',
+          jvm_opts: val('wJvmOpts').split('\n').map(x => x.trim()).filter(Boolean),
+          env_files: val('wEnvFiles').split('\n').map(x => x.trim()).filter(Boolean),
+          stop_timeout: num('jStopTimeout', 60),
+          start_timeout: num('jStartTimeout', 120),
+          readiness: {
+            type: 'http',
+            path: val('wHealthPath').trim() || '/',
+            expected_status: 200,
+            body_contains: val('wBodyContains').trim(),
+            timeout: num('wHealthTimeout', 120),
+            interval: num('wHealthInterval', 5),
+          },
+        };
+        const abs = [['jAppHome', '应用根目录'], ['wTomcatHome', 'Tomcat 目录'],
+                     ['wJavaHome', 'JDK 目录']];
+        for (const [id, label] of abs) {
+          if (!val(id).trim().startsWith('/')) {
+            H.fieldErr(id, label + '必须为绝对路径'); ok = false;
+          } else H.fieldErr(id, '');
+        }
+        if (!val('wContext').trim().startsWith('/')) {
+          H.fieldErr('wContext', '上下文路径必须以 / 开头'); ok = false;
+        } else H.fieldErr('wContext', '');
+        if (!val('wHealthPath').trim().startsWith('/')) {
+          H.fieldErr('wHealthPath', '健康路径必须以 / 开头'); ok = false;
+        } else H.fieldErr('wHealthPath', '');
+        const p = d.runtime_config.port;
+        if (!(Number.isInteger(p) && p >= 1024 && p <= 65535)) {
+          H.fieldErr('jPort', '端口必须为 1024-65535 的整数'); ok = false;
+        } else H.fieldErr('jPort', '');
+        if (!d.runtime_config.run_user) {
+          H.fieldErr('jRunUser', '运行用户必须填写目标机已存在的非 root 账号'); ok = false;
+        } else H.fieldErr('jRunUser', '');
+      } else if (isProc) {
         const num = (id, dflt) => {
           const n = Number(val(id));
           return Number.isFinite(n) && n > 0 ? n : dflt;

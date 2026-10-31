@@ -99,6 +99,22 @@ class DeployStrategy:
         """
         return False
 
+    # ---------- 严格主机生命周期（WAR/Tomcat 显式 opt-in） ----------
+
+    # 严格主机生命周期：WAR/Tomcat 显式 opt-in，旧七种策略保持 False 走原编排路径
+    strict_host_lifecycle = False
+
+    def deploy_host(self, server, server_entry: dict = None):
+        raise NotImplementedError("当前发布方式未实现严格主机发布")
+
+    def rollback_host(self, server, target_version: str,
+                      server_entry: dict = None):
+        raise NotImplementedError("当前发布方式未实现严格主机回滚")
+
+    def restart_host(self, server, server_entry: dict = None,
+                     release_maintenance: bool = False):
+        raise NotImplementedError("当前发布方式未实现严格主机重启")
+
 
 def register(cls):
     if not getattr(cls, "name", ""):
