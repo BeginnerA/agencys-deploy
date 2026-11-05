@@ -13,11 +13,14 @@ import os
 import sys
 import json
 import time
+import queue
 import shutil
+import signal
 import hashlib
 import tarfile
 import zipfile
 import subprocess
+import threading
 import argparse
 from pathlib import Path
 from common import (load_config, get_project_config, get_registry_auth,
@@ -257,6 +260,119 @@ def is_transient_io_failure(output: str) -> bool:
     return "repackage failed" in output and "out of bounds for length" in output
 
 
+def _kill_process_tree(proc) -> None:
+    """终止命令及其全部子进程
+
+    Windows 上 proc.kill() 只结束直接子进程：构建命令多在 cmd.exe 包装层下运行，
+    Maven 真正的 java.exe、npm 的 node 都是孙进程，只杀直接子进程会让它们继续
+    持有输出管道，调用方读取管道时继续阻塞（超时形同虚设）。
+    """
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=10)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _run_streaming(cmd, cwd, env: dict = None, timeout: int = None,
+                   shell: bool = False, on_line=None) -> tuple:
+    """执行命令并逐行透传输出，超时终止整棵进程树
+
+    返回 (returncode, 完整输出)。on_line 省略时按 '  | 行内容' 打印，
+    与既有日志格式保持一致。超时抛 subprocess.TimeoutExpired，由调用方报错。
+    """
+    emit = on_line or (lambda line: print(f"  | {line}", flush=True))
+    popen_kwargs = dict(
+        cwd=cwd, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, errors="replace", bufsize=1, shell=shell,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+    )
+    if os.name != "nt":
+        # 独立进程组：超时后按组终止，连带 shell/孙进程一并结束
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+
+    chunks: list = []
+    lines: "queue.Queue" = queue.Queue()
+
+    def reader():
+        try:
+            for raw in proc.stdout:
+                chunks.append(raw)
+                line = raw.rstrip("\r\n")
+                if line:
+                    lines.put(line)
+        finally:
+            lines.put(None)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+
+    def close_pipe():
+        # 读者线程仍在读时由 GC 回收，避免主线程关闭流引发 ValueError
+        if proc.stdout is not None and not thread.is_alive():
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+
+    deadline = None if timeout is None else time.monotonic() + timeout
+    timed_out = False
+    while True:
+        wait = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            # 分片等待，保证截止时间到点在输出停止时也能及时生效
+            wait = min(remaining, 0.5)
+        try:
+            line = lines.get(timeout=wait)
+        except queue.Empty:
+            continue
+        if line is None:
+            break
+        emit(line)
+
+    if timed_out:
+        _kill_process_tree(proc)
+        # 终止后的短等待只为回收句柄：绝不能无限期等孙进程自然退出
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        thread.join(timeout=5)
+        close_pipe()
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    rc = proc.wait()
+    thread.join(timeout=5)
+    close_pipe()
+    return rc, "".join(chunks)
+
+
 def run(cmd: list, cwd: Path, env: dict = None, timeout: int = None,
         retry_on_clean_failure: bool = False,
         max_retries: int = 2, retry_delay: int = 3):
@@ -269,35 +385,20 @@ def run(cmd: list, cwd: Path, env: dict = None, timeout: int = None,
     """
     log(f"执行: {' '.join(cmd)}")
     try:
-        result = subprocess.run(
-            cmd, cwd=cwd, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=timeout,
-        )
-        # 实时输出已经通过 PIPE 捕获，统一打印
-        if result.stdout:
-            for line in result.stdout.rstrip().splitlines():
-                print(f"  | {line}", flush=True)
-        if result.returncode != 0 and retry_on_clean_failure and is_transient_io_failure(result.stdout or ""):
+        rc, output = _run_streaming(cmd, cwd, env=env, timeout=timeout)
+        if rc != 0 and retry_on_clean_failure and is_transient_io_failure(output):
             for attempt in range(1, max_retries + 1):
                 log(f"构建目录/生成文件可能被其他进程占用（IDE 编译、杀毒扫描等），{retry_delay} 秒后自动重试（第 {attempt}/{max_retries} 次）")
                 time.sleep(retry_delay)
-                result = subprocess.run(
-                    cmd, cwd=cwd, env=env,
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, timeout=timeout,
-                )
-                if result.stdout:
-                    for line in result.stdout.rstrip().splitlines():
-                        print(f"  | {line}", flush=True)
-                if result.returncode == 0:
+                rc, output = _run_streaming(cmd, cwd, env=env, timeout=timeout)
+                if rc == 0:
                     return
-                if not is_transient_io_failure(result.stdout or ""):
+                if not is_transient_io_failure(output):
                     break
-        if result.returncode != 0:
-            if is_transient_io_failure(result.stdout or ""):
+        if rc != 0:
+            if is_transient_io_failure(output):
                 log("提示: 若本机 IDE 打开了该项目且正在编译，请关闭项目窗口后重试发布")
-            fail(f"命令执行失败 (rc={result.returncode}): {' '.join(cmd)}")
+            fail(f"命令执行失败 (rc={rc}): {' '.join(cmd)}")
     except subprocess.TimeoutExpired:
         fail(f"命令超时 ({timeout}s): {' '.join(cmd)}")
     except FileNotFoundError:
@@ -312,16 +413,9 @@ def run_shell(cmd: str, cwd: Path, env: dict = None, timeout: int = None):
     log(f"执行: {cmd}")
     shell_cmd = cmd if os.name != "nt" else f'cmd /c "{cmd}"'
     try:
-        result = subprocess.run(
-            shell_cmd, cwd=cwd, env=env,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, shell=True, timeout=timeout,
-        )
-        if result.stdout:
-            for line in result.stdout.rstrip().splitlines():
-                print(f"  | {line}", flush=True)
-        if result.returncode != 0:
-            fail(f"命令执行失败 (rc={result.returncode}): {cmd}")
+        rc, _ = _run_streaming(shell_cmd, cwd, env=env, timeout=timeout, shell=True)
+        if rc != 0:
+            fail(f"命令执行失败 (rc={rc}): {cmd}")
     except subprocess.TimeoutExpired:
         fail(f"命令超时 ({timeout}s): {cmd}")
 
@@ -426,8 +520,10 @@ def _run_maven_steps(proj: dict, project_root: Path, version: str,
             f"-P{maven_profiles}", f"-Drevision={version}", "-DskipTests",
         ]
         # Windows 下 target 可能被 IDE 增量编译/杀毒等瞬时占用导致 clean 失败或
-        # 读取生成文件失败，自动重试自愈（间隔 5 秒 × 3 次，给足 IDE 编译窗口）
-        run(cmd, project_root, env=_step_env(env_vars, step), timeout=600,
+        # 读取生成文件失败，自动重试自愈（间隔 5 秒 × 3 次，给足 IDE 编译窗口）。
+        # 超时上限 1800 秒：冷机多模块全量编译（依赖首次下载）正常可超过 10 分钟，
+        # 短上限会把仍在正常推进的构建误杀。
+        run(cmd, project_root, env=_step_env(env_vars, step), timeout=1800,
             retry_on_clean_failure=True, max_retries=3, retry_delay=5)
 
 
