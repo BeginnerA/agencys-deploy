@@ -23,7 +23,12 @@ DEFAULTS = {
 
 
 def _env(name: str) -> str:
-    return os.environ.get(_ENV_PREFIX + name, "").strip()
+    """按文档里的全大写名取环境变量（AGENT_LLM_BASE_URL 等）
+
+    配置项名是小写的 base_url，拼上去必须 upper()：Linux 的 os.environ 区分大小写，
+    Windows 不区分——少这一步，环境变量只在开发机上"看起来生效"，生产上永远读不到。
+    """
+    return os.environ.get(_ENV_PREFIX + name.upper(), "").strip()
 
 
 def _bool_env(name: str, default: bool = False) -> bool:

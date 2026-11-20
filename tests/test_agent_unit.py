@@ -232,6 +232,21 @@ class TestLlmGateway(AgentBase):
         self.assertEqual(s2["base_url"], "https://env/v1")
         self.assertTrue(agent_config.llm_available(self.db))
 
+    def test_env_names_are_the_documented_uppercase_ones(self):
+        """README/错误提示里写的是 AGENT_LLM_BASE_URL 这种全大写名，而 Linux 的进程环境
+        区分大小写。Windows 的 os.environ 不区分大小写，会把拼错的大小写一起兜住，
+        本机永远发现不了「生产上环境变量根本没生效」——所以这里用普通 dict 冒充
+        区分大小写的进程环境，把两个平台的行为对齐到用例里。"""
+        from agent import config as agent_config
+        env = {"AGENT_LLM_BASE_URL": "https://env/v1",
+               "AGENT_LLM_API_KEY": "env-key",
+               "AGENT_LLM_MODEL": "env-model"}
+        with mock.patch.object(os, "environ", env):
+            s = agent_config.get_llm_settings()
+        self.assertEqual(s["base_url"], "https://env/v1")
+        self.assertEqual(s["api_key"], "env-key")
+        self.assertEqual(s["model"], "env-model")
+
     def test_stream_chat_sse_parse_and_tool_assembly(self):
         from agent import llm as llm_mod
         lines = [
