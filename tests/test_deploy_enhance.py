@@ -238,7 +238,6 @@ class TestDeployScheduler(unittest.TestCase):
     def test_submit_failure_does_not_advance_next_run(self):
         """提交失败时保留 next_run_at/enabled，等待下轮重试"""
         from webapp.deploy_scheduler import DeployScheduler
-        now = int(time.time())
         sid = self._cron_schedule(name="retry")
         before = dbm.get_record(self.db, "deploy_schedules", sid)
         scheduler = DeployScheduler(self.db)
@@ -478,7 +477,7 @@ class TestDeployEnhanceAPI(unittest.TestCase):
             version="1.0.0", image_versions='{"auth":"auth:1.0.0"}',
             nacos_config_hash="aaa", env_vars_hash="eee",
             deployed_at=now - 200))
-        sid2 = dbm.create_record(self.db_path, "deployment_snapshots", dict(
+        dbm.create_record(self.db_path, "deployment_snapshots", dict(
             project_id=self.proj_id, env="prod", task_id=2,
             version="1.1.0", image_versions='{"auth":"auth:1.1.0"}',
             nacos_config_hash="bbb", env_vars_hash="eee",
@@ -590,7 +589,7 @@ class TestCanaryAutoAdvance(unittest.TestCase):
 
     def test_wait_canary_decision_missing_file(self):
         """无决策请求文件时，read 返回 none 状态（API 侧表现为无请求）"""
-        from deploy import read_canary_decision, canary_decision_path
+        from deploy import read_canary_decision
         tmp_dir = tempfile.mkdtemp()
 
         def fake_path(task_id, data_dir=None):

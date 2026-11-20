@@ -1,5 +1,4 @@
 """SnailJob 定时任务管理：备份、暂停、恢复、清零巡检计数器"""
-import sys
 import json
 import argparse
 import datetime
@@ -101,7 +100,7 @@ def restore_jobs(group_name: str, backup, env: str = None):
         backup = backup["snapshot"]
     resume_ids = [str(i) for i, s in backup.items() if int(s) == 1]
     if not resume_ids:
-        log(f"快照中无备份时为运行状态的任务，无需恢复")
+        log("快照中无备份时为运行状态的任务，无需恢复")
         return
     conn = connect(env=env)
     try:

@@ -1,5 +1,4 @@
 """实时探测调度器：周期 SSH 容器状态 + Nacos 实例健康，内存缓存供大屏轮询"""
-import json
 import re
 import shlex
 import sys
@@ -518,7 +517,6 @@ def _compute_security(servers: list) -> dict:
         return {"score": None, "key_ratio": None, "total": 0}
     key_count = sum(1 for s in servers if s.get("ssh_key_file"))
     pwd_only = sum(1 for s in servers if not s.get("ssh_key_file") and s.get("ssh_password"))
-    no_auth = sum(1 for s in servers if not s.get("ssh_key_file") and not s.get("ssh_password"))
     total = len(servers)
     key_ratio = key_count / total if total else 0
     # 评分：密钥认证 1.0 + 仅密码 0.4 + 无认证 0.0
@@ -538,10 +536,10 @@ def _parse_host_metrics(out: str) -> dict:
     """
     metrics = {"cpu": None, "mem": None, "disk": None, "load": None,
                "cpu_raw": None}
-    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
     # /proc/stat 首行: cpu user nice system idle iowait irq softirq steal...
-    for l in lines:
-        parts = l.split()
+    for ln in lines:
+        parts = ln.split()
         if parts and parts[0] == "cpu" and len(parts) >= 5:
             try:
                 vals = [int(v) for v in parts[1:9]]
@@ -552,20 +550,20 @@ def _parse_host_metrics(out: str) -> dict:
             break
     # /proc/meminfo
     mi = {}
-    for l in lines:
+    for ln in lines:
         for k in ("MemTotal", "MemFree", "Buffers", "Cached"):
-            if l.startswith(k + ":"):
+            if ln.startswith(k + ":"):
                 try:
-                    mi[k] = int(l.split()[1])
+                    mi[k] = int(ln.split()[1])
                 except (ValueError, IndexError):
                     pass
     if mi.get("MemTotal"):
         free = mi.get("MemFree", 0) + mi.get("Buffers", 0) + mi.get("Cached", 0)
         metrics["mem"] = round((mi["MemTotal"] - free) / mi["MemTotal"] * 100, 1)
     # df -P /
-    for l in lines:
-        parts = l.split()
-        if "/" in parts and l.startswith("/dev/"):
+    for ln in lines:
+        parts = ln.split()
+        if "/" in parts and ln.startswith("/dev/"):
             for p in parts:
                 if p.endswith("%"):
                     try:
@@ -576,13 +574,13 @@ def _parse_host_metrics(out: str) -> dict:
             break
     # CPU 核数（grep -c 输出纯数字行）
     ncpu = 1
-    for l in lines:
-        if l.isdigit():
-            ncpu = max(1, int(l))
+    for ln in lines:
+        if ln.isdigit():
+            ncpu = max(1, int(ln))
             break
     # load average（1min）/ CPU 核数 → 百分比
-    for l in lines:
-        parts = l.split()
+    for ln in lines:
+        parts = ln.split()
         if len(parts) >= 3 and "." in parts[0]:
             try:
                 load1 = float(parts[0])
@@ -698,7 +696,7 @@ def _parse_network(out: str) -> dict:
     """解析网络流量（两次 /proc/net/dev 采样差值 / 1s 间隔）
     返回 {"net_rx": bytes/s, "net_tx": bytes/s}，取所有非 lo 接口总和"""
     result = {"net_rx": None, "net_tx": None}
-    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
     # /proc/net/dev 格式: 2 行 header + N 行数据
     # 命令: head -5 /proc/net/dev; sleep 1; head -5 /proc/net/dev
     # 输出 10 行（5+5），前 5 行是第一次采样，后 5 行是第二次采样
@@ -739,7 +737,7 @@ def _parse_diskio(out: str) -> dict:
     """解析磁盘 IO（两次 /proc/diskstats 采样差值 / 1s 间隔）
     返回 {"disk_read": sectors/s, "disk_write": sectors/s}"""
     result = {"disk_read": None, "disk_write": None}
-    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
     # /proc/diskstats: major minor name reads_merged reads sectors ... writes_merged writes sectors ...
     def parse_diskstats(lines_list):
         stats = {}

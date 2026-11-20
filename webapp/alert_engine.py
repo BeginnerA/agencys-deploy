@@ -559,7 +559,7 @@ class AlertEngine:
 
     def _evaluate_probe_failures(self, snap, default_channels):
         """评估 SSL 探测失败告警：连续失败 >= PROBE_FAIL_THRESHOLD 次触发告警"""
-        from .ssl_monitor import get_ssl_monitor, PROBE_FAIL_THRESHOLD
+        from .ssl_monitor import get_ssl_monitor
         mon = get_ssl_monitor()
         if not mon:
             return

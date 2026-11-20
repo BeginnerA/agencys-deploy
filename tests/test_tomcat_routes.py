@@ -10,8 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _TMP = tempfile.mkdtemp(prefix="war_routes_")
 
-from webapp import create_app
-from webapp import db as dbm
+from webapp import create_app  # noqa: E402
+from webapp import db as dbm  # noqa: E402
 
 RUNTIME = {
     "app_home": "/opt/apps/orders", "tomcat_home": "/opt/tomcat",

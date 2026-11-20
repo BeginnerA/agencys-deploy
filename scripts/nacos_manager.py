@@ -3,10 +3,8 @@
 兼容 Nacos 1.x Open API。若使用 Nacos 2.x，通常 1.x API 仍兼容，
 如有差异请在 config/deploy.yaml 中调整 url 或自行适配。
 """
-import sys
 import time
 import requests
-from urllib.parse import urlencode
 from common import load_config, get_nacos_auth, log, fail
 
 

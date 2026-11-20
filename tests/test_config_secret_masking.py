@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _TMP = tempfile.mkdtemp(prefix="config_mask_test_")
 
-from webapp import create_app
+from webapp import create_app  # noqa: E402
 
 
 class TestConfigSecretMasking(unittest.TestCase):

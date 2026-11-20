@@ -16,7 +16,6 @@
 安全约束：全程临时目录；导出用 stub，绝不写仓库 data/。
 """
 import json
-import os
 import shutil
 import sys
 import tempfile

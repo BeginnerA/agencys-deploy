@@ -536,7 +536,7 @@ def _run_frontend_steps(proj: dict, project_root: Path, version: str,
     """
     node = find_node()
     log(f"使用 Node: {node}")
-    log(f"构建类型: frontend（Web 前端项目）")
+    log("构建类型: frontend（Web 前端项目）")
 
     for step in proj.get("build_order", []):
         step_name = step.get("name", "未命名步骤")

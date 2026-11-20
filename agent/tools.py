@@ -413,8 +413,8 @@ def _logs_context(ctx, id=None, lines=5, **kw) -> dict:
                 if not line:
                     break
                 tail.append(line)
-        context_lines = [l.decode("utf-8", "ignore").rstrip("\r\n")
-                         for l in prev[-lines:] + tail]
+        context_lines = [ln.decode("utf-8", "ignore").rstrip("\r\n")
+                         for ln in prev[-lines:] + tail]
     except (ValueError, OSError):
         raise ToolError("日志文件读取失败")
     start = max(0, target_line - lines)

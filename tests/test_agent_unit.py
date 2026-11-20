@@ -385,7 +385,7 @@ class TestTools(AgentBase):
                  b"line3 after", b"line4 end"]
         with open(fpath, "wb") as f:
             f.write(b"\n".join(lines) + b"\n")
-        offset = sum(len(l) + 1 for l in lines[:2])  # 行 2 的字节起点
+        offset = sum(len(ln) + 1 for ln in lines[:2])  # 行 2 的字节起点
         entry_id = dbm.create_record(self.db, "log_entries", dict(
             ts=now, env="prod", service="hqb-auth", container="hqb-auth",
             file_path=fpath, line_offset=offset, line_count=1,
@@ -475,7 +475,7 @@ class TestTools(AgentBase):
         from agent import tools as tools_mod
         now = int(time.time())
         # 两服务：auth 依赖 api（发布顺序 api 先）
-        api_id = dbm.create_record(self.db, "services", dict(
+        dbm.create_record(self.db, "services", dict(
             project_id=self.proj_id, name="api", image_name="api",
             service_name="hqb-api", docker_context="", dockerfile="",
             build_order="[]", nacos_groups="[]", dubbo_services="[]",
@@ -657,7 +657,7 @@ class TestExecutor(AgentBase):
         self.assertIn("--force-window", task["extra"])
 
     def test_approve_and_reject_flow(self):
-        from agent.executor import ExecutorError, decide_run, get_run
+        from agent.executor import ExecutorError, decide_run
         run = self._plan()
         # 非法动作
         with self.assertRaises(ExecutorError):
@@ -1132,8 +1132,8 @@ class TestAgentDecideTool(AgentBase):
         self.assertIn("已批准", resp["hint"])
         # 审计落库（via=agent 与 Web 端区分）
         logs = dbm.list_audit_logs(self.db, 10)
-        entry = next((l for l in logs if l["action"] == "agent_approve"
-                      and l["target_id"] == run_id), None)
+        entry = next((it for it in logs if it["action"] == "agent_approve"
+                      and it["target_id"] == run_id), None)
         self.assertIsNotNone(entry)
         detail = json.loads(entry["detail"] or "{}")
         self.assertEqual(detail.get("via"), "agent")
@@ -1154,8 +1154,8 @@ class TestAgentDecideTool(AgentBase):
         self.assertEqual(resp["task_id"], 0)
         self.assertIn("已驳回", resp["hint"])
         logs = dbm.list_audit_logs(self.db, 10)
-        entry = next((l for l in logs if l["action"] == "agent_reject"
-                      and l["target_id"] == created["run_id"]), None)
+        entry = next((it for it in logs if it["action"] == "agent_reject"
+                      and it["target_id"] == created["run_id"]), None)
         self.assertIsNotNone(entry)
 
 
@@ -1526,8 +1526,8 @@ class TestAgentManageTools(AgentBase):
             "action": "settings", "log_retention_days": 400})
         self.assertIn("error", bad)
         logs = dbm.list_audit_logs(self.db, 10)
-        entry = next((l for l in logs
-                      if l["action"] == "agent_update_log_settings"), None)
+        entry = next((it for it in logs
+                      if it["action"] == "agent_update_log_settings"), None)
         self.assertIsNotNone(entry)
         detail = json.loads(entry["detail"] or "{}")
         self.assertEqual(detail.get("via"), "agent")
@@ -1557,8 +1557,8 @@ class TestAgentManageTools(AgentBase):
         self.assertIn("error", busy)
         # cleanup 审计落库
         logs = dbm.list_audit_logs(self.db, 10)
-        entry = next((l for l in logs
-                      if l["action"] == "agent_manual_log_cleanup"), None)
+        entry = next((it for it in logs
+                      if it["action"] == "agent_manual_log_cleanup"), None)
         self.assertIsNotNone(entry)
         detail = json.loads(entry["detail"] or "{}")
         self.assertEqual(detail.get("deleted_entries"), 5)
@@ -1593,8 +1593,8 @@ class TestAgentManageTools(AgentBase):
         self.assertTrue(ok["ok"])
         dep_id = ok["id"]
         logs = dbm.list_audit_logs(self.db, 10)
-        entry = next((l for l in logs
-                      if l["action"] == "agent_add_dependency"), None)
+        entry = next((it for it in logs
+                      if it["action"] == "agent_add_dependency"), None)
         self.assertIsNotNone(entry)
         self.assertEqual(entry["target_id"], dep_id)
         # 重复创建 → UNIQUE 拒绝
@@ -1697,7 +1697,7 @@ class TestAgentManageTools(AgentBase):
         self.assertIn("admin", op_cfg["error"])
         # 审计落库
         logs = dbm.list_audit_logs(self.db, 50)
-        actions = {l["action"] for l in logs}
+        actions = {it["action"] for it in logs}
         self.assertIn("agent_create_monitor", actions)
         self.assertIn("agent_update_monitor", actions)
         self.assertIn("agent_update_monitor_config", actions)
@@ -1733,7 +1733,7 @@ class TestAgentManageTools(AgentBase):
         self.assertIn("连接失败", r2["message"])
         # 成功探测才写审计
         logs = dbm.list_audit_logs(self.db, 20)
-        self.assertIn("agent_test_server", {l["action"] for l in logs})
+        self.assertIn("agent_test_server", {it["action"] for it in logs})
 
     def test_refresh_and_config_backup_tools(self):
         # refresh_monitor：采集器未启动→报错；启动→ok（mock get_monitor）
@@ -1763,7 +1763,7 @@ class TestAgentManageTools(AgentBase):
         self.assertTrue(out["ok"])
         self.assertEqual(out["count"], 2)
         logs = dbm.list_audit_logs(self.db, 20)
-        self.assertIn("agent_export_config", {l["action"] for l in logs})
+        self.assertIn("agent_export_config", {it["action"] for it in logs})
         # admin import（mock import_from_config）
         import webapp.importer as importer_mod
         with mock.patch.object(importer_mod, "import_from_config",
@@ -1835,7 +1835,7 @@ class TestAgentManageTools(AgentBase):
     def test_end_to_end_onboarding_chain(self):
         """对话式接入链全通：建项目 → 注册服务 → clone 环境 → 生成发布审批单"""
         from agent import executor as executor_mod
-        proj = self._call("manage_projects", {
+        self._call("manage_projects", {
             "action": "create", "name": "新应用", "code": "app2"})
         self._call("manage_services", {
             "action": "create", "project": "app2", "name": "web-api",
@@ -2277,12 +2277,13 @@ class TestAgentDigest(AgentBase):
         from agent import digest
         now = int(time.time())
         # 四条到期监控：阶梯命中 / 超阈值排除 / 全局默认命中 / 已到期
-        mk = lambda **kw: dbm.create_record(self.db, "custom_monitors", dict(
-            type=kw.get("type", "ssl"), name=kw["name"],
-            target=kw.get("target", "a.com"), days_left=kw["days_left"],
-            warn_days=kw.get("warn_days", 0),
-            tiered_thresholds=kw.get("tiered", ""), enabled=1,
-            created_at=now, updated_at=now))
+        def mk(**kw):
+            return dbm.create_record(self.db, "custom_monitors", dict(
+                type=kw.get("type", "ssl"), name=kw["name"],
+                target=kw.get("target", "a.com"), days_left=kw["days_left"],
+                warn_days=kw.get("warn_days", 0),
+                tiered_thresholds=kw.get("tiered", ""), enabled=1,
+                created_at=now, updated_at=now))
         mk(name="阶梯命中", type="ssl", days_left=5,
            tiered='{"30":"P3","7":"P1"}')      # 最宽档 30，5<=30 入选
         mk(name="超阈排除", type="domain", days_left=20, warn_days=7)  # 20>7 不入选

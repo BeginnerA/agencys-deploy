@@ -109,7 +109,6 @@ class NodeTransferTest(unittest.TestCase):
         self.assertIn(f"{APP_HOME}/releases/1.0.0.tmp/node_modules/.bin", joined)
 
 
-from deploy_strategies.python_process import PythonProcessStrategy  # noqa: E402
 from deploy_strategies.process_config import validate_runtime_config  # noqa: E402
 
 

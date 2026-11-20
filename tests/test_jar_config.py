@@ -1,6 +1,5 @@
 """jar_service 配置契约：解析兜底、校验规则、产物命名与校验和"""
 import json
-import os
 import shutil
 import sys
 import tempfile

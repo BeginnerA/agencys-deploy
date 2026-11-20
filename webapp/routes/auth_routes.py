@@ -1,7 +1,7 @@
 """认证与用户路由"""
 import time
 
-from flask import Blueprint, request, jsonify, current_app, g
+from flask import request, jsonify, current_app, g
 
 from .. import db as dbm
 from ..auth import (auth_bp, require_auth, require_role, hash_password,

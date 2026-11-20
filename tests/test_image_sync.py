@@ -14,7 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from deploy import Deployer, tar_image_id, tar_repo_tags  # noqa: E402
+from deploy import Deployer, tar_image_id  # noqa: E402
 
 
 class FakeServer:
@@ -188,7 +188,7 @@ class TestEnsureImageReady(unittest.TestCase):
         回归：--skip-build 且本地无目标镜像时，旧逻辑无条件复用任意同名 tar，
         把 tag 不符的旧包 load 到服务器后才报"docker load 后仍未找到镜像"。
         """
-        tar = make_tar(self.tmp, "app_1.0.30.tar.gz", ["app:local"])
+        make_tar(self.tmp, "app_1.0.30.tar.gz", ["app:local"])
         server = FakeServer(image_ids=[None])
         with mock.patch("deploy.local_image_id", return_value=None), \
                 mock.patch("deploy.log"):

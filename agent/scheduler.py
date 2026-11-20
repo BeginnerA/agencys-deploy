@@ -7,7 +7,6 @@
 """
 import sys
 import threading
-import time
 
 from . import advisor as advisor_mod
 

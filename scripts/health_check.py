@@ -1,5 +1,4 @@
 """健康检查：HTTP 探活 + TCP 端口连通 + 远程容器运行/日志错误关键字检查"""
-import sys
 import time
 import re
 import socket
@@ -144,7 +143,8 @@ def wait_for_healthy(host: str, project_name: str, version: str = None, ssh_over
 
     if health_url:
         log(f"开始健康检查: {health_url}，超时 {timeout} 秒")
-        is_ok = lambda: check_http(health_url)
+        def is_ok():
+            return check_http(health_url)
     elif health_port:
         # 未配置 health_url 但配了业务端口：在服务器内部对回环端口做 TCP 连通检查。
         # 微服务业务端口常不对公网放行（云安全组只挡外部），从平台机直连公网 IP 必超时
@@ -167,7 +167,8 @@ def wait_for_healthy(host: str, project_name: str, version: str = None, ssh_over
     else:
         # 既无 health_url 也无 health_port：跳过网络检查，退化为容器运行状态检查，避免盲发
         log(f"未配置 health_url/health_port，改用容器运行状态检查: {service_name}，超时 {timeout} 秒")
-        is_ok = lambda: check_container_running(host, service_name, ssh_cfg)
+        def is_ok():
+            return check_container_running(host, service_name, ssh_cfg)
 
     deadline = time.time() + timeout
     while time.time() < deadline:

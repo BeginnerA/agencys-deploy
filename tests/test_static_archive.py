@@ -5,9 +5,7 @@
 验证退化路径、回滚快速与慢速路径、deploy_server 端到端（Nacos 零调用）。
 """
 import contextlib
-import io
 import tempfile
-import threading
 import time
 import unittest
 import zipfile

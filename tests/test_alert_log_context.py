@@ -8,12 +8,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import webapp as webapp_pkg
 
 _TMP = tempfile.mkdtemp(prefix="alert_log_ctx_test_")
 
-from webapp import create_app
-from webapp import db as dbm
+from webapp import create_app  # noqa: E402
+from webapp import db as dbm  # noqa: E402
 
 
 class TestAlertLogContext(unittest.TestCase):
@@ -79,7 +78,7 @@ class TestAlertLogContext(unittest.TestCase):
                     "line_offset, line_count, content, keywords) "
                     "VALUES (?, ?, ?, '', ?, ?, 1, ?, '[]')",
                     (ts, "prod", "svc-a",
-                     f"/logs/prod/svc-a/2026-08-18.log", i,
+                     "/logs/prod/svc-a/2026-08-18.log", i,
                      f"line {i} content"))
                 rowids.append(cur.lastrowid)
             conn.commit()

@@ -1,5 +1,4 @@
 """构建产物契约：可执行 jar 选择规则、校验和生成、docker 零调用"""
-import os
 import shutil
 import sys
 import tempfile
@@ -49,7 +48,7 @@ class SelectJarTest(unittest.TestCase):
             build_mod._select_jar(proj, self.root)
 
     def test_make_artifact_and_sha256(self):
-        jar = self._touch("target/app.jar", 123)
+        self._touch("target/app.jar", 123)
         proj = {"runtime_config": {}, "image_name": "hqb-auth"}
         with mock.patch.object(build_mod, "log"):
             out = build_mod._make_jar_artifact(proj, self.root, "1.0.31",

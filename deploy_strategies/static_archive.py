@@ -16,7 +16,6 @@
 版本号是日期号（YYYYMMDD，当日重复发布追加 -N 后缀避免覆盖 backup 同名包），
 非 semver；线上版本标记文件 {site_root}/.deploy_version 每次换入时写入。
 """
-import os
 import re
 import time
 from pathlib import Path
@@ -45,8 +44,8 @@ class StaticArchiveStrategy(DeployStrategy):
         self.site_root = (proj.get("site_root") or "").rstrip("/")
         if not self.site_root:
             raise ValueError(
-                f"deploy_mode=static_archive 必须配置 site_root"
-                f"（1Panel 站点根，如 /data/1panel/www/sites/example.com/index）")
+                "deploy_mode=static_archive 必须配置 site_root"
+                "（1Panel 站点根，如 /data/1panel/www/sites/example.com/index）")
         self.parent = str(Path(self.site_root).parent.as_posix())
         self.backup_dir = (proj.get("backup_dir") or f"{self.parent}/backup").rstrip("/")
         self.entry_file = proj.get("entry_file") or "index.html"

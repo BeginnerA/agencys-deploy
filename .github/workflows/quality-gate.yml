@@ -1,0 +1,51 @@
+# 质量门禁：把 scripts/quality_gate.py 从"本地自愿"变成主干合入的硬约束
+#
+# 契约由 tests/test_ci_quality_gate.py 钉住（触发分支、两个 requirements 文件、
+# python 版本、node、--strict、timeout）。改本文件请先改那个测试。
+name: 质量门禁
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+# 门禁只读源码，不需要写权限；不写这一行会继承仓库设置的 read-write
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: quality_gate --strict
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与发布镜像 Dockerfile（python:3.11-slim）、ruff.toml target-version 对齐；
+      # 不固定则 runner 自带的 3.12 会放行 3.11 环境里跑不出来的语法
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # 前端步（node --check + tests/js 无头用例）依赖 node；runner 自带版本会漂移
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # requirements.txt 是运行时依赖（单测要 import Flask/paramiko），
+      # requirements-dev.txt 是门禁工具；缺后者在 --strict 下 lint 步直接 FAIL
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: 质量门禁（工具缺失也算失败）
+        run: python scripts/quality_gate.py --strict

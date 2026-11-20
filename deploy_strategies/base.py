@@ -20,7 +20,6 @@ _SCRIPTS = str(Path(__file__).resolve().parent.parent / "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
-from common import log  # noqa: E402
 
 # 注册表：deploy_mode -> 策略类
 _REGISTRY = {}

@@ -651,7 +651,7 @@ class TestCustomMonitorAlerts(unittest.TestCase):
     def test_fires_with_global_default(self):
         """全局默认 30 天，监控项 days_left=5 → 触发告警"""
         self._set_global_config(warn_days=30, severity="P1")
-        mid = self._add_monitor(days_left=5)
+        self._add_monitor(days_left=5)
         e = self._engine()
         e._seed_rules()
         snap = e._load_snapshot()

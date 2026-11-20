@@ -617,9 +617,9 @@ class Deployer:
         """
         log(f"\n{'=' * 60}")
         log(f"金丝雀模式：首台 {first_host} 已发布成功")
-        log(f"请验证服务是否正常，然后选择操作：")
-        log(f"  [y] 继续发布剩余服务器")
-        log(f"  [n] 停止发布（首台保持新版本）")
+        log("请验证服务是否正常，然后选择操作：")
+        log("  [y] 继续发布剩余服务器")
+        log("  [n] 停止发布（首台保持新版本）")
         if self.previous_version:
             log(f"  [r] 回滚首台到 {self.previous_version}")
         log(f"{'=' * 60}")
@@ -1185,7 +1185,8 @@ class Deployer:
         if self.canary:
             try:
                 from webapp.deploy_scheduler import compute_canary_batches
-                import sqlite3, json as _json
+                import sqlite3
+                import json as _json
                 _db = platform_db_path()
                 _conn = sqlite3.connect(str(_db))
                 _conn.row_factory = sqlite3.Row

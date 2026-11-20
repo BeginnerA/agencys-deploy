@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _TMP = tempfile.mkdtemp(prefix="alert_routes_test_")
 
-from webapp import create_app
+from webapp import create_app  # noqa: E402
 
 
 class TestAlertRoutes(unittest.TestCase):

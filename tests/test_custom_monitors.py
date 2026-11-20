@@ -1,5 +1,4 @@
 """到期监控 CRUD API + 全局配置测试"""
-import json
 import shutil
 import sys
 import tempfile
@@ -10,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _TMP = tempfile.mkdtemp(prefix="custom_monitors_test_")
 
-from webapp import create_app
+from webapp import create_app  # noqa: E402
 
 
 class TestCustomMonitorRoutes(unittest.TestCase):

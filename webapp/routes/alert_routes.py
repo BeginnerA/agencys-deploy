@@ -1,6 +1,5 @@
 """告警 API：列表/ack/resolve/统计 + 规则 CRUD + 静默窗口 CRUD + 渠道配置"""
 import json
-import re
 import time
 from datetime import datetime, timedelta
 
@@ -62,10 +61,12 @@ def list_alerts():
     where, params = [], []
     st = request.args.get("status")
     if st in STATUSES:
-        where.append("status=?"); params.append(st)
+        where.append("status=?")
+        params.append(st)
     sev = request.args.get("severity")
     if sev in SEVERITIES:
-        where.append("severity=?"); params.append(sev)
+        where.append("severity=?")
+        params.append(sev)
     kw = (request.args.get("keyword") or "").strip()
     if kw:
         where.append("(subject LIKE ? OR description LIKE ?)")
@@ -74,7 +75,8 @@ def list_alerts():
     project_id = request.args.get("project_id", 0, type=int)
     pf, pp = _project_alert_filter(project_id)
     if pf:
-        where.append(pf); params.extend(pp)
+        where.append(pf)
+        params.extend(pp)
     # 环境筛选
     env_val = (request.args.get("env") or "").strip()
     if env_val:

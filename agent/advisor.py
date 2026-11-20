@@ -8,8 +8,6 @@
        供 Web 决策弹窗/告警卡片/智能助手引用。
 """
 import json
-import os
-import re
 import time
 from pathlib import Path
 
@@ -330,12 +328,11 @@ def analyze_failure(db_path: str, task_id: int, actor: dict = None,
     if log_tail:
         reasons.append("任务日志存在错误痕迹：" + (hint or "详见日志尾部"))
     if svc_state and svc_state.get("status") == "online":
-        reasons.append(f"监控显示服务当前 online（容器存活，探测正常）")
+        reasons.append("监控显示服务当前 online（容器存活，探测正常）")
     elif svc_state and svc_state.get("status") in ("probe_failed", "stopped"):
         reasons.append(f"监控显示服务当前 {svc_state.get('status')}，存在异常")
     for a in alerts[:2]:
         reasons.append(f"活跃告警 {a['severity']}「{a.get('subject')}」")
-    has_rollback_target = bool(prev)
     if prev:
         suggestion = (f"若容器/流量已异常：优先回滚到 {prev}（全量回滚通道）。"
                       "若失败发生在滚动期且平台已自动回滚故障服务器，请先核对大屏任务详情。")
@@ -406,7 +403,7 @@ def advise_canary(db_path: str, task_id: int, file_data: dict = None,
     if svc_state and svc_state.get("status") == "probe_failed":
         decision = "rollback"
         confidence = 0.9
-        reasons.append(f"首台健康探测失败（状态 probe_failed），继续放量风险高")
+        reasons.append("首台健康探测失败（状态 probe_failed），继续放量风险高")
     elif svc_state and svc_state.get("status") != "online":
         decision = "rollback"
         confidence = 0.8
@@ -424,7 +421,7 @@ def advise_canary(db_path: str, task_id: int, file_data: dict = None,
             confidence = 0.7
             reasons.append("首台服务状态 online 且健康检查通过")
         reasons.append("无错误日志与高级别告警")
-        reasons.append(f"业务侧请人工抽验后决定（灰度决策建议仅供参考）")
+        reasons.append("业务侧请人工抽验后决定（灰度决策建议仅供参考）")
     if prev and decision == "rollback":
         reasons.append(f"已提供回滚目标 {prev}")
     elif not prev and decision == "rollback":
@@ -563,7 +560,6 @@ def run_precheck(db_path: str, target: str, env: str = "",
         raise ValueError(f"未找到服务或流水线「{target}」")
     rec = (svc or pl)[0]
     project_id = rec["project_id"]
-    proj = dbm.get_record(db_path, "projects", project_id)
     kind = "服务" if svc else "流水线"
     add(f"目标 {kind}「{target}」存在且已启用",
         "ok" if rec.get("enabled", 1) else "block",

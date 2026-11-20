@@ -18,9 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _TMP = tempfile.mkdtemp(prefix="realtime_test_")
 
-from webapp import create_app, events
-from webapp import db as dbm
-from webapp.routes.stream_routes import KNOWN_TOPICS
+from webapp import create_app, events  # noqa: E402
+from webapp import db as dbm  # noqa: E402
+from webapp.routes.stream_routes import KNOWN_TOPICS  # noqa: E402
 
 
 def _decode(chunk) -> str:

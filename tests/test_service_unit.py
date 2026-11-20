@@ -1,7 +1,5 @@
 """systemd 单元生成与接入：只写 unit + daemon-reload + enable"""
-import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock

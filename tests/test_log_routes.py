@@ -57,7 +57,7 @@ class TestLogRoutes(unittest.TestCase):
                     "INSERT INTO log_entries (ts, env, service, container, file_path, line_offset, line_count, content, keywords) "
                     "VALUES (?, ?, ?, '', ?, 0, 1, ?, '[]')",
                     (int(time.time()) - i * 60, "prod", "api-service",
-                     f"/logs/prod/api-service/2026-08-18.log",
+                     "/logs/prod/api-service/2026-08-18.log",
                      f"ERROR something failed line {i}")
                 )
                 rowid = cursor.lastrowid

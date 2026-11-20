@@ -50,7 +50,6 @@ class TestTcpPortCheck(unittest.TestCase):
             cc.return_value.close.assert_called_once()
 
     def test_refused_returns_false(self):
-        import socket as _s
         with mock.patch("socket.create_connection",
                         side_effect=ConnectionRefusedError("refused")):
             self.assertFalse(hc.check_tcp_port("10.0.0.1", 9210))
