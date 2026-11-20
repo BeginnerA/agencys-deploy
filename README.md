@@ -149,6 +149,7 @@ python webapp/app.py          # 默认 http://127.0.0.1:5678
 - 色彩对比与表单可读性：弱化文本与亮色底上的文字统一按 WCAG AA 校正（亮色填充一律用深字 token `--on-bright`，渐变端点提亮），小字对比度达标；表单控件自动关联字段名（`label for`/`aria-label`/`aria-labelledby`，换肤下拉同步镜像到焦点元素）、必填项标 `aria-required`、提示与错误说明经 `aria-describedby` 关联、校验失败置 `aria-invalid` 且错误文本以 `role="alert"` 即时播报。
 - 导航地标与表格语义：页面首部提供“跳到主内容” skip link（键盘 Tab 首站可见、点击直达，默认隐藏）；侧栏导航包为 `<nav aria-label=主导航>`、`<aside>`/`<header>`/`<main>`/`<footer>` 构成页地标；数据表列头自动补 `scope=col`（读屏可将单元格对上列头）、表名就近取面板标题/页签（无标题回退到页签名）。
 - 配置存 `data/platform.db`（权威源）；`config/` 目录为导出产物 + CLI 兼容（`deploy.py --config-source yaml`）。
+- 平台库自护：「配置管理 → 数据库快照」（admin，`#/config/database`）一键把 `platform.db` 拍成紧凑快照（只读 `VACUUM INTO` + gzip，不阻塞发布，产物在 `data/backups/db/`）；回滚分两段——先校验并暂存，**平台重启后**才换库，重启前可撤回。快照按份数轮转（默认 3）、审计日志按天清理（默认 180 天，直接删行），由采集线程每小时的维护周期执行；结构迁移前自动留回滚点。
 - 数据目录可整体外置：`python webapp/app.py --data-dir /srv/deploy-a --config-dir /srv/cfg-a [--log-dir /var/log/deploy-a]`，同一份代码即可跑多套互不干扰的实例（库、密钥、导出物、任务日志全部跟随 `--data-dir`）；不传参数时保持项目内 `data/`、`config/` 的默认落点。
 - 角色：admin（全部）/ operator（发布回滚）/ viewer（只读）。生产部署建议 `--host 0.0.0.0` + 前置 Nginx 反代 + 环境变量注入 `DASHBOARD_SECRET_KEY`。
 
@@ -403,7 +404,7 @@ python scripts/quality_gate.py --strict   # 工具缺失（ruff/node）也判 FA
 四步的含义与口径：
 
 - **compile**：`ast.parse` 逐个解析全部 Python 源码与 `tests/`，语法错误当场失败；纯只读（不在源码树落 `__pycache__`、不执行任何模块代码），成本 <1s。
-- **lint**：装了 `ruff` 才跑（配置见 `ruff.toml`，只选 F/E4/E7/E9/W6 这类真错误规则；风格类规则刻意没开，历史长行未清理前开了就是噪音）。没装记 SKIP，`--strict` 下记 FAIL。
+- **lint**：`ruff check .`（配置见 `ruff.toml`，只选 F/E4/E7/E9/W6 这类真错误规则；风格类规则刻意没开，历史长行未清理前开了就是噪音）。没装 ruff 记 SKIP，`--strict` 下记 FAIL。仓库当前是零违规基线，且这条基线由 `tests/test_quality_gate.py::RepoLintCleanTest` 在本地就拦住，不必等 CI。
 - **pytest**：`tests/` 全量用例，见下方测试隔离约定。
 - **js**：`node --check` 逐个语法校验 `webapp/static/js/**`，再跑 `tests/js/*_test.js` 无头用例（不依赖浏览器）。没装 node 记 SKIP。
 
@@ -414,7 +415,12 @@ python scripts/quality_gate.py --strict   # 工具缺失（ruff/node）也判 FA
 - 禁止真实副作用：不发起 SSH/HTTP/构建，子进程用 stub（参考 `tests/test_task_log_isolation.py` 里 `mock.patch.object(task_manager, "build_cli", ...)`），导出用 `mock.patch("webapp.exporter.export_all", ...)`。RED 阶段的失败必须"失败在校验上"，不能失败成"真的写了生产目录"。
 - `webapp/app.py` 在 import 时不建 app（惰性 `get_app()`），所以只 import 工具函数的脚本不会再触发首启引导。
 
-`jenkins/Jenkinsfile` 在 Deploy 前加了 **Quality gate** stage：门禁任一 FAIL 直接中止，不进入发布；CI 镜像未装 node/ruff 时该步记 SKIP，不会误伤发布。
+两条自动化链的口径不同，各有理由：
+
+- **GitHub Actions**（`.github/workflows/quality-gate.yml`）：push / PR 到 `master` 时跑 `quality_gate.py --strict`——依赖由 workflow 自己装齐（`requirements.txt` + `requirements-dev.txt` + node），所以工具缺失就是配置坏了，必须 FAIL。漏掉 `--strict` 时这条链可以长期"全绿但没跑 lint"，这正是本文件要堵的口子。
+- **`jenkins/Jenkinsfile`**：在 Deploy 前跑不带 `--strict` 的同一条门禁。注意 `ruff` 不是运行时依赖，门禁 stage 自己补一句 `pip install -r requirements-dev.txt || true`，随后走宽容口径：构建机缺工具时记 SKIP，不阻断一次正常发布。要在发布链上也强制 lint，先确认 agent 装了 ruff/node，再给该 stage 加 `--strict`。
+
+workflow 的触发分支、依赖安装、Python 版本与 `--strict` 由 `tests/test_ci_quality_gate.py` 钉住：改 workflow 先改测试，配置漂移会在本地红。
 
 ## 注意事项
 

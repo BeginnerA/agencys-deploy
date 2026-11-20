@@ -53,7 +53,7 @@ pip install -r requirements-dev.txt
 python scripts/quality_gate.py     # 语法 + 静态检查 + 单测 + 前端无头用例
 ```
 
-发布流水线（`jenkins/Jenkinsfile`）已在 Deploy 前加同名门禁 stage，任一 FAIL 即中止发布。工具缺失（未装 ruff/node）记 SKIP，加 `--strict` 可强制 FAIL。
+质量门禁有两条自动化链：GitHub Actions（`.github/workflows/quality-gate.yml`）在 push / PR 到 `master` 时跑 `python scripts/quality_gate.py --strict`，工具缺失即 FAIL；发布流水线（`jenkins/Jenkinsfile`）在 Deploy 前跑同一条门禁但不加 `--strict`，任一 FAIL 即中止发布，构建机缺 ruff/node 时该步记 SKIP 而不阻断发布。口径差异与 workflow 契约的说明见 [README.md](../README.md)「开发与质量门禁」。
 
 测试隔离：`tests/conftest.py` 在会话开始把 `webapp.DATA_DIR` / `webapp.CONFIG_DIR` 重定向到 pytest 临时目录，所以即使某个用例漏传目录，`create_app()` 也不会去真实 `data/` 上跑迁移或写导出物。写用例时仍应显式传 `create_app(data_dir=...)`；涉及任务/采集日志目录的用例要自己 `mock.patch.object(task_manager, "LOG_DIR", tmp)`——那个全局每次 `create_app` 都会被改写，不能依赖它的当前值。
 
@@ -704,13 +704,16 @@ python webapp/app.py          # 默认 http://127.0.0.1:5678
 - 后台服务周期独立：发布调度 `--deploy-interval`（默认 30s，或 `DASHBOARD_DEPLOY_INTERVAL`）、AI 建议 `--agent-interval`（默认 30s，或 `DASHBOARD_AGENT_INTERVAL`，`0` 单独关闭）；监控关闭时日志采集回退为 120s 独立轮询。
 - 日志采集：周期为监控的 2 倍；按主机聚合为单条 SSH 批量拉取（`@@LOGCUT` 分段标记），同名环境跨项目去重，避免重复追加与重复索引。
 - 数据库维护：新库自动启用 `auto_vacuum=INCREMENTAL`，采集器每日执行 FTS optimize + 增量空间回收；存量库执行 `python scripts/db_vacuum.py` 一次性 VACUUM 回收空洞（需先停止平台）。也可在「日志监控 → 服务日志 → ⚙ 保留设置」抽屉（admin）查看存储概况并点「立即清理」手动执行同套策略（删过期索引行、归档过期文件、回收空闲页；与每日自动维护同一实现）。
+- 平台库快照与恢复（admin，「配置管理 → 数据库快照」`#/config/database`）：「立即快照」走只读 `VACUUM INTO` + gzip，活库正被写事务占用也拍得下来，产物在 `<data-dir>/backups/db/*.db.gz`（台账记快照大小、原库大小与 sha256）。回滚是两段式：点「恢复到此快照」先比对 sha256（对不上直接拒绝），把当前库另存为一条「恢复前自动」快照，再解压到 `<data-dir>/restore_staging.db` 并写 `<data-dir>/restore_pending.json`；**平台重启后才真正换库**，重启前可在本页「撤回待恢复」（删标记与暂存副本，快照一份不动）。换库前旧库三件套（主库 + `-wal` + `-shm`）整体挪进 `<data-dir>/backups/db/discarded/<时间戳>/`，只留最新一组。待恢复标记与快照台账都放在库外（台账是 `backups/db/index.json`，读不到就按盘上文件重建）：写进库里的恢复标记会被恢复本身带回来变成自锁，换库则会抹掉库内台账。保留份数（默认 3，可设 1~50）与审计日志保留天数（默认 180，可设 7~3650）在本页设置，由日志采集线程每小时的维护周期执行快照轮转与 `audit_logs` 删除（直接删行，不归档）；存量库的结构与本版本产物不一致时（这次 `init_db` 会跑 `_migrate`）自动留一条「迁移前自动」快照，同一结构状态只拍一次；首启空库不拍——手写的列级迁移没有 down 脚本，回滚点只能在结构变更之前留。快照、暂存恢复、撤回、改策略四类操作与重启时真正生效的换库都写审计（后者记在 `system` 名下）。
 - 配置存 `data/platform.db`（权威源）；`config/` 目录为导出产物 + CLI 兼容（`deploy.py --config-source yaml`）。
 - 数据目录外置（多实例）：`python webapp/app.py --data-dir /srv/deploy-a [--config-dir /srv/cfg-a] [--log-dir /var/log/deploy-a]`。`--data-dir` 决定库文件、`secret_key`、配置导出物（`<data-dir>/export/config/`）与日志默认位置；灰度决策文件（`canary_decision_<任务ID>.json`）也写在它下面。同机跑第二套实例时必须显式指定，否则两套实例争用同一个 `data/platform.db`。不传参时与历史行为一致（项目内 `data/`、`config/`）。
 - 平台拉起发布子进程时会注入两个环境变量：`PLATFORM_TASK_ID`（当前任务 ID）与 `PLATFORM_DATA_DIR`（实例数据目录）。发布脚本据此把灰度决策文件、db 模式的库文件与运行时配置目录都定位到本实例；手工在命令行跑 `deploy.py --canary` 时两个变量都不存在，回落到项目内 `data/`，属正常行为。
 - `DASHBOARD_SECRET_KEY` 未设置时，密钥持久化在 `<data-dir>/secret_key`（按实例隔离，重启不掉登录态）；该目录不可写时回退内置开发密钥并在启动日志告警——生产务必显式注入。
 - 角色：admin（全部）/ operator（发布回滚）/ viewer（只读）。生产部署建议 `--host 0.0.0.0` + 前置 Nginx 等反代，环境变量注入 `DASHBOARD_SECRET_KEY`。
 
-- 发布任务通过子进程调用 `deploy.py` / `deploy_pipeline.py`（`--config-source db --project-id <ID>`），行为与命令行一致；任务串行后台执行、日志实时查看。
+- 发布任务通过子进程调用 `deploy.py` / `deploy_pipeline.py`（`--config-source db --project-id <ID>`），行为与命令行一致；日志实时查看。
+- 提交互斥：同一目标（服务，或流水线及其成员服务）在同一环境内只允许一个活动任务（状态 `pending`/`running`）。重复提交返回 409（`error=active_task`，附带占用方任务号，前端给出「打开该任务」入口）；定时计划与 webhook 撞上同一约束时跳过本轮并推进下一次时间，Agent 在生成审批单之前先预检以免白走审批。平台进程重启遗留的 `pending`/`running` 任务在启动时收敛为失败——活动状态即占用发布目标，留着会让该服务再也提交不了（日志注明目标主机上可能仍在执行，需人工核对）。
+- 并行执行：任务按「执行道」并行，共道排队、异道并行。道键覆盖四类共享资源——发布目标、构建工作目录（`git_repo` 指向的仓库与 `build_order` 各模块目录）、目标机上的 `docker-compose.yml`（按 `主机:路径`，平台要下载改写再上传，并发即丢更新）、SnailJob 分组（部署前暂停、结束后恢复）。槽位数由 `PLATFORM_TASK_CONCURRENCY` 控制（默认 3，设为 `1` 即恢复旧的单 worker 串行）。效果：一次 20 分钟的 Maven 构建不再挡住无关服务的发布，同一 mono-repo 下的服务仍严格排队。
 
 ### 10.6 配置来源与 CLI 兼容（--config-source）
 
