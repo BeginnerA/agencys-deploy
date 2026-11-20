@@ -23,6 +23,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from webapp import create_app
 from webapp import db as dbm
@@ -728,8 +729,37 @@ class LayeringTest(BackupCase):
         self.assertEqual(rows[0]["label"], "", "标签只活在台账里，扫描不出来")
         self.assertEqual(rows[0]["sha256"], "")
         db_backup.stage_restore(self.db, rec["name"])
-        self.assertEqual(db_backup.list_snapshots(self.db)[0]["sha256"], rec["sha256"],
+        rows = {r["name"]: r for r in db_backup.list_snapshots(self.db)}
+        self.assertEqual(rows[rec["name"]]["sha256"], rec["sha256"],
                          "缺校验值就现场补算并写回台账，下次才有得比")
+
+    def test_lost_index_does_not_reuse_a_number_still_on_disk(self):
+        """index.json 丢了不能从 1 重新编号：文件名里的时间戳只在同一秒内顺手挡住了重号
+        （snapshot 的换号重试比的是文件名），跨秒拍下就不撞名了，撞的是编号。
+        同编号 + 同一秒的 created_at，台账分不出谁新（排序并列后落到目录读取顺序，Linux
+        与 Windows 还不一样），轮转「保留最近 N 份」于是可能删掉刚拍的、留下旧的。"""
+        stamps = ["20260101-000001", "20260101-000002", "20260101-000003"]
+        with mock.patch.object(db_backup, "_now_stamp", side_effect=stamps):
+            first = db_backup.snapshot(self.db, label="一")
+            second = db_backup.snapshot(self.db, label="二")
+            (self.data_dir / "backups" / "db" / "index.json").unlink()
+            third = db_backup.snapshot(self.db, label="补拍")
+        rows = db_backup.list_snapshots(self.db)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len({r["id"] for r in rows}), 3,
+                         f"快照编号重复：{[(r['id'], r['name']) for r in rows]}")
+        self.assertGreater(third["id"], max(first["id"], second["id"]),
+                           "台账没了也要比盘上已有的编号更新，否则「最新一条」无从判定")
+
+    def test_equal_stamp_and_number_still_have_one_order(self):
+        """同时间戳同编号（台账丢过一次、撞了号的历史文件就是这样）也必须给出唯一顺序：
+        列表顺序就是轮转的取舍顺序，不能由目录读取顺序决定。"""
+        bdir = self.data_dir / "backups" / "db"
+        bdir.mkdir(parents=True, exist_ok=True)
+        for kind in ("manual", "pre-restore"):
+            (bdir / f"platform.000007.20260101-000000.{kind}.db.gz").write_bytes(b"x")
+        names = [r["name"] for r in db_backup.list_snapshots(self.db)]
+        self.assertEqual(names, sorted(names, reverse=True))
 
     def test_a_corrupt_index_does_not_break_the_write_path(self):
         rec = db_backup.snapshot(self.db)

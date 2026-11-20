@@ -289,11 +289,27 @@ def _unlink(path: Path) -> None:
         pass
 
 
+def _disk_numbers(db_path: str) -> list:
+    """盘上快照文件名里的编号（备份目录还不存在时就是空）"""
+    numbers = []
+    for path in _backup_dir(db_path).glob("*.db.gz"):
+        matched = _NAME_RE.match(path.name)
+        if matched:
+            numbers.append(int(matched.group(1)))
+    return numbers
+
+
 def _next_id(db_path: str) -> int:
-    """台账里的自增号：只用来给文件名去重，不代表数据库里的任何东西"""
+    """台账里的自增号：只用来给文件名去重，不代表数据库里的任何东西
+
+    要同时看台账和盘上现有编号：index.json 丢了台账从 1 起步，而新快照时间戳不同、
+    文件名不撞，撞的是编号。编号一样又落在同一秒，「最新一条」就只剩目录读取顺序能
+    决定（Linux 与 Windows 读序还不同），轮转保留最近 N 份会按错的顺序删文件。
+    """
     with _index_lock:
         index = _index_read(db_path)
-        return int(index.get("next_id") or 1)
+        return max(int(index.get("next_id") or 1),
+                   max(_disk_numbers(db_path), default=0) + 1)
 
 
 def _record(db_path: str, name: str, kind: str, label: str,
@@ -378,8 +394,10 @@ def list_snapshots(db_path: str) -> list:
     for name, meta in known.items():
         entries.setdefault(name, _entry(db_path, name, meta,
                                         exists=(bdir / name).is_file()))
+    # 文件名也进排序键：同一秒同一编号时只剩名字可比（编号只在台账里保证唯一，
+    # 台账丢过一次的盘上就可能留着撞号的历史文件），不能让目录读取顺序决定轮转留谁
     return sorted(entries.values(),
-                  key=lambda e: (e["created_at"], e["id"]), reverse=True)
+                  key=lambda e: (e["created_at"], e["id"], e["name"]), reverse=True)
 
 
 def prune(db_path: str, keep: int = None) -> list:
