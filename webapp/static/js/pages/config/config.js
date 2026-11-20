@@ -1,4 +1,4 @@
-// config.js — 配置管理入口：按 hash 子路由分发到工作台 / 项目仪表盘 / 用户管理
+// config.js — 配置管理入口：按 hash 子路由分发到工作台 / 项目仪表盘 / 用户管理 / 渠道 / 数据库快照
 (function(){
   'use strict';
   async function render(root){
@@ -12,6 +12,7 @@
     }
     if (parts[1] === 'users') return await window.cfgHome.render(root, 'users');
     if (parts[1] === 'channels') return await window.cfgHome.render(root, 'channels');
+    if (parts[1] === 'database') return await window.cfgDb.render(root);
     if (parts[1] === 'servers'){
       // 平台级服务器入口（工作台统计卡）：跳转到第一个项目的服务器子页
       const ps = await api('/api/projects');

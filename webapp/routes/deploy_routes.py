@@ -5,6 +5,7 @@ from .. import db as dbm
 from ..auth import require_auth, require_role, audit
 from ..task_manager import submit_task, tail_log, kill_task
 from ..deploy_scheduler import check_deploy_window
+from . import task_busy_response
 
 deploy_bp = Blueprint("deploy", __name__)
 
@@ -117,11 +118,14 @@ def create_task():
                             "window": {"name": window["name"], "id": window["id"]}}), 409
         if type_ != "restart":
             extra.append("--force-window")
-    task_id = dbm.create_task(current_app.config["DB_PATH"], project_id, type_,
-                              ref_id, rec["name"], env, version,
-                              previous_version, g.user["id"], extra=extra,
-                              action='rollback' if rollback else
-                              ('restart' if type_ == "restart" else 'deploy'))
+    try:
+        task_id = dbm.create_task(current_app.config["DB_PATH"], project_id, type_,
+                                  ref_id, rec["name"], env, version,
+                                  previous_version, g.user["id"], extra=extra,
+                                  action='rollback' if rollback else
+                                  ('restart' if type_ == "restart" else 'deploy'))
+    except dbm.ActiveTaskConflict as exc:
+        return task_busy_response(exc.conflict)
     task = dbm.get_task(current_app.config["DB_PATH"], task_id)
     # 显式传本实例日志目录：同进程可能存在其它 app（测试），不依赖模块全局
     submit_task(current_app.config["DB_PATH"], task, extra,

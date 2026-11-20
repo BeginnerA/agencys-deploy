@@ -213,3 +213,13 @@
 .ch-desc{font-size:11px;color:var(--text-3)}
 .ch-head .badge{margin-left:auto}
 .ch-test-btn{flex-shrink:0}
+
+/* ============ 数据库快照与恢复 ============ */
+.db-banner{display:flex;align-items:center;gap:12px;background:rgba(254,176,25,.08);border:1px solid rgba(254,176,25,.35);border-radius:var(--r-panel);padding:var(--sp-3) var(--sp-4)}
+.db-banner .dbb-ico{font-size:20px;flex-shrink:0}
+.db-banner .dbb-text{flex:1;font-size:12.5px;color:var(--text-1);line-height:1.6}
+.db-tools{display:flex;align-items:center;gap:12px}
+.db-tools .db-hint{flex:1;font-size:var(--fs-11);color:var(--text-3);line-height:1.5}
+.db-retention{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:var(--sp-4);align-items:end;padding:var(--sp-4)}
+.db-retention .section-title{grid-column:1/-1}
+.db-retention .hint{grid-column:1/-1;font-size:var(--fs-11);color:var(--text-3);line-height:1.6}

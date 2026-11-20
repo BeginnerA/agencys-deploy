@@ -78,12 +78,14 @@
         const r = await doRun(false);
         toastSuccess(`任务 #${r.task_id} 已创建`);
       } catch(e) {
+        const busy = taskBusyText(e);
+        if (busy){ toastError(busy); return; }
         if (e.message === 'window_warn' && e.data && e.data.window){
           if (!await confirmDialog(`当前处于发布窗口「${e.data.window.name}」（软警告），确认仍要继续执行？`)) return;
           try{
             const r2 = await doRun(true);
             toastSuccess(`任务 #${r2.task_id} 已创建（已忽略窗口警告）`);
-          }catch(e2){ toastError(e2.message); }
+          }catch(e2){ toastError(taskBusyText(e2) || e2.message); }
         } else { toastError(e.message); }
       }
     });

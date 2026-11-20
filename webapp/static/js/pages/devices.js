@@ -221,13 +221,15 @@
       toastSuccess(`任务 #${resp.id} 已创建`);
       location.hash = '#/deploy';
     }catch(e){
+      const busy = taskBusyText(e);
+      if (busy){ toastError(busy); return; }
       if (e.message === 'window_warn' && e.data && e.data.window){
         if (!await confirmDialog(`当前处于发布窗口「${e.data.window.name}」（软警告），确认仍要继续重启？`)) return;
         try{
           const resp2 = await doRestart(true);
           toastSuccess(`任务 #${resp2.id} 已创建（已忽略窗口警告）`);
           location.hash = '#/deploy';
-        }catch(e2){ toastError(e2.message); }
+        }catch(e2){ toastError(taskBusyText(e2) || e2.message); }
       } else { toastError(e.message); }
     }
   }
@@ -296,6 +298,8 @@
           document.getElementById('drawerRoot').classList.add('hidden');
           location.hash = '#/deploy';
         }catch(e){
+          const busy = taskBusyText(e);
+          if (busy){ toastError(busy); return; }
           if (e.message === 'window_warn' && e.data && e.data.window){
             if (!await confirmDialog(`当前处于发布窗口「${e.data.window.name}」（软警告），确认仍要继续回滚？`)) return;
             try{
@@ -303,7 +307,7 @@
               toastSuccess(`任务 #${resp2.id} 已创建（已忽略窗口警告）`);
               document.getElementById('drawerRoot').classList.add('hidden');
               location.hash = '#/deploy';
-            }catch(e2){ toastError(e2.message); }
+            }catch(e2){ toastError(taskBusyText(e2) || e2.message); }
           } else { toastError(e.message); }
         }
       };
@@ -367,6 +371,8 @@
         document.getElementById('drawerRoot').classList.add('hidden');
         location.hash = '#/deploy';
       }catch(e){
+        const busy = taskBusyText(e);
+        if (busy){ toastError(busy); return; }
         if (e.message === 'window_warn' && e.data && e.data.window){
           if (!await confirmDialog(`当前处于发布窗口「${e.data.window.name}」（软警告），确认仍要继续发布？`)) return;
           try{
@@ -374,7 +380,7 @@
             toastSuccess(`任务 #${resp2.id} 已创建（已忽略窗口警告）`);
             document.getElementById('drawerRoot').classList.add('hidden');
             location.hash = '#/deploy';
-          }catch(e2){ toastError(e2.message); }
+          }catch(e2){ toastError(taskBusyText(e2) || e2.message); }
         } else { toastError(e.message); }
       }
     };

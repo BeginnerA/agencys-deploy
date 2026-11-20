@@ -1,5 +1,7 @@
 """DB → 旧格式 YAML 导出：全量导出（Dashboard 手动/CI 一致性）+ 运行时导出（deploy.py db 模式）"""
+import os
 import re
+import time
 from pathlib import Path
 
 from deploy_strategies.base import process_modes
@@ -23,7 +25,6 @@ def _yaml_dump(data: dict) -> str:
 
 def export_projects_yaml(db_path: str, project_id: int) -> str:
     """导出 projects.yaml（单个项目 + 其全部服务）"""
-    proj = dbm.get_record(db_path, "projects", project_id)
     projects = {}
     for s in dbm.list_services(db_path, project_id):
         if not s["enabled"]:
@@ -201,6 +202,31 @@ def export_all(db_path: str, target_dir: Path) -> list:
     return written
 
 
+def _write_runtime_yaml(path: Path, text: str) -> None:
+    """运行时导出落盘：临时文件 + 原子改名
+
+    并行执行后，同一项目同一环境的两个任务会先后导出到同一目录
+    （data/runtime/p{pid}/{env}）——就地截断写会让另一个任务读到半份 YAML
+    （解析失败或按残缺配置发布）。同 project+env 的导出内容本就是同一份，
+    改名只会在"完整旧文件 ↔ 完整新文件"之间切换。
+    Windows 上目标文件被另一进程打开时改名会报 PermissionError，重试三次兜住。
+    """
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        for attempt in range(3):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.1)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
 def export_runtime(db_path: str, project_id: int, env: str,
                    target_dir: Path) -> Path:
     """deploy.py db 模式：生成与 config/ 同构的临时 YAML 目录，返回该目录"""
@@ -217,12 +243,12 @@ def export_runtime(db_path: str, project_id: int, env: str,
         raise ValueError("该项目未配置任何环境，请先在 Dashboard 配置")
     name = env_obj["name"]
     _check_safe_name(name, "环境名")
-    (target_dir / "projects.yaml").write_text(
-        export_projects_yaml(db_path, project_id), encoding="utf-8")
-    (target_dir / "pipelines.yaml").write_text(
-        export_pipelines_yaml(db_path, project_id), encoding="utf-8")
-    (target_dir / ("deploy.yaml" if name == "prod" else f"deploy.{name}.yaml")).write_text(
-        export_env_yaml(db_path, env_obj), encoding="utf-8")
-    (target_dir / ("servers.yaml" if name == "prod" else f"servers.{name}.yaml")).write_text(
-        export_servers_yaml(db_path, env_obj), encoding="utf-8")
+    _write_runtime_yaml(target_dir / "projects.yaml",
+                        export_projects_yaml(db_path, project_id))
+    _write_runtime_yaml(target_dir / "pipelines.yaml",
+                        export_pipelines_yaml(db_path, project_id))
+    _write_runtime_yaml(target_dir / ("deploy.yaml" if name == "prod" else f"deploy.{name}.yaml"),
+                        export_env_yaml(db_path, env_obj))
+    _write_runtime_yaml(target_dir / ("servers.yaml" if name == "prod" else f"servers.{name}.yaml"),
+                        export_servers_yaml(db_path, env_obj))
     return target_dir

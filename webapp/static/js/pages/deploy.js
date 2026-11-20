@@ -249,6 +249,15 @@
       await loadTasks();
       openTaskDetail(resp.id, true);
     }catch(e){
+      const busy = taskBusyText(e);
+      if (busy){
+        // 占用方就是本页任务列表里的一条：给出跳转，省掉"先找出谁挡路"
+        const detail = e.data && e.data.active_task;
+        if (detail && await confirmDialog(`${busy} 现在打开该任务查看？`))
+          openTaskDetail(detail.task_id, true);
+        else toastError(busy);
+        return;
+      }
       if (e.message === 'window_warn' && e.data && e.data.window){
         if (!await confirmDialog(`当前处于发布窗口「${e.data.window.name}」（软警告），确认仍要继续重新运行？`)) return;
         try{
@@ -256,7 +265,7 @@
           toastSuccess(`任务 #${resp2.id} 已创建，开始重新运行（已忽略窗口警告）`);
           await loadTasks();
           openTaskDetail(resp2.id, true);
-        }catch(e2){ toastError('重新运行失败：' + e2.message); }
+        }catch(e2){ toastError('重新运行失败：' + (taskBusyText(e2) || e2.message)); }
       } else { toastError('重新运行失败：' + e.message); }
     }
   }

@@ -25,6 +25,13 @@ async function api(path, opts={}){
 }
 function logout(){ localStorage.removeItem('token'); localStorage.removeItem('user'); location.href='/'; }
 
+// 发布目标被占用（409 active_task）时取可读说明：后端 message 已是完整中文句子，
+// 直接展示即可；其余错误码返回空串，由调用方走各自的分支（如 window_warn 的二次确认）。
+function taskBusyText(e){
+  if(!e || e.message !== 'active_task') return '';
+  return (e.data && e.data.message) || '';
+}
+
 // 注：原先这里的 poll() 盲轮询封装已删除——全站取数改走 live.js 的 liveBind（事件驱动 + 降级兜底），
 // 保留它只会诱导新页面退回定时轮询。子进程日志文件的增量追尾仍需要定时器的两处（发布抽屉、日志中心）
 // 直接用自己的 setInterval，并在注释里写明「为何必须保留」。

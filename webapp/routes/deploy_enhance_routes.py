@@ -10,6 +10,7 @@ from .. import db as dbm
 from .. import alert_spec
 from ..auth import require_auth, require_role, audit
 from ..deploy_scheduler import check_deploy_window, check_release_window
+from . import task_busy_response
 
 deploy_enhance_bp = Blueprint("deploy_enhance", __name__)
 
@@ -234,12 +235,15 @@ def run_schedule(sid):
         svc = dbm.get_record(_db_path(), "services", rec["ref_id"])
         if svc:
             task_name = svc["name"]
-    task_id = dbm.create_task(
-        _db_path(), rec["project_id"],
-        rec["ref_type"], rec["ref_id"],
-        task_name, rec["env"],
-        rec["version"], rec["previous_version"],
-        g.user["id"], extra=extra)
+    try:
+        task_id = dbm.create_task(
+            _db_path(), rec["project_id"],
+            rec["ref_type"], rec["ref_id"],
+            task_name, rec["env"],
+            rec["version"], rec["previous_version"],
+            g.user["id"], extra=extra)
+    except dbm.ActiveTaskConflict as exc:
+        return task_busy_response(exc.conflict)
     from .. import task_manager
     task = dbm.get_task(_db_path(), task_id)
     task_manager.submit_task(_db_path(), task, extra, log_dir=_log_dir())
@@ -790,9 +794,13 @@ def webhook():
     svc = dbm.get_service_by_name(_db_path(), project_id, service_name)
     if not svc:
         return jsonify({"error": "服务不存在"}), 404
-    task_id = dbm.create_task(
-        _db_path(), project_id, "project", svc["id"],
-        service_name, env, version, "", 0, action="deploy")
+    try:
+        task_id = dbm.create_task(
+            _db_path(), project_id, "project", svc["id"],
+            service_name, env, version, "", 0, action="deploy")
+    except dbm.ActiveTaskConflict as exc:
+        # 外部 CI 重复触发（如流水线重跑）：与 Web 入口同一机器码，调用方可据此去重
+        return task_busy_response(exc.conflict)
     from .. import task_manager
     task = dbm.get_task(_db_path(), task_id)
     task_manager.submit_task(_db_path(), task, [], log_dir=_log_dir())

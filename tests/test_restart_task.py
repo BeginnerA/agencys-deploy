@@ -106,6 +106,8 @@ class TestRestartAPI(unittest.TestCase):
             resp2 = self.client.post("/api/tasks", headers=self.headers, json={
                 "project_id": self.proj_id, "type": "restart",
                 "ref_id": self.svc_id, "env": "prod", "force_window": True})
+            self.assertEqual(resp2.status_code, 201,
+                             "force_window 放行后应受理任务")
             submit.assert_called_once()
             _, _, extra = submit.call_args.args  # (db_path, task, extra)
             self.assertEqual(extra, [])

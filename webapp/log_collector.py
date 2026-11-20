@@ -214,7 +214,7 @@ class LogCollector:
             self._thread.join(timeout=5)
 
     def _run_loop(self):
-        """主循环：每 interval 秒执行一轮采集 + 每小时归档检查 + FTS 维护"""
+        """主循环：每 interval 秒执行一轮采集 + 每小时归档检查 + FTS 维护 + 平台库维护"""
         last_archive_check = 0
         while not self._stop.is_set():
             try:
@@ -223,10 +223,24 @@ class LogCollector:
                 if now - last_archive_check >= 3600:
                     self._archive_and_cleanup()
                     self._fts_maintenance()  # 每日一次：FTS optimize + 空间回收
+                    self._db_housekeeping()  # 快照轮转 + 审计按天清理
                     last_archive_check = now
             except Exception as e:
                 print(f"[log-collector] 采集周期异常: {e!r}", file=sys.stderr)
             self._stop.wait(self.interval)
+
+    def _db_housekeeping(self):
+        """平台库自身维护：快照按 keep-N 轮转 + audit_logs 按天清理
+
+        异常就地吞掉，不冒到主循环的 except：备份盘写不动只决定库长多快，
+        不该带走整轮采集。时间戳照常被主循环推进，所以失败是每小时重试一次，
+        不是每 30 秒刷一次异常。
+        """
+        from . import db_backup
+        try:
+            db_backup.housekeeping(self.db_path)
+        except Exception as e:
+            print(f"[log-collector] 平台库维护异常: {e!r}", file=sys.stderr)
 
     def _collect_round(self):
         """单轮采集：全部启用监控的环境按「主机」聚合后去重采集
@@ -668,7 +682,6 @@ class LogCollector:
         engine = get_engine()
         if engine is None:
             return
-        service = entries[0][2] if entries else ""
         # 排除关键词上下文窗口大小（检查前后各 _EXCLUDE_CTX 条）
         _EXCLUDE_CTX = 5
         for rule in rules:

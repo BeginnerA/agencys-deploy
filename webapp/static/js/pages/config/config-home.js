@@ -29,6 +29,7 @@
         { ico:'🖥️', num: servers.length, label:'服务器', sub: `SSH 正常 ${okCnt}${errCnt ? ' · 异常 ' + errCnt : ''}`, tip:'平台级资源，环境中选择绑定', go: () => { location.hash = '#/config/servers'; } },
         { ico:'👤', num: users.length, label:'用户', tip:'账号与角色管理', go: () => { location.hash = '#/config/users'; } },
         { ico:'📡', num: '-', label:'通知渠道', sub:'6 种渠道', tip:'告警通知发送配置', go: () => { location.hash = '#/config/channels'; } },
+        { ico:'📦', num: '-', label:'数据库快照', sub:'回滚点', tip:'平台库快照、恢复与保留策略', go: () => { location.hash = '#/config/database'; } },
       ];
 
       // 快速开始跳转：需项目上下文；无项目时引导新建

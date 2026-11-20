@@ -1,4 +1,4 @@
-"""后台任务执行器：单 worker 串行；--config-source db --project-id 调用 deploy.py"""
+"""后台任务执行器：按执行道并行（同道串行）；--config-source db --project-id 调用 deploy.py"""
 import os
 import re
 import signal
@@ -7,9 +7,9 @@ import threading
 import time
 import subprocess
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, Future
 
 from . import db as dbm
+from . import lanes
 from .db import update_task
 
 DEPLOY_ROOT = Path(__file__).resolve().parent.parent
@@ -19,8 +19,9 @@ _DEFAULT_LOG_DIR = DEPLOY_ROOT / "data" / "logs"
 # 用模块全局而非私有变量：既有测试直接 patch 本名，patch/restore 语义保持不变。
 LOG_DIR = _DEFAULT_LOG_DIR
 
-_executor = ThreadPoolExecutor(max_workers=1)
-# 排队期 task_id -> Future（占位，支持队列内取消）；运行期被 Popen 覆盖
+# 执行队列：槽位数取 PLATFORM_TASK_CONCURRENCY，互斥单位是 lanes.task_lanes 算出的道
+_queue = lanes.TaskQueue()
+# 排队期 task_id -> QueuedTask（占位，支持队列内取消）；运行期被 Popen 覆盖
 _task_registry = {}
 
 
@@ -119,11 +120,17 @@ def backfill_existing_auto_versions(db_path: str):
 
 
 def submit_task(db_path: str, task: dict, extra_args: list = None, log_dir=None):
-    """排队执行任务；log_dir 省略时取模块配置（由 create_app 写入）"""
-    fut = _executor.submit(_run_task, db_path, task, extra_args or [], log_dir)
-    # 登记 Future 占位：kill_task 在排队窗口期（Popen 之前）也能取消。
+    """排队执行任务；log_dir 省略时取模块配置（由 create_app 写入）
+
+    并行度来自执行道：与在跑任务不共道的立刻开跑，共道的按提交顺序排队，
+    排队期间不占执行槽（见 webapp/lanes.TaskQueue）。
+    """
+    extra_args = list(extra_args or [])
+    item = _queue.submit(task["id"], lanes.task_lanes(db_path, task, extra_args),
+                         lambda: _run_task(db_path, task, extra_args, log_dir))
+    # 登记排队占位：kill_task 在拿到道之前（Popen 之前）也能取消。
     # setdefault 防微秒级竞态：若 _run_task 已抢先注册 Popen，占位不得覆盖它
-    _task_registry.setdefault(task["id"], fut)
+    _task_registry.setdefault(task["id"], item)
 
 
 def _save_deploy_snapshot(db_path, task_id: int, log_file: str):
@@ -274,7 +281,7 @@ def tail_log(log_file: str, offset: int = 0, max_chars: int = 8000, tail: bool =
 
 
 def kill_task(task_id: int, db_path: str = None) -> bool:
-    """终止任务：排队中取消 Future；运行中 restart 置协作取消标志（由 worker 落库终态）；其余类型终止进程树（Windows taskkill /T；POSIX killpg）。
+    """终止任务：排队中取消队列占位；运行中 restart 置协作取消标志（由 worker 落库终态）；其余类型终止进程树（Windows taskkill /T；POSIX killpg）。
     db_path 传入时，排队取消会同步落库 failed（避免大屏出现永久 pending 幽灵任务）"""
     entry = _task_registry.get(task_id)
     if entry is None:
@@ -283,7 +290,7 @@ def kill_task(task_id: int, db_path: str = None) -> bool:
         # 协作取消：仅置标志，终态（failed）由 worker 线程观察到 cancel 后落库
         entry.cancel.set()
         return True
-    if isinstance(entry, Future):
+    if isinstance(entry, lanes.QueuedTask):
         if entry.cancel():
             # 取消成功：任务不会执行，占位需手动清除（_run_task 不再有机会 pop）
             _task_registry.pop(task_id, None)
@@ -291,11 +298,11 @@ def kill_task(task_id: int, db_path: str = None) -> bool:
                 update_task(db_path, task_id, status="failed",
                             finished_at=time.time())
             return True
-        # cancel 失败：_run_task 已启动但 Popen 注册可能尚未完成，短暂等待重试
+        # 已拿到道开始执行：_run_task 注册 Popen 可能尚未完成，短暂等待重试
         for _ in range(50):
             time.sleep(0.05)
             entry = _task_registry.get(task_id)
-            if entry is not None and not isinstance(entry, Future):
+            if entry is not None and not isinstance(entry, lanes.QueuedTask):
                 break
         else:
             # 任务已在执行且注册窗口已过但 registry 无 Popen（异常退出被 pop）
@@ -319,6 +326,41 @@ def kill_task(task_id: int, db_path: str = None) -> bool:
         except Exception:
             pass
     return True
+
+def reap_interrupted_tasks(db_path: str) -> int:
+    """回收无人认领的活动任务（本进程重启后 DB 残留的 pending/running 行），返回回收条数
+
+    互斥闸按 status 判定目标占用，而进程重启后这些任务既没人推进也没人终止：
+    不收敛成终态，对应服务/环境就被一行幽灵记录永久锁死。
+    _task_registry 里还有句柄的是本进程真在排队/执行的任务，不能动。
+    POSIX 上子进程（start_new_session）可能在重启中存活，所以日志注明需人工核对，
+    而不是谎报「已终止」。
+    """
+    conn = dbm.get_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id, status, log_file FROM tasks "
+            "WHERE status IN ('pending','running') ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    reaped = 0
+    for row in rows:
+        task_id = row["id"]
+        if task_id in _task_registry:
+            continue
+        note = ("[platform] 平台重启，任务状态未知（原状态 {}）；"
+                "目标主机上可能仍在执行，请人工核对\n".format(row["status"]))
+        log_file = row["log_file"]
+        if log_file:
+            try:
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(note)
+            except OSError:
+                pass
+        update_task(db_path, task_id, status="failed", finished_at=time.time())
+        reaped += 1
+    return reaped
+
 
 # restart 健康检查轮询参数（测试可 patch 缩短，避免真实等待 60s）
 _RESTART_HEALTH_TIMEOUT = 60.0

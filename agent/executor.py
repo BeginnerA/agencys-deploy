@@ -65,7 +65,7 @@ def _steps_text(op: str, env: str, svc_names: list, servers: list,
     host_text = f"{len(servers)} 台服务器" if servers else "0 台服务器（环境未绑定服务器!）"
     if op == "restart":
         return ["并发对每台服务器执行 docker restart",
-                f"逐台健康检查（health_url，最多约 60s）"]
+                "逐台健康检查（health_url，最多约 60s）"]
     base = ["Maven 构建并推送镜像（skip_build 时跳过）",
             "SnailJob 任务组暂停（配置了 snailjob_group 时）",
             "镜像预传输（直传模式并行 save/upload/load）"]
@@ -206,6 +206,24 @@ def _window_warning(db_path: str, project_id: int, env: str = "",
 
 # ---------- 计划 ----------
 
+def _task_type_of(op: str, kind: str) -> str:
+    """审批单参数 → 任务 type：与 _submit_task 建单时的取值口径一致"""
+    if kind == "pipeline":
+        return "pipeline"
+    return "restart" if op == "restart" else "project"
+
+
+def _reject_if_target_busy(db_path: str, project_id: int, type_: str,
+                           ref_id: int, env: str) -> None:
+    """目标已有活动任务 → 不生成审批单
+
+    否则用户走完审批才发现提交被拒（db.create_task 的互斥闸），
+    审批这一步纯属浪费。"""
+    conflict = dbm.find_active_task(db_path, project_id, type_, ref_id, env)
+    if conflict:
+        raise ExecutorError(dbm.describe_active_task(conflict))
+
+
 def plan_operation(db_path: str, user: dict, op: str, target: str = "",
                    project_code: str = "", env: str = "", version: str = "",
                    previous_version: str = "", canary: bool = False,
@@ -225,6 +243,9 @@ def plan_operation(db_path: str, user: dict, op: str, target: str = "",
     warn, window_text = _window_warning(
         db_path, args["project_id"], env=args["env"],
         ref_type=args["ref_type"], ref_id=args["ref_id"])
+    _reject_if_target_busy(db_path, args["project_id"],
+                           _task_type_of(args["op"], args["kind"]),
+                           args["ref_id"], args["env"])
     servers = _env_servers(db_path, args["project_id"], args["env"])
     svc_names = [args["name"]]
     if args["kind"] == "service":
@@ -278,6 +299,10 @@ def plan_schedule_run(db_path: str, user: dict, schedule_id: int,
     warn, window_text = _window_warning(
         db_path, sched["project_id"], env=sched.get("env") or "",
         ref_type=sched.get("ref_type") or "", ref_id=sched.get("ref_id") or 0)
+    # 计划落地的任务 type 就是 sched["ref_type"]（见 _submit_task），同口径预检
+    _reject_if_target_busy(db_path, sched["project_id"],
+                           sched.get("ref_type") or "project",
+                           sched.get("ref_id") or 0, sched.get("env") or "")
     # 任务名解析与 run_schedule 对齐：服务级计划显示服务名
     target_name = sched["name"]
     if sched.get("ref_type") == "service" and sched.get("ref_id"):

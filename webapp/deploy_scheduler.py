@@ -359,6 +359,14 @@ class DeployScheduler:
                 task = dbm.get_task(self._db_path, task_id)
                 task_manager.submit_task(self._db_path, task, extra)
                 print(f"[deploy-sched] 定时任务 #{task_id} 已创建: {sched['name']}")
+            except dbm.ActiveTaskConflict as e:
+                # 目标被其它任务占用：与封网窗口同语义——跳过并推进计划。
+                # 沿用下方通用失败的"保留 next_run_at 重试"会让每轮 tick
+                # 反复撞同一个占用（长构建期间日志刷屏），且计划真正执行时
+                # 已远离原定时间点。
+                self._update_next_run(sched, now)
+                print(f"[deploy-sched] 跳过 {sched['name']}：{e}")
+                continue
             except Exception as e:
                 # 创建/提交失败：不推进 next_run_at，下轮重试；
                 # 否则 cron 计划会跳过本次并静默等到下一个周期，once 计划则直接禁用

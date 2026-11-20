@@ -97,11 +97,30 @@ def create_app(data_dir=None, config_dir=None, log_dir=None):
     # 日志目录（任务执行/采集/归档/手动清理共用；独立成配置便于测试隔离）
     app.config["LOG_DIR"] = str(log_dir)
     app.config["MONITOR_INTERVAL"] = int(os.environ.get("DASHBOARD_MONITOR_INTERVAL", "30"))
+    # 快照/恢复的启动钩子必须抢在 init_db 之前（init_db 里跑的是手写 `_migrate`）：
+    #   - 换库晚于迁移 → 本版本对旧库白迁移一遍，还可能踩迁移不幂等的分支
+    #   - 回滚点晚于迁移 → `_migrate` 跑坏了没有任何东西可回
+    # 钩子内部吞异常（快照子系统坏了不能让平台起不来），契约见
+    # tests/test_db_backup.py::StartupWiringTest
+    from . import db_backup
+    restore_audit = db_backup.run_boot_hooks(app.config["DB_PATH"])
     init_db(app.config["DB_PATH"])
+    if restore_audit:
+        # 审计表随换库一起被换掉了，恢复结果只能事后补记
+        dbm.create_audit(app.config["DB_PATH"], 0, restore_audit["username"],
+                         restore_audit["action"], "db", 0, restore_audit["detail"])
+        app.config["DB_RESTORE_APPLIED"] = restore_audit
     # 任务日志落点交给执行器模块：后台线程（调度器/Agent）无 app 上下文，
     # 只能从这里取得目录，否则会把日志写进仓库默认 data/logs
     from .task_manager import set_log_dir
     set_log_dir(log_dir)
+    # 上一进程遗留的 pending/running 任务收敛为 failed：活动状态即占用发布目标，
+    # 留着会让该服务/环境再也提交不了（详见 task_manager.reap_interrupted_tasks）
+    from .task_manager import reap_interrupted_tasks
+    reaped = reap_interrupted_tasks(app.config["DB_PATH"])
+    if reaped:
+        app.logger.warning("[platform] 已回收 %d 个重启遗留任务（置为失败，需人工核对目标主机）",
+                           reaped)
     # 历史自动版本任务回填：从日志解析实际版本号写入 DB（幂等，仅处理 version 为空的记录）
     from .task_manager import backfill_existing_auto_versions
     backfill_existing_auto_versions(app.config["DB_PATH"])
@@ -114,6 +133,7 @@ def create_app(data_dir=None, config_dir=None, log_dir=None):
 
     from .routes.auth_routes import auth_bp
     from .routes.config_routes import config_bp
+    from .routes.db_routes import db_bp
     from .routes.deploy_routes import deploy_bp
     from .routes.dash_routes import dash_bp
     from .routes.alert_routes import alert_bp
@@ -123,6 +143,7 @@ def create_app(data_dir=None, config_dir=None, log_dir=None):
     from .routes.tomcat_routes import tomcat_bp
     app.register_blueprint(auth_bp, url_prefix="/api")
     app.register_blueprint(config_bp, url_prefix="/api")
+    app.register_blueprint(db_bp, url_prefix="/api")
     app.register_blueprint(deploy_bp, url_prefix="/api")
     app.register_blueprint(dash_bp, url_prefix="/api")
     app.register_blueprint(alert_bp, url_prefix="/api")

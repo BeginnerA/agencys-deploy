@@ -2,6 +2,7 @@
 import json
 import re
 import sqlite3
+import threading
 import time
 
 from . import events
@@ -464,6 +465,7 @@ CREATE TABLE IF NOT EXISTS agent_session_meta (
 CREATE INDEX IF NOT EXISTS idx_agent_session_meta_user
     ON agent_session_meta(user_id, session_id);
 """
+
 
 # JSON 字段（读写时自动序列化/反序列化）
 JSON_FIELDS = {
@@ -1001,6 +1003,92 @@ def reorder_env_servers(db_path: str, env_id: int, server_ids: list) -> None:
 
 # ---------- 任务 ----------
 
+# 活动状态：处于队列或执行中，占用其发布目标
+_ACTIVE_TASK_STATUSES = ("pending", "running")
+# 检查与插入必须同进程原子：提交方既有 Web 多线程也有调度/Agent 后台线程，
+# 分开读写会让"连点两次"的两个请求同时通过检查。平台按单实例部署
+# （日志目录、调度锁都以此为前提），进程内互斥量即足够，不必引入库级锁表。
+_create_task_lock = threading.Lock()
+
+
+class ActiveTaskConflict(Exception):
+    """目标已有活动任务时拒绝再建任务；conflict 为占用方任务摘要，供入口回显"""
+
+    def __init__(self, conflict: dict):
+        self.conflict = conflict
+        super().__init__(describe_active_task(conflict))
+
+
+def describe_active_task(conflict: dict) -> str:
+    """占用方的一句话说明：各入口（409 / 调度日志 / Agent 拒单）共用同一措辞"""
+    return (f"「{conflict.get('name', '')}」已有活动任务 "
+            f"#{conflict.get('task_id')}（状态 {conflict.get('status')}），"
+            f"请等其结束或先终止该任务")
+
+
+# 任务 type 中以单个服务为目标的取值：定时计划的 ref_type=service
+# 会原样写入任务 type，与手工发布/重启指向同一个目标
+_SERVICE_LEVEL_TYPES = ("project", "restart", "service")
+
+
+def task_service_ids(db_path: str, type_: str, ref_id: int) -> list:
+    """任务涉及的服务 ID（去重保序）：单服务类型取自身，流水线取全部成员。
+
+    非服务级 type 返回空表——调用方据此判断"不知道它动了谁"，不得当成"没动任何人"。
+    """
+    if type_ in _SERVICE_LEVEL_TYPES:
+        return [ref_id]
+    if type_ == "pipeline":
+        ids = []
+        pl = get_record(db_path, "pipelines", ref_id)
+        for stage in (pl.get("stages") if pl else None) or []:
+            if not isinstance(stage, dict):
+                continue
+            for svc in stage.get("services") or []:
+                sid = svc.get("service_id") if isinstance(svc, dict) else None
+                if sid and sid not in ids:
+                    ids.append(sid)
+        return ids
+    return []
+
+
+def task_target_keys(db_path: str, type_: str, ref_id: int) -> set:
+    """任务的目标互斥键：发布(project)/重启(restart)/计划发布(service) 占用其服务，
+    流水线(pipeline) 占用自身及其成员服务（含同一服务的两条流水线不得并发）。
+
+    其余取值（历史遗留 type、测试构造）落在 "{type}:{ref_id}" 自有命名空间：
+    同 type 同目标之间互斥，但不与服务/流水线键空间相互占用。
+    """
+    if type_ in _SERVICE_LEVEL_TYPES:
+        return {f"service:{ref_id}"}
+    if type_ == "pipeline":
+        keys = {f"pipeline:{ref_id}"}
+        keys.update(f"service:{sid}" for sid in task_service_ids(db_path, type_, ref_id))
+        return keys
+    return {f"{type_}:{ref_id}"}
+
+
+def find_active_task(db_path: str, project_id: int, type_: str, ref_id: int,
+                     env: str):
+    """返回与目标冲突的活动任务摘要（dict），无冲突返回 None"""
+    keys = task_target_keys(db_path, type_, ref_id)
+    marks = ",".join("?" * len(_ACTIVE_TASK_STATUSES))
+    conn = get_conn(db_path)
+    try:
+        rows = conn.execute(
+            f"SELECT id, type, ref_id, name, env, status FROM tasks "
+            f"WHERE project_id=? AND env=? AND status IN ({marks}) ORDER BY id",
+            (project_id, env or "", *_ACTIVE_TASK_STATUSES)).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        r = dict(row)
+        if keys & task_target_keys(db_path, r["type"], r["ref_id"]):
+            return {"task_id": r["id"], "type": r["type"], "ref_id": r["ref_id"],
+                    "name": r["name"], "env": r["env"], "status": r["status"]}
+    return None
+
+
 def create_task(db_path: str, project_id: int, type_: str, ref_id: int, name: str,
                 env: str, version: str, previous_version: str, created_by: int,
                 extra: list = None, action: str = 'deploy') -> int:
@@ -1010,7 +1098,11 @@ def create_task(db_path: str, project_id: int, type_: str, ref_id: int, name: st
                   env=env, version=version, previous_version=previous_version,
                   extra=extra or [], action=action, status="pending",
                   created_by=created_by)
-    task_id = create_record(db_path, "tasks", fields)
+    with _create_task_lock:
+        conflict = find_active_task(db_path, project_id, type_, ref_id, env)
+        if conflict:
+            raise ActiveTaskConflict(conflict)
+        task_id = create_record(db_path, "tasks", fields)
     # 新建任务也推 events：列表页靠它即时看到排队项（状态流转只覆盖已有任务）；
     # 全部创建入口（Web/CLI/Agent/调度/webhook）均经本函数，一处即收口
     events.publish("tasks", {"task_id": task_id, "status": "pending",
@@ -1065,8 +1157,10 @@ def delete_task(db_path: str, task_id: int) -> tuple:
         conn.close()
     import os
     if log_file:
-        try: os.remove(log_file)
-        except OSError: pass
+        try:
+            os.remove(log_file)
+        except OSError:
+            pass
     return True, ""
 
 

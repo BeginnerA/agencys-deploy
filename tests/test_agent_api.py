@@ -75,6 +75,11 @@ class AgentApiBase(unittest.TestCase):
             kw.get("name", "auth"), kw.get("env", "prod"),
             kw.get("version", "1.1.0"),
             kw.get("previous_version", "1.0.0"), 1)
+        if kw.get("status"):
+            # 状态只能经 update_task 落库（create_task 恒为 pending）：
+            # 少了这一步，用例里的"失败任务"实际一直占着发布目标
+            dbm.update_task(self.db_path, task_id, status=kw["status"],
+                            finished_at=time.time())
         return task_id
 
     def _make_alert(self):
