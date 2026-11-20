@@ -716,12 +716,22 @@ def _write_sha256(path: Path) -> None:
                                                      encoding="utf-8")
 
 
+def _is_windows() -> bool:
+    """构建主机是否 Windows：可执行名形态与交叉编译目标两处的唯一分歧判据
+
+    用例要跑另一侧分支时替换本函数，不要伪造 os.name —— pathlib 每构造一个 Path 都
+    读 os.name，把它改成 "nt" 会让 Linux 解释器连 Path() 都抛 NotImplementedError，
+    整条构建链的用例集体报错（本机却全绿，因为 Windows 上那是恒真赋值）。
+    """
+    return os.name == "nt"
+
+
 def _tool_candidate_names(tool: str) -> tuple:
     """配置分支下工具可执行文件的候选名：非 Windows 仅裸名（与既有形态逐字一致）；
     Windows CreateProcess 不做扩展名解析（exists("C:/Go/bin/go") 对 go.exe 恒 False），
     必须补齐 PATHEXT 常见可执行形态，否则 build.go_home/cargo_home 这条逃生通道
     在 Windows 主机上必然误报"配置无效"""
-    if os.name == "nt":
+    if _is_windows():
         return (tool, tool + ".exe", tool + ".cmd", tool + ".bat")
     return (tool,)
 
@@ -777,7 +787,7 @@ def _run_rust_steps(proj: dict, project_root: Path, version: str,
                        "或 build_type=none 外部投入产物")
     build_cfg = config.get("build") or {}
     triple = str(build_cfg.get("rust_target") or "")
-    if not triple and os.name == "nt":
+    if not triple and _is_windows():
         fail("build.rust_target 未配置：Windows 平台机无法自动确定 Linux 交叉目标；"
              "请配置（如 x86_64-unknown-linux-gnu，并安装对应 target 与 linker），"
              "或改用 WSL/Linux 构建，或 build_type=none 外部投入产物")

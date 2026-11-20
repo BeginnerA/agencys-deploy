@@ -177,12 +177,32 @@ class TestBuildWorkspaceLanes(_DbCase):
         self.assertEqual(self._prefixed(self._keys(self._task("project", url, "auth")), "repo:"),
                          self._prefixed(self._keys(self._task("project", local, "web")), "repo:"))
 
-    def test_repo_lane_is_case_and_separator_insensitive(self):
-        """同一目录的两种写法必须落到同一个键，否则互斥静默失效"""
-        a = self._svc("auth", git_repo="Repo/Sub")
-        b = self._svc("web", git_repo="repo\\sub")
-        self.assertEqual(self._prefixed(self._keys(self._task("project", a, "auth")), "repo:"),
-                         self._prefixed(self._keys(self._task("project", b, "web")), "repo:"))
+    def test_repo_lane_follows_host_path_identity(self):
+        """车道键的判据是「在本机是不是同一个目录」，不是字符串长得像不像：
+        同一目录算出两个键，两个任务会同时往一份源码里 checkout + mvn clean；
+        不同目录算成一个键，无关发布就白白排队。而大小写、反斜杠在哪边算同一路径
+        是宿主规矩（Windows 折叠，POSIX 上 repo\\sub 只是含反斜杠的目录名），
+        所以这两种写法按宿主分别断言，用例在两种 runner 上都得是真判据。"""
+        upper = self._svc("auth", git_repo="Repo/Sub")
+        backslash = self._svc("web", git_repo="repo\\sub")
+        k_upper = self._prefixed(self._keys(self._task("project", upper, "auth")), "repo:")
+        k_back = self._prefixed(self._keys(self._task("project", backslash, "web")), "repo:")
+        self.assertEqual(len(k_upper), 1)
+        if os.name == "nt":
+            self.assertEqual(k_upper, k_back)
+        else:
+            self.assertFalse(k_upper & k_back)
+
+    def test_repo_lane_ignores_spelling_that_never_means_another_dir(self):
+        """尾分隔符、./ 、重复分隔符在任何宿主上都不是另一个目录：这类别名必须同键，
+        否则同一份源码能被两个任务同时占用（这条与平台无关，两边 runner 都跑同样断言）"""
+        base = self._svc("auth", git_repo="repo-sub")
+        k_base = self._prefixed(self._keys(self._task("project", base, "auth")), "repo:")
+        self.assertEqual(len(k_base), 1)
+        for i, alias in enumerate(("repo-sub/", "repo-sub/.", "repo-sub//", "./repo-sub")):
+            svc = self._svc(f"web{i}", git_repo=alias)
+            self.assertEqual(k_base, self._prefixed(self._keys(
+                self._task("project", svc, f"web{i}")), "repo:"), f"别名 {alias} 落到了另一条道")
 
     def test_relative_project_root_is_stable_across_cwd(self):
         """键在平台进程里算、子进程在别的工作目录里跑：相对根必须锚定成绝对路径，

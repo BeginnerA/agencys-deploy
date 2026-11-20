@@ -82,7 +82,7 @@ class RustBuildTest(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix="rust_build_"))
         with mock.patch.object(build_mod, "run") as run_mock, \
                 mock.patch.object(build_mod, "_find_tool", return_value="cargo"), \
-                mock.patch.object(build_mod.os, "name", "nt"):
+                mock.patch.object(build_mod, "_is_windows", return_value=True):
             with self.assertRaises(SystemExit):
                 build_mod._run_rust_steps({"image_name": "report"}, root, "1.0.0",
                                           {}, base_config(root))
@@ -99,7 +99,7 @@ class RustBuildTest(unittest.TestCase):
         with mock.patch.object(build_mod, "run",
                                side_effect=lambda cmd, cwd, **kw: calls.append(cmd)), \
                 mock.patch.object(build_mod, "_find_tool", return_value="cargo"), \
-                mock.patch.object(build_mod.os, "name", "nt"):
+                mock.patch.object(build_mod, "_is_windows", return_value=True):
             build_mod._run_rust_steps({"image_name": "report"}, root, "1.0.0", {}, cfg)
         self.assertEqual(calls[0][:4], ["cargo", "build", "--release", "--target"])
         out = root / "out" / "report-1.0.0"
@@ -116,7 +116,7 @@ class FindToolTest(unittest.TestCase):
         (root / "bin" / "go.exe").write_bytes(b"mock")
         cfg = base_config(root)
         cfg["build"] = {"go_home": str(root)}
-        with mock.patch.object(build_mod.os, "name", "nt"):
+        with mock.patch.object(build_mod, "_is_windows", return_value=True):
             found = build_mod._find_tool("go", "go_home", cfg, "hint")
         self.assertEqual(Path(found), root / "bin" / "go.exe")
 
@@ -125,7 +125,7 @@ class FindToolTest(unittest.TestCase):
         (root / "cargo.exe").write_bytes(b"mock")
         cfg = base_config(root)
         cfg["build"] = {"cargo_home": str(root)}
-        with mock.patch.object(build_mod.os, "name", "nt"):
+        with mock.patch.object(build_mod, "_is_windows", return_value=True):
             found = build_mod._find_tool("cargo", "cargo_home", cfg, "hint")
         self.assertEqual(Path(found), root / "cargo.exe")
 
@@ -134,19 +134,19 @@ class FindToolTest(unittest.TestCase):
         (root / "bin").mkdir()
         cfg = base_config(root)
         cfg["build"] = {"go_home": str(root)}
-        with mock.patch.object(build_mod.os, "name", "nt"), \
+        with mock.patch.object(build_mod, "_is_windows", return_value=True), \
                 mock.patch.object(build_mod.shutil, "which") as which:
             with self.assertRaises(SystemExit):
                 build_mod._find_tool("go", "go_home", cfg, "未找到 Go 的提示")
         which.assert_not_called()  # 显式配置=权威：全不中直接 fail，绝不静默回退 PATH
 
     def test_windows_candidate_names_include_exe_forms(self):
-        with mock.patch.object(build_mod.os, "name", "nt"):
+        with mock.patch.object(build_mod, "_is_windows", return_value=True):
             names = build_mod._tool_candidate_names("go")
         self.assertEqual(names, ("go", "go.exe", "go.cmd", "go.bat"))
 
     def test_posix_candidate_names_bare_only(self):
-        with mock.patch.object(build_mod.os, "name", "posix"):
+        with mock.patch.object(build_mod, "_is_windows", return_value=False):
             names = build_mod._tool_candidate_names("go")
         self.assertEqual(names, ("go",))  # Linux 行为逐字不变：仅裸名形态
 
