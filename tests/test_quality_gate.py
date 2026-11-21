@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -115,6 +116,36 @@ class RepoLintCleanTest(unittest.TestCase):
             self.skipTest("未安装 ruff（pip install -r requirements-dev.txt）")
         status, detail = quality_gate.step_lint(strict=True)
         self.assertEqual(status, quality_gate.PASS, msg=detail[-3000:])
+
+
+class PytestEvidenceTest(unittest.TestCase):
+    """绿灯必须带条数证据：pytest 只看退出码会让两种假通过溜过去——
+    用例被整体挪走（rc=0，但只跑了几条）和全量 skip（rc=0，一条没跑）。
+    门禁存在的意义就是把这两类"看起来绿"钉成红的。"""
+
+    def _green(self, summary):
+        with mock.patch.object(quality_gate, "_run", return_value=(0, summary)):
+            return quality_gate.step_pytest()
+
+    def test_passed_count_is_read_from_the_summary(self):
+        self.assertEqual(quality_gate._passed_count("1196 passed in 70.29s"), 1196)
+
+    def test_summary_without_passed_count_is_no_evidence(self):
+        """取不到条数记 -1，由调用方按「没证据」处理，而不是当成 0 通过"""
+        self.assertEqual(quality_gate._passed_count("1196 skipped in 9.11s"), -1)
+
+    def test_green_with_too_few_passed_still_fails(self):
+        status, detail = self._green("12 passed in 1.02s")
+        self.assertEqual(status, quality_gate.FAIL, msg=detail)
+
+    def test_everything_skipped_is_a_failure_not_a_pass(self):
+        status, detail = self._green("1196 skipped in 9.11s")
+        self.assertEqual(status, quality_gate.FAIL, msg=detail)
+
+    def test_green_at_expected_scale_reports_the_count(self):
+        status, detail = self._green("1196 passed in 70.29s")
+        self.assertEqual(status, quality_gate.PASS, msg=detail)
+        self.assertIn("1196", detail, "通过条数要出现在门禁输出里，绿了也能审计")
 
 
 if __name__ == "__main__":

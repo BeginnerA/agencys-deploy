@@ -5,6 +5,8 @@
     - 无打包器、无转译（前端是原生 JS SPA），所以前端只能做「语法 + 无头单测」两道检查；
     - ruff / node 属可选工具：缺失时该步记为 SKIP 而非 FAIL（缺依赖不该让发布中断），
       但 `--strict` 下 SKIP 也视为失败，用于 CI 这种依赖应当齐备的环境；
+    - pytest 步除退出码外还要核对通过条数（MIN_PASSED_TESTS）并把该行打进日志：
+      用例被整体挪走、收集失败、全量 skip 三种情况退出码都是 0，只看 rc 就是假绿；
     - 所有步骤都是只读的：语法步用 ast.parse（不在源码树落 __pycache__），
       单测走 `-p no:cacheprovider`，全程不读写 data/ 运行数据。
 
@@ -16,6 +18,7 @@
 """
 import argparse
 import ast
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +35,11 @@ JS_DIR = ROOT / "webapp" / "static" / "js"
 JS_TESTS = sorted((ROOT / "tests" / "js").glob("*_test.js"))
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
+
+# pytest 步的通过条数门槛：本仓库套件在 1200 条量级，掉到门槛以下只可能是用例被挪走、
+# 收集失败或整体 skip（三种都是 rc=0 的假绿）。真要合理收缩套件时连这里一起改，
+# 别让它靠放宽判据悄悄失效。
+MIN_PASSED_TESTS = 1000
 
 
 class Step:
@@ -115,13 +123,27 @@ def step_lint(strict=False):
     return FAIL, tail
 
 
+def _passed_count(summary: str) -> int:
+    """从 pytest 收尾行取通过条数；取不到返回 -1（调用方按「没有证据」处理）
+
+    只认 `N passed`：`N skipped`、`no tests ran` 都是 rc=0 的绿灯，但一条断言没跑。
+    """
+    matched = re.search(r"\b(\d+) passed\b", summary)
+    return int(matched.group(1)) if matched else -1
+
+
 def step_pytest():
     rc, tail = _run([sys.executable, "-m", "pytest", "-q",
                      "-p", "no:cacheprovider"])
     last = [ln for ln in tail.strip().splitlines() if ln.strip()][-1:] or [""]
-    if rc == 0:
-        return PASS, last[0]
-    return FAIL, tail
+    if rc != 0:
+        return FAIL, tail
+    passed = _passed_count(last[0])
+    if passed < MIN_PASSED_TESTS:
+        return FAIL, (f"pytest 退出码 0，但通过条数只有 {passed}（门槛 "
+                      f"{MIN_PASSED_TESTS}）：用例被挪走、收集失败或整体 skip 都会"
+                      f"这样假绿。收尾行：{last[0]!r}\n{tail}")
+    return PASS, last[0]
 
 
 def step_js(strict=False):
@@ -184,6 +206,9 @@ def main():
         if status == FAIL:
             failed.append(title)
             print("    " + detail.replace("\n", "\n    "))
+        elif detail:
+            # 绿灯也要把证据打在日志里（pytest 那行是通过条数），否则日志只有四个 PASS
+            print("    " + detail.splitlines()[0])
     if failed:
         print(f"[gate] 未通过：{', '.join(failed)}")
         return 1
