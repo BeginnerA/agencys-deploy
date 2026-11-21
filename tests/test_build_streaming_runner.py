@@ -93,6 +93,48 @@ class TimeoutKillsWholeTreeTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5.0)
 
 
+class OutputEncodingTest(unittest.TestCase):
+    """子进程输出解码兜底：JDK 8/Maven 写 GBK，JDK 18+/docker 写 UTF-8
+
+    线上事故回归：本机 ACP 为 cp65001，text=True 无显式 encoding 时按 UTF-8 解码，
+    JDK 8 写出的 GBK 中文被打成乱码，is_transient_io_failure 的中文关键词
+    "读取…时出错" 永不命中，可自愈的瞬时文件占用被直接判失败。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _emit_script(self, codec, message):
+        """让子进程按指定编码吐原始字节，绕开控制台代码页，编码由测试完全掌控"""
+        script = self.cwd / "emit.py"
+        script.write_text(
+            "import sys\n"
+            f"sys.stdout.buffer.write({message!r}.encode({codec!r}) + b'\\n')\n"
+            "sys.stdout.buffer.flush()\n",
+            encoding="utf-8")
+        return script
+
+    def test_gbk_child_output_keeps_chinese_keyword_matchable(self):
+        script = self._emit_script("gbk", "[ERROR] 读取 A.java 时出错")
+        rc, text = build._run_streaming([sys.executable, str(script)], self.cwd,
+                                        timeout=30, on_line=lambda line: None)
+        self.assertEqual(rc, 0)
+        self.assertIn("读取", text)
+        self.assertIn("时出错", text)
+        self.assertTrue(build.is_transient_io_failure(text))
+
+    def test_utf8_child_output_is_not_reread_as_gbk(self):
+        script = self._emit_script("utf-8", "删除 D:\\work\\狼途传媒\\pay 目录")
+        rc, text = build._run_streaming([sys.executable, str(script)], self.cwd,
+                                        timeout=30, on_line=lambda line: None)
+        self.assertEqual(rc, 0)
+        self.assertIn("狼途传媒", text)
+
+
 class RunWrappersTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

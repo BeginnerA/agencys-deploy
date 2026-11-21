@@ -291,6 +291,18 @@ def _kill_process_tree(proc) -> None:
         pass
 
 
+def _decode_output(raw: bytes) -> str:
+    """子进程输出解码：Windows 上 JDK 8/Maven 写 GBK、JDK 18+/docker 写 UTF-8，
+    而本机 ACP 为 cp65001 时按 locale 解码会把 GBK 中文打成乱码，
+    令 is_transient_io_failure 的中文关键词匹配失效，故 UTF-8 优先、GBK 兜底。"""
+    for enc in (("utf-8", "gbk") if os.name == "nt" else ("utf-8",)):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def _run_streaming(cmd, cwd, env: dict = None, timeout: int = None,
                    shell: bool = False, on_line=None) -> tuple:
     """执行命令并逐行透传输出，超时终止整棵进程树
@@ -299,10 +311,11 @@ def _run_streaming(cmd, cwd, env: dict = None, timeout: int = None,
     与既有日志格式保持一致。超时抛 subprocess.TimeoutExpired，由调用方报错。
     """
     emit = on_line or (lambda line: print(f"  | {line}", flush=True))
+    # 二进制读取：编码由 _decode_output 逐行判定，不能交给 text=True 按 locale 猜
     popen_kwargs = dict(
         cwd=cwd, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, errors="replace", bufsize=1, shell=shell,
+        bufsize=-1, shell=shell,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
     )
     if os.name != "nt":
@@ -316,8 +329,9 @@ def _run_streaming(cmd, cwd, env: dict = None, timeout: int = None,
     def reader():
         try:
             for raw in proc.stdout:
-                chunks.append(raw)
-                line = raw.rstrip("\r\n")
+                decoded = _decode_output(raw)
+                chunks.append(decoded)
+                line = decoded.rstrip("\r\n")
                 if line:
                     lines.put(line)
         finally:
@@ -515,8 +529,11 @@ def _run_maven_steps(proj: dict, project_root: Path, version: str,
             fail(f"未找到 pom.xml: {pom}")
         extra = step.get("extra_profile")
         maven_profiles = f"{profile},{extra}" if extra else profile
+        # -f 传相对 cwd(project_root) 的 ASCII 路径：中文项目根目录只留在 cwd（Unicode 安全），
+        # 不进 mvn.cmd 批处理参数，否则控制台非 UTF-8 时 cmd.exe 按 OEM 码页转码会损坏中文致 POM 找不到。
+        pom_arg = Path(os.path.relpath(pom, project_root)).as_posix()
         cmd = [
-            mvn, "-f", str(pom), "clean", step["goal"],
+            mvn, "-f", pom_arg, "clean", step["goal"],
             f"-P{maven_profiles}", f"-Drevision={version}", "-DskipTests",
         ]
         # Windows 下 target 可能被 IDE 增量编译/杀毒等瞬时占用导致 clean 失败或
