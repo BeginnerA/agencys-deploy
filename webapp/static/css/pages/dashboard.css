@@ -38,6 +38,8 @@
 }
 .trend-tabs{display:flex;gap:6px}
 .trend-tabs .tab-btn{padding:3px 12px;font-size:12px}
+/* 上限与 .dash-grid 图表的 260px 同高：列表再长也只在自己内部滚动，不撑高三栏网格整行 */
+.rlist{max-height:260px;overflow-y:auto;padding-right:2px}
 .rlist .list-item{border-bottom:1px solid rgba(0,212,255,.06)}
 .rlist .list-item:last-child{border-bottom:none}
 .tbl-wrap{overflow-x:auto}

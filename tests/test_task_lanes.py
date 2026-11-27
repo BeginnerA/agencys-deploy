@@ -1,17 +1,8 @@
-# tests/test_task_lanes.py
-"""并行执行道：哪些任务可以同时跑，哪些必须排队
+"""任务并行：目标互斥与跨任务 SnailJob 互斥
 
-单 worker 串行队列把一次 20 分钟的 Maven 构建放大成全平台停机；无脑并发又会破坏
-读-改-写型的共享状态。真正决定"能不能并行"的不是主机，而是任务会碰到的共享资源：
-
-  svc/pl   发布目标本身（与提交互斥闸同一套键，见 db.task_target_keys）
-  repo     构建工作目录（git clone/checkout/pull 的目标目录）
-  mod      build_order 每个模块的 pom/package 目录（mvn clean 会删 target/）
-  compose  宿主机上的 docker-compose.yml（平台先下载改镜像再上传，同文件并发即丢更新）
-  snailjob SnailJob 分组（部署前暂停任务、结束后恢复，两个任务共用一组会互相提前恢复）
-
-键集相交 → 排队串行；不相交 → 并行。互斥下沉到这里，队列只认键不认业务。
+仓库、模块和 Compose 锁只覆盖实际共享操作，不能再把不同服务整任务排队。
 """
+
 import os
 import shutil
 import tempfile
@@ -88,7 +79,6 @@ class TestTargetLanes(_DbCase):
         self.assertIn(f"service:{svc}", keys)
 
     def test_schedule_created_task_uses_service_lane(self):
-        """定时计划落库的任务 type 是 ref_type（service），不能落到自有命名空间"""
         svc = self._svc("auth")
         keys = self._keys(self._task("service", svc, "auth"))
         self.assertIn(f"service:{svc}", keys)
@@ -104,188 +94,43 @@ class TestTargetLanes(_DbCase):
         self.assertIn(f"service:{web}", keys)
 
     def test_same_target_different_env_share_target_lane(self):
-        """目标是服务本身，跨环境同样只能有一个在跑（与互斥闸的环境维度互补）"""
         svc = self._svc("auth")
-        self.assertEqual(self._prefixed(self._keys(self._task("project", svc, "auth", "prod")), "service:"),
-                         self._prefixed(self._keys(self._task("project", svc, "auth", "test")), "service:"))
+        prod = self._prefixed(self._keys(self._task("project", svc, "auth", "prod")), "service:")
+        test = self._prefixed(self._keys(self._task("project", svc, "auth", "test")), "service:")
+        self.assertEqual(prod, test)
 
     def test_target_lane_matches_dedup_guard_keys(self):
-        """队列键与提交闸键同源：两处算法分叉会让'能提交却永远排不上'或反之"""
         svc = self._svc("auth")
         self.assertEqual(self._prefixed(self._keys(self._task("project", svc, "auth")), "service:"),
                          dbm.task_target_keys(self.db, "project", svc))
 
 
-class TestBuildWorkspaceLanes(_DbCase):
-    """构建工作目录：同一份源码不能同时被两个任务 checkout + mvn clean"""
-
-    def test_same_git_repo_shares_one_repo_lane(self):
+class TestOperationResourcesDoNotBlockTaskStart(_DbCase):
+    def test_shared_repo_module_and_compose_do_not_block_other_service(self):
         a = self._svc("auth", git_repo="saas-backend",
-                      build_order=[{"path": "auth", "goal": "package"}])
-        b = self._svc("gateway", git_repo="saas-backend",
-                      build_order=[{"path": "gateway", "goal": "package"}])
-        ka, kb = self._keys(self._task("project", a, "auth")), self._keys(self._task("project", b, "gateway"))
-        self.assertEqual(self._prefixed(ka, "repo:"), self._prefixed(kb, "repo:"))
-        self.assertEqual(len(self._prefixed(ka, "repo:")), 1)
+                      build_order=[{"path": "shared-api", "goal": "install"},
+                                   {"path": "auth", "goal": "package"}])
+        b = self._svc("web", git_repo="saas-backend",
+                      build_order=[{"path": "shared-api", "goal": "install"},
+                                   {"path": "web", "goal": "package"}])
+        ta = self._task("project", a, "auth")
+        tb = self._task("project", b, "web")
+        self.assertFalse(lanes.task_lanes(self.db, ta) & lanes.task_lanes(self.db, tb))
 
-    def test_different_git_repos_do_not_share_repo_lane(self):
-        a = self._svc("auth", git_repo="repo-a")
-        b = self._svc("web", git_repo="repo-b")
-        self.assertFalse(self._prefixed(self._keys(self._task("project", a, "auth")), "repo:")
-                         & self._prefixed(self._keys(self._task("project", b, "web")), "repo:"))
-
-    def test_module_paths_are_lanes_of_their_own(self):
-        """无 git_repo（人工同步的本地仓库）时，同模块目录仍必须互斥：mvn clean 会删同一个 target/"""
-        a = self._svc("auth", build_order=[{"path": "shared-api", "goal": "package"}])
-        b = self._svc("web", build_order=[{"path": "shared-api", "goal": "package"}])
-        c = self._svc("job", build_order=[{"path": "other", "goal": "package"}])
-        ka = self._keys(self._task("project", a, "auth"))
-        kb = self._keys(self._task("project", b, "web"))
-        kc = self._keys(self._task("project", c, "job"))
-        self.assertEqual(self._prefixed(ka, "mod:"), self._prefixed(kb, "mod:"))
-        self.assertEqual(len(self._prefixed(ka, "mod:")), 1)
-        self.assertFalse(self._prefixed(ka, "mod:") & self._prefixed(kc, "mod:"))
-
-    def test_pipeline_covers_member_repos(self):
-        a = self._svc("auth", git_repo="repo-a")
-        b = self._svc("web", git_repo="repo-b")
-        pl = dbm.create_record(self.db, "pipelines", dict(
-            project_id=self.proj, name="pl1", build_first=1,
-            stages=[{"services": [{"service_id": a}, {"service_id": b}]}]))
-        keys = self._keys(self._task("pipeline", pl, "pl1"))
-        self.assertEqual(len(self._prefixed(keys, "repo:")), 2)
-
-    def test_skip_build_drops_workspace_lanes(self):
-        """"仅重启镜像不改代码"的发布（--skip-build）不碰源码目录，不该被构建道挡住"""
-        svc = self._svc("auth", git_repo="repo-a")
-        task = self._task("project", svc, "auth")
-        keys = self._keys(task, extra=["--skip-build"])
-        self.assertFalse(self._prefixed(keys, "repo:"))
-        self.assertFalse(self._prefixed(keys, "mod:"))
-        self.assertTrue(self._prefixed(keys, "compose:"))
-
-    def test_restart_never_builds(self):
-        svc = self._svc("auth", git_repo="repo-a")
-        keys = self._keys(self._task("restart", svc, "auth", version=""))
-        self.assertFalse(self._prefixed(keys, "repo:"))
-        self.assertFalse(self._prefixed(keys, "mod:"))
-
-    def test_remote_git_url_lane_matches_its_clone_dir(self):
-        """远程 URL clone 到 project_root/末段目录名：与写同名本地路径的服务必须同一条道"""
-        url = self._svc("auth", git_repo="https://git.example.com/team/saas-backend.git")
-        local = self._svc("web", git_repo="saas-backend")
-        self.assertEqual(self._prefixed(self._keys(self._task("project", url, "auth")), "repo:"),
-                         self._prefixed(self._keys(self._task("project", local, "web")), "repo:"))
-
-    def test_repo_lane_follows_host_path_identity(self):
-        """车道键的判据是「在本机是不是同一个目录」，不是字符串长得像不像：
-        同一目录算出两个键，两个任务会同时往一份源码里 checkout + mvn clean；
-        不同目录算成一个键，无关发布就白白排队。而大小写、反斜杠在哪边算同一路径
-        是宿主规矩（Windows 折叠，POSIX 上 repo\\sub 只是含反斜杠的目录名），
-        所以这两种写法按宿主分别断言，用例在两种 runner 上都得是真判据。"""
-        upper = self._svc("auth", git_repo="Repo/Sub")
-        backslash = self._svc("web", git_repo="repo\\sub")
-        k_upper = self._prefixed(self._keys(self._task("project", upper, "auth")), "repo:")
-        k_back = self._prefixed(self._keys(self._task("project", backslash, "web")), "repo:")
-        self.assertEqual(len(k_upper), 1)
-        if os.name == "nt":
-            self.assertEqual(k_upper, k_back)
-        else:
-            self.assertFalse(k_upper & k_back)
-
-    def test_repo_lane_ignores_spelling_that_never_means_another_dir(self):
-        """尾分隔符、./ 、重复分隔符在任何宿主上都不是另一个目录：这类别名必须同键，
-        否则同一份源码能被两个任务同时占用（这条与平台无关，两边 runner 都跑同样断言）"""
-        base = self._svc("auth", git_repo="repo-sub")
-        k_base = self._prefixed(self._keys(self._task("project", base, "auth")), "repo:")
-        self.assertEqual(len(k_base), 1)
-        for i, alias in enumerate(("repo-sub/", "repo-sub/.", "repo-sub//", "./repo-sub")):
-            svc = self._svc(f"web{i}", git_repo=alias)
-            self.assertEqual(k_base, self._prefixed(self._keys(
-                self._task("project", svc, f"web{i}")), "repo:"), f"别名 {alias} 落到了另一条道")
-
-    def test_relative_project_root_is_stable_across_cwd(self):
-        """键在平台进程里算、子进程在别的工作目录里跑：相对根必须锚定成绝对路径，
-        否则同一目录在不同调用点算出不同键，互斥静默失效"""
-        svc = self._svc("auth", git_repo="x")
-        dbm.create_record(self.db, "environments", dict(
-            project_id=self.proj, name="rel", is_default=0, registry={}, nacos={},
-            mysql_snailjob={}, ssh={}, build={}, deploy={"project_root": "repos"},
-            docker_compose_path="", maven_profile="", monitor_enabled=1))
-        task = dbm.get_task(self.db, dbm.create_task(self.db, self.proj, "project", svc,
-                                                     "auth", "rel", "1.0.0", "", 1))
-        here = os.getcwd()
-        try:
-            keys_here = self._keys(task)
-            os.chdir(tempfile.gettempdir())
-            keys_there = self._keys(task)
-        finally:
-            os.chdir(here)
-        repo_keys = self._prefixed(keys_here, "repo:")
-        self.assertEqual(len(repo_keys), 1)
-        self.assertEqual(keys_here, keys_there)
-        self.assertTrue(os.path.isabs(next(iter(repo_keys)).split(":", 1)[1]))
-
-    def test_no_project_root_config_yields_no_workspace_lanes(self):
-        """没配 project_root 就无从判断目录是否相同：只保留目标道，不得凭空造键"""
-        svc = self._svc("auth", git_repo="repo-a")
-        dbm.update_record(self.db, "environments", self.prod,
-                          {"deploy": {"project_root": ""}})
+    def test_task_lanes_never_contain_operation_resource_keys(self):
+        svc = self._svc("auth", git_repo="repo-a",
+                        build_order=[{"path": "shared", "goal": "package"}])
         keys = self._keys(self._task("project", svc, "auth"))
-        self.assertFalse(self._prefixed(keys, "repo:"))
-        self.assertIn(f"service:{svc}", keys)
+        for prefix in ("repo:", "mod:", "compose:"):
+            self.assertFalse(self._prefixed(keys, prefix), prefix)
 
-
-class TestComposeLanes(_DbCase):
-    """compose 文件：平台要改写它（换镜像 tag），同一文件同机并发即丢更新"""
-
-    def test_container_service_holds_its_env_hosts_compose_lane(self):
-        svc = self._svc("auth")
-        keys = self._keys(self._task("project", svc, "auth"))
-        self.assertEqual(self._prefixed(keys, "compose:"),
-                         {"compose:10.0.0.1:/opt/app/docker-compose.yml"})
-
-    def test_second_host_adds_its_own_lane(self):
-        svc = self._svc("auth")
-        dbm.bind_server(self.db, self.prod, self.s2, 1)
-        self.assertEqual(len(self._prefixed(self._keys(self._task("project", svc, "auth")), "compose:")), 2)
-
-    def test_different_hosts_same_path_are_different_lanes(self):
-        """prod 与 test 各在一台机器上，用同一个 compose 路径：可以并行"""
-        svc = self._svc("auth")
-        prod_keys = self._keys(self._task("project", svc, "auth", "prod"))
-        test_keys = self._keys(self._task("project", svc, "auth", "test"))
-        self.assertFalse(self._prefixed(prod_keys, "compose:") & self._prefixed(test_keys, "compose:"))
-
-    def test_same_host_and_path_is_one_lane(self):
-        """两个环境共用同一台机同一个 compose 文件：物理上就是同一份文件，必须串行"""
-        self._env("gray", self.root, "/opt/app/docker-compose.yml", [self.s1])
-        svc = self._svc("auth")
-        prod_keys = self._keys(self._task("project", svc, "auth", "prod"))
-        gray_keys = dbm.get_task(self.db, dbm.create_task(
-            self.db, self.proj, "project", svc, "auth", "gray", "1.0.0", "", 1))
-        self.assertTrue(prod_keys & self._keys(gray_keys))
-
-    def test_non_container_modes_have_no_compose_lane(self):
-        """WAR 有自己的远端 gate.lock，进程族按 systemd 单元操作：都不碰 compose"""
-        for mode in ("war_tomcat", "jar_service", "static_archive"):
-            svc = self._svc(f"s-{mode}", deploy_mode=mode)
-            self.assertFalse(self._prefixed(self._keys(self._task("project", svc, "s")), "compose:"),
-                             f"{mode} 不该占 compose 道")
-
-    def test_missing_compose_path_yields_no_compose_lane(self):
-        svc = self._svc("auth")
-        dbm.update_record(self.db, "environments", self.prod, {"docker_compose_path": ""})
-        keys = self._keys(self._task("project", svc, "auth"))
-        self.assertFalse(self._prefixed(keys, "compose:"))
-        self.assertIn(f"service:{svc}", keys)
-
-    def test_restart_uses_docker_restart_not_compose(self):
-        """restart 走 docker restart（不改 compose 文件），不该被 compose 道挡住"""
-        svc = self._svc("auth")
-        keys = self._keys(self._task("restart", svc, "auth", version=""))
-        self.assertFalse(self._prefixed(keys, "compose:"))
-        self.assertIn(f"service:{svc}", keys)
+    def test_skip_build_and_restart_keep_only_target_lanes(self):
+        svc = self._svc("auth", git_repo="repo-a")
+        restart_svc = self._svc("restart-auth", git_repo="repo-a")
+        skip_keys = self._keys(self._task("project", svc, "auth"), ["--skip-build"])
+        restart_keys = self._keys(self._task("restart", restart_svc, "restart-auth", version=""))
+        self.assertEqual(skip_keys, {f"service:{svc}"})
+        self.assertEqual(restart_keys, {f"service:{restart_svc}"})
 
 
 class TestSnailjobLanes(_DbCase):
@@ -304,10 +149,27 @@ class TestSnailjobLanes(_DbCase):
         svc = self._svc("auth")
         self.assertFalse(self._prefixed(self._keys(self._task("project", svc, "auth")), "snailjob:"))
 
+    def test_skip_build_keeps_snailjob_lane(self):
+        svc = self._svc("auth", snailjob_group="same")
+        keys = self._keys(self._task("project", svc, "auth"), ["--skip-build"])
+        self.assertEqual(self._prefixed(keys, "snailjob:"), {"snailjob:same"})
+
+    def test_skip_snailjob_drops_snailjob_lane(self):
+        svc = self._svc("auth", snailjob_group="same")
+        keys = self._keys(self._task("project", svc, "auth"), ["--skip-snailjob"])
+        self.assertFalse(self._prefixed(keys, "snailjob:"))
+
+    def test_pipeline_without_build_first_keeps_snailjob_lane(self):
+        svc = self._svc("auth", snailjob_group="same")
+        pl = dbm.create_record(self.db, "pipelines", dict(
+            project_id=self.proj, name="pl1", build_first=0,
+            stages=[{"services": [{"service_id": svc}]}]))
+        keys = self._keys(self._task("pipeline", pl, "pl1"))
+        self.assertEqual(self._prefixed(keys, "snailjob:"), {"snailjob:same"})
+
 
 class TestLaneRobustness(_DbCase):
     def test_lanes_are_never_empty(self):
-        """空键集 = 无约束并行，任何解析失败都必须退回目标道"""
         for task in (self._task("project", 9999, "ghost"),
                      self._task("pipeline", 9999, "ghost-pl"),
                      self._task("legacy", 5, "legacy-one"),
@@ -315,21 +177,12 @@ class TestLaneRobustness(_DbCase):
             self.assertTrue(self._keys(task), f"{task['type']}/{task['ref_id']} 键集为空")
 
     def test_unknown_type_keeps_its_own_namespace(self):
-        """未知 type（历史遗留/测试构造）之间互斥，但不与 svc/pl 键空间相互占用"""
         t1 = self._task("legacy", 7, "one")
-        t2 = dict(t1, id=999, name="two")  # 同目标的第二条建不出来（互斥闸），只取键集语义
+        t2 = dict(t1, id=999, name="two")
         self.assertTrue(self._keys(t1) & self._keys(t2))
         svc = self._svc("auth")
         self.assertFalse(self._keys(t1) & self._keys(self._task("project", svc, "auth")))
 
-    def test_deleted_env_falls_back_to_default_env(self):
-        """任务 env 为空时按默认环境解析（与 export_runtime 同口径）"""
-        svc = self._svc("auth")
-        task = self._task("project", svc, "auth", env="")
-        self.assertIn("compose:10.0.0.1:/opt/app/docker-compose.yml", self._keys(task))
-
-
-# ---------- 执行队列 ----------
 
 class _Runner:
     """可控假执行体：记录同时在跑的任务数，按事件门放行"""
@@ -394,8 +247,8 @@ class TestTaskQueue(unittest.TestCase):
         r = _Runner()
         q = self._queue(3)
         r.gate.clear()
-        q.submit(1, {"repo:x"}, r.make(1, block_on_gate=True))
-        q.submit(2, {"repo:x"}, r.make(2))
+        q.submit(1, {"shared:x"}, r.make(1, block_on_gate=True))
+        q.submit(2, {"shared:x"}, r.make(2))
         deadline = time.time() + 3
         while r.order != [1] and time.time() < deadline:
             time.sleep(0.01)
@@ -407,14 +260,12 @@ class TestTaskQueue(unittest.TestCase):
         self.assertEqual(r.peak, 1)
 
     def test_blocked_task_does_not_eat_a_slot(self):
-        """槽位有限时，等同道的任务不得占着执行槽：否则并行池退化回 FIFO，
-        一条繁忙道就能把后面所有道堵死（正是本次要消灭的"一堵全停"）"""
         r = _Runner()
         q = self._queue(2)
         r.gate.clear()
-        q.submit(1, {"repo:x"}, r.make(1, block_on_gate=True))
-        q.submit(2, {"repo:x"}, r.make(2))
-        q.submit(3, {"repo:y"}, r.make(3))
+        q.submit(1, {"shared:x"}, r.make(1, block_on_gate=True))
+        q.submit(2, {"shared:x"}, r.make(2))
+        q.submit(3, {"shared:y"}, r.make(3))
         deadline = time.time() + 3
         while 3 not in r.order and time.time() < deadline:
             time.sleep(0.01)
@@ -436,7 +287,7 @@ class TestTaskQueue(unittest.TestCase):
         r = _Runner(hold=0.02)
         q = self._queue(3)
         for i in (1, 2, 3):
-            q.submit(i, {"repo:x"}, r.make(i))
+            q.submit(i, {"shared:x"}, r.make(i))
         self.assertTrue(self._wait_idle(q))
         self.assertEqual(r.order, [1, 2, 3])
 
@@ -450,16 +301,16 @@ class TestTaskQueue(unittest.TestCase):
         def ok():
             done.set()
 
-        q.submit(1, {"repo:x"}, boom)
-        q.submit(2, {"repo:x"}, ok)
+        q.submit(1, {"shared:x"}, boom)
+        q.submit(2, {"shared:x"}, ok)
         self.assertTrue(done.wait(5), "前一个任务异常后同道任务必须能继续")
 
     def test_cancel_before_start_prevents_execution(self):
         r = _Runner()
         q = self._queue(1)
         r.gate.clear()
-        q.submit(1, {"repo:x"}, r.make(1, block_on_gate=True))
-        item = q.submit(2, {"repo:y"}, r.make(2))
+        q.submit(1, {"shared:x"}, r.make(1, block_on_gate=True))
+        item = q.submit(2, {"shared:y"}, r.make(2))
         self.assertTrue(item.cancel())
         self.assertFalse(item.cancel(), "重复取消不得算成功")
         r.gate.set()
@@ -469,7 +320,7 @@ class TestTaskQueue(unittest.TestCase):
     def test_cancel_running_task_reports_false(self):
         r = _Runner()
         q = self._queue(1)
-        item = q.submit(1, {"repo:x"}, r.make(1))
+        item = q.submit(1, {"shared:x"}, r.make(1))
         deadline = time.time() + 3
         while not r.order and time.time() < deadline:
             time.sleep(0.01)
@@ -508,8 +359,6 @@ class TestSubmitTaskWiring(_DbCase):
 
         patchers = [mock.patch.object(task_manager, "_queue", self.q),
                     mock.patch.object(task_manager, "_run_task", fake_run)]
-        # 假执行体不会 pop 注册表，而任务号每个用例都从 1 重来：逐用例清空再还原，
-        # 否则上个用例遗留的占位会让 kill_task 找到别的队列里的同名任务
         self._saved_registry = dict(task_manager._task_registry)
         task_manager._task_registry.clear()
         for p in patchers:
@@ -525,7 +374,6 @@ class TestSubmitTaskWiring(_DbCase):
         super().tearDown()
 
     def _hold_lane(self):
-        """占住执行道：假执行体进门后等 gate，用于构造"一个在跑、一个在等道" """
         self.gate.clear()
         return self.ran
 
@@ -533,9 +381,8 @@ class TestSubmitTaskWiring(_DbCase):
         self.tm.submit_task(self.db, task, extra or [], log_dir=self.tmp)
         return task
 
-    def _shared_repo_task(self):
-        """与 auth 共用构建目录（repo-a）的另一个服务：目标道不同、构建道相同"""
-        web = self._svc("web", git_repo="repo-a")
+    def _shared_snailjob_task(self):
+        web = self._svc("web", snailjob_group="same")
         return dbm.get_task(self.db, dbm.create_task(self.db, self.proj, "project", web,
                                                      "web", "prod", "1.0.0", "", 1))
 
@@ -570,13 +417,10 @@ class TestSubmitTaskWiring(_DbCase):
         self.assertEqual(seen[task["id"]], expected)
 
     def test_blocked_task_stays_pending_in_db(self):
-        """排队中的任务状态仍是 pending：大屏与 409 判定都以活动状态为准，
-        把"等道"显示成"运行中"会让操作员误判进度"""
         ran = self._hold_lane()
-        a = self._submit(self._task("project", self._svc("auth", git_repo="repo-a"), "auth"))
+        a = self._submit(self._task("project", self._svc("auth", snailjob_group="same"), "auth"))
         self._wait_busy()
-        # 同服务第二个任务提交不了（互斥闸），换一个共用构建目录的服务来排队
-        b = self._submit(self._shared_repo_task())
+        b = self._submit(self._shared_snailjob_task())
         self.assertEqual(self.q.pending_count(), 1)
         self.assertEqual(dbm.get_task(self.db, b["id"])["status"], "pending")
         self.gate.set()
@@ -586,9 +430,9 @@ class TestSubmitTaskWiring(_DbCase):
     def test_kill_queued_task_releases_lane_and_marks_failed(self):
         from webapp import task_manager
         ran = self._hold_lane()
-        self._submit(self._task("project", self._svc("auth", git_repo="repo-a"), "auth"))
+        self._submit(self._task("project", self._svc("auth", snailjob_group="same"), "auth"))
         self._wait_busy()
-        b = self._submit(self._shared_repo_task())
+        b = self._submit(self._shared_snailjob_task())
         self.assertTrue(task_manager.kill_task(b["id"], self.db))
         self.assertEqual(self.q.pending_count(), 0)
         self.assertEqual(dbm.get_task(self.db, b["id"])["status"], "failed")
@@ -597,7 +441,6 @@ class TestSubmitTaskWiring(_DbCase):
         self.assertNotIn(b["id"], ran, "排队中被终止的任务不得再被执行")
 
     def test_serial_mode_when_concurrency_is_one(self):
-        """PLATFORM_TASK_CONCURRENCY=1 必须复现旧的单 worker 串行语义"""
         r = _Runner()
         q = lanes.TaskQueue(1)
         self.addCleanup(q.shutdown)
@@ -619,7 +462,6 @@ class TestRuntimeExportIsolation(_DbCase):
     """db 模式导出的运行时 YAML 落在 data/runtime/p{pid}/{env}/：并行后同项目两个任务同目录"""
 
     def test_export_writes_by_atomic_replace(self):
-        """就地截断写会让另一任务读到半份 YAML（解析失败或按旧配置发布），必须临时文件 + replace"""
         from webapp import exporter
         replaced = []
         real_replace = os.replace

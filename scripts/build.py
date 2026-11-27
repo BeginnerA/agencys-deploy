@@ -20,15 +20,32 @@ import hashlib
 import tarfile
 import zipfile
 import subprocess
+import tempfile
 import threading
 import argparse
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from common import (load_config, get_project_config, get_registry_auth,
                     get_registry_mode, log, fail,
                     is_remote_git_url, mask_git_url, repo_local_path)
+from resource_locks import (artifact_lock_key, module_lock, module_lock_plan,
+                            repo_lock_key, resource_lock)
 
 
-def git_prepare(proj: dict, project_root: Path) -> None:
+def _git_head(repo_path: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        fail(f"无法读取 Git HEAD（{repo_path}）: {exc}")
+    if result.returncode != 0 or not result.stdout.strip():
+        fail(f"无法读取 Git HEAD（{repo_path}）: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def git_prepare(proj: dict, project_root: Path):
     """构建前 Git 准备：远程 URL 自动 clone + 切换分支 + 拉取最新代码
 
     行为由 projects.yaml（或 DB services 表）的字段控制：
@@ -49,6 +66,14 @@ def git_prepare(proj: dict, project_root: Path) -> None:
     if repo_path is None:
         log(f"警告: 远程 URL 末段目录名不合法（须字母数字 _ -），跳过: {mask_git_url(repo)}")
         return
+    with resource_lock(repo_lock_key(project_root, repo)):
+        _git_prepare_repo(proj, project_root, repo, repo_path)
+        if (repo_path / ".git").exists():
+            return repo_path, _git_head(repo_path)
+    return None
+
+
+def _git_prepare_repo(proj: dict, project_root: Path, repo: str, repo_path: Path):
     if is_remote_git_url(repo):
         # 远程 URL：本地无仓库时自动 clone，已 clone 过则复用本地
         if not (repo_path / ".git").exists():
@@ -475,7 +500,8 @@ def get_maven_profile(config: dict, env: str = None) -> str:
 
 
 def _run_build_steps(proj: dict, project_root: Path, version: str,
-                     profile: str, env_vars: dict, config: dict = None):
+                     profile: str, env_vars: dict, config: dict = None,
+                     lock_modules: bool = True):
     """根据 build_type 执行对应构建步骤（maven/frontend/go/rust/node/python/none）"""
     build_type = proj.get("build_type", "maven")
     if build_type == "none":
@@ -483,21 +509,30 @@ def _run_build_steps(proj: dict, project_root: Path, version: str,
         log("构建类型 none：跳过构建，直接使用现成产物")
         return
     if build_type == "frontend":
-        _run_frontend_steps(proj, project_root, version, env_vars)
+        _run_frontend_steps(proj, project_root, version, env_vars,
+                            lock_modules=lock_modules)
         return
+    if build_type in ("go", "rust", "node", "python"):
+        if lock_modules:
+            with module_lock(project_root, "."):
+                _run_root_build(proj, project_root, version, env_vars, config, build_type)
+        else:
+            _run_root_build(proj, project_root, version, env_vars, config, build_type)
+        return
+    _run_maven_steps(proj, project_root, version, profile, env_vars, config,
+                     lock_modules=lock_modules)
+
+
+def _run_root_build(proj: dict, project_root: Path, version: str,
+                    env_vars: dict, config: dict, build_type: str):
     if build_type == "go":
         _run_go_steps(proj, project_root, version, env_vars, config)
-        return
-    if build_type == "rust":
+    elif build_type == "rust":
         _run_rust_steps(proj, project_root, version, env_vars, config)
-        return
-    if build_type == "node":
+    elif build_type == "node":
         _run_node_steps(proj, project_root, version, env_vars, config)
-        return
-    if build_type == "python":
+    else:
         _run_python_steps(proj, project_root, version, env_vars, config)
-        return
-    _run_maven_steps(proj, project_root, version, profile, env_vars, config)
 
 
 def _step_env(env_vars: dict, step: dict) -> dict:
@@ -512,7 +547,8 @@ def _step_env(env_vars: dict, step: dict) -> dict:
 
 
 def _run_maven_steps(proj: dict, project_root: Path, version: str,
-                     profile: str, env_vars: dict, config: dict = None):
+                     profile: str, env_vars: dict, config: dict = None,
+                     lock_modules: bool = True):
     """Maven 多模块构建（原有逻辑）"""
     mvn = find_mvn(config)
     java_home = find_java_home(config)
@@ -540,12 +576,17 @@ def _run_maven_steps(proj: dict, project_root: Path, version: str,
         # 读取生成文件失败，自动重试自愈（间隔 5 秒 × 3 次，给足 IDE 编译窗口）。
         # 超时上限 1800 秒：冷机多模块全量编译（依赖首次下载）正常可超过 10 分钟，
         # 短上限会把仍在正常推进的构建误杀。
-        run(cmd, project_root, env=_step_env(env_vars, step), timeout=1800,
-            retry_on_clean_failure=True, max_retries=3, retry_delay=5)
+        if lock_modules:
+            with module_lock(project_root, step["path"]):
+                run(cmd, project_root, env=_step_env(env_vars, step), timeout=1800,
+                    retry_on_clean_failure=True, max_retries=3, retry_delay=5)
+        else:
+            run(cmd, project_root, env=_step_env(env_vars, step), timeout=1800,
+                retry_on_clean_failure=True, max_retries=3, retry_delay=5)
 
 
 def _run_frontend_steps(proj: dict, project_root: Path, version: str,
-                        env_vars: dict):
+                        env_vars: dict, lock_modules: bool = True):
     """前端构建：按 build_order 中每个步骤的 commands 列表顺序执行
 
     commands 中的命令支持 shell 语法（管道、重定向等）。
@@ -563,25 +604,48 @@ def _run_frontend_steps(proj: dict, project_root: Path, version: str,
             log(f"警告: 步骤 [{step_name}] 无 commands，跳过")
             continue
         log(f">>> 前端步骤: {step_name}（{step_path}）")
-        step_env = _step_env(env_vars, step)
-        for cmd_template in commands:
-            # 支持 ${VERSION} 变量替换
-            cmd = cmd_template.replace("${VERSION}", version)
-            # 如果命令以 npm/pnpm/yarn 开头，尝试定位绝对路径
-            parts = cmd.split(None, 1)
-            if parts and parts[0] in ("npm", "pnpm", "yarn"):
-                pm = shutil.which(parts[0])
-                if pm:
-                    # run_shell 用 cmd /c "{cmd}" 包裹：路径含空格时（如 nvm/IDEA 自带
-                    # Node 装在带空格目录）必须给可执行文件再加一层引号，凑齐 cmd 的多引号
-                    # 保留规则，否则 cmd 剥掉外层引号后按空格截断报 "不是内部或外部命令"
-                    if " " in pm:
-                        pm = f'"{pm}"'
-                    cmd = pm + (" " + parts[1] if len(parts) > 1 else "")
-            run_shell(cmd, step_path, env=step_env, timeout=600)
+        if lock_modules:
+            with module_lock(project_root, step.get("path", ".")):
+                _run_frontend_commands(step, step_path, version, env_vars)
+        else:
+            _run_frontend_commands(step, step_path, version, env_vars)
 
 
-def _make_static_zip(proj: dict, project_root: Path, version: str, config: dict):
+def _run_frontend_commands(step: dict, step_path: Path, version: str, env_vars: dict):
+    step_env = _step_env(env_vars, step)
+    for cmd_template in step.get("commands", []):
+        # 支持 ${VERSION} 变量替换
+        cmd = cmd_template.replace("${VERSION}", version)
+        # 如果命令以 npm/pnpm/yarn 开头，尝试定位绝对路径
+        parts = cmd.split(None, 1)
+        if parts and parts[0] in ("npm", "pnpm", "yarn"):
+            pm = shutil.which(parts[0])
+            if pm:
+                # run_shell 用 cmd /c "{cmd}" 包裹：路径含空格时（如 nvm/IDEA 自带
+                # Node 装在带空格目录）必须给可执行文件再加一层引号，凑齐 cmd 的多引号
+                # 保留规则，否则 cmd 剥掉外层引号后按空格截断报 "不是内部或外部命令"
+                if " " in pm:
+                    pm = f'"{pm}"'
+                cmd = pm + (" " + parts[1] if len(parts) > 1 else "")
+        run_shell(cmd, step_path, env=step_env, timeout=600)
+
+
+@contextmanager
+def _atomic_output(path: Path):
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=path.suffix,
+                                    dir=path.parent)
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        yield tmp_path
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _make_static_zip(proj: dict, project_root: Path, version: str, config: dict,
+                     project_name: str = ""):
     """静态发布打包：构建产出目录 → dist/{zip_prefix}-{version}.zip（文件直接置于包根）
 
     zip 名与 deploy_strategies.static_archive 的约定一致；dist 目录解析规则与
@@ -590,16 +654,13 @@ def _make_static_zip(proj: dict, project_root: Path, version: str, config: dict)
     src = project_root / (proj.get("static_dist_dir") or "dist")
     if not src.exists():
         fail(f"静态构建产出目录不存在: {src}（检查 static_dist_dir 配置与构建命令产出）")
-    prefix = proj.get("zip_prefix") or proj.get("service_name") or proj.get("image_name") or "site"
-    dist_dir = Path(config["deploy"].get("dist_dir", "dist"))
-    if not dist_dir.is_absolute():
-        dist_dir = Path(__file__).resolve().parent.parent / dist_dir
-    dist_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = dist_dir / f"{prefix}-{version}.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for p in sorted(src.rglob("*")):
-            if p.is_file():
-                zf.write(p, p.relative_to(src).as_posix())
+    prefix = proj.get("zip_prefix") or project_name or "site"
+    zip_path = _dist_dir(config) / f"{prefix}-{version}.zip"
+    with _atomic_output(zip_path) as tmp_path:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in sorted(src.rglob("*")):
+                if p.is_file():
+                    zf.write(p, p.relative_to(src).as_posix())
     log(f"静态包已生成: {zip_path}（{zip_path.stat().st_size / 1024 / 1024:.1f} MB）")
 
 
@@ -654,18 +715,11 @@ def _select_war(proj: dict, project_root: Path) -> Path:
 def _make_war_artifact(proj: dict, project_root: Path, version: str, config: dict) -> Path:
     src = _select_war(proj, project_root)
     service = proj.get("image_name") or proj.get("name") or "app"
-    dist_dir = Path(config["deploy"].get("dist_dir", "dist"))
-    if not dist_dir.is_absolute():
-        dist_dir = Path(__file__).resolve().parent.parent / dist_dir
-    dist_dir.mkdir(parents=True, exist_ok=True)
-    out = dist_dir / f"{service}-{version}.war"
-    shutil.copy2(src, out)
-    h = hashlib.sha256()
-    with open(out, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    out.with_name(out.name + ".sha256").write_text(h.hexdigest() + "\n", encoding="utf-8")
-    log(f"WAR 产物已生成: {out}（sha256={h.hexdigest()[:12]}…）")
+    out = _dist_dir(config) / f"{service}-{version}.war"
+    with _atomic_output(out) as tmp_path:
+        shutil.copy2(src, tmp_path)
+    digest = _write_sha256(out)
+    log(f"WAR 产物已生成: {out}（sha256={digest[:12]}…）")
     return out
 
 
@@ -700,18 +754,11 @@ def _make_jar_artifact(proj: dict, project_root: Path, version: str, config: dic
     """
     src = _select_jar(proj, project_root)
     service = proj.get("image_name") or proj.get("name") or "app"
-    dist_dir = Path(config["deploy"].get("dist_dir", "dist"))
-    if not dist_dir.is_absolute():
-        dist_dir = Path(__file__).resolve().parent.parent / dist_dir
-    dist_dir.mkdir(parents=True, exist_ok=True)
-    out = dist_dir / f"{service}-{version}.jar"
-    shutil.copy2(src, out)
-    h = hashlib.sha256()
-    with open(out, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    out.with_name(out.name + ".sha256").write_text(h.hexdigest() + "\n", encoding="utf-8")
-    log(f"jar 产物已生成: {out}（{out.stat().st_size / 1024 / 1024:.1f} MB，sha256={h.hexdigest()[:12]}…）")
+    out = _dist_dir(config) / f"{service}-{version}.jar"
+    with _atomic_output(out) as tmp_path:
+        shutil.copy2(src, tmp_path)
+    digest = _write_sha256(out)
+    log(f"jar 产物已生成: {out}（{out.stat().st_size / 1024 / 1024:.1f} MB，sha256={digest[:12]}…）")
     return out
 
 
@@ -724,13 +771,16 @@ def _dist_dir(config: dict) -> Path:
     return dist_dir
 
 
-def _write_sha256(path: Path) -> None:
+def _write_sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
-    path.with_name(path.name + ".sha256").write_text(h.hexdigest() + "\n",
-                                                     encoding="utf-8")
+    digest = h.hexdigest()
+    sidecar = path.with_name(path.name + ".sha256")
+    with _atomic_output(sidecar) as tmp_path:
+        tmp_path.write_text(digest + "\n", encoding="utf-8")
+    return digest
 
 
 def _is_windows() -> bool:
@@ -788,9 +838,10 @@ def _run_go_steps(proj: dict, project_root: Path, version: str,
     cmd = [go, "build", "-trimpath"]
     if build_cfg.get("go_ldflags"):
         cmd += ["-ldflags", str(build_cfg["go_ldflags"])]
-    cmd += ["-o", str(out), main]
     log(f"使用 Go: {go}（CGO_ENABLED=0 GOOS=linux GOARCH={arch}）")
-    run(cmd, project_root, env=env, timeout=600)
+    with _atomic_output(out) as tmp_path:
+        cmd += ["-o", str(tmp_path), main]
+        run(cmd, project_root, env=env, timeout=600)
     _write_sha256(out)
     log(f"二进制产物已生成: {out}（sha256 已写旁文件）")
 
@@ -819,7 +870,8 @@ def _run_rust_steps(proj: dict, project_root: Path, version: str,
     if not src.exists():
         fail(f"cargo 产物不存在: {src}（检查 build.rust_bin 与 build.rust_target）")
     out = _dist_dir(config) / f"{service}-{version}"
-    shutil.copy2(src, out)
+    with _atomic_output(out) as tmp_path:
+        shutil.copy2(src, tmp_path)
     _write_sha256(out)
     log(f"二进制产物已生成: {out}（sha256 已写旁文件）")
 
@@ -850,8 +902,9 @@ def _make_node_package(proj: dict, project_root: Path, version: str,
     """项目目录（含 node_modules）→ dist/{service}-{version}.tar.gz + .sha256"""
     service = proj.get("image_name") or proj.get("name") or "app"
     out = _dist_dir(config) / f"{service}-{version}.tar.gz"
-    with tarfile.open(out, "w:gz") as tf:
-        tf.add(project_root, arcname=".", filter=_tar_filter(out))
+    with _atomic_output(out) as tmp_path:
+        with tarfile.open(tmp_path, "w:gz") as tf:
+            tf.add(project_root, arcname=".", filter=_tar_filter(tmp_path))
     _write_sha256(out)
     log(f"Node 产物已生成: {out}（含 node_modules，sha256 已写旁文件）")
     return out
@@ -886,10 +939,11 @@ def _make_python_package(proj: dict, project_root: Path, version: str,
     """源码 + requirements + wheels/ → dist/{service}-{version}.tar.gz + .sha256"""
     service = proj.get("image_name") or proj.get("name") or "app"
     out = _dist_dir(config) / f"{service}-{version}.tar.gz"
-    with tarfile.open(out, "w:gz") as tf:
-        tf.add(project_root, arcname=".", filter=_tar_filter(out))
-        tf.add(str(wheels_dir), arcname="wheels")
-        tf.add(str(project_root / req_name), arcname=req_name)
+    with _atomic_output(out) as tmp_path:
+        with tarfile.open(tmp_path, "w:gz") as tf:
+            tf.add(project_root, arcname=".", filter=_tar_filter(tmp_path))
+            tf.add(str(wheels_dir), arcname="wheels")
+            tf.add(str(project_root / req_name), arcname=req_name)
     _write_sha256(out)
     log(f"Python 产物已生成: {out}（含 wheels 离线依赖，sha256 已写旁文件）")
     return out
@@ -921,9 +975,18 @@ def _run_python_steps(proj: dict, project_root: Path, version: str,
     _make_python_package(proj, project_root, version, config, wheels_dir, req_name)
 
 
-def build_project(project_name: str, version: str, env: str = None):
+def build_project(project_name: str, version: str, env: str = None,
+                  lock_artifact: bool = True):
     config = load_config(env=env)
     proj = get_project_config(project_name)
+    if lock_artifact:
+        with resource_lock(artifact_lock_key(project_name, proj)):
+            return _build_project(project_name, version, env, config, proj)
+    return _build_project(project_name, version, env, config, proj)
+
+
+def _build_project(project_name: str, version: str, env: str,
+                   config: dict, proj: dict):
     registry = get_registry_auth(config)
     mode = get_registry_mode(config)
     build_type = proj.get("build_type", "maven")
@@ -940,8 +1003,6 @@ def build_project(project_name: str, version: str, env: str = None):
         log(f"警告: 项目根目录不存在: {project_root}（Docker 部署时请勾选「跳过构建」，或在宿主机上确认路径存在）")
         return
 
-    git_prepare(proj, project_root)
-
     if artifact != "image":
         log(f"发布方式 {deploy_mode}（产物 {artifact}）: 跳过 docker login")
     elif mode == "push":
@@ -950,43 +1011,92 @@ def build_project(project_name: str, version: str, env: str = None):
         log(f"直传模式（{mode}）: 跳过 docker login / docker push")
 
     env_vars = os.environ.copy()
-    _run_build_steps(proj, project_root, version, profile, env_vars, config)
-
+    workspace_keys = {
+        repo_lock_key(project_root, "."),
+        repo_lock_key(project_root, proj.get("git_repo") or "."),
+    }
+    build_paths = {step.get("path") or "." for step in proj.get("build_order", [])}
     if artifact == "archive":
-        _make_static_zip(proj, project_root, version, config)
-        return
-    if artifact == "jar":
-        _make_jar_artifact(proj, project_root, version, config)
-        return
-    if artifact == "war":
-        _make_war_artifact(proj, project_root, version, config)
-        return
-    if artifact in ("binary", "package"):
-        return  # 产物已在对应 _run_*_steps 内生成（含 .sha256），无后续打包
-
-    # Docker 构建（超时 10 分钟，--progress=plain 便于排查）
-    if mode == "push":
-        image = f"{registry['host']}/{registry['namespace']}/{proj['image_name']}:{version}"
+        module_paths = build_paths | {proj.get("static_dist_dir") or "dist"}
+    elif artifact in ("jar", "war"):
+        module_paths = build_paths | {"."}
     else:
-        ns = registry["namespace"]
-        image = f"{ns}/{proj['image_name']}:{version}" if ns else f"{proj['image_name']}:{version}"
-    dockerfile = project_root / proj["dockerfile"]
-    context = project_root / proj["docker_context"]
-    cmd = [
-        "docker", "build",
-        "--progress=plain",
-        "-t", image,
-        "-f", str(dockerfile),
-        str(context),
-    ]
-    run(cmd, project_root, timeout=600)
+        context_path = proj.get("docker_context") or "."
+        module_paths = {context_path}
+        workspace_keys.add(repo_lock_key(project_root, context_path))
+    module_plan = {}
+    for path in module_paths:
+        for key, shared in module_lock_plan(project_root, path).items():
+            module_plan[key] = module_plan.get(key, True) and shared
+    build_module_plan = {}
+    for path in build_paths:
+        for key, shared in module_lock_plan(project_root, path).items():
+            build_module_plan[key] = build_module_plan.get(key, True) and shared
+            if not shared and key in module_plan:
+                module_plan[key] = False
 
-    if mode == "push":
-        cmd = ["docker", "push", image]
-        run(cmd, project_root, timeout=600)
-        log(f"镜像已推送: {image}")
-    else:
-        log(f"镜像已构建（未推送，部署时直传）: {image}")
+    for attempt in range(1, 4):
+        snapshot = git_prepare(proj, project_root)
+        if not isinstance(snapshot, tuple) or len(snapshot) != 2:
+            snapshot = None
+        with ExitStack() as locks:
+            for key in sorted(workspace_keys):
+                locks.enter_context(resource_lock(key, shared=True))
+            for key, shared in sorted(module_plan.items()):
+                locks.enter_context(resource_lock(key, shared=shared))
+            if snapshot:
+                repo_path, expected_head = snapshot
+                if _git_head(repo_path) != expected_head:
+                    log(f"Git HEAD 在准备后已变化，重新准备源码（第 {attempt}/3 次）")
+                    continue
+            with ExitStack() as build_locks:
+                for key, shared in sorted(build_module_plan.items()):
+                    if key not in module_plan:
+                        build_locks.enter_context(resource_lock(key, shared=shared))
+                _run_build_steps(proj, project_root, version, profile, env_vars, config,
+                                 lock_modules=False)
+
+            if artifact in ("binary", "package"):
+                return snapshot  # 产物已在对应 _run_*_steps 内生成（含 .sha256），无后续打包
+
+            if artifact == "archive":
+                _make_static_zip(proj, project_root, version, config,
+                                 project_name=project_name)
+                return snapshot
+            if artifact == "jar":
+                _make_jar_artifact(proj, project_root, version, config)
+                return snapshot
+            if artifact == "war":
+                _make_war_artifact(proj, project_root, version, config)
+                return snapshot
+
+            # Docker 构建（超时 10 分钟，--progress=plain 便于排查）
+            if mode == "push":
+                image = f"{registry['host']}/{registry['namespace']}/{proj['image_name']}:{version}"
+            else:
+                ns = registry["namespace"]
+                image = f"{ns}/{proj['image_name']}:{version}" if ns else f"{proj['image_name']}:{version}"
+            dockerfile = project_root / proj["dockerfile"]
+            context = project_root / proj["docker_context"]
+            temporary_image = f"{image.rsplit(':', 1)[0]}:platform-build"
+            cmd = [
+                "docker", "build",
+                "--progress=plain",
+                "-t", temporary_image,
+                "-f", str(dockerfile),
+                str(context),
+            ]
+            run(cmd, project_root, timeout=600)
+            run(["docker", "tag", temporary_image, image], project_root, timeout=60)
+
+            if mode == "push":
+                cmd = ["docker", "push", image]
+                run(cmd, project_root, timeout=600)
+                log(f"镜像已推送: {image}")
+            else:
+                log(f"镜像已构建（未推送，部署时直传）: {image}")
+            return snapshot
+    fail("Git HEAD 在构建前连续发生变化，请停止并发切分支后重试")
 
 
 def main():

@@ -7,10 +7,11 @@ Git 操作失败仅告警，不阻断发布流程。
 import subprocess
 
 from common import log, mask_git_url, repo_local_path
+from resource_locks import repo_lock_key, resource_lock
 
 
 def tag_project(proj_cfg: dict, version: str, project_root: str, push: bool = True,
-                suffix: str = "") -> bool:
+                suffix: str = "", expected_head: str = "") -> bool:
     """为项目对应的源码仓库打 tag；返回是否成功（失败返回 False 并告警）
 
     suffix 非空时 tag 名为 v{version}-{suffix}（如 v1.0.30-test），
@@ -18,6 +19,7 @@ def tag_project(proj_cfg: dict, version: str, project_root: str, push: bool = Tr
 
     tag 已存在时：指向当前 HEAD 则跳过；指向旧提交则强制移动到当前 HEAD
     （同版本重复发布时保证 tag 标记最新代码），推送远端时使用 --force。
+    expected_head 非空时必须与当前 HEAD 一致，避免 Tag 指向构建后被切换的提交。
     """
     repo = (proj_cfg.get("git_repo") or "").strip()
     image_name = proj_cfg.get("image_name", "")
@@ -32,34 +34,38 @@ def tag_project(proj_cfg: dict, version: str, project_root: str, push: bool = Tr
         log(f"警告: {repo_path} 不是 Git 仓库，跳过 Git Tag")
         return False
     tag = f"v{version}-{suffix}" if suffix else f"v{version}"
-    try:
-        head = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"],
-                              check=True, capture_output=True, text=True).stdout.strip()
+    with resource_lock(repo_lock_key(project_root, repo)):
         try:
-            existing = subprocess.run(["git", "-C", str(repo_path), "rev-parse", tag],
-                                      check=True, capture_output=True, text=True).stdout.strip()
-        except subprocess.CalledProcessError:
-            existing = None
-        if existing and existing != head:
-            log(f"Git Tag {tag} 已存在（指向 {existing[:8]}），强制更新到当前 HEAD（{head[:8]}）")
-            subprocess.run(["git", "-C", str(repo_path), "tag", "-f", tag],
-                           check=True, capture_output=True, text=True)
-        elif existing:
-            log(f"Git Tag 已存在且指向当前 HEAD，跳过打标: {mask_git_url(repo)} {tag}")
-        else:
-            subprocess.run(["git", "-C", str(repo_path), "tag", tag],
-                           check=True, capture_output=True, text=True)
-        if push:
+            head = subprocess.run(["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+            if expected_head and head != expected_head:
+                log(f"警告: Git HEAD 已从构建快照 {expected_head[:8]} 变为 {head[:8]}，跳过 Git Tag")
+                return False
+            try:
+                existing = subprocess.run(["git", "-C", str(repo_path), "rev-parse", tag],
+                                          check=True, capture_output=True, text=True).stdout.strip()
+            except subprocess.CalledProcessError:
+                existing = None
             if existing and existing != head:
-                # 远端已存在旧 tag，需强制推送才能更新指向
-                subprocess.run(["git", "-C", str(repo_path), "push", "origin", tag, "--force"],
+                log(f"Git Tag {tag} 已存在（指向 {existing[:8]}），强制更新到当前 HEAD（{head[:8]}）")
+                subprocess.run(["git", "-C", str(repo_path), "tag", "-f", tag],
                                check=True, capture_output=True, text=True)
+            elif existing:
+                log(f"Git Tag 已存在且指向当前 HEAD，跳过打标: {mask_git_url(repo)} {tag}")
             else:
-                # 新 tag 或与远端一致：普通推送（幂等，可确认远端存在）
-                subprocess.run(["git", "-C", str(repo_path), "push", "origin", tag],
+                subprocess.run(["git", "-C", str(repo_path), "tag", tag],
                                check=True, capture_output=True, text=True)
-        log(f"Git Tag 完成: {mask_git_url(repo)} {tag}" + ("（已推送远端）" if push else "（未推送）"))
-        return True
-    except subprocess.CalledProcessError as e:
-        log(f"警告: Git Tag 失败（不影响发布）: {e.stderr.strip() or e}")
-        return False
+            if push:
+                if existing and existing != head:
+                    # 远端已存在旧 tag，需强制推送才能更新指向
+                    subprocess.run(["git", "-C", str(repo_path), "push", "origin", tag, "--force"],
+                                   check=True, capture_output=True, text=True)
+                else:
+                    # 新 tag 或与远端一致：普通推送（幂等，可确认远端存在）
+                    subprocess.run(["git", "-C", str(repo_path), "push", "origin", tag],
+                                   check=True, capture_output=True, text=True)
+            log(f"Git Tag 完成: {mask_git_url(repo)} {tag}" + ("（已推送远端）" if push else "（未推送）"))
+            return True
+        except subprocess.CalledProcessError as e:
+            log(f"警告: Git Tag 失败（不影响发布）: {e.stderr.strip() or e}")
+            return False

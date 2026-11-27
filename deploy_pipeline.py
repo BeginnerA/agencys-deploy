@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import argparse
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 from common import (
     load_config,
     get_pipeline_config,
+    get_project_config,
     get_registry_mode,
     load_yaml,
     log,
@@ -28,6 +30,7 @@ from common import (
     default_servers_file,
 )
 from build import build_project
+from resource_locks import artifact_lock_key, resource_lock
 from snailjob_manager import clear_summary
 from deploy import (
     Deployer, platform_db_path, runtime_config_dir,
@@ -139,18 +142,35 @@ def auto_fill_versions(pipeline_cfg: dict, config: dict, env: str = None):
         log(f"[{name}] 自动版本: 当前线上 {current} → 新版本 {svc['version']}")
 
 
-def build_services(service_specs: list, env: str = None):
+@contextmanager
+def _pipeline_artifact_locks(service_specs: list):
+    keys = {artifact_lock_key(name, get_project_config(name))
+            for name, _ in service_specs}
+    with ExitStack() as locks:
+        for key in sorted(keys):
+            locks.enter_context(resource_lock(key))
+        yield
+
+
+def _snapshot_head(snapshot) -> str:
+    return snapshot[1] if isinstance(snapshot, tuple) and len(snapshot) == 2 else ""
+
+
+def build_services(service_specs: list, env: str = None, lock_artifact: bool = True):
     """顺序构建并推送指定服务的镜像
 
     service_specs: [(name, version), ...]，同一服务不同版本以第一次出现为准
     """
     seen = set()
+    snapshots = {}
     for name, version in service_specs:
         if name in seen:
             continue
         seen.add(name)
         log(f">>> 构建镜像: {name}:{version}")
-        build_project(name, version, env=env)
+        snapshot = build_project(name, version, env=env, lock_artifact=lock_artifact)
+        snapshots[name] = _snapshot_head(snapshot)
+    return snapshots
 
 
 def deploy_one_service(
@@ -162,6 +182,8 @@ def deploy_one_service(
     skip_snailjob: bool,
     env: str = None,
     canary: bool = False,
+    built_git_head: str = "",
+    lock_artifact: bool = True,
 ) -> bool:
     """发布单个服务到指定服务器清单"""
     servers_path = Path(servers_file)
@@ -174,11 +196,13 @@ def deploy_one_service(
 
     try:
         deployer = Deployer(service_name, version, previous_version, config, env=env, canary=canary)
+        deployer._built_git_head = built_git_head
         return deployer.run(
             servers,
             skip_build=True,
             skip_snailjob=skip_snailjob,
             clear_summary_flag=False,
+            lock_artifact=lock_artifact,
         )
     except Exception as e:
         log(f"[{service_name}] 发布异常: {e}")
@@ -259,6 +283,7 @@ def push_one_service(
     servers_file: str,
     config: dict,
     env: str = None,
+    lock_artifact: bool = True,
 ) -> bool:
     """推送单个服务的镜像到服务器（仅直传模式）"""
     servers_path = Path(servers_file)
@@ -271,7 +296,7 @@ def push_one_service(
 
     try:
         deployer = Deployer(service_name, version, previous_version, config, env=env)
-        return deployer.push_image_only(servers)
+        return deployer.push_image_only(servers, lock_artifact=lock_artifact)
     except Exception as e:
         log(f"[{service_name}] 推送异常: {e}")
         return False
@@ -284,6 +309,7 @@ def push_stage(
     default_servers_file: str,
     config: dict,
     env: str = None,
+    lock_artifact: bool = True,
 ) -> bool:
     """推送一个 stage 中所有服务的镜像到服务器"""
     stage_name = stage.get("name", "unknown")
@@ -301,7 +327,8 @@ def push_stage(
         svc_version = svc.get("version", version)
         svc_previous = svc.get("previous_version", previous_version)
         servers_file = svc.get("servers_file") or default_servers_file
-        ok = push_one_service(name, svc_version, svc_previous, servers_file, config, env)
+        ok = push_one_service(name, svc_version, svc_previous, servers_file, config, env,
+                              lock_artifact=lock_artifact)
         results.append((name, ok))
 
     all_ok = all(ok for _, ok in results)
@@ -321,6 +348,8 @@ def run_stage(
     skip_snailjob: bool,
     env: str = None,
     canary: bool = False,
+    build_snapshots: dict = None,
+    lock_artifact: bool = True,
 ) -> bool:
     """执行一个 stage，返回是否全部成功"""
     stage_name = stage.get("name", "unknown")
@@ -333,7 +362,6 @@ def run_stage(
 
     log(f"\n========== 进入 stage [{stage_name}] parallel={parallel} ==========")
 
-    # 解析每个服务的版本号与服务器清单（支持服务级覆盖）。
     # 必须以元组携带 servers_file：循环变量在循环结束后仍指向最后一个服务，
     # 若在后续循环里再从 svc 取值，所有服务都会误用最后一台服务的清单。
     service_versions = []
@@ -344,45 +372,55 @@ def run_stage(
         servers_file = svc.get("servers_file") or default_servers_file
         service_versions.append((name, svc_version, svc_previous, servers_file))
 
-    # 如果流水线不要求 build_first，且未跳过构建，则在本 stage 部署前顺序构建
-    if not skip_build:
-        build_services([(name, svc_version)
-                        for name, svc_version, _, _ in service_versions], env=env)
+    service_specs = [(name, svc_version)
+                     for name, svc_version, _, _ in service_versions]
+    deploy_lock_artifact = lock_artifact if skip_build else False
+    lock_scope = (_pipeline_artifact_locks(service_specs)
+                  if not skip_build and lock_artifact else nullcontext())
+    with lock_scope:
+        if not skip_build:
+            build_snapshots = build_services(
+                service_specs, env=env, lock_artifact=False)
+        build_snapshots = build_snapshots or {}
 
-    results = []
+        results = []
+        if parallel:
+            with ThreadPoolExecutor(max_workers=len(services)) as executor:
+                futures = {}
+                for name, svc_version, svc_previous, servers_file in service_versions:
+                    futures[
+                        executor.submit(
+                            deploy_one_service,
+                            name,
+                            svc_version,
+                            svc_previous,
+                            servers_file,
+                            config,
+                            skip_snailjob,
+                            env,
+                            canary,
+                            built_git_head=build_snapshots.get(name, ""),
+                            lock_artifact=deploy_lock_artifact,
+                        )
+                    ] = name
 
-    if parallel:
-        with ThreadPoolExecutor(max_workers=len(services)) as executor:
-            futures = {}
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        ok = future.result()
+                    except Exception as e:
+                        log(f"[{name}] stage [{stage_name}] 执行异常: {e}")
+                        ok = False
+                    results.append((name, ok))
+        else:
             for name, svc_version, svc_previous, servers_file in service_versions:
-                futures[
-                    executor.submit(
-                        deploy_one_service,
-                        name,
-                        svc_version,
-                        svc_previous,
-                        servers_file,
-                        config,
-                        skip_snailjob,
-                        env,
-                        canary,
-                    )
-                ] = name
-
-            for future in as_completed(futures):
-                name = futures[future]
-                try:
-                    ok = future.result()
-                except Exception as e:
-                    log(f"[{name}] stage [{stage_name}] 执行异常: {e}")
-                    ok = False
+                ok = deploy_one_service(
+                    name, svc_version, svc_previous, servers_file, config,
+                    skip_snailjob, env, canary,
+                    built_git_head=build_snapshots.get(name, ""),
+                    lock_artifact=deploy_lock_artifact,
+                )
                 results.append((name, ok))
-    else:
-        for name, svc_version, svc_previous, servers_file in service_versions:
-            ok = deploy_one_service(
-                name, svc_version, svc_previous, servers_file, config, skip_snailjob, env, canary
-            )
-            results.append((name, ok))
 
     all_ok = all(ok for _, ok in results)
     for name, ok in results:
@@ -478,77 +516,88 @@ def main():
     # --push-only: 构建 + 推送所有服务镜像
     if args.push_only:
         all_services = all_pipeline_services(pipeline_cfg)
+        service_specs = [(svc["name"], svc.get("version", args.version))
+                         for svc in all_services]
         log(f">>> 构建并推送模式：构建 {len(all_services)} 个服务的镜像")
-        build_services(
-            [(svc["name"], svc.get("version", args.version)) for svc in all_services],
-            env=args.env,
-        )
-        mode = get_registry_mode(config)
-        if mode != "direct":
-            log(f"当前为仓库模式（{mode}），构建阶段已将镜像推送到 registry，无需额外推送")
-        else:
-            log(">>> 直传模式：推送镜像到各服务器")
-            pipeline_success = True
-            for stage in pipeline_cfg.get("stages", []):
-                ok = push_stage(
-                    stage, args.version, args.previous_version,
-                    args.servers_file or default_servers, config, env=args.env,
-                )
-                if not ok:
-                    pipeline_success = False
-                    break
-            if pipeline_success:
-                log("镜像推送完成")
+        with _pipeline_artifact_locks(service_specs):
+            build_services(service_specs, env=args.env, lock_artifact=False)
+            mode = get_registry_mode(config)
+            if mode != "direct":
+                log(f"当前为仓库模式（{mode}），构建阶段已将镜像推送到 registry，无需额外推送")
             else:
-                fail("部分服务镜像推送失败")
+                log(">>> 直传模式：推送镜像到各服务器")
+                pipeline_success = True
+                for stage in pipeline_cfg.get("stages", []):
+                    ok = push_stage(
+                        stage, args.version, args.previous_version,
+                        args.servers_file or default_servers, config, env=args.env,
+                        lock_artifact=False,
+                    )
+                    if not ok:
+                        pipeline_success = False
+                        break
+                if pipeline_success:
+                    log("镜像推送完成")
+                else:
+                    fail("部分服务镜像推送失败")
         sys.exit(0)
 
     # 若配置 build_first，先统一构建所有涉及的镜像（支持每个服务不同版本）
-    if pipeline_cfg.get("build_first", True) and not args.skip_build:
-        all_services = all_pipeline_services(pipeline_cfg)
-        log(f">>> 流水线要求 build_first，先统一构建 {len(all_services)} 个服务")
-        build_services(
-            [(svc["name"], svc.get("version", args.version)) for svc in all_services],
-            env=args.env,
-        )
+    build_snapshots = {}
+    build_first = pipeline_cfg.get("build_first", True) and not args.skip_build
+    hold_artifact_locks = build_first and not args.rollback
+    all_services = all_pipeline_services(pipeline_cfg) if build_first else []
+    service_specs = [(svc["name"], svc.get("version", args.version))
+                     for svc in all_services]
+    lock_scope = (_pipeline_artifact_locks(service_specs)
+                  if hold_artifact_locks else nullcontext())
+    with lock_scope:
+        if build_first:
+            log(f">>> 流水线要求 build_first，先统一构建 {len(all_services)} 个服务")
+            build_snapshots = build_services(
+                service_specs, env=args.env,
+                lock_artifact=not hold_artifact_locks,
+            )
 
-    # 按顺序执行 stage（回滚模式逆序）
-    stages = pipeline_cfg.get("stages", [])
-    if args.rollback:
-        stages = list(reversed(stages))
-        log(">>> 全量回滚模式：按 stage 逆序回滚")
-
-    pipeline_success = True
-    from notify import send_notify
-    send_notify(config, "start", project=args.pipeline, version=args.version,
-                previous_version=args.previous_version, env=args.env)
-    start_ts = time.time()
-    for stage in stages:
+        # 按顺序执行 stage（回滚模式逆序）
+        stages = pipeline_cfg.get("stages", [])
         if args.rollback:
-            ok = rollback_stage(
-                stage,
-                args.version,
-                args.previous_version,
-                args.servers_file or default_servers,
-                config,
-                args.skip_snailjob,
-                env=args.env,
-            )
-        else:
-            ok = run_stage(
-                stage,
-                args.version,
-                args.previous_version,
-                args.servers_file or default_servers,
-                config,
-                args.skip_build,
-                args.skip_snailjob,
-                env=args.env,
-                canary=args.canary,
-            )
-        if not ok:
-            pipeline_success = False
-            break
+            stages = list(reversed(stages))
+            log(">>> 全量回滚模式：按 stage 逆序回滚")
+
+        pipeline_success = True
+        from notify import send_notify
+        send_notify(config, "start", project=args.pipeline, version=args.version,
+                    previous_version=args.previous_version, env=args.env)
+        start_ts = time.time()
+        for stage in stages:
+            if args.rollback:
+                ok = rollback_stage(
+                    stage,
+                    args.version,
+                    args.previous_version,
+                    args.servers_file or default_servers,
+                    config,
+                    args.skip_snailjob,
+                    env=args.env,
+                )
+            else:
+                ok = run_stage(
+                    stage,
+                    args.version,
+                    args.previous_version,
+                    args.servers_file or default_servers,
+                    config,
+                    args.skip_build or build_first,
+                    args.skip_snailjob,
+                    env=args.env,
+                    canary=args.canary,
+                    build_snapshots=build_snapshots,
+                    lock_artifact=not hold_artifact_locks,
+                )
+            if not ok:
+                pipeline_success = False
+                break
 
     if args.clear_summary:
         log(">>> 流水线结束，清零 sj_job_summary 计数器")

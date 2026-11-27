@@ -47,6 +47,27 @@ class SelectJarTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             build_mod._select_jar(proj, self.root)
 
+    def test_failed_copy_preserves_previous_artifact(self):
+        self._touch("target/app.jar", 123)
+        out_dir = self.root / "out"
+        out_dir.mkdir()
+        out = out_dir / "hqb-auth-1.0.31.jar"
+        out.write_bytes(b"previous")
+        proj = {"runtime_config": {}, "image_name": "hqb-auth"}
+
+        def failed_copy(src, dst):
+            Path(dst).write_bytes(b"partial")
+            raise RuntimeError("copy failed")
+
+        with mock.patch.object(build_mod.shutil, "copy2", side_effect=failed_copy), \
+                mock.patch.object(build_mod, "log"):
+            with self.assertRaises(RuntimeError):
+                build_mod._make_jar_artifact(
+                    proj, self.root, "1.0.31",
+                    {"deploy": {"dist_dir": str(out_dir)}})
+        self.assertEqual(out.read_bytes(), b"previous")
+        self.assertEqual(sorted(p.name for p in out_dir.iterdir()), [out.name])
+
     def test_make_artifact_and_sha256(self):
         self._touch("target/app.jar", 123)
         proj = {"runtime_config": {}, "image_name": "hqb-auth"}

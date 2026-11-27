@@ -2,7 +2,9 @@
 """服务重启任务测试：路由创建 + task_manager 基建 + 执行器 + 分发"""
 import os
 import shutil
+import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -419,6 +421,94 @@ class TestDeploySnapshot(unittest.TestCase):
             from webapp.task_manager import _run_task
             _run_task(self.db, task, [])
         self.assertEqual(self._snapshots(), [])
+
+    def test_run_task_keeps_handle_until_terminal_status_persisted(self):
+        proc = mock.Mock()
+        proc.wait.return_value = 0
+        task_id = self._make_task()
+        task = dbm.get_task(self.db, task_id)
+        real_update = dbm.update_task
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_update(db_path, tid, **fields):
+            if fields.get("status") == "success":
+                entered.set()
+                release.wait(2)
+            return real_update(db_path, tid, **fields)
+
+        with mock.patch("webapp.task_manager.subprocess.Popen", return_value=proc), \
+             mock.patch("webapp.task_manager.update_task", side_effect=blocking_update):
+            from webapp.task_manager import _run_task, _task_registry
+            worker = threading.Thread(target=_run_task,
+                                      args=(self.db, task, [], self.tmp))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertIn(task_id, _task_registry)
+            finally:
+                release.set()
+                worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn(task_id, _task_registry)
+        self.assertEqual(dbm.get_task(self.db, task_id)["status"], "success")
+
+    def test_restart_keeps_handle_until_terminal_status_persisted(self):
+        task_id = self._make_task(type="restart", version="")
+        task = dbm.get_task(self.db, task_id)
+        real_update = dbm.update_task
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_update(db_path, tid, **fields):
+            if fields.get("status") == "success":
+                entered.set()
+                release.wait(2)
+            return real_update(db_path, tid, **fields)
+
+        with mock.patch("webapp.task_manager._run_restart", return_value="success"), \
+             mock.patch("webapp.task_manager.update_task", side_effect=blocking_update):
+            from webapp.task_manager import _run_task, _task_registry
+            worker = threading.Thread(target=_run_task,
+                                      args=(self.db, task, [], self.tmp))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.assertIn(task_id, _task_registry)
+            finally:
+                release.set()
+                worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn(task_id, _task_registry)
+        self.assertEqual(dbm.get_task(self.db, task_id)["status"], "success")
+
+    def test_run_task_retries_locked_terminal_status_write(self):
+        proc = mock.Mock()
+        proc.wait.return_value = 1
+        task_id = self._make_task()
+        task = dbm.get_task(self.db, task_id)
+        real_update = dbm.update_task
+        locked_writes = 0
+
+        def flaky_update(db_path, tid, **fields):
+            nonlocal locked_writes
+            if fields.get("status") == "failed" and locked_writes < 2:
+                locked_writes += 1
+                raise sqlite3.OperationalError("database is locked")
+            return real_update(db_path, tid, **fields)
+
+        with mock.patch("webapp.task_manager.subprocess.Popen", return_value=proc), \
+             mock.patch("webapp.task_manager.update_task", side_effect=flaky_update), \
+             mock.patch("webapp.task_manager.time.sleep"):
+            from webapp.task_manager import _run_task
+            _run_task(self.db, task, [], log_dir=self.tmp)
+
+        persisted = dbm.get_task(self.db, task_id)
+        self.assertEqual(persisted["status"], "failed")
+        self.assertTrue(persisted["finished_at"])
+        self.assertEqual(locked_writes, 2)
 
     def test_restart_no_snapshot(self):
         task_id = self._make_task(type="restart", version="", action="restart")

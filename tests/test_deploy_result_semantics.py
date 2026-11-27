@@ -1,4 +1,5 @@
 """发布结果语义：灰度停止/回滚后健康检查失败不得上报成功"""
+import os
 import sys
 import tempfile
 import threading
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from deploy import Deployer
+from resource_locks import artifact_lock_key, resource_lock, snailjob_lock_key
 
 
 class FakeServer:
@@ -39,6 +41,203 @@ class TestCanaryStopSemantics(unittest.TestCase):
         self.deployer.prev_image = "app:1.0.0"
         self.deployer._no_git_tag = True
         self.deployer._skip_git_push = True
+
+    def test_run_waits_for_same_final_artifact_identity(self):
+        entered = threading.Event()
+        errors = []
+        self.deployer._strategy = mock.Mock(supports_prefetch=False)
+
+        def run():
+            try:
+                self.deployer.run([], skip_build=True, skip_snailjob=True)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"PLATFORM_DATA_DIR": tmp}), \
+                mock.patch("deploy.log"), \
+                mock.patch("deploy.send_notify", side_effect=lambda *a, **k: entered.set()):
+            with resource_lock(artifact_lock_key(self.deployer.project, self.deployer.proj_cfg)):
+                thread = threading.Thread(target=run)
+                thread.start()
+                self.assertFalse(entered.wait(0.1), "同名产物被占用时发布不得开始")
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(entered.is_set())
+
+    def test_build_and_push_share_final_artifact_lock(self):
+        built = threading.Event()
+        pushed = threading.Event()
+        errors = []
+
+        def run():
+            try:
+                self.deployer.build_and_push([])
+            except BaseException as exc:
+                errors.append(exc)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"PLATFORM_DATA_DIR": tmp}), \
+                mock.patch("deploy.build_project",
+                           side_effect=lambda *a, **k: built.set()) as build, \
+                mock.patch.object(self.deployer, "_push_image_only",
+                                  side_effect=lambda *a, **k: pushed.set() or True):
+            thread = None
+            try:
+                with resource_lock(artifact_lock_key(self.deployer.project,
+                                                     self.deployer.proj_cfg)):
+                    thread = threading.Thread(target=run)
+                    thread.start()
+                    self.assertFalse(built.wait(0.1), "构建到推送窗口不得被其他产物任务插入")
+            finally:
+                if thread is not None:
+                    thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(built.is_set())
+        self.assertTrue(pushed.is_set())
+        self.assertFalse(build.call_args.kwargs["lock_artifact"])
+
+    def test_snailjob_pause_waits_for_same_group(self):
+        self.deployer.proj_cfg["snailjob_group"] = "shared"
+        self.deployer._strategy = mock.Mock(supports_prefetch=False)
+        entered = threading.Event()
+        errors = []
+
+        def run():
+            try:
+                self.deployer.run([], skip_build=True)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"PLATFORM_DATA_DIR": tmp}), \
+                mock.patch("deploy.log"), \
+                mock.patch("deploy.send_notify"), \
+                mock.patch("deploy.backup_jobs", return_value={},
+                           side_effect=lambda *a, **k: entered.set()) as backup, \
+                mock.patch("deploy.set_job_status"), \
+                mock.patch("deploy.restore_jobs") as restore:
+            thread = None
+            try:
+                with resource_lock(snailjob_lock_key("shared")):
+                    thread = threading.Thread(target=run)
+                    thread.start()
+                    self.assertFalse(entered.wait(0.1), "同组 SnailJob 暂停生命周期必须互斥")
+            finally:
+                if thread is not None:
+                    thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        backup.assert_called_once()
+        restore.assert_called_once()
+
+    def test_snailjob_restores_when_prefetch_raises(self):
+        self.deployer.proj_cfg["snailjob_group"] = "shared"
+        self.deployer._strategy = mock.Mock(supports_prefetch=True)
+        self.deployer._strategy.prefetch.side_effect = RuntimeError("prefetch failed")
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"PLATFORM_DATA_DIR": tmp}), \
+                mock.patch("deploy.log"), \
+                mock.patch("deploy.send_notify"), \
+                mock.patch("deploy.backup_jobs", return_value={"jobs": []}), \
+                mock.patch("deploy.set_job_status") as pause, \
+                mock.patch("deploy.restore_jobs") as restore, \
+                self.assertRaisesRegex(RuntimeError, "prefetch failed"):
+            self.deployer.run([], skip_build=True)
+        pause.assert_called_once()
+        restore.assert_called_once()
+
+    def test_snailjob_restores_when_pause_raises(self):
+        self.deployer.proj_cfg["snailjob_group"] = "shared"
+        self.deployer._strategy = mock.Mock(supports_prefetch=False)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"PLATFORM_DATA_DIR": tmp}), \
+                mock.patch("deploy.log"), \
+                mock.patch("deploy.send_notify"), \
+                mock.patch("deploy.backup_jobs", return_value={"jobs": []}), \
+                mock.patch("deploy.set_job_status", side_effect=RuntimeError("pause failed")), \
+                mock.patch("deploy.restore_jobs") as restore, \
+                self.assertRaisesRegex(RuntimeError, "pause failed"):
+            self.deployer.run([], skip_build=True)
+        restore.assert_called_once()
+
+    def test_snailjob_rollback_restores_when_pause_raises(self):
+        self.deployer.proj_cfg["snailjob_group"] = "shared"
+        self.deployer._strategy = mock.Mock(strict_host_lifecycle=False)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"PLATFORM_DATA_DIR": tmp}), \
+                mock.patch("deploy.log"), \
+                mock.patch("deploy.send_notify"), \
+                mock.patch("deploy.backup_jobs", return_value={"jobs": []}), \
+                mock.patch("deploy.set_job_status", side_effect=RuntimeError("pause failed")), \
+                mock.patch("deploy.restore_jobs") as restore, \
+                self.assertRaisesRegex(RuntimeError, "pause failed"):
+            self.deployer.rollback_all([])
+        restore.assert_called_once()
+
+    def test_snailjob_rollback_waits_for_same_group(self):
+        self.deployer.proj_cfg["snailjob_group"] = "shared"
+        self.deployer._strategy = mock.Mock(strict_host_lifecycle=False)
+        entered = threading.Event()
+        errors = []
+
+        def run():
+            try:
+                self.deployer.rollback_all([])
+            except BaseException as exc:
+                errors.append(exc)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"PLATFORM_DATA_DIR": tmp}), \
+                mock.patch("deploy.log"), \
+                mock.patch("deploy.send_notify"), \
+                mock.patch("deploy.backup_jobs", return_value={},
+                           side_effect=lambda *a, **k: entered.set()) as backup, \
+                mock.patch("deploy.set_job_status"), \
+                mock.patch("deploy.restore_jobs") as restore:
+            thread = None
+            try:
+                with resource_lock(snailjob_lock_key("shared")):
+                    thread = threading.Thread(target=run)
+                    thread.start()
+                    self.assertFalse(entered.wait(0.1), "同组回滚暂停生命周期必须互斥")
+            finally:
+                if thread is not None:
+                    thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        backup.assert_called_once()
+        restore.assert_called_once()
+
+    def test_successful_tag_uses_verified_build_snapshot(self):
+        self.deployer.config = {"deploy": {"project_root": "/repos"}}
+        self.deployer.proj_cfg["git_tag_enabled"] = True
+        self.deployer._no_git_tag = False
+        self.deployer._strategy = mock.Mock(supports_prefetch=False)
+        snapshot = (Path("/repos/app"), "a" * 40)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"PLATFORM_DATA_DIR": tmp}), \
+                mock.patch("deploy.log"), \
+                mock.patch("deploy.send_notify"), \
+                mock.patch("deploy.build_project", return_value=snapshot), \
+                mock.patch.object(self.deployer, "deploy_server", return_value=True), \
+                mock.patch("git_tag.tag_project") as tag:
+            ok = self.deployer.run([{"ip": "10.0.0.1"}], skip_snailjob=True)
+        self.assertTrue(ok)
+        self.assertEqual(tag.call_args.kwargs.get("expected_head"), snapshot[1])
+
+    def test_run_reuses_held_artifact_lock(self):
+        self.deployer._strategy = mock.Mock(supports_prefetch=False)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"PLATFORM_DATA_DIR": tmp}), \
+                mock.patch("deploy.log"), \
+                mock.patch("deploy.send_notify"), \
+                resource_lock(artifact_lock_key(self.deployer.project, self.deployer.proj_cfg)):
+            ok = self.deployer.run([], skip_build=True, skip_snailjob=True,
+                                   lock_artifact=False)
+        self.assertTrue(ok)
 
     def test_stop_after_first_server_is_not_success(self):
         servers = [{"ip": "10.0.0.1"}, {"ip": "10.0.0.2"}]

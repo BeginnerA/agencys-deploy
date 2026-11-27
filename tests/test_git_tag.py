@@ -1,8 +1,11 @@
 """Git Tag 拼接与调用测试：v{version} / v{version}-{suffix} / tag 已存在时的更新语义"""
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -10,20 +13,21 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 from git_tag import tag_project  # noqa: E402
+from resource_locks import repo_lock_key, resource_lock  # noqa: E402
 
 HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 OLD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 
-def run_side_effect(existing):
-    """模拟 git 命令：rev-parse HEAD 恒返回 HEAD；rev-parse <tag> 按 existing 返回"""
+def run_side_effect(existing, head=HEAD):
+    """模拟 git 命令：rev-parse HEAD 返回 head；rev-parse <tag> 按 existing 返回"""
     def side_effect(cmd, **kwargs):
         r = mock.Mock()
         r.returncode = 0
         r.stderr = ""
         if len(cmd) >= 5 and cmd[3] == "rev-parse":
             if cmd[4] == "HEAD":
-                r.stdout = HEAD + "\n"
+                r.stdout = head + "\n"
             elif existing is None:
                 raise subprocess.CalledProcessError(1, cmd)
             else:
@@ -141,6 +145,48 @@ class TestGitTag(unittest.TestCase):
         self.assertTrue(ok)
         calls = git_calls(run)
         self.assertTrue(has_push_call(calls, "v1.0.30", force=True))
+
+    def test_tag_sequence_waits_for_repo_writer(self):
+        repo = Path(self._make_repo())
+        project_root = repo.parent
+        proj = {"git_repo": repo.name, "image_name": "svc"}
+        errors = []
+
+        def run():
+            try:
+                tag_project(proj, "1.0.30", str(project_root), push=False)
+            except BaseException as exc:
+                errors.append(exc)
+
+        with tempfile.TemporaryDirectory() as data_dir, \
+                mock.patch.dict(os.environ, {"PLATFORM_DATA_DIR": data_dir}), \
+                mock.patch("subprocess.run", side_effect=run_side_effect(None)) as git_run, \
+                mock.patch("git_tag.log"):
+            thread = None
+            try:
+                with resource_lock(repo_lock_key(project_root, repo.name)):
+                    thread = threading.Thread(target=run)
+                    thread.start()
+                    time.sleep(0.1)
+                    self.assertFalse(git_run.called, "仓库写入期间不得读取 HEAD 或打 Tag")
+            finally:
+                if thread is not None:
+                    thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(has_tag_call(git_calls(git_run), "v1.0.30"))
+
+    def test_changed_head_does_not_tag_unbuilt_commit(self):
+        repo = Path(self._make_repo())
+        with mock.patch("subprocess.run", side_effect=run_side_effect(None, head=OLD)) as run, \
+                mock.patch("git_tag.log") as log:
+            ok = tag_project({"git_repo": repo.name, "image_name": "svc"},
+                             "1.0.30", str(repo.parent), push=True,
+                             expected_head=HEAD)
+        self.assertFalse(ok, "HEAD 已变化时不得把 Tag 指向未构建的提交")
+        self.assertFalse(has_tag_call(git_calls(run), "v1.0.30"))
+        self.assertFalse(has_push_call(git_calls(run), "v1.0.30"))
+        self.assertIn("HEAD", " ".join(str(c.args[0]) for c in log.call_args_list))
 
     def test_skip_when_no_repo_configured(self):
         with mock.patch("git_tag.log") as log:

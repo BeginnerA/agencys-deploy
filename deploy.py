@@ -13,6 +13,7 @@ import argparse
 import tempfile
 import subprocess
 import threading
+from contextlib import ExitStack
 from pathlib import Path
 import yaml
 import paramiko
@@ -27,6 +28,8 @@ from snailjob_manager import backup_jobs, set_job_status, restore_jobs, clear_su
 from health_check import wait_for_healthy
 from notify import send_notify
 from deploy_strategies import create_strategy
+from resource_locks import (artifact_lock_key, compose_lock_key, resource_lock,
+                            snailjob_lock_key)
 
 
 # ---------- 实例数据目录：CLI 与 Web 子进程共用的落点解析 ----------
@@ -705,16 +708,17 @@ class Deployer:
             server.exec(f"docker pull {self.full_image}", timeout=120)
         # 镜像就绪后容器已可替换，标记为已修改
         self.target_modified = True
-        # 停止并删除旧容器
-        server.exec(f"docker compose -f {self.compose_path} stop {self.service_name}", timeout=60)
-        server.exec(f"docker compose -f {self.compose_path} rm -f {self.service_name}", timeout=30)
-        # 手动部署迁移场景：compose 够不着无标签的游离同名容器，up 前检测清理
-        self.remove_orphan_container(server)
-        # 清空宿主机旧应用日志（可选，配置 clear_log_dir 时生效；失败仅告警）
-        self.clear_project_logs(server)
-        # 修改 docker-compose.yml 并启动
-        server.update_compose_image(self.compose_path, self.service_name, self.full_image)
-        server.exec(f"docker compose -f {self.compose_path} up -d {self.service_name}", timeout=120)
+        with resource_lock(compose_lock_key(server.host, self.compose_path)):
+            # 停止并删除旧容器
+            server.exec(f"docker compose -f {self.compose_path} stop {self.service_name}", timeout=60)
+            server.exec(f"docker compose -f {self.compose_path} rm -f {self.service_name}", timeout=30)
+            # 手动部署迁移场景：compose 够不着无标签的游离同名容器，up 前检测清理
+            self.remove_orphan_container(server)
+            # 清空宿主机旧应用日志（可选，配置 clear_log_dir 时生效；失败仅告警）
+            self.clear_project_logs(server)
+            # 修改 docker-compose.yml 并启动
+            server.update_compose_image(self.compose_path, self.service_name, self.full_image)
+            server.exec(f"docker compose -f {self.compose_path} up -d {self.service_name}", timeout=120)
 
     def remove_orphan_container(self, server: RemoteServer):
         """compose rm 后清理游离同名容器（手动 docker run 遗留，无 compose 项目标签）
@@ -763,11 +767,12 @@ class Deployer:
             self.ensure_image_ready(server, version=self.previous_version)
         else:
             server.exec(f"docker pull {self.prev_image}", timeout=120)
-        server.exec(f"docker compose -f {self.compose_path} stop {self.service_name}", timeout=60)
-        server.exec(f"docker compose -f {self.compose_path} rm -f {self.service_name}", timeout=30)
-        self.remove_orphan_container(server)
-        server.update_compose_image(self.compose_path, self.service_name, self.prev_image)
-        server.exec(f"docker compose -f {self.compose_path} up -d {self.service_name}", timeout=120)
+        with resource_lock(compose_lock_key(server.host, self.compose_path)):
+            server.exec(f"docker compose -f {self.compose_path} stop {self.service_name}", timeout=60)
+            server.exec(f"docker compose -f {self.compose_path} rm -f {self.service_name}", timeout=30)
+            self.remove_orphan_container(server)
+            server.update_compose_image(self.compose_path, self.service_name, self.prev_image)
+            server.exec(f"docker compose -f {self.compose_path} up -d {self.service_name}", timeout=120)
 
     def ensure_docker_login(self, server: RemoteServer):
         """检查远程服务器 Docker 登录状态，未登录则自动登录（直传模式无需登录）"""
@@ -848,28 +853,35 @@ class Deployer:
                     # docker save 流式输出并 gzip 压缩：传输量约减 1/3，
                     # 避免未压缩中间文件；远端 docker load 自动识别 gzip
                     import gzip
-                    proc = subprocess.Popen(
-                        ["docker", "save", image],
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    )
+                    fd, tmp_name = tempfile.mkstemp(
+                        prefix=f".{local_tar.name}.", suffix=".tmp", dir=self.dist_dir)
+                    os.close(fd)
+                    tmp_path = Path(tmp_name)
                     try:
-                        with gzip.open(str(local_tar), "wb", compresslevel=self.image_compress_level) as fout:
-                            while True:
-                                chunk = proc.stdout.read(1024 * 1024)
-                                if not chunk:
-                                    break
-                                fout.write(chunk)
-                    finally:
-                        proc.stdout.close()
-                    err = proc.stderr.read().decode("utf-8", errors="ignore")
-                    proc.stderr.close()
-                    rc = proc.wait()
-                    if rc != 0:
-                        local_tar.unlink(missing_ok=True)  # 清理残留的半成品包
-                        raise RuntimeError(
-                            f"本地 docker save {image} 失败（本地可能没有该版本镜像）: "
-                            f"{err.strip()}"
+                        proc = subprocess.Popen(
+                            ["docker", "save", image],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         )
+                        try:
+                            with gzip.open(str(tmp_path), "wb", compresslevel=self.image_compress_level) as fout:
+                                while True:
+                                    chunk = proc.stdout.read(1024 * 1024)
+                                    if not chunk:
+                                        break
+                                    fout.write(chunk)
+                        finally:
+                            proc.stdout.close()
+                        err = proc.stderr.read().decode("utf-8", errors="ignore")
+                        proc.stderr.close()
+                        rc = proc.wait()
+                        if rc != 0:
+                            raise RuntimeError(
+                                f"本地 docker save {image} 失败（本地可能没有该版本镜像）: "
+                                f"{err.strip()}"
+                            )
+                        os.replace(tmp_path, local_tar)
+                    finally:
+                        tmp_path.unlink(missing_ok=True)
         return local_tar, local_id, image
 
     def _transfer_image_to_server(self, server: RemoteServer, version: str = None):
@@ -1131,7 +1143,14 @@ class Deployer:
         finally:
             server.close()
 
-    def run(self, servers: list, skip_build: bool = False, skip_snailjob: bool = False, clear_summary_flag: bool = False):
+    def run(self, servers: list, skip_build: bool = False, skip_snailjob: bool = False,
+            clear_summary_flag: bool = False, lock_artifact: bool = True):
+        if lock_artifact:
+            with resource_lock(artifact_lock_key(self.project, self.proj_cfg)):
+                return self._run(servers, skip_build, skip_snailjob, clear_summary_flag)
+        return self._run(servers, skip_build, skip_snailjob, clear_summary_flag)
+
+    def _run(self, servers: list, skip_build: bool = False, skip_snailjob: bool = False, clear_summary_flag: bool = False):
         # 普通发布未指定回滚版本时，自动查询当前线上版本作为失败回滚目标（策略层按发布方式实现）；
         # 首次发版（查不到线上版本）或查询失败时维持现状：previous_version 保持空，失败则跳过回滚
         if not self.previous_version:
@@ -1152,142 +1171,147 @@ class Deployer:
         start_ts = time.time()
         if not skip_build:
             log(">>> 步骤 1/5: " + ("前端构建并打包静态 zip" if self.strategy.name != "container" else "Maven 构建并推送镜像"))
-            build_project(self.project, self.version, env=self.env)
+            snapshot = build_project(self.project, self.version, env=self.env,
+                                     lock_artifact=False)
+            self._built_git_head = snapshot[1] if isinstance(snapshot, tuple) and len(snapshot) == 2 else ""
         else:
             log(">>> 步骤 1/5: 跳过构建")
 
-        group = self.proj_cfg.get("snailjob_group", "")
-        backup = None
-        if group and not skip_snailjob:
-            log(f">>> 步骤 2/5: 暂停 SnailJob group={group}")
-            backup = backup_jobs(group, Path("backups"), env=self.env)
-            set_job_status(group, 0, env=self.env)
-        else:
-            log(">>> 步骤 2/5: 无需暂停 SnailJob")
+        with ExitStack() as snailjob_locks:
+            group = self.proj_cfg.get("snailjob_group", "")
+            backup = None
+            if group and not skip_snailjob:
+                snailjob_locks.enter_context(resource_lock(snailjob_lock_key(group)))
+                log(f">>> 步骤 2/5: 暂停 SnailJob group={group}")
+                backup = backup_jobs(group, Path("backups"), env=self.env)
+            else:
+                log(">>> 步骤 2/5: 无需暂停 SnailJob")
 
-        if self.strategy.supports_prefetch:
-            if self.strategy.name != "container":
-                log(">>> 步骤 3/6: 并行预传输制品（各服务器并行）")
-            elif self.registry_mode == "direct":
-                log(">>> 步骤 3/6: 并行预传输镜像（直传模式，上传+load 并行）")
-            else:
-                log(">>> 步骤 3/6: 并行预传输镜像（仓库模式，构建时已推送，跳过）")
-            prefetch_failures = self.strategy.prefetch(servers)
-        else:
-            log(">>> 步骤 3/6: 当前发布方式无预传输阶段，跳过")
-            prefetch_failures = []
-        if prefetch_failures:
-            log(f"预传输失败 {len(prefetch_failures)} 台（滚动发布时将自动重试）: {prefetch_failures}")
-        log(">>> 步骤 4/6: 滚动发布" + ("（金丝雀模式）" if self.canary else ""))
-        success_all = True  # 全部服务器成功的汇总标志，任一台失败或中断即置 False
-        # canary batch: read from DB
-        canary_batches = None
-        if self.canary:
             try:
-                from webapp.deploy_scheduler import compute_canary_batches
-                import sqlite3
-                import json as _json
-                _db = platform_db_path()
-                _conn = sqlite3.connect(str(_db))
-                _conn.row_factory = sqlite3.Row
-                try:
-                    _proj = _conn.execute("SELECT id FROM projects WHERE code=?", (self.project,)).fetchone()
-                    if _proj:
-                        _cfg = _conn.execute("SELECT steps FROM canary_configs WHERE project_id=? AND is_default=1 LIMIT 1", (_proj["id"],)).fetchone()
-                        if _cfg:
-                            canary_batches = compute_canary_batches(_json.loads(_cfg["steps"]), len(servers))
-                finally:
-                    _conn.close()
-            except Exception as e:
-                log(f"[canary] read config failed, fallback: {e}")
-        try:
-            if canary_batches:
-                log(f">>> canary batches: {len(canary_batches)}")
-                for bi, batch in enumerate(canary_batches):
-                    log(f'--- batch {batch["batch"]}/{len(canary_batches)}: {batch["server_count"]} servers ---')
-                    batch_ok = True
-                    for si in batch["server_indices"]:
-                        srv = servers[si]
-                        host = srv["ip"]
-                        ok = self.deploy_server(host, srv, is_canary=(bi==0 and si==batch["server_indices"][0]))
-                        if not ok:
-                            success_all = False
-                            batch_ok = False
-                            break
-                    if not batch_ok:
-                        break
-                    if batch["observe_minutes"] > 0 and bi < len(canary_batches) - 1:
-                        if batch["auto_advance"]:
-                            time.sleep(batch["observe_minutes"] * 60)
-                        else:
-                            dec = self._canary_prompt(servers[batch["server_indices"][0]]["ip"])
-                            if dec != "continue":
-                                success_all = False
-                                break
-            else:
-                try:
-                    for idx, srv in enumerate(servers):
-                        host = srv["ip"]
-                        is_canary = (idx == 0)
-                        ok = self.deploy_server(host, srv, is_canary=is_canary)
-                        if not ok:
-                            success_all = False
-                            log("首台或中间服务器失败，停止继续滚动，请人工排查。")
-                            break
-                        # 金丝雀模式：首台成功后暂停，等待人工确认
-                        if self.canary and is_canary and idx < len(servers) - 1:
-                            decision = self._canary_prompt(host)
-                            if decision == "rollback":
-                                if self.strategy.strict_host_lifecycle is True:
-                                    # 严格生命周期：只回本次发布记录在该主机的恢复基线，
-                                    # 基线缺失（如停机前失败）由 _rollback_first_host_strict 拒绝
-                                    recorded = self.strategy.last_results.get(host) or {}
-                                    baseline = recorded.get("recovery_target") or ""
-                                    self._rollback_first_host_strict(host, srv, baseline)
+                if group and not skip_snailjob:
+                    set_job_status(group, 0, env=self.env)
+                if self.strategy.supports_prefetch:
+                    if self.strategy.name != "container":
+                        log(">>> 步骤 3/6: 并行预传输制品（各服务器并行）")
+                    elif self.registry_mode == "direct":
+                        log(">>> 步骤 3/6: 并行预传输镜像（直传模式，上传+load 并行）")
+                    else:
+                        log(">>> 步骤 3/6: 并行预传输镜像（仓库模式，构建时已推送，跳过）")
+                    prefetch_failures = self.strategy.prefetch(servers)
+                else:
+                    log(">>> 步骤 3/6: 当前发布方式无预传输阶段，跳过")
+                    prefetch_failures = []
+                if prefetch_failures:
+                    log(f"预传输失败 {len(prefetch_failures)} 台（滚动发布时将自动重试）: {prefetch_failures}")
+                log(">>> 步骤 4/6: 滚动发布" + ("（金丝雀模式）" if self.canary else ""))
+                success_all = True  # 全部服务器成功的汇总标志，任一台失败或中断即置 False
+                # canary batch: read from DB
+                canary_batches = None
+                if self.canary:
+                    try:
+                        from webapp.deploy_scheduler import compute_canary_batches
+                        import sqlite3
+                        import json as _json
+                        _db = platform_db_path()
+                        _conn = sqlite3.connect(str(_db))
+                        _conn.row_factory = sqlite3.Row
+                        try:
+                            _proj = _conn.execute("SELECT id FROM projects WHERE code=?", (self.project,)).fetchone()
+                            if _proj:
+                                _cfg = _conn.execute("SELECT steps FROM canary_configs WHERE project_id=? AND is_default=1 LIMIT 1", (_proj["id"],)).fetchone()
+                                if _cfg:
+                                    canary_batches = compute_canary_batches(_json.loads(_cfg["steps"]), len(servers))
+                        finally:
+                            _conn.close()
+                    except Exception as e:
+                        log(f"[canary] read config failed, fallback: {e}")
+                if canary_batches:
+                        log(f">>> canary batches: {len(canary_batches)}")
+                        for bi, batch in enumerate(canary_batches):
+                            log(f'--- batch {batch["batch"]}/{len(canary_batches)}: {batch["server_count"]} servers ---')
+                            batch_ok = True
+                            for si in batch["server_indices"]:
+                                srv = servers[si]
+                                host = srv["ip"]
+                                ok = self.deploy_server(host, srv, is_canary=(bi==0 and si==batch["server_indices"][0]))
+                                if not ok:
                                     success_all = False
+                                    batch_ok = False
                                     break
-                                log(f">>> 回滚首台 {host} 到 {self.previous_version}")
-                                rollback_server = RemoteServer(host, merge_server_ssh(self.ssh_cfg, srv))
-                                try:
-                                    nacos_ip = self._nacos_ip(srv)
-                                    if self.strategy.supports_nacos:
-                                        self.nacos_offline(nacos_ip)
-                                    rolled_back = self.strategy.rollback(rollback_server)
-                                    if self.strategy.supports_nacos:
-                                        self.nacos_online(nacos_ip, weight=1.0)
-                                    if rolled_back is False:
-                                        log(f"首台 {host} 回滚被前置检查阻止"
-                                            "（旧版本缺少依赖产物），服务保持现状，请人工处理")
-                                    else:
-                                        log(f"首台 {host} 已回滚")
-                                except Exception as re:
-                                    log(f"首台回滚失败: {re}")
+                            if not batch_ok:
+                                break
+                            if batch["observe_minutes"] > 0 and bi < len(canary_batches) - 1:
+                                if batch["auto_advance"]:
+                                    time.sleep(batch["observe_minutes"] * 60)
+                                else:
+                                    dec = self._canary_prompt(servers[batch["server_indices"][0]]["ip"])
+                                    if dec != "continue":
+                                        success_all = False
+                                        break
+                else:
+                    try:
+                        for idx, srv in enumerate(servers):
+                            host = srv["ip"]
+                            is_canary = (idx == 0)
+                            ok = self.deploy_server(host, srv, is_canary=is_canary)
+                            if not ok:
+                                success_all = False
+                                log("首台或中间服务器失败，停止继续滚动，请人工排查。")
+                                break
+                            # 金丝雀模式：首台成功后暂停，等待人工确认
+                            if self.canary and is_canary and idx < len(servers) - 1:
+                                decision = self._canary_prompt(host)
+                                if decision == "rollback":
+                                    if self.strategy.strict_host_lifecycle is True:
+                                        # 严格生命周期：只回本次发布记录在该主机的恢复基线，
+                                        # 基线缺失（如停机前失败）由 _rollback_first_host_strict 拒绝
+                                        recorded = self.strategy.last_results.get(host) or {}
+                                        baseline = recorded.get("recovery_target") or ""
+                                        self._rollback_first_host_strict(host, srv, baseline)
+                                        success_all = False
+                                        break
+                                    log(f">>> 回滚首台 {host} 到 {self.previous_version}")
+                                    rollback_server = RemoteServer(host, merge_server_ssh(self.ssh_cfg, srv))
                                     try:
+                                        nacos_ip = self._nacos_ip(srv)
+                                        if self.strategy.supports_nacos:
+                                            self.nacos_offline(nacos_ip)
+                                        rolled_back = self.strategy.rollback(rollback_server)
                                         if self.strategy.supports_nacos:
                                             self.nacos_online(nacos_ip, weight=1.0)
-                                    except Exception:
-                                        pass
-                                finally:
-                                    rollback_server.close()
-                                success_all = False
-                                break
-                            elif decision == "stop":
-                                # 仅部分服务器发布，属于未完成发布：不得按成功打标签/发通知
-                                log("已停止发布剩余服务器，首台保持新版本（本次发布未完成）")
-                                success_all = False
-                                break
-                            # continue → 继续发布剩余服务器
-                except Exception as e:
-                    log(f"部署异常: {e}")
-                    success_all = False
-        finally:
-            # 无论发布成功/失败/异常，都必须恢复 SnailJob，避免任务组长期停留在暂停状态
-            if group and not skip_snailjob:
-                log(f">>> 步骤 5/6: 恢复 SnailJob group={group}")
-                # 按备份快照精确恢复：只恢复备份前运行的任务，备份前暂停的保持暂停
-                restore_jobs(group, backup, env=self.env)
-            else:
-                log(">>> 步骤 5/6: 无需恢复 SnailJob")
+                                        if rolled_back is False:
+                                            log(f"首台 {host} 回滚被前置检查阻止"
+                                                "（旧版本缺少依赖产物），服务保持现状，请人工处理")
+                                        else:
+                                            log(f"首台 {host} 已回滚")
+                                    except Exception as re:
+                                        log(f"首台回滚失败: {re}")
+                                        try:
+                                            if self.strategy.supports_nacos:
+                                                self.nacos_online(nacos_ip, weight=1.0)
+                                        except Exception:
+                                            pass
+                                    finally:
+                                        rollback_server.close()
+                                    success_all = False
+                                    break
+                                elif decision == "stop":
+                                    # 仅部分服务器发布，属于未完成发布：不得按成功打标签/发通知
+                                    log("已停止发布剩余服务器，首台保持新版本（本次发布未完成）")
+                                    success_all = False
+                                    break
+                                # continue → 继续发布剩余服务器
+                    except Exception as e:
+                        log(f"部署异常: {e}")
+                        success_all = False
+            finally:
+                # 无论发布成功/失败/异常，都必须恢复 SnailJob，避免任务组长期停留在暂停状态
+                if group and not skip_snailjob:
+                    log(f">>> 步骤 5/6: 恢复 SnailJob group={group}")
+                    # 按备份快照精确恢复：只恢复备份前运行的任务，备份前暂停的保持暂停
+                    restore_jobs(group, backup, env=self.env)
+                else:
+                    log(">>> 步骤 5/6: 无需恢复 SnailJob")
 
         if clear_summary_flag:
             log(">>> 步骤 6/6: 清零 sj_job_summary 计数器")
@@ -1309,7 +1333,8 @@ class Deployer:
                 tag_project(self.proj_cfg, self.version,
                             self.config["deploy"]["project_root"],
                             push=not self._skip_git_push,
-                            suffix=suffix)
+                            suffix=suffix,
+                            expected_head=getattr(self, "_built_git_head", ""))
         else:
             log("发布中断，已回滚失败服务器")
             send_notify(self.config, "failed", project=self.project, version=self.version,
@@ -1318,6 +1343,10 @@ class Deployer:
         return success_all
 
     def rollback_all(self, servers: list, skip_snailjob: bool = False):
+        with resource_lock(artifact_lock_key(self.project, self.proj_cfg)):
+            return self._rollback_all(servers, skip_snailjob)
+
+    def _rollback_all(self, servers: list, skip_snailjob: bool = False):
         """全量回滚：将所有服务器从当前版本回滚到 previous_version
 
         流程与 run() 类似，但跳过构建，各服务器并行执行：Nacos 下线 → 回滚目标 → 健康检查 → Nacos 上线。
@@ -1334,116 +1363,119 @@ class Deployer:
                     previous_version=self.previous_version, env=self.env)
         start_ts = time.time()
 
-        group = self.proj_cfg.get("snailjob_group", "")
-        backup = None
-        if group and not skip_snailjob:
-            log(f">>> 步骤 1/3: 暂停 SnailJob group={group}")
-            backup = backup_jobs(group, Path("backups"), env=self.env)
-            set_job_status(group, 0, env=self.env)
-        else:
-            log(">>> 步骤 1/3: 无需暂停 SnailJob")
-
-        # WAR 严格生命周期：逐台回滚，一台失败/未知即停止后续主机。SnailJob 恢复
-        # 对两条路径共用（try/finally 包住分支，异常路径同样恢复，与既有保证一致）
-        rollback_results = {}  # {host: bool}
-        try:
-            if self.strategy.strict_host_lifecycle is True:
-                log(">>> 步骤 2/3: WAR 逐台严格回滚（失败即停止）")
-                rollback_results = self._rollback_all_strict(servers)
+        with ExitStack() as snailjob_locks:
+            group = self.proj_cfg.get("snailjob_group", "")
+            backup = None
+            if group and not skip_snailjob:
+                snailjob_locks.enter_context(resource_lock(snailjob_lock_key(group)))
+                log(f">>> 步骤 1/3: 暂停 SnailJob group={group}")
+                backup = backup_jobs(group, Path("backups"), env=self.env)
             else:
-                log(">>> 步骤 2/3: 并行回滚所有服务器（各服务器独立 SSH 连接，传输+回滚并行）")
+                log(">>> 步骤 1/3: 无需暂停 SnailJob")
 
-                def _rollback_one(srv: dict) -> tuple:
-                    """单台回滚：Nacos 下线 → 回滚目标 → 健康检查 → Nacos 上线，返回 (host, ok)"""
-                    host = srv["ip"]
-                    log(f"\n========== 开始回滚 {host} ==========")
-                    ssh_cfg = merge_server_ssh(self.ssh_cfg, srv)
-                    server = RemoteServer(host, ssh_cfg)
-                    nacos_ip = self._nacos_ip(srv)
-                    snapshotted = False
-                    container_rolled_back = False
-                    try:
-                        # 显式回滚前置检查：进程模式无 releases/{version} 时 rollback 会「跳过」，
-                        # 直接返回成功会误导操作者，这里在 Nacos 下线前即判该主机回滚失败
-                        if self.strategy.rollback_source_missing(server):
-                            log(f"[{host}] 回滚源缺失（releases/{self.previous_version} 不存在），"
-                                f"该主机回滚失败；请先重传该版本产物或显式跳过此主机")
-                            return host, False
-                        if self.strategy.supports_nacos:
-                            self.nacos_offline(nacos_ip)
-                            # 记录回滚前 Nacos 是否确实有该服务的实例（用于后续判断是否需要等待 Nacos 上线）
-                            snapshotted = any(
-                                (svc, grp, nacos_ip) in self.nacos._snapshotted_keys
-                                for svc in self.service_names()
-                                for grp in self.nacos_groups()
-                            )
-                        self.strategy.rollback(server)
-                        container_rolled_back = True  # 回滚执行成功即标记
+            # WAR 严格生命周期：逐台回滚，一台失败/未知即停止后续主机。SnailJob 恢复
+            # 对两条路径共用（try/finally 包住分支，异常路径同样恢复，与既有保证一致）
+            rollback_results = {}  # {host: bool}
+            try:
+                if group and not skip_snailjob:
+                    set_job_status(group, 0, env=self.env)
+                if self.strategy.strict_host_lifecycle is True:
+                    log(">>> 步骤 2/3: WAR 逐台严格回滚（失败即停止）")
+                    rollback_results = self._rollback_all_strict(servers)
+                else:
+                    log(">>> 步骤 2/3: 并行回滚所有服务器（各服务器独立 SSH 连接，传输+回滚并行）")
+
+                    def _rollback_one(srv: dict) -> tuple:
+                        """单台回滚：Nacos 下线 → 回滚目标 → 健康检查 → Nacos 上线，返回 (host, ok)"""
+                        host = srv["ip"]
+                        log(f"\n========== 开始回滚 {host} ==========")
+                        ssh_cfg = merge_server_ssh(self.ssh_cfg, srv)
+                        server = RemoteServer(host, ssh_cfg)
+                        nacos_ip = self._nacos_ip(srv)
+                        snapshotted = False
+                        container_rolled_back = False
                         try:
-                            self.strategy.verify(server, srv)
-                        except Exception as ve:
-                            # 目标已切回旧版本但健康检查未通过：回滚不算成功，必须如实上报
-                            log(f"[{host}] 回滚后健康检查失败: {ve}")
+                            # 显式回滚前置检查：进程模式无 releases/{version} 时 rollback 会「跳过」，
+                            # 直接返回成功会误导操作者，这里在 Nacos 下线前即判该主机回滚失败
+                            if self.strategy.rollback_source_missing(server):
+                                log(f"[{host}] 回滚源缺失（releases/{self.previous_version} 不存在），"
+                                    f"该主机回滚失败；请先重传该版本产物或显式跳过此主机")
+                                return host, False
+                            if self.strategy.supports_nacos:
+                                self.nacos_offline(nacos_ip)
+                                # 记录回滚前 Nacos 是否确实有该服务的实例（用于后续判断是否需要等待 Nacos 上线）
+                                snapshotted = any(
+                                    (svc, grp, nacos_ip) in self.nacos._snapshotted_keys
+                                    for svc in self.service_names()
+                                    for grp in self.nacos_groups()
+                                )
+                            self.strategy.rollback(server)
+                            container_rolled_back = True  # 回滚执行成功即标记
+                            try:
+                                self.strategy.verify(server, srv)
+                            except Exception as ve:
+                                # 目标已切回旧版本但健康检查未通过：回滚不算成功，必须如实上报
+                                log(f"[{host}] 回滚后健康检查失败: {ve}")
+                                if snapshotted:
+                                    try:
+                                        self.nacos_online(nacos_ip, weight=1.0)
+                                    except Exception:
+                                        pass
+                                log(f"========== {host} 回滚失败（健康检查未通过） ==========")
+                                return host, False
+                            # 回滚成功 + 健康检查通过
                             if snapshotted:
+                                # 回滚前服务在 Nacos 有注册，需要恢复上线并等待健康
                                 try:
                                     self.nacos_online(nacos_ip, weight=1.0)
-                                except Exception:
-                                    pass
-                            log(f"========== {host} 回滚失败（健康检查未通过） ==========")
-                            return host, False
-                        # 回滚成功 + 健康检查通过
-                        if snapshotted:
-                            # 回滚前服务在 Nacos 有注册，需要恢复上线并等待健康
-                            try:
-                                self.nacos_online(nacos_ip, weight=1.0)
-                            except Exception as ne:
-                                # 目标已回滚成功，仅 Nacos 上线失败，记为警告而非失败
-                                log(f"[{host}] 警告: 回滚成功，但 Nacos 上线异常: {ne}")
-                        elif self.strategy.supports_nacos:
-                            # 回滚前服务就未在 Nacos 注册，尝试上线但不等待健康
-                            try:
-                                self.nacos_online(nacos_ip, weight=1.0)
-                            except Exception:
-                                pass
-                        self._record_host_state(host, self.previous_version, self.version)
-                        log(f"========== {host} 回滚成功 ==========")
-                        return host, True
-                    except Exception as e:
-                        log(f"[{host}] 回滚异常: {e}")
-                        if container_rolled_back:
-                            # 目标已成功回滚到旧版本，仅 Nacos 等后续步骤失败
-                            log(f"[{host}] 警告: 已回滚到 {self.previous_version}，但后续步骤异常: {e}")
-                            if snapshotted:
+                                except Exception as ne:
+                                    # 目标已回滚成功，仅 Nacos 上线失败，记为警告而非失败
+                                    log(f"[{host}] 警告: 回滚成功，但 Nacos 上线异常: {ne}")
+                            elif self.strategy.supports_nacos:
+                                # 回滚前服务就未在 Nacos 注册，尝试上线但不等待健康
                                 try:
                                     self.nacos_online(nacos_ip, weight=1.0)
                                 except Exception:
                                     pass
                             self._record_host_state(host, self.previous_version, self.version)
-                            log(f"========== {host} 回滚成功（目标已回滚，Nacos 待恢复） ==========")
+                            log(f"========== {host} 回滚成功 ==========")
                             return host, True
-                        # 目标未成功回滚
-                        if snapshotted:
-                            try:
-                                self.nacos_online(nacos_ip, weight=1.0)
-                            except Exception:
-                                pass
-                        log(f"========== {host} 回滚失败 ==========")
-                        return host, False
-                    finally:
-                        server.close()
+                        except Exception as e:
+                            log(f"[{host}] 回滚异常: {e}")
+                            if container_rolled_back:
+                                # 目标已成功回滚到旧版本，仅 Nacos 等后续步骤失败
+                                log(f"[{host}] 警告: 已回滚到 {self.previous_version}，但后续步骤异常: {e}")
+                                if snapshotted:
+                                    try:
+                                        self.nacos_online(nacos_ip, weight=1.0)
+                                    except Exception:
+                                        pass
+                                self._record_host_state(host, self.previous_version, self.version)
+                                log(f"========== {host} 回滚成功（目标已回滚，Nacos 待恢复） ==========")
+                                return host, True
+                            # 目标未成功回滚
+                            if snapshotted:
+                                try:
+                                    self.nacos_online(nacos_ip, weight=1.0)
+                                except Exception:
+                                    pass
+                            log(f"========== {host} 回滚失败 ==========")
+                            return host, False
+                        finally:
+                            server.close()
 
-                # 本地旧版本镜像包只导出一次（_ensure_local_tar 内 _save_lock 保证），
-                # 各服务器并行回滚，耗时从 N 倍降为 1 倍（受最慢服务器瓶颈）
-                from concurrent.futures import ThreadPoolExecutor
-                workers = max(1, min(len(servers), 8))  # 上限 8，与并行预传输一致
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    rollback_results = dict(pool.map(_rollback_one, servers))
-        finally:
-            if group and not skip_snailjob:
-                log(f">>> 步骤 3/3: 恢复 SnailJob group={group}")
-                restore_jobs(group, backup, env=self.env)
-            else:
-                log(">>> 步骤 3/3: 无需恢复 SnailJob")
+                    # 本地旧版本镜像包只导出一次（_ensure_local_tar 内 _save_lock 保证），
+                    # 各服务器并行回滚，耗时从 N 倍降为 1 倍（受最慢服务器瓶颈）
+                    from concurrent.futures import ThreadPoolExecutor
+                    workers = max(1, min(len(servers), 8))  # 上限 8，与并行预传输一致
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        rollback_results = dict(pool.map(_rollback_one, servers))
+            finally:
+                if group and not skip_snailjob:
+                    log(f">>> 步骤 3/3: 恢复 SnailJob group={group}")
+                    restore_jobs(group, backup, env=self.env)
+                else:
+                    log(">>> 步骤 3/3: 无需恢复 SnailJob")
 
         # 汇总结果
         success_count = sum(1 for v in rollback_results.values() if v)
@@ -1458,7 +1490,18 @@ class Deployer:
                     detail=f"全量回滚：成功 {success_count} 台，失败 {fail_count} 台")
         return fail_count == 0
 
-    def push_image_only(self, servers: list):
+    def build_and_push(self, servers: list):
+        with resource_lock(artifact_lock_key(self.project, self.proj_cfg)):
+            build_project(self.project, self.version, env=self.env, lock_artifact=False)
+            return self._push_image_only(servers)
+
+    def push_image_only(self, servers: list, lock_artifact: bool = True):
+        if lock_artifact:
+            with resource_lock(artifact_lock_key(self.project, self.proj_cfg)):
+                return self._push_image_only(servers)
+        return self._push_image_only(servers)
+
+    def _push_image_only(self, servers: list):
         """仅推送镜像到服务器，不执行发布（不 Nacos 下线、不更新容器）
 
         直传模式：并行 docker save → 上传 → docker load；仓库模式（push）的
@@ -1543,13 +1586,12 @@ def main():
     # --push-only: 构建 + 推送镜像到服务器
     if args.push_only:
         log(f">>> 构建并推送模式：{args.project} {args.version}")
-        build_project(args.project, args.version, env=args.env)
         servers_file = args.servers_file or default_servers_file(env=args.env)
         servers = load_yaml(Path(servers_file)).get("servers", [])
         if not servers:
             fail("服务器清单为空")
         deployer = Deployer(args.project, args.version, args.previous_version, config, env=args.env)
-        success = deployer.push_image_only(servers)
+        success = deployer.build_and_push(servers)
         if success:
             log("镜像推送完成")
         else:

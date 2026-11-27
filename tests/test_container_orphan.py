@@ -3,10 +3,14 @@
 # update_container/rollback_container 须在 compose rm 后检测并分流清理：
 # 无标签 → 游离旧容器直接清理；有标签 → 属于其它 compose 项目，报错交人工。
 # 运行：python -m pytest tests/test_container_orphan.py -q
+import os
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
 from deploy import Deployer, get_current_remote_version
+import resource_locks
 
 
 class FakeServer:
@@ -77,6 +81,56 @@ class _FakeClient:
 
     def close(self):
         pass
+
+
+class ComposeMutationLockTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"PLATFORM_DATA_DIR": self.tmp.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _assert_mutation_waits(self, method_name):
+        d = make_deployer()
+        d.previous_version = "0.9.0"
+        d.prev_image = "fenfa/fenfa:0.9.0"
+        server = FakeServer()
+        image_ready = threading.Event()
+        errors = []
+
+        def run():
+            try:
+                getattr(d, method_name)(server)
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(d, "ensure_image_ready",
+                               side_effect=lambda *a, **k: image_ready.set()), \
+                mock.patch("deploy.log"):
+            thread = None
+            try:
+                with resource_locks.resource_lock(
+                        resource_locks.compose_lock_key(server.host, d.compose_path)):
+                    thread = threading.Thread(target=run)
+                    thread.start()
+                    self.assertTrue(image_ready.wait(1), "镜像传输不得被 compose 锁阻塞")
+                    self.assertFalse(
+                        any("compose" in cmd and " stop " in cmd for cmd in server.exec_calls),
+                        "同机同 compose 文件的容器切换必须互斥")
+            finally:
+                if thread is not None:
+                    thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(any("compose" in cmd and " up -d " in cmd
+                            for cmd in server.exec_calls))
+
+    def test_update_waits_for_same_compose_lock(self):
+        self._assert_mutation_waits("update_container")
+
+    def test_rollback_waits_for_same_compose_lock(self):
+        self._assert_mutation_waits("rollback_container")
 
 
 class CurrentRemoteVersionFilterTest(unittest.TestCase):

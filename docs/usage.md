@@ -224,7 +224,7 @@ pipelines:
           - name: xxx
 ```
 
-- `build_first: true` 适合全量发布，避免阶段并行时多个 Maven 进程冲突。
+- `build_first: true` 先统一构建所有镜像，再进入滚动发布；构建结果与对应 Git HEAD 快照直接传给部署阶段，不会在 stage 内重复构建。不同服务是否真正并行取决于共享资源的操作级锁，不会再因整任务全局锁逐个等待。
 - `build_first: false` 时，每个 stage 开始前会顺序构建本 stage 涉及的服务，再进入部署。
 - 如果某个 stage 中任一服务发布失败，流水线会停止后续 stage，已经成功的服务保持新版本。
 
@@ -454,6 +454,8 @@ Maven profile 决定 jar 内固化的环境配置：`application.yml` 中的 `@p
 ```bash
 ./pipeline.sh --pipeline xxx --version 1.0.29 --push-only
 ```
+
+单服务与流水线的 `--push-only` 都在同一个最终产物锁内完成构建和推送，其他任务不能在这段窗口内覆盖同名镜像；流水线会按产物身份排序加锁，避免相互等待形成死锁。
 
 > **典型用法**：先 `--push-only` 提前传输镜像，发布时 `--skip-build` 跳过构建直接部署，大幅缩短发布窗口。
 
@@ -713,7 +715,14 @@ python webapp/app.py          # 默认 http://127.0.0.1:5678
 
 - 发布任务通过子进程调用 `deploy.py` / `deploy_pipeline.py`（`--config-source db --project-id <ID>`），行为与命令行一致；日志实时查看。
 - 提交互斥：同一目标（服务，或流水线及其成员服务）在同一环境内只允许一个活动任务（状态 `pending`/`running`）。重复提交返回 409（`error=active_task`，附带占用方任务号，前端给出「打开该任务」入口）；定时计划与 webhook 撞上同一约束时跳过本轮并推进下一次时间，Agent 在生成审批单之前先预检以免白走审批。平台进程重启遗留的 `pending`/`running` 任务在启动时收敛为失败——活动状态即占用发布目标，留着会让该服务再也提交不了（日志注明目标主机上可能仍在执行，需人工核对）。
-- 并行执行：任务按「执行道」并行，共道排队、异道并行。道键覆盖四类共享资源——发布目标、构建工作目录（`git_repo` 指向的仓库与 `build_order` 各模块目录）、目标机上的 `docker-compose.yml`（按 `主机:路径`，平台要下载改写再上传，并发即丢更新）、SnailJob 分组（部署前暂停、结束后恢复）。槽位数由 `PLATFORM_TASK_CONCURRENCY` 控制（默认 3，设为 `1` 即恢复旧的单 worker 串行）。效果：一次 20 分钟的 Maven 构建不再挡住无关服务的发布，同一 mono-repo 下的服务仍严格排队。
+- 并行执行：不同服务默认并行，任务层只保留发布目标与 SnailJob 分组两类整任务互斥；同一目标、同一 SnailJob 分组仍排队，只有 `--skip-snailjob` 才移除分组互斥（`--skip-build` 不影响暂停/恢复）。槽位数由 `PLATFORM_TASK_CONCURRENCY` 控制（默认 3，设为 `1` 即恢复旧的单 worker 串行）。
+- 操作级跨进程锁：锁文件常驻 `<data-dir>/locks/`，多个发布子进程共用；只锁实际争用文件或远程资源的操作，不在整个任务期间持有。
+  - 仓库：Git clone/checkout/pull/tag 占写锁，构建、打包与 Docker build 占读锁。源码准备后记录 HEAD，构建前复核；HEAD 已被其他任务改变时重新准备，发布后打 Tag 也复核同一 HEAD，避免标记未构建的提交。
+  - 模块：同一模块目录串行；子模块共享祖先守卫，兄弟模块仍可并行，父模块对自身路径独占。构建步骤只在实际执行期间加锁，Docker 子上下文之外的构建模块不会继续阻塞后续 Docker build。
+  - Compose：同机等价路径只串行 stop/rm、游离容器清理、日志清理、改写 Compose 和 up；镜像 pull/传输在锁外。
+  - 最终产物：容器按 `image_name`、静态包按 `zip_prefix`（默认项目名）识别，同名产物的构建、发布、回滚和仅推送跨进程互斥；`build_first` 与 stage 构建会持续持锁到部署结束，避免同名镜像在窗口内被覆盖，部署阶段复用外层锁而不重复加锁。
+  - SnailJob：发布脚本对同组的备份、暂停、恢复生命周期加跨进程锁；暂停动作本身失败或部分提交时也进入恢复路径。
+- 产物完整性：jar/war/zip/压缩包、镜像 tar.gz 与 `.sha256` 先写同目录临时文件，完整写入后才原子替换；失败保留旧正式产物。Docker 先构建到 `:platform-build` 临时 Tag，构建成功后才提升为正式版本 Tag 并推送。
 
 ### 10.6 配置来源与 CLI 兼容（--config-source）
 

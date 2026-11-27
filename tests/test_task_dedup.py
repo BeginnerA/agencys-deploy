@@ -217,6 +217,17 @@ class TestInterruptedTaskRecovery(unittest.TestCase):
             self.assertEqual(reap_interrupted_tasks(self.db), 0)
         self.assertEqual(dbm.get_task(self.db, tid)["status"], "running")
 
+    def test_kill_orphaned_running_task_marks_failed(self):
+        from unittest import mock
+
+        from webapp import task_manager
+        tid = self._stale("running", with_log=True)
+        with mock.patch.dict(task_manager._task_registry, {}, clear=True):
+            self.assertTrue(task_manager.kill_task(tid, self.db))
+        task = dbm.get_task(self.db, tid)
+        self.assertEqual(task["status"], "failed")
+        self.assertTrue(task["finished_at"])
+
     def test_reap_appends_reason_to_task_log(self):
         from webapp.task_manager import reap_interrupted_tasks
         tid = self._stale("running", with_log=True)

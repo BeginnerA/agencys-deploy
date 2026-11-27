@@ -13,6 +13,7 @@ admin 引导，导出接口也顺着默认 `DATA_DIR` 覆盖了 `data/export/con
   2. 路由内 `current_app.config` 缺失时的兜底常量（各自模块的 CONFIG_DIR /
      DEPLOY_ROOT）不受本护栏影响，那些路径只在无 app 上下文时才会被读到。
 """
+import os
 import sys
 from pathlib import Path
 
@@ -31,11 +32,17 @@ def isolate_default_dirs(tmp_path_factory):
     orig_data = webapp.DATA_DIR
     orig_config = webapp.CONFIG_DIR
     orig_log = task_manager.LOG_DIR
+    orig_platform_data = os.environ.get("PLATFORM_DATA_DIR")
     webapp.DATA_DIR = root / "data"
     webapp.CONFIG_DIR = root / "config"
+    os.environ["PLATFORM_DATA_DIR"] = str(root / "data")
     try:
         yield root
     finally:
         webapp.DATA_DIR = orig_data
         webapp.CONFIG_DIR = orig_config
         task_manager.set_log_dir(orig_log)
+        if orig_platform_data is None:
+            os.environ.pop("PLATFORM_DATA_DIR", None)
+        else:
+            os.environ["PLATFORM_DATA_DIR"] = orig_platform_data

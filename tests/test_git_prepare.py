@@ -17,7 +17,7 @@ def _ok_run():
     r = mock.Mock()
     r.returncode = 0
     r.stderr = ""
-    r.stdout = ""
+    r.stdout = "a" * 40 + "\n"
     return r
 
 
@@ -52,9 +52,10 @@ class TestGitPrepare(unittest.TestCase):
         (self.root / "order-service").mkdir()
         (self.root / "order-service" / ".git").mkdir()
         with mock.patch("build.subprocess.run", return_value=_ok_run()) as run:
-            # 已 clone 过且未配 branch/pull → 复用本地，不调任何 git 命令
+            # 已 clone 过且未配 branch/pull → 复用本地，只读取构建快照 HEAD
             git_prepare({"git_repo": url}, self.root)
-        run.assert_not_called()
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][-2:], ["rev-parse", "HEAD"])
 
     def test_url_with_credentials_masked_in_log(self):
         url = "https://ci:token123@git.example.com/order-service.git"

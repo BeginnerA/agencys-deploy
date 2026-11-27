@@ -164,6 +164,22 @@ class TestEnsureImageReady(unittest.TestCase):
         save_calls = [c for c in proc.call_args_list if c.args[0][0] == "docker"]
         self.assertTrue(save_calls, "tar 与本地不一致时必须重新 docker save")
 
+    def test_failed_save_preserves_previous_tar_and_cleans_temp_file(self):
+        tar = Path(self.tmp) / "app_1.0.30.tar.gz"
+        tar.write_bytes(b"previous-valid-archive")
+        proc = mock.Mock()
+        proc.stdout = io.BytesIO(b"partial-archive")
+        proc.stderr = io.BytesIO(b"save failed")
+        proc.wait.return_value = 1
+        with mock.patch("deploy.local_image_id", return_value="sha256:new"), \
+                mock.patch("deploy.tar_image_id", return_value="sha256:old"), \
+                mock.patch("deploy.subprocess.Popen", return_value=proc), \
+                mock.patch("deploy.log"), \
+                self.assertRaisesRegex(RuntimeError, "docker save.*失败"):
+            self.deployer._ensure_local_tar()
+        self.assertEqual(tar.read_bytes(), b"previous-valid-archive")
+        self.assertEqual(list(Path(self.tmp).iterdir()), [tar])
+
     def test_load_mismatch_raises(self):
         """load 后远端 digest 与本地仍不一致：报错"""
         server = FakeServer(image_ids=[None, "sha256:other"])
@@ -230,6 +246,7 @@ class TestPrefetchImages(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.deployer = make_deployer(self.tmp)
         self.deployer.registry_mode = "direct"
+        self.deployer.proj_cfg = {"image_name": "app"}
         self.deployer.ssh_cfg = {}
 
     def _patch_remote(self, fake_servers):

@@ -2,6 +2,7 @@
 import os
 import re
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -184,6 +185,36 @@ def _save_deploy_snapshot(db_path, task_id: int, log_file: str):
         pass
 
 
+def _update_task_with_retry(db_path, task_id, **fields):
+    for attempt in range(3):
+        try:
+            return update_task(db_path, task_id, **fields)
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            if attempt == 2:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+
+
+def _reap_orphaned_task(task_id, db_path):
+    if not db_path:
+        return False
+    task = dbm.get_task(db_path, task_id)
+    if not task or task.get("status") not in ("pending", "running"):
+        return False
+    log_file = task.get("log_file")
+    if log_file:
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write("[platform] 任务进程已不存在，残留状态已收敛为 failed\n")
+        except OSError:
+            pass
+    return _update_task_with_retry(db_path, task_id, status="failed",
+                                   finished_at=time.time())
+
+
 def _run_task(db_path, task, extra_args, log_dir=None):
     # 落点目录：显式参数（提交方 app.config）优先，否则模块配置
     log_root = _log_root(log_dir)
@@ -200,11 +231,10 @@ def _run_task(db_path, task, extra_args, log_dir=None):
             # 注册 _RestartHandle 供 kill_task 协作取消（覆盖排队期 Future 占位）
             handle = _RestartHandle()
             _task_registry[task["id"]] = handle
-            try:
-                status = _run_restart(db_path, task, str(log_file), handle)
-            finally:
-                _task_registry.pop(task["id"], None)
-            update_task(db_path, task["id"], status=status, finished_at=time.time())
+            status = _run_restart(db_path, task, str(log_file), handle)
+            _update_task_with_retry(db_path, task["id"], status=status,
+                                    finished_at=time.time())
+            _task_registry.pop(task["id"], None)
             return
         cmd = build_cli(task, extra)
         env_map = dict(os.environ)
@@ -223,12 +253,13 @@ def _run_task(db_path, task, extra_args, log_dir=None):
                                         subprocess, "CREATE_NO_WINDOW", 0))
         _task_registry[task["id"]] = proc  # 覆盖排队期 Future 占位
         rc = proc.wait()
-        _task_registry.pop(task["id"], None)
         # 自动版本号场景：子进程已解析实际版本并写入日志，回写到任务记录
         if "--auto-version" in extra:
             _backfill_auto_versions(db_path, task["id"], str(log_file))
-        update_task(db_path, task["id"], status="success" if rc == 0 else "failed",
-                    finished_at=time.time())
+        _update_task_with_retry(db_path, task["id"],
+                                status="success" if rc == 0 else "failed",
+                                finished_at=time.time())
+        _task_registry.pop(task["id"], None)
         if rc == 0:
             _save_deploy_snapshot(db_path, task["id"], str(log_file))
     except Exception as exc:
@@ -237,8 +268,8 @@ def _run_task(db_path, task, extra_args, log_dir=None):
         try:
             with open(log_file, "a", encoding="utf-8") as f:
                 f.write(f"\n[platform] 任务执行异常: {exc!r}\n")
-            update_task(db_path, task["id"], status="failed",
-                        finished_at=time.time())
+            _update_task_with_retry(db_path, task["id"], status="failed",
+                                    finished_at=time.time())
         except Exception:
             pass
 
@@ -285,7 +316,7 @@ def kill_task(task_id: int, db_path: str = None) -> bool:
     db_path 传入时，排队取消会同步落库 failed（避免大屏出现永久 pending 幽灵任务）"""
     entry = _task_registry.get(task_id)
     if entry is None:
-        return False
+        return _reap_orphaned_task(task_id, db_path)
     if isinstance(entry, _RestartHandle):
         # 协作取消：仅置标志，终态（failed）由 worker 线程观察到 cancel 后落库
         entry.cancel.set()
@@ -305,8 +336,7 @@ def kill_task(task_id: int, db_path: str = None) -> bool:
             if entry is not None and not isinstance(entry, lanes.QueuedTask):
                 break
         else:
-            # 任务已在执行且注册窗口已过但 registry 无 Popen（异常退出被 pop）
-            return False
+            return _reap_orphaned_task(task_id, db_path)
         if isinstance(entry, _RestartHandle):
             entry.cancel.set()
             return True
