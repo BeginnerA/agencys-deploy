@@ -118,6 +118,7 @@ class OutputEncodingTest(unittest.TestCase):
             encoding="utf-8")
         return script
 
+    @unittest.skipUnless(os.name == "nt", "GBK 兜底仅 Windows 启用")
     def test_gbk_child_output_keeps_chinese_keyword_matchable(self):
         script = self._emit_script("gbk", "[ERROR] 读取 A.java 时出错")
         rc, text = build._run_streaming([sys.executable, str(script)], self.cwd,
