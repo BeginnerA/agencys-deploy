@@ -457,7 +457,7 @@
     </nav>
     <div class="head-cta">
       <a class="ghost-link" href="https://github.com/BeginnerA/agencys-deploy" target="_blank" rel="noopener">GITHUB ↗</a>
-      <a class="btn btn-primary btn-sm" href="https://github.com/BeginnerA/agencys-deploy/releases/tag/v0.4.1" target="_blank" rel="noopener">下载 v0.4.1</a>
+      <a class="btn btn-primary btn-sm" href="https://github.com/BeginnerA/agencys-deploy/releases/tag/v0.5.0" target="_blank" rel="noopener">下载 v0.5.0</a>
     </div>
     <button class="nav-toggle" id="navToggle" aria-expanded="false" aria-controls="mobileNav"><i aria-hidden="true"></i>菜单</button>
   </div>
@@ -490,7 +490,7 @@
             </a>
           </div>
           <div class="hero-meta" aria-label="版本与运行信息">
-            <span><i aria-hidden="true"></i>v0.4.1 已发布</span>
+            <span><i aria-hidden="true"></i>v0.5.0 已发布</span>
             <span><i aria-hidden="true"></i>Windows 10 / 11 x64</span>
             <span><i aria-hidden="true"></i>约 19 MB · 解压即用</span>
             <span><i aria-hidden="true"></i>Apache-2.0</span>
@@ -570,7 +570,7 @@
             <span class="chip">失败自动回滚</span>
             <span class="chip">发布窗口拦截</span>
             <span class="chip">每步任务可追溯</span>
-            <span class="chip">整条流水线排队</span>
+            <span class="chip">不同服务并行发布</span>
           </div>
           <div class="foot"><span>配置：项目 → 服务 → 环境 → 服务器</span><span><b>一条命令</b> · 全程留痕</span></div>
         </div>
@@ -688,7 +688,7 @@
           <figure class="shot-panel" role="tabpanel" id="panel-deploy" aria-labelledby="tab-deploy" data-panel hidden>
             <img src="assets/deploy.webp" width="1500" height="937" alt="发布中心界面：任务列表按编号展示服务、操作类型、环境、版本、状态、启动时间与耗时">
             <figcaption class="shot-caption">
-              <div><strong>发布中心</strong><span>服务与流水线任务统一排队；版本、环境、状态、耗时和日志都可追溯，运行中的任务可以终止或回滚。</span></div>
+              <div><strong>发布中心</strong><span>同一发布目标互斥、不同服务并行执行；版本、环境、状态、耗时和日志都可追溯，运行中的任务可以终止或回滚。</span></div>
               <div class="meta"><i>任务队列</i><i>发布 / 回滚 / 重启</i><i>增量日志</i><i>终止与重跑</i></div>
             </figcaption>
           </figure>
@@ -744,7 +744,7 @@
           <div class="local-cards">
             <div class="local-card">
               <svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v6c0 1.7 3.1 3 7 3s7-1.3 7-3V5M5 11v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/></svg>
-              <div><b>单文件数据库</b><span>备份、迁移、导入导出都在本机完成，数据库不需要额外的服务进程。</span></div>
+              <div><b>单文件数据库</b><span>库内自带快照与两段式恢复（换库在平台重启后生效，重启前可撤回）；备份、迁移、导入导出都在本机完成，不需要额外的服务进程。</span></div>
             </div>
             <div class="local-card">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 5 6v5c0 4 2.9 7.5 7 9 4.1-1.5 7-5 7-9V6l-7-3Z"/><path d="M9.5 12h5M12 9.5v5"/></svg>
@@ -780,14 +780,14 @@
             <div class="kicker">06 / <span>DOWNLOAD</span></div>
             <h2 id="downloadTitle">下载，解压，开始发布。</h2>
           </div>
-          <div class="ver"><span>RELEASE</span><strong>v0.4.1</strong></div>
+          <div class="ver"><span>RELEASE</span><strong>v0.5.0</strong></div>
         </div>
         <div class="dl-grid">
           <div class="dl-main">
             <h3>智能运维平台 · Windows 便携版</h3>
             <p class="dl-meta">WINDOWS 10 / 11 · X64　·　约 19 MB　·　解压后约 45 MB</p>
             <div class="dl-actions">
-              <a class="btn btn-primary" href="https://github.com/BeginnerA/agencys-deploy/releases/download/v0.4.1/SmartOps-portable-v0.4.1-win-x64.zip" target="_blank" rel="noopener">下载便携版 zip
+              <a class="btn btn-primary" href="https://github.com/BeginnerA/agencys-deploy/releases/download/v0.5.0/SmartOps-portable-v0.5.0-win-x64.zip" target="_blank" rel="noopener">下载便携版 zip
                 <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m0 0 3.2-3.2M8 10 4.8 6.8M3 12.5h10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
               </a>
               <a class="btn btn-ghost" href="https://github.com/BeginnerA/agencys-deploy" target="_blank" rel="noopener">GitHub 仓库
@@ -797,7 +797,7 @@
             <p class="dl-note">内置 Python 3.12 运行时与全部依赖。无需 pip、无需安装开发环境。构建镜像时仍需本机具备 git / Maven / Docker。</p>
             <div class="dl-links">
               <a href="https://gitee.com/agencys/agencys-deploy" target="_blank" rel="noopener">Gitee 镜像</a><i>·</i>
-              <a href="https://github.com/BeginnerA/agencys-deploy/releases/tag/v0.4.1" target="_blank" rel="noopener">Release 说明</a><i>·</i>
+              <a href="https://github.com/BeginnerA/agencys-deploy/releases/tag/v0.5.0" target="_blank" rel="noopener">Release 说明</a><i>·</i>
               <a href="https://github.com/BeginnerA/agencys-deploy/blob/main/LICENSE" target="_blank" rel="noopener">Apache-2.0</a><i>·</i>
               <span>校验与更新以 Release 页为准</span>
             </div>
